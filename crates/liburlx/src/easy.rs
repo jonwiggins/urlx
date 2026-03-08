@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use crate::cookie::CookieJar;
 use crate::error::Error;
+use crate::pool::{ConnectionPool, PooledStream};
 use crate::protocol::http::response::{Response, TransferInfo};
 use crate::url::Url;
 
@@ -14,7 +15,7 @@ use crate::url::Url;
 ///
 /// This is the main entry point for the liburlx API, modeled after
 /// curl's `CURL *` easy handle.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Easy {
     url: Option<Url>,
     method: Option<String>,
@@ -29,12 +30,34 @@ pub struct Easy {
     proxy: Option<Url>,
     noproxy: Option<String>,
     cookie_jar: Option<CookieJar>,
+    pool: ConnectionPool,
+}
+
+impl Clone for Easy {
+    fn clone(&self) -> Self {
+        Self {
+            url: self.url.clone(),
+            method: self.method.clone(),
+            headers: self.headers.clone(),
+            body: self.body.clone(),
+            follow_redirects: self.follow_redirects,
+            max_redirects: self.max_redirects,
+            verbose: self.verbose,
+            accept_encoding: self.accept_encoding,
+            connect_timeout: self.connect_timeout,
+            timeout: self.timeout,
+            proxy: self.proxy.clone(),
+            noproxy: self.noproxy.clone(),
+            cookie_jar: self.cookie_jar.clone(),
+            pool: ConnectionPool::new(),
+        }
+    }
 }
 
 impl Easy {
     /// Create a new transfer handle.
     #[must_use]
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             url: None,
             method: None,
@@ -49,6 +72,7 @@ impl Easy {
             proxy: None,
             noproxy: None,
             cookie_jar: None,
+            pool: ConnectionPool::new(),
         }
     }
 
@@ -226,6 +250,7 @@ impl Easy {
             effective_proxy,
             effective_noproxy,
             &mut self.cookie_jar,
+            &mut self.pool,
         );
 
         // Apply total transfer timeout if set
@@ -258,6 +283,7 @@ async fn perform_transfer(
     proxy: Option<&Url>,
     noproxy: Option<&str>,
     cookie_jar: &mut Option<CookieJar>,
+    pool: &mut ConnectionPool,
 ) -> Result<Response, Error> {
     let transfer_start = Instant::now();
     let mut current_url = url.clone();
@@ -294,6 +320,7 @@ async fn perform_transfer(
             accept_encoding,
             connect_timeout,
             effective_proxy,
+            pool,
         )
         .await?;
         last_connect_time = connect_start.elapsed();
@@ -329,9 +356,6 @@ async fn perform_transfer(
                     }
                 }
 
-                // 303: always change to GET, drop body
-                // 301/302: change to GET for POST (curl compat), drop body
-                // 307/308: preserve method and body
                 // 303: always change to GET, drop body
                 // 301/302: change POST to GET (curl compat), drop body
                 // 307/308: preserve method and body
@@ -370,9 +394,12 @@ async fn do_single_request(
     accept_encoding: bool,
     connect_timeout: Option<Duration>,
     proxy: Option<&Url>,
+    pool: &mut ConnectionPool,
 ) -> Result<Response, Error> {
     let (host, port) = url.host_and_port()?;
     let host_header = url.host_header_value();
+    let is_tls = url.scheme() == "https";
+    let use_pool = proxy.is_none();
 
     // Build effective headers (add Accept-Encoding if decompression enabled)
     let mut effective_headers: Vec<(String, String)> = headers.to_vec();
@@ -381,6 +408,49 @@ async fn do_single_request(
             "Accept-Encoding".to_string(),
             crate::protocol::http::decompress::accepted_encodings().to_string(),
         ));
+    }
+
+    // Try to use a pooled connection
+    if use_pool {
+        if let Some(mut stream) = pool.get(&host, port, is_tls) {
+            if verbose {
+                #[allow(clippy::print_stderr)]
+                {
+                    eprintln!("* Re-using existing connection to {host} port {port}");
+                }
+            }
+
+            let request_target = url.request_target();
+            let result = crate::protocol::http::h1::request(
+                &mut stream,
+                method,
+                &host_header,
+                &request_target,
+                &effective_headers,
+                body,
+                url.as_str(),
+                true,
+            )
+            .await;
+
+            match result {
+                Ok((response, can_reuse)) => {
+                    if can_reuse {
+                        pool.put(&host, port, is_tls, stream);
+                    }
+                    return maybe_decompress(response, accept_encoding);
+                }
+                Err(_) => {
+                    // Pooled connection was stale — fall through to create new one
+                    if verbose {
+                        #[allow(clippy::print_stderr)]
+                        {
+                            eprintln!("* Connection stale, creating new connection");
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // Determine what to connect to: proxy or target directly
@@ -415,7 +485,6 @@ async fn do_single_request(
             #[cfg(feature = "rustls")]
             {
                 let tls_stream_inner = if proxy.is_some() {
-                    // CONNECT tunneling: establish tunnel through proxy first
                     if verbose {
                         #[allow(clippy::print_stderr)]
                         {
@@ -440,7 +509,7 @@ async fn do_single_request(
                             eprintln!("* Using HTTP/2");
                         }
                     }
-                    crate::protocol::http::h2::request(
+                    let resp = crate::protocol::http::h2::request(
                         tls_stream,
                         method,
                         &host_header,
@@ -449,36 +518,29 @@ async fn do_single_request(
                         body,
                         url.as_str(),
                     )
-                    .await?
-                } else {
-                    let mut tls_stream = tls_stream;
-                    crate::protocol::http::h1::request(
-                        &mut tls_stream,
-                        method,
-                        &host_header,
-                        &request_target,
-                        &effective_headers,
-                        body,
-                        url.as_str(),
-                    )
-                    .await?
+                    .await?;
+                    return maybe_decompress(resp, accept_encoding);
                 }
 
-                #[cfg(not(feature = "http2"))]
-                {
-                    let request_target = url.request_target();
-                    let mut tls_stream = tls_stream;
-                    crate::protocol::http::h1::request(
-                        &mut tls_stream,
-                        method,
-                        &host_header,
-                        &request_target,
-                        &effective_headers,
-                        body,
-                        url.as_str(),
-                    )
-                    .await?
+                // HTTP/1.1 over TLS
+                let mut stream = PooledStream::Tls(tls_stream);
+                let (resp, can_reuse) = crate::protocol::http::h1::request(
+                    &mut stream,
+                    method,
+                    &host_header,
+                    &request_target,
+                    &effective_headers,
+                    body,
+                    url.as_str(),
+                    use_pool,
+                )
+                .await?;
+
+                if can_reuse && use_pool {
+                    pool.put(&host, port, is_tls, stream);
                 }
+
+                resp
             }
             #[cfg(not(feature = "rustls"))]
             {
@@ -486,25 +548,37 @@ async fn do_single_request(
             }
         }
         "http" => {
-            let mut tcp_stream = tcp_stream;
             // For HTTP through proxy, use absolute URL as request target
             let request_target =
                 if proxy.is_some() { url.as_str().to_string() } else { url.request_target() };
-            crate::protocol::http::h1::request(
-                &mut tcp_stream,
+
+            let mut stream = PooledStream::Tcp(tcp_stream);
+            let (resp, can_reuse) = crate::protocol::http::h1::request(
+                &mut stream,
                 method,
                 &host_header,
                 &request_target,
                 &effective_headers,
                 body,
                 url.as_str(),
+                use_pool,
             )
-            .await?
+            .await?;
+
+            if can_reuse && use_pool {
+                pool.put(&host, port, is_tls, stream);
+            }
+
+            resp
         }
         scheme => return Err(Error::Http(format!("unsupported scheme: {scheme}"))),
     };
 
-    // Decompress body if Content-Encoding is present and we requested compression
+    maybe_decompress(response, accept_encoding)
+}
+
+/// Decompress response body if Content-Encoding is present and decompression was requested.
+fn maybe_decompress(response: Response, accept_encoding: bool) -> Result<Response, Error> {
     if accept_encoding {
         if let Some(encoding) = response.header("content-encoding") {
             if encoding != "identity" {
@@ -519,7 +593,6 @@ async fn do_single_request(
             }
         }
     }
-
     Ok(response)
 }
 
@@ -930,5 +1003,14 @@ mod tests {
             resolve_relative("http://example.com/dir/file", "other"),
             "http://example.com/dir/other"
         );
+    }
+
+    #[test]
+    fn easy_clone_has_empty_pool() {
+        let mut easy = Easy::new();
+        easy.url("http://example.com").unwrap();
+        let cloned = easy.clone();
+        // Clone succeeds with its own pool and preserves URL
+        assert!(cloned.url.is_some());
     }
 }

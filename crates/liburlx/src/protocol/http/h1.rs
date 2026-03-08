@@ -1,6 +1,9 @@
 //! HTTP/1.1 request/response codec.
 //!
 //! Constructs HTTP/1.1 requests, sends them over a stream, and parses responses.
+//! Supports both `Connection: close` and keep-alive modes. In keep-alive mode,
+//! the response body is read precisely using Content-Length or chunked encoding,
+//! leaving the stream ready for reuse.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -15,9 +18,17 @@ const MAX_HEADER_SIZE: usize = 64 * 1024;
 
 /// Send an HTTP/1.1 request and read the response.
 ///
+/// When `keep_alive` is true, the request omits `Connection: close` and
+/// reads the response body precisely (using Content-Length or chunked
+/// encoding), leaving the stream ready for reuse.
+///
+/// Returns the response and a boolean indicating whether the connection
+/// can be reused.
+///
 /// # Errors
 ///
 /// Returns errors for I/O failures or malformed responses.
+#[allow(clippy::too_many_arguments)]
 pub async fn request<S>(
     stream: &mut S,
     method: &str,
@@ -26,7 +37,8 @@ pub async fn request<S>(
     custom_headers: &[(String, String)],
     body: Option<&[u8]>,
     url: &str,
-) -> Result<Response, Error>
+    keep_alive: bool,
+) -> Result<(Response, bool), Error>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -54,7 +66,12 @@ where
         let _ = write!(req, "Content-Length: {}\r\n", body_data.len());
     }
 
-    req.push_str("Connection: close\r\n\r\n");
+    // Connection management
+    if !keep_alive {
+        req.push_str("Connection: close\r\n");
+    }
+
+    req.push_str("\r\n");
 
     // Send request headers
     stream
@@ -72,90 +89,99 @@ where
 
     stream.flush().await.map_err(|e| Error::Http(format!("flush failed: {e}")))?;
 
-    // For HEAD requests, we don't expect a body
     let is_head = method.eq_ignore_ascii_case("HEAD");
 
-    // Read the entire response.
-    // Many servers close TLS connections without close_notify (UnexpectedEof).
-    // If we already have data, treat it as a complete response.
-    let mut buf = Vec::new();
-    match stream.read_to_end(&mut buf).await {
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof && !buf.is_empty() => {
-            // Got data before unexpected EOF — proceed with what we have
-        }
-        Err(e) => return Err(Error::Http(format!("read failed: {e}"))),
-    }
+    // Read response headers incrementally
+    let (header_bytes, body_prefix) = read_response_headers(stream).await?;
 
-    parse_response(&buf, url, is_head)
+    // Parse response headers
+    let (status, headers) = parse_headers(&header_bytes)?;
+
+    // 1xx, 204, and 304 responses have no body per HTTP spec
+    let no_body = is_head || status == 204 || status == 304 || (100..200).contains(&status);
+
+    // Read body
+    let (response_body, body_read_to_eof) = if no_body {
+        (Vec::new(), false)
+    } else {
+        let is_chunked =
+            headers.get("transfer-encoding").is_some_and(|te| te.eq_ignore_ascii_case("chunked"));
+
+        if is_chunked {
+            let body = read_chunked_body_streaming(stream, body_prefix).await?;
+            (body, false)
+        } else if let Some(cl) = headers.get("content-length") {
+            let content_length: usize =
+                cl.parse().map_err(|e| Error::Http(format!("invalid Content-Length: {e}")))?;
+            let body = read_exact_body(stream, content_length, body_prefix).await?;
+            (body, false)
+        } else if keep_alive {
+            // No Content-Length, no chunked, but keep-alive → assume empty body
+            // (reading to EOF would hang since the server keeps the connection open)
+            (body_prefix, false)
+        } else {
+            // No Content-Length, no chunked, connection close → read until EOF
+            let mut body = body_prefix;
+            match stream.read_to_end(&mut body).await {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof && !body.is_empty() => {}
+                Err(e) => return Err(Error::Http(format!("read failed: {e}"))),
+            }
+            (body, true)
+        }
+    };
+
+    // Determine if connection can be reused
+    let server_wants_close =
+        headers.get("connection").is_some_and(|v| v.eq_ignore_ascii_case("close"));
+    let can_reuse = keep_alive && !server_wants_close && !body_read_to_eof;
+
+    Ok((Response::new(status, headers, response_body, url.to_string()), can_reuse))
 }
 
-/// Decode a chunked transfer-encoded body.
+/// Read response headers incrementally from a stream.
 ///
-/// Format: each chunk is `<hex-size>[;extensions]\r\n<data>\r\n`,
-/// terminated by a zero-length chunk `0\r\n\r\n`.
-///
-/// # Errors
-///
-/// Returns [`Error::Http`] if the chunked encoding is malformed.
-fn decode_chunked(data: &[u8]) -> Result<Vec<u8>, Error> {
-    let mut body = Vec::new();
-    let mut pos = 0;
+/// Returns the raw header bytes (including the trailing `\r\n\r\n`) and
+/// any body data that was read past the header boundary.
+async fn read_response_headers<S>(stream: &mut S) -> Result<(Vec<u8>, Vec<u8>), Error>
+where
+    S: AsyncRead + Unpin,
+{
+    let mut buf = Vec::with_capacity(4096);
+    let mut tmp = [0u8; 4096];
 
     loop {
-        // Find the end of the chunk size line
-        let line_end = find_crlf(data, pos)
-            .ok_or_else(|| Error::Http("incomplete chunked encoding: missing chunk size".into()))?;
+        let n =
+            stream.read(&mut tmp).await.map_err(|e| Error::Http(format!("read failed: {e}")))?;
 
-        // Parse the chunk size (hex, possibly with extensions after ';')
-        let size_str = std::str::from_utf8(&data[pos..line_end])
-            .map_err(|_| Error::Http("invalid chunk size encoding".into()))?;
-        let size_str = size_str.split(';').next().unwrap_or(size_str).trim();
-
-        let chunk_size = usize::from_str_radix(size_str, 16)
-            .map_err(|e| Error::Http(format!("invalid chunk size '{size_str}': {e}")))?;
-
-        // Move past the size line's \r\n
-        pos = line_end + 2;
-
-        // Zero-length chunk = end of body
-        if chunk_size == 0 {
-            break;
+        if n == 0 {
+            if buf.is_empty() {
+                return Err(Error::Http("empty response (connection closed)".to_string()));
+            }
+            return Err(Error::Http("incomplete response headers".to_string()));
         }
 
-        // Read chunk data
-        let chunk_end = pos + chunk_size;
-        if chunk_end > data.len() {
-            // Partial chunk — take what we have
-            body.extend_from_slice(&data[pos..]);
-            break;
-        }
-        body.extend_from_slice(&data[pos..chunk_end]);
+        buf.extend_from_slice(&tmp[..n]);
 
-        // Skip the trailing \r\n after chunk data
-        pos = chunk_end + 2;
-        if pos > data.len() {
-            break;
+        // Check for end of headers
+        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            let header_end = pos + 4;
+            let body_prefix = buf[header_end..].to_vec();
+            buf.truncate(header_end);
+            return Ok((buf, body_prefix));
+        }
+
+        if buf.len() > MAX_HEADER_SIZE {
+            return Err(Error::Http(format!(
+                "response headers too large: {} bytes (max {MAX_HEADER_SIZE})",
+                buf.len()
+            )));
         }
     }
-
-    Ok(body)
 }
 
-/// Find the position of `\r\n` starting at `offset`.
-fn find_crlf(data: &[u8], offset: usize) -> Option<usize> {
-    if data.len() < offset + 2 {
-        return None;
-    }
-    data[offset..].windows(2).position(|w| w == b"\r\n").map(|p| offset + p)
-}
-
-/// Parse a raw HTTP/1.1 response into a `Response`.
-///
-/// # Errors
-///
-/// Returns [`Error::Http`] if the response is malformed.
-pub fn parse_response(data: &[u8], effective_url: &str, is_head: bool) -> Result<Response, Error> {
+/// Parse raw header bytes into a status code and header map.
+fn parse_headers(data: &[u8]) -> Result<(u16, HashMap<String, String>), Error> {
     let mut headers_buf = [httparse::EMPTY_HEADER; 64];
     let mut parsed = httparse::Response::new(&mut headers_buf);
 
@@ -196,15 +222,216 @@ pub fn parse_response(data: &[u8], effective_url: &str, is_head: bool) -> Result
         }
     }
 
-    // HEAD responses have no body
+    Ok((status, headers))
+}
+
+/// Read exactly `content_length` bytes of body, using any already-read prefix.
+async fn read_exact_body<S>(
+    stream: &mut S,
+    content_length: usize,
+    prefix: Vec<u8>,
+) -> Result<Vec<u8>, Error>
+where
+    S: AsyncRead + Unpin,
+{
+    let mut body = prefix;
+
+    if body.len() >= content_length {
+        body.truncate(content_length);
+        return Ok(body);
+    }
+
+    let remaining = content_length - body.len();
+    let mut remaining_buf = vec![0u8; remaining];
+    let _n = stream
+        .read_exact(&mut remaining_buf)
+        .await
+        .map_err(|e| Error::Http(format!("body read failed: {e}")))?;
+    body.extend_from_slice(&remaining_buf);
+    Ok(body)
+}
+
+/// Read a chunked transfer-encoded body incrementally from a stream.
+async fn read_chunked_body_streaming<S>(stream: &mut S, prefix: Vec<u8>) -> Result<Vec<u8>, Error>
+where
+    S: AsyncRead + Unpin,
+{
+    let mut buf = prefix;
+    let mut decoded = Vec::new();
+    let mut pos = 0;
+
+    loop {
+        // Ensure we have a complete chunk size line
+        while find_crlf(&buf, pos).is_none() {
+            let mut tmp = [0u8; 4096];
+            let n = stream
+                .read(&mut tmp)
+                .await
+                .map_err(|e| Error::Http(format!("chunked read failed: {e}")))?;
+            if n == 0 {
+                return Ok(decoded);
+            }
+            buf.extend_from_slice(&tmp[..n]);
+        }
+
+        let line_end = find_crlf(&buf, pos)
+            .ok_or_else(|| Error::Http("incomplete chunked encoding".into()))?;
+
+        let size_str = std::str::from_utf8(&buf[pos..line_end])
+            .map_err(|_| Error::Http("invalid chunk size encoding".into()))?;
+        let size_str = size_str.split(';').next().unwrap_or(size_str).trim();
+        let chunk_size = usize::from_str_radix(size_str, 16)
+            .map_err(|e| Error::Http(format!("invalid chunk size '{size_str}': {e}")))?;
+
+        pos = line_end + 2;
+
+        if chunk_size == 0 {
+            // Read trailing CRLF after last chunk
+            while buf.len() < pos + 2 {
+                let mut tmp = [0u8; 256];
+                let n = stream
+                    .read(&mut tmp)
+                    .await
+                    .map_err(|e| Error::Http(format!("chunked trailer read failed: {e}")))?;
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+            }
+            break;
+        }
+
+        // Ensure we have the full chunk data + trailing \r\n
+        let needed = pos + chunk_size + 2;
+        while buf.len() < needed {
+            let mut tmp = [0u8; 4096];
+            let n = stream
+                .read(&mut tmp)
+                .await
+                .map_err(|e| Error::Http(format!("chunk data read failed: {e}")))?;
+            if n == 0 {
+                // Partial chunk — take what we have
+                let available = buf.len().saturating_sub(pos).min(chunk_size);
+                decoded.extend_from_slice(&buf[pos..pos + available]);
+                return Ok(decoded);
+            }
+            buf.extend_from_slice(&tmp[..n]);
+        }
+
+        decoded.extend_from_slice(&buf[pos..pos + chunk_size]);
+        pos += chunk_size + 2;
+    }
+
+    Ok(decoded)
+}
+
+/// Decode a chunked transfer-encoded body from a complete buffer.
+///
+/// Format: each chunk is `<hex-size>[;extensions]\r\n<data>\r\n`,
+/// terminated by a zero-length chunk `0\r\n\r\n`.
+///
+/// # Errors
+///
+/// Returns [`Error::Http`] if the chunked encoding is malformed.
+fn decode_chunked(data: &[u8]) -> Result<Vec<u8>, Error> {
+    let mut body = Vec::new();
+    let mut pos = 0;
+
+    loop {
+        let line_end = find_crlf(data, pos)
+            .ok_or_else(|| Error::Http("incomplete chunked encoding: missing chunk size".into()))?;
+
+        let size_str = std::str::from_utf8(&data[pos..line_end])
+            .map_err(|_| Error::Http("invalid chunk size encoding".into()))?;
+        let size_str = size_str.split(';').next().unwrap_or(size_str).trim();
+
+        let chunk_size = usize::from_str_radix(size_str, 16)
+            .map_err(|e| Error::Http(format!("invalid chunk size '{size_str}': {e}")))?;
+
+        pos = line_end + 2;
+
+        if chunk_size == 0 {
+            break;
+        }
+
+        let chunk_end = pos + chunk_size;
+        if chunk_end > data.len() {
+            body.extend_from_slice(&data[pos..]);
+            break;
+        }
+        body.extend_from_slice(&data[pos..chunk_end]);
+
+        pos = chunk_end + 2;
+        if pos > data.len() {
+            break;
+        }
+    }
+
+    Ok(body)
+}
+
+/// Find the position of `\r\n` starting at `offset`.
+fn find_crlf(data: &[u8], offset: usize) -> Option<usize> {
+    if data.len() < offset + 2 {
+        return None;
+    }
+    data[offset..].windows(2).position(|w| w == b"\r\n").map(|p| offset + p)
+}
+
+/// Parse a raw HTTP/1.1 response into a `Response`.
+///
+/// This parses from a complete byte buffer. Used for unit tests and
+/// for responses read via `read_to_end`.
+///
+/// # Errors
+///
+/// Returns [`Error::Http`] if the response is malformed.
+pub fn parse_response(data: &[u8], effective_url: &str, is_head: bool) -> Result<Response, Error> {
+    let mut headers_buf = [httparse::EMPTY_HEADER; 64];
+    let mut parsed = httparse::Response::new(&mut headers_buf);
+
+    let header_len = match parsed.parse(data) {
+        Ok(httparse::Status::Complete(len)) => len,
+        Ok(httparse::Status::Partial) => {
+            return Err(Error::Http("incomplete response headers".to_string()));
+        }
+        Err(e) => {
+            return Err(Error::Http(format!("failed to parse response: {e}")));
+        }
+    };
+
+    if header_len > MAX_HEADER_SIZE {
+        return Err(Error::Http(format!(
+            "response headers too large: {header_len} bytes (max {MAX_HEADER_SIZE})"
+        )));
+    }
+
+    let status =
+        parsed.code.ok_or_else(|| Error::Http("response has no status code".to_string()))?;
+
+    let mut headers = HashMap::new();
+    for header in parsed.headers.iter() {
+        let name = header.name.to_lowercase();
+        let value = String::from_utf8_lossy(header.value).to_string();
+        if name == "set-cookie" {
+            let _entry = headers
+                .entry(name)
+                .and_modify(|existing: &mut String| {
+                    existing.push('\n');
+                    existing.push_str(&value);
+                })
+                .or_insert(value);
+        } else {
+            let _old = headers.insert(name, value);
+        }
+    }
+
     if is_head {
         return Ok(Response::new(status, headers, Vec::new(), effective_url.to_string()));
     }
 
-    // Determine body boundaries
     let body_data = &data[header_len..];
 
-    // Handle Transfer-Encoding: chunked
     let is_chunked =
         headers.get("transfer-encoding").is_some_and(|te| te.eq_ignore_ascii_case("chunked"));
 
@@ -326,7 +553,6 @@ mod tests {
 
     #[test]
     fn parse_chunked_with_chunk_extensions() {
-        // Chunk extensions after the size are allowed by HTTP spec
         let raw =
             b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5;ext=val\r\nhello\r\n0\r\n\r\n";
         let resp = parse_response(raw, "http://example.com", false).unwrap();
@@ -342,7 +568,6 @@ mod tests {
 
     #[test]
     fn parse_chunked_hex_sizes() {
-        // Chunk sizes are in hex
         let raw =
             b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\na\r\n0123456789\r\n0\r\n\r\n";
         let resp = parse_response(raw, "http://example.com", false).unwrap();
@@ -375,7 +600,7 @@ mod tests {
             server.shutdown().await.unwrap();
         });
 
-        let resp = request(
+        let (resp, _can_reuse) = request(
             &mut client,
             "GET",
             "example.com",
@@ -383,6 +608,7 @@ mod tests {
             &[],
             None,
             "http://example.com/test",
+            false,
         )
         .await
         .unwrap();
@@ -411,7 +637,7 @@ mod tests {
             server.shutdown().await.unwrap();
         });
 
-        let resp = request(
+        let (resp, _can_reuse) = request(
             &mut client,
             "POST",
             "example.com",
@@ -419,6 +645,7 @@ mod tests {
             &[],
             Some(b"hello request"),
             "http://example.com/submit",
+            false,
         )
         .await
         .unwrap();
@@ -451,11 +678,95 @@ mod tests {
             ("Authorization".to_string(), "Bearer token123".to_string()),
         ];
 
-        let resp =
-            request(&mut client, "GET", "example.com", "/", &headers, None, "http://example.com/")
-                .await
-                .unwrap();
+        let (resp, _can_reuse) = request(
+            &mut client,
+            "GET",
+            "example.com",
+            "/",
+            &headers,
+            None,
+            "http://example.com/",
+            false,
+        )
+        .await
+        .unwrap();
         assert_eq!(resp.status(), 200);
+
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn request_keep_alive_can_reuse() {
+        use tokio::io::duplex;
+
+        let (mut client, mut server) = duplex(4096);
+
+        let server_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 1024];
+            let n = server.read(&mut buf).await.unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]);
+            // Should NOT contain Connection: close
+            assert!(!req.contains("Connection: close"));
+
+            // Send response with Content-Length (required for keep-alive)
+            let response = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+            server.write_all(response).await.unwrap();
+            // Don't shutdown — keep-alive means connection stays open
+        });
+
+        let (resp, can_reuse) = request(
+            &mut client,
+            "GET",
+            "example.com",
+            "/test",
+            &[],
+            None,
+            "http://example.com/test",
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.body_str().unwrap(), "hello");
+        assert!(can_reuse, "connection should be reusable");
+
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn request_keep_alive_server_closes() {
+        use tokio::io::duplex;
+
+        let (mut client, mut server) = duplex(4096);
+
+        let server_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 1024];
+            let _n = server.read(&mut buf).await.unwrap();
+
+            // Server says Connection: close
+            let response =
+                b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello";
+            server.write_all(response).await.unwrap();
+            server.shutdown().await.unwrap();
+        });
+
+        let (resp, can_reuse) = request(
+            &mut client,
+            "GET",
+            "example.com",
+            "/test",
+            &[],
+            None,
+            "http://example.com/test",
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.body_str().unwrap(), "hello");
+        assert!(!can_reuse, "server said Connection: close");
 
         server_task.await.unwrap();
     }
