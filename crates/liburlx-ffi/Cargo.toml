@@ -1,0 +1,16 @@
+[package]
+name = "liburlx-ffi"
+description = "C ABI compatibility layer for liburlx — drop-in replacement for libcurl"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "staticlib"]
+
+[lints]
+workspace = true
+
+[dependencies]
+liburlx = { path = "../liburlx", version = "0.1.0" }

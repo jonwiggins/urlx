@@ -1,0 +1,44 @@
+repos:
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt
+        entry: cargo fmt --all -- --check
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      - id: cargo-clippy
+        name: cargo clippy
+        entry: cargo clippy --workspace --all-targets -- -D warnings
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      - id: cargo-test
+        name: cargo test
+        entry: cargo test --workspace --lib
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      - id: cargo-deny
+        name: cargo deny
+        entry: cargo deny check
+        language: system
+        pass_filenames: false
+
+      - id: cargo-doc
+        name: cargo doc
+        entry: cargo doc --workspace --no-deps
+        language: system
+        types: [rust]
+        pass_filenames: false
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+
+      - id: conventional-commit
+        name: conventional commit
+        entry: sh -c 'echo "$1" | grep -qE "^(feat|fix|refactor|test|docs|chore|ci|perf|build|style|revert)(\(.+\))?(!)?: .+"'
+        language: system
+        stages: [commit-msg]

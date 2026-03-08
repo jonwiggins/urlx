@@ -1,0 +1,88 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+  RUSTDOCFLAGS: "-D warnings"
+
+jobs:
+  commit-lint:
+    name: Commit message lint
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Validate conventional commits
+        run: |
+          commits=$(git log --format="%s" origin/${{ github.base_ref }}..HEAD)
+          regex="^(feat|fix|refactor|test|docs|chore|ci|perf|build|style|revert)(\(.+\))?(!)?: .+"
+          failed=0
+          while IFS= read -r msg; do
+            if ! echo "$msg" | grep -qE "$regex"; then
+              echo "Bad commit message: $msg"
+              failed=1
+            fi
+          done <<< "$commits"
+          if [ "$failed" = "1" ]; then
+            echo ""
+            echo "Commit messages must follow Conventional Commits:"
+            echo "  <type>(<scope>): <description>"
+            echo "  Types: feat|fix|refactor|test|docs|chore|ci|perf|build|style|revert"
+            exit 1
+          fi
+          echo "All commit messages valid"
+
+  check:
+    name: Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Doc
+        run: cargo doc --workspace --no-deps
+
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Unit tests
+        run: cargo test --workspace --lib
+      - name: Integration tests
+        run: cargo test --workspace --test '*'
+      - name: Doc tests
+        run: cargo test --workspace --doc
+
+  deny:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v1
+
+  msrv:
+    name: Minimum supported Rust version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.75.0
+      - run: cargo check --workspace

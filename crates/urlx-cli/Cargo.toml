@@ -1,0 +1,17 @@
+[package]
+name = "urlx-cli"
+description = "urlx — a memory-safe command-line URL transfer tool, drop-in replacement for curl"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "urlx"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+liburlx = { path = "../liburlx", version = "0.1.0" }

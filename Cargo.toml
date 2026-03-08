@@ -1,0 +1,36 @@
+[workspace]
+members = ["crates/liburlx", "crates/liburlx-ffi", "crates/urlx-cli"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75.0"
+license = "MIT"
+repository = "https://github.com/jonatan/urlx"
+
+[workspace.lints.rust]
+missing_docs = "warn"
+unused_results = "warn"
+elided_lifetimes_in_paths = "warn"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "warn"
+panic = "deny"
+todo = "warn"
+dbg_macro = "deny"
+print_stdout = "warn"
+print_stderr = "warn"
+cast_possible_truncation = "warn"
+cast_sign_loss = "warn"
+cast_possible_wrap = "warn"
+missing_errors_doc = "warn"
+missing_panics_doc = "warn"
+
+[workspace.dependencies]
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
