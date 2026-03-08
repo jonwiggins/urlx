@@ -13,235 +13,310 @@ fn main() -> ExitCode {
     run(&args)
 }
 
+/// Parsed CLI options.
+#[allow(clippy::struct_excessive_bools)]
+struct CliOptions {
+    easy: liburlx::Easy,
+    urls: Vec<String>,
+    output_file: Option<String>,
+    write_out: Option<String>,
+    show_progress: bool,
+    silent: bool,
+    show_error: bool,
+    fail_on_error: bool,
+    include_headers: bool,
+    dump_header: Option<String>,
+}
+
+/// Print usage information to stderr.
+fn print_usage() {
+    eprintln!("urlx 0.1.0 — a memory-safe curl replacement");
+    eprintln!("Usage: urlx [options] <url>");
+    eprintln!();
+    eprintln!("Options:");
+    eprintln!("  -X, --request <method>    HTTP method (GET, POST, PUT, DELETE, HEAD, PATCH)");
+    eprintln!("  -H, --header <header>     Custom header (e.g., 'Content-Type: application/json')");
+    eprintln!("  -d, --data <data>         Request body data (use @filename to read from file)");
+    eprintln!("      --data-raw <data>     Request body data (@ is not interpreted)");
+    eprintln!("  -L, --location            Follow redirects");
+    eprintln!("      --max-redirs <num>    Maximum number of redirects (default: 50)");
+    eprintln!("  -I, --head                Send HEAD request");
+    eprintln!("  -o, --output <file>       Write output to file");
+    eprintln!("  -D, --dump-header <file>  Write response headers to file");
+    eprintln!("  -i, --include             Include response headers in output");
+    eprintln!("  -v, --verbose             Verbose output");
+    eprintln!("  -s, --silent              Silent mode (no progress or errors)");
+    eprintln!("  -S, --show-error          Show errors even in silent mode");
+    eprintln!("  -f, --fail                Fail silently on HTTP errors (exit code 22)");
+    eprintln!("      --compressed          Request compressed response and decompress");
+    eprintln!("      --connect-timeout <s> Maximum time for connection in seconds");
+    eprintln!("  -m, --max-time <s>        Maximum time for transfer in seconds");
+    eprintln!("  -u, --user <user:pass>    HTTP Basic authentication");
+    eprintln!("  -A, --user-agent <name>   Set User-Agent header");
+    eprintln!("  -w, --write-out <fmt>     Output format after transfer");
+    eprintln!("  -x, --proxy <url>         Use proxy (e.g., http://proxy:8080)");
+    eprintln!("      --noproxy <list>      Comma-separated list of hosts to bypass proxy");
+    eprintln!("  -F, --form <name=value>   Multipart form field (use @file for file upload)");
+    eprintln!("  -r, --range <range>       Byte range (e.g., 0-499, 500-, -500)");
+    eprintln!("  -C, --continue-at <off>   Resume download from byte offset");
+    eprintln!("  -#, --progress-bar        Display transfer progress bar");
+}
+
+/// Parse CLI arguments into options.
+///
+/// Returns `None` if parsing fails (error already printed).
 #[allow(clippy::too_many_lines)]
-fn run(args: &[String]) -> ExitCode {
-    if args.len() < 2 {
-        eprintln!("urlx 0.1.0 — a memory-safe curl replacement");
-        eprintln!("Usage: urlx [options] <url>");
-        eprintln!();
-        eprintln!("Options:");
-        eprintln!("  -X, --request <method>   HTTP method (GET, POST, PUT, DELETE, HEAD, PATCH)");
-        eprintln!(
-            "  -H, --header <header>    Custom header (e.g., 'Content-Type: application/json')"
-        );
-        eprintln!("  -d, --data <data>        Request body data");
-        eprintln!("  -L, --location           Follow redirects");
-        eprintln!("  -I, --head               Send HEAD request");
-        eprintln!("  -o, --output <file>      Write output to file");
-        eprintln!("  -v, --verbose            Verbose output");
-        eprintln!("      --compressed         Request compressed response and decompress");
-        eprintln!("      --connect-timeout <s> Maximum time for connection in seconds");
-        eprintln!("  -m, --max-time <s>       Maximum time for transfer in seconds");
-        eprintln!("  -u, --user <user:pass>   HTTP Basic authentication");
-        eprintln!("  -w, --write-out <fmt>    Output format after transfer");
-        eprintln!("  -x, --proxy <url>        Use proxy (e.g., http://proxy:8080)");
-        eprintln!("      --noproxy <list>     Comma-separated list of hosts to bypass proxy");
-        eprintln!("  -F, --form <name=value>  Multipart form field (use @file for file upload)");
-        eprintln!("  -r, --range <range>      Byte range (e.g., 0-499, 500-, -500)");
-        eprintln!("  -C, --continue-at <off>  Resume download from byte offset");
-        eprintln!("  -#, --progress-bar       Display transfer progress bar");
-        return ExitCode::FAILURE;
-    }
+fn parse_args(args: &[String]) -> Option<CliOptions> {
+    let mut opts = CliOptions {
+        easy: liburlx::Easy::new(),
+        urls: Vec::new(),
+        output_file: None,
+        write_out: None,
+        show_progress: false,
+        silent: false,
+        show_error: false,
+        fail_on_error: false,
+        include_headers: false,
+        dump_header: None,
+    };
 
-    let mut easy = liburlx::Easy::new();
-    let mut show_progress = false;
-    let mut urls: Vec<String> = Vec::new();
-    let mut output_file: Option<String> = None;
-    let mut write_out: Option<String> = None;
     let mut i = 1;
-
     while i < args.len() {
         match args[i].as_str() {
             "-X" | "--request" => {
                 i += 1;
-                if i >= args.len() {
-                    eprintln!("urlx: option -X requires an argument");
-                    return ExitCode::FAILURE;
-                }
-                easy.method(&args[i]);
+                let val = require_arg(args, i, "-X")?;
+                opts.easy.method(val);
             }
             "-H" | "--header" => {
                 i += 1;
-                if i >= args.len() {
-                    eprintln!("urlx: option -H requires an argument");
-                    return ExitCode::FAILURE;
-                }
-                if let Some((name, value)) = args[i].split_once(':') {
-                    easy.header(name.trim(), value.trim());
+                let val = require_arg(args, i, "-H")?;
+                if let Some((name, value)) = val.split_once(':') {
+                    opts.easy.header(name.trim(), value.trim());
                 } else {
-                    eprintln!("urlx: invalid header format: {}", args[i]);
-                    return ExitCode::FAILURE;
+                    eprintln!("urlx: invalid header format: {val}");
+                    return None;
                 }
             }
             "-d" | "--data" => {
                 i += 1;
-                if i >= args.len() {
-                    eprintln!("urlx: option -d requires an argument");
-                    return ExitCode::FAILURE;
+                let val = require_arg(args, i, "-d")?;
+                // Support @filename to read from file
+                if let Some(path) = val.strip_prefix('@') {
+                    match std::fs::read(path) {
+                        Ok(data) => opts.easy.body(&data),
+                        Err(e) => {
+                            eprintln!("urlx: error reading {path}: {e}");
+                            return None;
+                        }
+                    }
+                } else {
+                    opts.easy.body(val.as_bytes());
                 }
-                easy.body(args[i].as_bytes());
-                // curl auto-sets POST when -d is used
-                if easy.method_is_default() {
-                    easy.method("POST");
+                if opts.easy.method_is_default() {
+                    opts.easy.method("POST");
+                }
+            }
+            "--data-raw" => {
+                i += 1;
+                let val = require_arg(args, i, "--data-raw")?;
+                opts.easy.body(val.as_bytes());
+                if opts.easy.method_is_default() {
+                    opts.easy.method("POST");
                 }
             }
             "-L" | "--location" => {
-                easy.follow_redirects(true);
+                opts.easy.follow_redirects(true);
+            }
+            "--max-redirs" => {
+                i += 1;
+                let val = require_arg(args, i, "--max-redirs")?;
+                if let Ok(max) = val.parse::<u32>() {
+                    opts.easy.max_redirects(max);
+                } else {
+                    eprintln!("urlx: invalid max-redirs value: {val}");
+                    return None;
+                }
             }
             "-I" | "--head" => {
-                easy.method("HEAD");
+                opts.easy.method("HEAD");
             }
             "-o" | "--output" => {
                 i += 1;
-                if i >= args.len() {
-                    eprintln!("urlx: option -o requires an argument");
-                    return ExitCode::FAILURE;
-                }
-                output_file = Some(args[i].clone());
+                let val = require_arg(args, i, "-o")?;
+                opts.output_file = Some(val.to_string());
+            }
+            "-D" | "--dump-header" => {
+                i += 1;
+                let val = require_arg(args, i, "-D")?;
+                opts.dump_header = Some(val.to_string());
+            }
+            "-i" | "--include" => {
+                opts.include_headers = true;
             }
             "-v" | "--verbose" => {
-                easy.verbose(true);
+                opts.easy.verbose(true);
+            }
+            "-s" | "--silent" => {
+                opts.silent = true;
+            }
+            "-S" | "--show-error" => {
+                opts.show_error = true;
+            }
+            "-f" | "--fail" => {
+                opts.fail_on_error = true;
             }
             "--compressed" => {
-                easy.accept_encoding(true);
+                opts.easy.accept_encoding(true);
             }
             "--connect-timeout" => {
                 i += 1;
-                if i >= args.len() {
-                    eprintln!("urlx: option --connect-timeout requires an argument");
-                    return ExitCode::FAILURE;
-                }
-                if let Ok(secs) = args[i].parse::<f64>() {
-                    easy.connect_timeout(std::time::Duration::from_secs_f64(secs));
+                let val = require_arg(args, i, "--connect-timeout")?;
+                if let Ok(secs) = val.parse::<f64>() {
+                    opts.easy.connect_timeout(std::time::Duration::from_secs_f64(secs));
                 } else {
-                    eprintln!("urlx: invalid timeout value: {}", args[i]);
-                    return ExitCode::FAILURE;
+                    eprintln!("urlx: invalid timeout value: {val}");
+                    return None;
                 }
             }
             "-m" | "--max-time" => {
                 i += 1;
-                if i >= args.len() {
-                    eprintln!("urlx: option -m requires an argument");
-                    return ExitCode::FAILURE;
-                }
-                if let Ok(secs) = args[i].parse::<f64>() {
-                    easy.timeout(std::time::Duration::from_secs_f64(secs));
+                let val = require_arg(args, i, "-m")?;
+                if let Ok(secs) = val.parse::<f64>() {
+                    opts.easy.timeout(std::time::Duration::from_secs_f64(secs));
                 } else {
-                    eprintln!("urlx: invalid timeout value: {}", args[i]);
-                    return ExitCode::FAILURE;
+                    eprintln!("urlx: invalid timeout value: {val}");
+                    return None;
                 }
             }
             "-w" | "--write-out" => {
                 i += 1;
-                if i >= args.len() {
-                    eprintln!("urlx: option -w requires an argument");
-                    return ExitCode::FAILURE;
-                }
-                write_out = Some(args[i].clone());
+                let val = require_arg(args, i, "-w")?;
+                opts.write_out = Some(val.to_string());
             }
             "-x" | "--proxy" => {
                 i += 1;
-                if i >= args.len() {
-                    eprintln!("urlx: option -x requires an argument");
-                    return ExitCode::FAILURE;
-                }
-                if let Err(e) = easy.proxy(&args[i]) {
+                let val = require_arg(args, i, "-x")?;
+                if let Err(e) = opts.easy.proxy(val) {
                     eprintln!("urlx: invalid proxy URL: {e}");
-                    return ExitCode::FAILURE;
+                    return None;
                 }
             }
             "--noproxy" => {
                 i += 1;
-                if i >= args.len() {
-                    eprintln!("urlx: option --noproxy requires an argument");
-                    return ExitCode::FAILURE;
-                }
-                easy.noproxy(&args[i]);
+                let val = require_arg(args, i, "--noproxy")?;
+                opts.easy.noproxy(val);
             }
             "-u" | "--user" => {
                 i += 1;
-                if i >= args.len() {
-                    eprintln!("urlx: option -u requires an argument");
-                    return ExitCode::FAILURE;
-                }
-                if let Some((user, pass)) = args[i].split_once(':') {
-                    easy.basic_auth(user, pass);
+                let val = require_arg(args, i, "-u")?;
+                if let Some((user, pass)) = val.split_once(':') {
+                    opts.easy.basic_auth(user, pass);
                 } else {
-                    // No password — use empty password (curl compat)
-                    easy.basic_auth(&args[i], "");
+                    opts.easy.basic_auth(val, "");
                 }
+            }
+            "-A" | "--user-agent" => {
+                i += 1;
+                let val = require_arg(args, i, "-A")?;
+                opts.easy.header("User-Agent", val);
             }
             "-F" | "--form" => {
                 i += 1;
-                if i >= args.len() {
-                    eprintln!("urlx: option -F requires an argument");
-                    return ExitCode::FAILURE;
-                }
-                if let Some((name, value)) = args[i].split_once('=') {
+                let val = require_arg(args, i, "-F")?;
+                if let Some((name, value)) = val.split_once('=') {
                     if let Some(path) = value.strip_prefix('@') {
-                        if let Err(e) = easy.form_file(name, std::path::Path::new(path)) {
+                        if let Err(e) = opts.easy.form_file(name, std::path::Path::new(path)) {
                             eprintln!("urlx: error reading form file: {e}");
-                            return ExitCode::FAILURE;
+                            return None;
                         }
                     } else {
-                        easy.form_field(name, value);
+                        opts.easy.form_field(name, value);
                     }
                 } else {
-                    eprintln!("urlx: invalid form field format: {}", args[i]);
+                    eprintln!("urlx: invalid form field format: {val}");
                     eprintln!("  Use: -F name=value or -F name=@filename");
-                    return ExitCode::FAILURE;
+                    return None;
                 }
             }
             "-r" | "--range" => {
                 i += 1;
-                if i >= args.len() {
-                    eprintln!("urlx: option -r requires an argument");
-                    return ExitCode::FAILURE;
-                }
-                easy.range(&args[i]);
+                let val = require_arg(args, i, "-r")?;
+                opts.easy.range(val);
             }
             "-C" | "--continue-at" => {
                 i += 1;
-                if i >= args.len() {
-                    eprintln!("urlx: option -C requires an argument");
-                    return ExitCode::FAILURE;
-                }
-                if let Ok(offset) = args[i].parse::<u64>() {
-                    easy.resume_from(offset);
+                let val = require_arg(args, i, "-C")?;
+                if let Ok(offset) = val.parse::<u64>() {
+                    opts.easy.resume_from(offset);
                 } else {
-                    eprintln!("urlx: invalid offset value: {}", args[i]);
-                    return ExitCode::FAILURE;
+                    eprintln!("urlx: invalid offset value: {val}");
+                    return None;
                 }
             }
             "-#" | "--progress-bar" => {
-                show_progress = true;
+                opts.show_progress = true;
             }
             arg if arg.starts_with('-') => {
                 eprintln!("urlx: unknown option: {arg}");
-                return ExitCode::FAILURE;
+                return None;
             }
             url => {
-                urls.push(url.to_string());
+                opts.urls.push(url.to_string());
             }
         }
         i += 1;
     }
 
+    Some(opts)
+}
+
+/// Helper to require an argument value for an option flag.
+fn require_arg<'a>(args: &'a [String], i: usize, flag: &str) -> Option<&'a str> {
+    if i >= args.len() {
+        eprintln!("urlx: option {flag} requires an argument");
+        None
+    } else {
+        Some(&args[i])
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn run(args: &[String]) -> ExitCode {
+    if args.len() < 2 {
+        print_usage();
+        return ExitCode::FAILURE;
+    }
+
+    let Some(mut opts) = parse_args(args) else {
+        return ExitCode::FAILURE;
+    };
+
     // Multiple URLs: use Multi API for concurrent transfers
-    if urls.len() > 1 {
-        return run_multi(&easy, &urls, output_file.as_deref(), write_out.as_deref());
+    if opts.urls.len() > 1 {
+        return run_multi(
+            &opts.easy,
+            &opts.urls,
+            opts.output_file.as_deref(),
+            opts.write_out.as_deref(),
+            opts.silent,
+            opts.show_error,
+            opts.fail_on_error,
+        );
     }
 
     // Single URL: use Easy API
-    if let Some(url) = urls.first() {
-        if let Err(e) = easy.url(url) {
-            eprintln!("urlx: error parsing URL: {e}");
+    if let Some(url) = opts.urls.first() {
+        if let Err(e) = opts.easy.url(url) {
+            if !opts.silent || opts.show_error {
+                eprintln!("urlx: error parsing URL: {e}");
+            }
             return ExitCode::FAILURE;
         }
     }
 
-    if show_progress {
-        easy.progress_callback(liburlx::make_progress_callback(|info| {
+    if opts.show_progress && !opts.silent {
+        opts.easy.progress_callback(liburlx::make_progress_callback(|info| {
             let pct = if info.dl_total > 0 { (info.dl_now * 100) / info.dl_total } else { 0 };
             let bar_width: usize = 40;
             #[allow(clippy::cast_possible_truncation)]
@@ -258,20 +333,98 @@ fn run(args: &[String]) -> ExitCode {
         }));
     }
 
-    match easy.perform() {
+    match opts.easy.perform() {
         Ok(response) => {
-            if show_progress {
+            if opts.show_progress && !opts.silent {
                 eprintln!();
             }
-            output_response(&response, output_file.as_deref(), write_out.as_deref())
+
+            // --fail: exit 22 on HTTP error status codes
+            if opts.fail_on_error && response.status() >= 400 {
+                if !opts.silent || opts.show_error {
+                    eprintln!(
+                        "urlx: The requested URL returned error: {} {}",
+                        response.status(),
+                        http_status_text(response.status()),
+                    );
+                }
+                return ExitCode::from(22);
+            }
+
+            // --dump-header: write headers to file
+            if let Some(ref path) = opts.dump_header {
+                let header_text = format_headers(&response);
+                if let Err(e) = std::fs::write(path, header_text) {
+                    if !opts.silent || opts.show_error {
+                        eprintln!("urlx: error writing headers to {path}: {e}");
+                    }
+                    return ExitCode::FAILURE;
+                }
+            }
+
+            output_response(
+                &response,
+                opts.output_file.as_deref(),
+                opts.write_out.as_deref(),
+                opts.include_headers,
+                opts.silent,
+            )
         }
         Err(e) => {
-            if show_progress {
+            if opts.show_progress && !opts.silent {
                 eprintln!();
             }
-            eprintln!("urlx: {e}");
+            if !opts.silent || opts.show_error {
+                eprintln!("urlx: {e}");
+            }
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Format response headers as HTTP status line + headers.
+fn format_headers(response: &liburlx::Response) -> String {
+    let mut result =
+        format!("HTTP/1.1 {} {}\r\n", response.status(), http_status_text(response.status()),);
+    for (name, value) in response.headers() {
+        result.push_str(name);
+        result.push_str(": ");
+        result.push_str(value);
+        result.push_str("\r\n");
+    }
+    result.push_str("\r\n");
+    result
+}
+
+/// Get a human-readable HTTP status text.
+const fn http_status_text(code: u16) -> &'static str {
+    match code {
+        200 => "OK",
+        201 => "Created",
+        204 => "No Content",
+        301 => "Moved Permanently",
+        302 => "Found",
+        303 => "See Other",
+        304 => "Not Modified",
+        307 => "Temporary Redirect",
+        308 => "Permanent Redirect",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        408 => "Request Timeout",
+        409 => "Conflict",
+        410 => "Gone",
+        413 => "Payload Too Large",
+        415 => "Unsupported Media Type",
+        422 => "Unprocessable Entity",
+        429 => "Too Many Requests",
+        500 => "Internal Server Error",
+        502 => "Bad Gateway",
+        503 => "Service Unavailable",
+        504 => "Gateway Timeout",
+        _ => "",
     }
 }
 
@@ -280,14 +433,31 @@ fn output_response(
     response: &liburlx::Response,
     output_file: Option<&str>,
     write_out: Option<&str>,
+    include_headers: bool,
+    silent: bool,
 ) -> ExitCode {
+    // --include: prepend headers to output
+    if include_headers {
+        let header_text = format_headers(response);
+        if let Err(e) = std::io::stdout().write_all(header_text.as_bytes()) {
+            if !silent {
+                eprintln!("urlx: write error: {e}");
+            }
+            return ExitCode::FAILURE;
+        }
+    }
+
     if let Some(path) = output_file {
         if let Err(e) = std::fs::write(path, response.body()) {
-            eprintln!("urlx: error writing to {path}: {e}");
+            if !silent {
+                eprintln!("urlx: error writing to {path}: {e}");
+            }
             return ExitCode::FAILURE;
         }
     } else if let Err(e) = std::io::stdout().write_all(response.body()) {
-        eprintln!("urlx: write error: {e}");
+        if !silent {
+            eprintln!("urlx: write error: {e}");
+        }
         return ExitCode::FAILURE;
     }
 
@@ -300,18 +470,24 @@ fn output_response(
 }
 
 /// Run multiple URLs concurrently using the Multi API.
+#[allow(clippy::fn_params_excessive_bools)]
 fn run_multi(
     template: &liburlx::Easy,
     urls: &[String],
     _output_file: Option<&str>,
     write_out: Option<&str>,
+    silent: bool,
+    show_error: bool,
+    fail_on_error: bool,
 ) -> ExitCode {
     let mut multi = liburlx::Multi::new();
 
     for url in urls {
         let mut easy = template.clone();
         if let Err(e) = easy.url(url) {
-            eprintln!("urlx: error parsing URL '{url}': {e}");
+            if !silent || show_error {
+                eprintln!("urlx: error parsing URL '{url}': {e}");
+            }
             return ExitCode::FAILURE;
         }
         multi.add(easy);
@@ -320,7 +496,9 @@ fn run_multi(
     let results = match multi.perform_blocking() {
         Ok(results) => results,
         Err(e) => {
-            eprintln!("urlx: {e}");
+            if !silent || show_error {
+                eprintln!("urlx: {e}");
+            }
             return ExitCode::FAILURE;
         }
     };
@@ -329,8 +507,14 @@ fn run_multi(
     for (i, result) in results.into_iter().enumerate() {
         match result {
             Ok(response) => {
+                if fail_on_error && response.status() >= 400 {
+                    any_failed = true;
+                    continue;
+                }
                 if let Err(e) = std::io::stdout().write_all(response.body()) {
-                    eprintln!("urlx: write error: {e}");
+                    if !silent || show_error {
+                        eprintln!("urlx: write error: {e}");
+                    }
                     any_failed = true;
                 }
                 if let Some(fmt) = write_out {
@@ -339,7 +523,9 @@ fn run_multi(
                 }
             }
             Err(e) => {
-                eprintln!("urlx: transfer {} ({}): {e}", i + 1, urls[i]);
+                if !silent || show_error {
+                    eprintln!("urlx: transfer {} ({}): {e}", i + 1, urls[i]);
+                }
                 any_failed = true;
             }
         }
@@ -352,7 +538,7 @@ fn run_multi(
     }
 }
 
-/// Format a --write-out string by replacing %{variable} placeholders.
+/// Format a `--write-out` string by replacing `%{variable}` placeholders.
 fn format_write_out(fmt: &str, response: &liburlx::Response) -> String {
     let info = response.transfer_info();
     let mut result = fmt.to_string();
@@ -373,4 +559,158 @@ fn format_write_out(fmt: &str, response: &liburlx::Response) -> String {
     result = result.replace("\\r", "\r");
 
     result
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_write_out_http_code() {
+        let response = liburlx::Response::new(
+            200,
+            std::collections::HashMap::new(),
+            Vec::new(),
+            "http://example.com".to_string(),
+        );
+        let result = format_write_out("%{http_code}", &response);
+        assert_eq!(result, "200");
+    }
+
+    #[test]
+    fn format_write_out_escape_sequences() {
+        let response = liburlx::Response::new(
+            200,
+            std::collections::HashMap::new(),
+            Vec::new(),
+            String::new(),
+        );
+        let result = format_write_out("a\\nb\\tc", &response);
+        assert_eq!(result, "a\nb\tc");
+    }
+
+    #[test]
+    fn format_write_out_multiple_vars() {
+        let response = liburlx::Response::new(
+            404,
+            std::collections::HashMap::new(),
+            b"body".to_vec(),
+            "http://test.com/path".to_string(),
+        );
+        let result = format_write_out("%{http_code} %{size_download} %{url_effective}", &response);
+        assert_eq!(result, "404 4 http://test.com/path");
+    }
+
+    #[test]
+    fn http_status_text_known() {
+        assert_eq!(http_status_text(200), "OK");
+        assert_eq!(http_status_text(404), "Not Found");
+        assert_eq!(http_status_text(500), "Internal Server Error");
+    }
+
+    #[test]
+    fn http_status_text_unknown() {
+        assert_eq!(http_status_text(999), "");
+    }
+
+    #[test]
+    fn format_headers_basic() {
+        let mut headers = std::collections::HashMap::new();
+        let _old = headers.insert("content-type".to_string(), "text/plain".to_string());
+        let response = liburlx::Response::new(200, headers, Vec::new(), String::new());
+        let result = format_headers(&response);
+        assert!(result.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(result.contains("content-type: text/plain\r\n"));
+        assert!(result.ends_with("\r\n\r\n"));
+    }
+
+    #[test]
+    fn parse_args_basic_url() {
+        let args = vec!["urlx".to_string(), "http://example.com".to_string()];
+        let opts = parse_args(&args).unwrap();
+        assert_eq!(opts.urls, vec!["http://example.com"]);
+        assert!(!opts.silent);
+        assert!(!opts.fail_on_error);
+    }
+
+    #[test]
+    fn parse_args_silent_and_fail() {
+        let args = vec![
+            "urlx".to_string(),
+            "-s".to_string(),
+            "-f".to_string(),
+            "http://x.com".to_string(),
+        ];
+        let opts = parse_args(&args).unwrap();
+        assert!(opts.silent);
+        assert!(opts.fail_on_error);
+    }
+
+    #[test]
+    fn parse_args_include_headers() {
+        let args = vec!["urlx".to_string(), "-i".to_string(), "http://x.com".to_string()];
+        let opts = parse_args(&args).unwrap();
+        assert!(opts.include_headers);
+    }
+
+    #[test]
+    fn parse_args_user_agent() {
+        let args = vec![
+            "urlx".to_string(),
+            "-A".to_string(),
+            "TestAgent/1.0".to_string(),
+            "http://x.com".to_string(),
+        ];
+        let opts = parse_args(&args);
+        assert!(opts.is_some());
+    }
+
+    #[test]
+    fn parse_args_max_redirs() {
+        let args = vec![
+            "urlx".to_string(),
+            "--max-redirs".to_string(),
+            "5".to_string(),
+            "http://x.com".to_string(),
+        ];
+        let opts = parse_args(&args);
+        assert!(opts.is_some());
+    }
+
+    #[test]
+    fn parse_args_dump_header() {
+        let args = vec![
+            "urlx".to_string(),
+            "-D".to_string(),
+            "headers.txt".to_string(),
+            "http://x.com".to_string(),
+        ];
+        let opts = parse_args(&args).unwrap();
+        assert_eq!(opts.dump_header.as_deref(), Some("headers.txt"));
+    }
+
+    #[test]
+    fn parse_args_data_raw() {
+        let args = vec![
+            "urlx".to_string(),
+            "--data-raw".to_string(),
+            "@notafile".to_string(),
+            "http://x.com".to_string(),
+        ];
+        let opts = parse_args(&args);
+        assert!(opts.is_some());
+    }
+
+    #[test]
+    fn parse_args_unknown_option() {
+        let args = vec!["urlx".to_string(), "--bogus".to_string()];
+        assert!(parse_args(&args).is_none());
+    }
+
+    #[test]
+    fn parse_args_missing_arg() {
+        let args = vec!["urlx".to_string(), "-X".to_string()];
+        assert!(parse_args(&args).is_none());
+    }
 }
