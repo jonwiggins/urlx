@@ -14,11 +14,11 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 7b — CLI Completeness + Integration Tests
-**Last completed:** Phase 7a (FFI curl_easy_* C ABI layer) — 2026-03-08
-**In progress:** CLI enhancements and integration test suite
+**Phase:** 8 — Curl Test Suite Porting + Polish
+**Last completed:** Phase 7b (CLI completeness + integration tests) — 2026-03-08
+**In progress:** C header generation, curl behavioral test porting
 **Blockers:** None
-**Next up:** Phase 8 (curl test suite porting, differential testing)
+**Next up:** Differential testing, documentation
 
 ---
 
@@ -446,48 +446,39 @@ curl_easy_perform with write/header callbacks and catch_unwind panic safety,
 curl_easy_getinfo (6 info codes), curl_easy_strerror, curl_version. CURLcode/CURLoption/CURLINFO
 enums. 22 FFI unit tests. All unsafe blocks have SAFETY comments.
 
-### Phase 7b: CLI Completeness + Integration Tests
+### Phase 7b: CLI Completeness + Integration Tests — COMPLETED (2026-03-08)
 
-**Scope:** Expand CLI to handle more curl flags, add integration tests with real test servers.
-
-**Step 7b.1: Additional CLI flags**
-- `--data-raw` — POST data without @ interpretation
-- `--data-binary` — POST binary data from file
-- `-d @filename` — Read POST data from file
-- `-s`/`--silent` — Suppress progress and error messages
-- `-S`/`--show-error` — Show error even when silent
-- `-f`/`--fail` — Fail silently on HTTP errors (exit code 22)
-- `-D`/`--dump-header <file>` — Write response headers to file
-- `-i`/`--include` — Include response headers in output
-- `-k`/`--insecure` — Allow insecure TLS connections
-- `--max-redirs <num>` — Maximum number of redirects
-- `-A`/`--user-agent <name>` — Set User-Agent header
-
-**Step 7b.2: Integration test infrastructure**
-- Build a simple HTTP test server using hyper
-- Test GET/POST/PUT/DELETE against local server
-- Test redirect following with local server
-- Test header sending/receiving
-- Test error conditions (connection refused, 404, 500)
-- Test timeout behavior
-- Test verbose output format
-
-**Step 7b.3: CLI unit tests**
-- Test argument parsing for all flags
-- Test write-out format string expansion
-- Test error exit codes
-
-**Exit criteria:** urlx handles the 20 most common curl flags. Integration tests
-verify end-to-end behavior against local test servers. 250+ tests passing.
+CLI expanded with 10 new flags: -s/--silent, -S/--show-error, -f/--fail (exit 22),
+-i/--include, -D/--dump-header, -A/--user-agent, --data-raw, --max-redirs,
+-d @filename support. Refactored argument parsing into parse_args/run split with
+15 CLI unit tests. Built hyper-based integration test server with 24 end-to-end
+tests covering GET/POST/PUT/DELETE/HEAD, headers, status codes, redirects,
+timeouts, auth, encoding, ranges, multi-transfers. 336 total tests passing.
 
 ### Phase 8: Curl Test Suite Porting + Polish
 
-**Scope:** Port curl's behavioral tests, differential testing, documentation.
+**Scope:** C header generation, behavioral tests, documentation.
 
-- Port initial batch of curl's HTTP test cases
-- Set up differential testing framework (run same operation with urlx and curl)
-- C header generation via cbindgen
-- Documentation and README
+**Step 8.1: C header generation**
+- Set up cbindgen to generate urlx.h from liburlx-ffi
+- Configure cbindgen.toml for libcurl-compatible header output
+- Verify header compiles with a C test program
+
+**Step 8.2: Behavioral compatibility tests**
+- Port curl's basic HTTP GET test cases (verify status, body, headers)
+- Port redirect behavior tests (301/302/303/307/308 semantics)
+- Port POST data handling tests
+- Port authentication tests (Basic, Bearer)
+- Test cookie engine behavior against curl
+
+**Step 8.3: Documentation**
+- Crate-level documentation for liburlx, liburlx-ffi, urlx-cli
+- Module-level docs for all public modules
+- README with usage examples, build instructions, feature list
+- Verify `cargo doc --workspace --no-deps` passes cleanly
+
+**Exit criteria:** C header generated and compilable. Key curl behavioral
+tests ported. Documentation complete. 350+ tests passing.
 
 ---
 
