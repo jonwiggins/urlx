@@ -14,12 +14,12 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 23 — HSTS Integration + Proxy Behavior + CLI Write-Out Expansion
-**Last completed:** Phase 22 (HTTP conformance, cookie persistence, multipart roundtrip) — 2026-03-08
-**Total tests:** 890
-**In progress:** Planning Phase 23
+**Phase:** 24 — Comprehensive Stress Testing + API Surface Exhaustion
+**Last completed:** Phase 23 (HSTS integration, progress callbacks, proxy behavior) — 2026-03-08
+**Total tests:** 932
+**In progress:** Planning Phase 24
 **Blockers:** None
-**Next up:** HSTS upgrade integration tests, proxy tunneling tests, CLI write-out expansion
+**Next up:** Stress testing concurrent transfers, exercising remaining untested API surface
 
 ---
 
@@ -560,35 +560,43 @@ redirects 307/303). 6 cookie persistence tests (store/send, replacement, path
 scoping, disabled jar). 25 multipart tests (encoding, content-type detection,
 boundary, file data, binary). 890 total tests.
 
-### Phase 23: HSTS Integration + Proxy Behavior + CLI Write-Out Expansion
+### Phase 23: HSTS + Progress + Proxy — COMPLETED (2026-03-08)
 
-**Scope:** Test HSTS HTTP→HTTPS upgrade in transfers, proxy tunneling
-behavior, and expand CLI write-out variable testing.
+20 HSTS cache tests (store/upgrade, includeSubDomains, max-age=0, case-insensitive,
+purge_expired). 8 progress callback tests (invocation, download data, abort signaling).
+14 proxy behavior tests (URL validation, noproxy, credentials, resolve). 932 tests.
 
-**Step 23.1: HSTS upgrade integration tests**
-- Test HSTS header parsed from response enables upgrade
-- Test subsequent requests to same host use HTTPS
-- Test includeSubDomains behavior
-- Test HSTS max-age=0 removes entry
+### Phase 24: Comprehensive Stress Testing + API Surface Exhaustion
 
-**Step 23.2: Proxy behavior tests**
-- Test HTTP proxy forwards requests correctly
-- Test proxy auth header generation
-- Test noproxy bypass patterns
-- Test proxy URL validation
+**Scope:** Stress test concurrent transfers through Multi API, exercise
+remaining untested public API surface, add edge case tests for file
+protocol and WebSocket codec.
 
-**Step 23.3: CLI write-out expansion**
-- Test all supported write-out variables
-- Test write-out with redirects
-- Test write-out format string combinations
-- Test write-out with error conditions
+**Step 24.1: Multi API stress tests**
+- Test 10+ concurrent transfers
+- Test mixed success/failure concurrent transfers
+- Test concurrent transfers with different methods
+- Test Multi with empty handle list
 
-**Step 23.4: Progress callback verification**
-- Test progress callback receives updates during transfer
-- Test progress info has correct download size
-- Test progress callback with multiple transfers
+**Step 24.2: File protocol edge cases**
+- Test file:// with non-existent path
+- Test file:// with percent-encoded path
+- Test file:// with directory path
+- Test file:// with empty file
 
-**Exit criteria:** 960+ tests. HSTS, proxy, and CLI well-covered.
+**Step 24.3: WebSocket codec edge cases**
+- Test close frame with status code
+- Test ping/pong frame roundtrip
+- Test text frame with UTF-8 validation
+- Test maximum frame size handling
+
+**Step 24.4: Error path exhaustion**
+- Test all Error variant Display strings
+- Test error source chain traversal
+- Test error type Send+Sync bounds
+- Test error conversions
+
+**Exit criteria:** 1000+ tests. All public API surface exercised.
 
 ---
 
