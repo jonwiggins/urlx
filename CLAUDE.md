@@ -14,12 +14,12 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 24 — Comprehensive Stress Testing + API Surface Exhaustion
-**Last completed:** Phase 23 (HSTS integration, progress callbacks, proxy behavior) — 2026-03-08
-**Total tests:** 932
-**In progress:** Planning Phase 24
+**Phase:** 25 — Milestone: 1000 Tests + Final API Audit
+**Last completed:** Phase 24 (Multi concurrent stress, WebSocket codec edge cases) — 2026-03-08
+**Total tests:** 969
+**In progress:** Planning Phase 25
 **Blockers:** None
-**Next up:** Stress testing concurrent transfers, exercising remaining untested API surface
+**Next up:** Push past 1000 tests, audit remaining untested API surface
 
 ---
 
@@ -566,35 +566,40 @@ boundary, file data, binary). 890 total tests.
 purge_expired). 8 progress callback tests (invocation, download data, abort signaling).
 14 proxy behavior tests (URL validation, noproxy, credentials, resolve). 932 tests.
 
-### Phase 24: Comprehensive Stress Testing + API Surface Exhaustion
+### Phase 24: Multi Concurrent + WebSocket Codec — COMPLETED (2026-03-08)
 
-**Scope:** Stress test concurrent transfers through Multi API, exercise
-remaining untested public API surface, add edge case tests for file
-protocol and WebSocket codec.
+10 Multi API tests (empty, single, 3/10 concurrent, mixed codes, drain, methods,
+large bodies). 27 WebSocket codec tests (frame types, as_text, encoding, length
+fields, masking, key generation, RFC 6455 accept key). 969 total tests.
 
-**Step 24.1: Multi API stress tests**
-- Test 10+ concurrent transfers
-- Test mixed success/failure concurrent transfers
-- Test concurrent transfers with different methods
-- Test Multi with empty handle list
+### Phase 25: Milestone — 1000 Tests + Final API Audit
 
-**Step 24.2: File protocol edge cases**
-- Test file:// with non-existent path
-- Test file:// with percent-encoded path
-- Test file:// with directory path
-- Test file:// with empty file
+**Scope:** Push past 1000 tests by exercising remaining untested API
+surface: H1 parser edge cases, URL builder methods, DICT/TFTP protocol
+codecs, and Easy handle configuration completeness.
 
-**Step 24.3: WebSocket codec edge cases**
-- Test close frame with status code
-- Test ping/pong frame roundtrip
-- Test text frame with UTF-8 validation
-- Test maximum frame size handling
+**Step 25.1: H1 parser property tests**
+- Test parse_response with various Content-Length values
+- Test chunked body with trailing whitespace
+- Test header size limits
+- Test status line parsing edge cases
 
-**Step 24.4: Error path exhaustion**
-- Test all Error variant Display strings
-- Test error source chain traversal
-- Test error type Send+Sync bounds
-- Test error conversions
+**Step 25.2: URL builder edge cases**
+- Test scheme normalization
+- Test host normalization
+- Test path normalization with dot segments
+- Test query/fragment roundtripping
+
+**Step 25.3: DICT/TFTP protocol tests**
+- Test DICT response parsing
+- Test TFTP packet encoding
+- Test protocol-specific error handling
+
+**Step 25.4: Easy handle configuration completeness**
+- Test verbose output toggle
+- Test accept_encoding with various states
+- Test method_is_default semantics
+- Test form_field/form_file interactions
 
 **Exit criteria:** 1000+ tests. All public API surface exercised.
 
