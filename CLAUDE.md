@@ -14,11 +14,11 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 3c — Concurrent Transfers (Multi API)
-**Last completed:** Phase 3b (HTTP proxy, CONNECT tunneling, env vars) — 2026-03-08
-**In progress:** Multi API for concurrent transfers
+**Phase:** 4a — Connection Pooling + Cookie Engine
+**Last completed:** Phase 3c (Multi API for concurrent transfers) — 2026-03-08
+**In progress:** Connection pooling for HTTP keep-alive
 **Blockers:** None
-**Next up:** Phase 4 (Protocol Expansion)
+**Next up:** Phase 4b (FILE protocol, WebSocket)
 
 ---
 
@@ -384,44 +384,51 @@ through proxy. Noproxy bypass with domain suffix matching and wildcard.
 Environment variable support (http_proxy, https_proxy, no_proxy). CLI
 flags: -x/--proxy, --noproxy. 113 tests passing.
 
-### Phase 3c: Concurrent Transfers (Multi API)
+### Phase 3c: Concurrent Transfers (Multi API) — COMPLETED (2026-03-08)
 
-**Scope:** Add a Multi API for running multiple transfers concurrently
-using tokio's async runtime. This enables efficient parallel downloads
-and batch API requests.
+Multi handle with JoinSet-based concurrent execution. Preserves result
+ordering. Blocking `perform_blocking()` wrapper. CLI multi-URL support.
+123 tests passing.
 
-**Step 3c.1: Multi struct and API design**
-- Create `multi.rs` module with `Multi` struct
-- `Multi::new()` constructor
-- `Multi::add(easy: Easy)` to queue a transfer
-- `Multi::perform() -> Vec<Result<Response, Error>>` async method
-- Run all queued transfers concurrently via `tokio::spawn` / `JoinSet`
+### Phase 4a: Connection Pooling + Cookie Engine
 
-**Step 3c.2: Unit tests**
-- Test adding multiple Easy handles
-- Test empty Multi performs with no error
-- Test concurrent transfers against test servers
+**Scope:** Fill in remaining HTTP feature gaps before expanding to new protocols.
 
-**Step 3c.3: Integration tests**
-- Multiple concurrent GET requests to different endpoints
-- Mix of successful and failing transfers
-- Verify all responses are collected
+**Step 4a.1: Connection pooling (HTTP keep-alive)**
+- Create `pool.rs` module with `ConnectionPool`
+- Pool keyed by (host, port, scheme)
+- Reuse TCP/TLS connections for subsequent requests to same host
+- Support `Connection: keep-alive` (HTTP/1.1 default)
+- Remove `Connection: close` from default headers
+- Unit tests for pool operations
+- Integration test verifying connection reuse
 
-**Step 3c.4: CLI parallel URL support**
-- Accept multiple URLs on command line
-- Execute them concurrently via Multi API
-- Output results in order
+**Step 4a.2: Cookie engine**
+- Create `cookie.rs` module with `CookieJar`
+- Parse `Set-Cookie` response headers
+- Send matching cookies in `Cookie` request header
+- Domain/path matching per RFC 6265
+- Cookie expiration (Max-Age, Expires)
+- `cookie_jar()` method on Easy to enable cookie handling
+- Integration tests with Set-Cookie/Cookie round-trip
 
-**Exit criteria:** `urlx http://a.com http://b.com` fetches both URLs concurrently.
+**Exit criteria:** Connections are reused across requests. Cookies are
+stored and sent automatically.
 
-### Phase 4: Protocol Expansion
+### Phase 4b: FILE Protocol + Additional HTTP Features
+
+- `file://` protocol handler (read local files)
+- Multipart form uploads (POST with `Content-Type: multipart/form-data`)
+- Range requests / resume downloads
+- HSTS enforcement
+
+### Phase 4c: Protocol Expansion
 
 **Write tests first for each protocol before implementing:**
 - FTP/FTPS (active, passive, upload, download, directory listing, resume)
 - MQTT (connect, publish, subscribe)
 - SCP/SFTP
 - SMTP/IMAP/POP3
-- FILE protocol
 - LDAP
 
 ### Phase 5: Drop-in Replacement
