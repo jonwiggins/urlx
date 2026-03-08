@@ -14,12 +14,12 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 19 — Easy API Completeness + Transfer Options
-**Last completed:** Phase 18 (response/error/Multi stress tests) — 2026-03-08
-**Total tests:** 677
-**In progress:** Planning Phase 19
+**Phase:** 20 — Protocol Codec Hardening + Differential Testing
+**Last completed:** Phase 19 (Easy API coverage, URL normalization) — 2026-03-08
+**Total tests:** 740
+**In progress:** Planning Phase 20
 **Blockers:** None
-**Next up:** Easy option coverage, cookie file persistence, HSTS preload
+**Next up:** Differential testing framework, protocol codec fuzz improvements
 
 ---
 
@@ -532,34 +532,42 @@ content type, size_download, large bodies). 20 error coverage tests (all
 variants, display, debug, source chain, Send+Sync). 6 Multi API stress
 tests (concurrent transfers, mixed results, body sizes). 677 total tests.
 
-### Phase 19: Easy API Completeness + Transfer Options
+### Phase 19: Easy API Coverage + URL Normalization — COMPLETED (2026-03-08)
 
-**Scope:** Expand Easy API option coverage, add cookie file persistence,
-HSTS preload list support, and missing curl option mappings.
+30 Easy API tests (clone independence, multiple performs, option toggles,
+method/body interactions, auth, proxy, form, range, resolve). 33 URL
+normalization tests (scheme/host casing, default scheme, path/port/query/
+fragment handling, credentials, host_and_port, request target). 740 tests.
 
-**Step 19.1: Cookie file persistence tests**
-- Test cookie jar save to file and reload
-- Test cookie jar file format compatibility
-- Test expired cookies not persisted
+### Phase 20: Protocol Codec Hardening + SMTP/IMAP/POP3 Integration Tests
 
-**Step 19.2: Easy API option edge cases**
-- Test setting URL after perform (reset behavior)
-- Test cloned Easy handles are independent
-- Test multiple perform calls on same handle
-- Test method/header/body interactions
+**Scope:** Add integration tests for email protocols, harden protocol
+codec edge cases, expand differential testing.
 
-**Step 19.3: URL parser additional edge cases**
-- Test IDN domain handling
-- Test punycode conversion
-- Test URL normalization (dot segments, empty path)
+**Step 20.1: SMTP protocol edge cases**
+- Test EHLO/HELO response parsing
+- Test AUTH PLAIN encoding
+- Test MAIL FROM/RCPT TO/DATA flow
+- Test multi-line SMTP responses
 
-**Step 19.4: HTTP response edge cases**
-- Test responses with no reason phrase
-- Test HTTP/1.0 vs HTTP/1.1 version parsing
-- Test responses with invalid Content-Length
-- Test oversized headers
+**Step 20.2: IMAP protocol edge cases**
+- Test LOGIN response parsing
+- Test SELECT mailbox response
+- Test UID FETCH with various flags
+- Test untagged vs tagged responses
 
-**Exit criteria:** 720+ tests. Easy API fully exercised.
+**Step 20.3: POP3 protocol edge cases**
+- Test USER/PASS flow
+- Test LIST parsing
+- Test RETR with dot-stuffing
+- Test multi-line POP3 responses
+
+**Step 20.4: MQTT protocol edge cases**
+- Test CONNECT packet encoding
+- Test PUBLISH packet with various QoS levels
+- Test SUBSCRIBE packet encoding
+
+**Exit criteria:** 790+ tests. Email protocol codecs well-tested.
 
 ---
 
