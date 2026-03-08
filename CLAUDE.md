@@ -14,12 +14,12 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 21 — FFI Expansion + Transfer Info Hardening
-**Last completed:** Phase 20 (SMTP/IMAP/POP3/MQTT edge case tests) — 2026-03-08
-**Total tests:** 793
-**In progress:** Planning Phase 21
+**Phase:** 22 — HTTP Behavior Conformance + CLI Edge Cases
+**Last completed:** Phase 21 (FFI expansion, transfer info, protocol proptests, pool lifecycle) — 2026-03-08
+**Total tests:** 843
+**In progress:** Planning Phase 22
 **Blockers:** None
-**Next up:** FFI option coverage, transfer info accuracy tests, property-based protocol tests
+**Next up:** HTTP conformance edge cases, CLI argument interaction tests, cookie persistence tests
 
 ---
 
@@ -546,37 +546,45 @@ fragment handling, credentials, host_and_port, request target). 740 tests.
 21 POP3 tests (response reading, multiline, dot-stuffing, send_command, struct).
 11 MQTT tests (PacketType values, equality, debug, clone). 793 total tests.
 
-### Phase 21: FFI Expansion + Transfer Info Hardening
+### Phase 21: FFI Expansion + Transfer Info Hardening — COMPLETED (2026-03-08)
 
-**Scope:** Expand FFI option coverage, harden transfer info queries,
-add property-based tests for remaining protocol codecs, test FFI
-error handling paths.
+33 FFI/response tests (TransferInfo, Response status ranges, redirect detection,
+error mapping, header lookup). 16 transfer info accuracy tests (timing, redirect
+counting, effective URL, size_download). 12 protocol property tests (SMTP, POP3,
+IMAP, MQTT). 10 pool lifecycle tests (reuse, isolation, error survival). 843 tests.
 
-**Step 21.1: FFI option expansion tests**
-- Test curl_easy_setopt with additional CURLOPT_* codes
-- Test curl_easy_getinfo with additional CURLINFO_* codes
-- Test FFI null pointer handling on all entry points
-- Test FFI error string completeness
+### Phase 22: HTTP Behavior Conformance + CLI Edge Cases
 
-**Step 21.2: Transfer info accuracy tests**
-- Test timing info (namelookup, connect, starttransfer, total)
-- Test redirect info (count, url) across redirect chains
-- Test size info (upload, download, headers) accuracy
-- Test effective URL tracking through redirects
+**Scope:** Test HTTP protocol conformance edge cases, CLI argument
+interactions, cookie persistence across requests, and multipart
+form data round-tripping.
 
-**Step 21.3: Property-based SMTP/IMAP/POP3 tests**
-- SMTP response code categories (2xx/3xx/4xx/5xx)
-- IMAP tag generation and response parsing
-- POP3 response format (+OK/-ERR) roundtripping
-- MQTT packet type exhaustive coverage
+**Step 22.1: HTTP conformance edge cases**
+- Test HTTP/1.0 vs HTTP/1.1 connection behavior
+- Test HEAD responses with Content-Length but no body
+- Test chunked encoding edge cases (zero-length chunks, trailer headers)
+- Test keep-alive vs close connection headers
+- Test case-insensitive header matching in responses
 
-**Step 21.4: Connection pool lifecycle tests**
-- Test pool eviction under connection limits
-- Test pool behavior with mixed HTTP/HTTPS connections
-- Test pool key generation correctness
-- Test pool connection reuse counting
+**Step 22.2: CLI argument interaction tests**
+- Test flag combinations (-v with -s, -f with -o, -L with --max-redirs)
+- Test URL encoding/escaping in CLI arguments
+- Test stdin body reading (-d @-)
+- Test error output format with -S
 
-**Exit criteria:** 860+ tests. FFI layer well-tested, transfer info verified.
+**Step 22.3: Cookie persistence integration tests**
+- Test cookies sent on subsequent requests to same origin
+- Test cookie domain scoping (subdomain cookies)
+- Test cookie path scoping
+- Test cookie expiry behavior
+
+**Step 22.4: Multipart form data verification**
+- Test boundary generation uniqueness
+- Test file upload content type detection
+- Test multi-field form encoding
+- Test large file upload handling
+
+**Exit criteria:** 910+ tests. HTTP edge cases well-covered.
 
 ---
 
