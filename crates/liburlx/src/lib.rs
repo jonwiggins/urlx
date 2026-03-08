@@ -18,6 +18,7 @@ pub mod hsts;
 pub mod multi;
 pub(crate) mod pool;
 pub mod protocol;
+pub mod proxy;
 pub mod tls;
 pub mod url;
 

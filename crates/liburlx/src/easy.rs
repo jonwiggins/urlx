@@ -624,11 +624,36 @@ async fn do_single_request(
         connect_fut.await.map_err(Error::Connect)?
     };
 
+    // Handle SOCKS proxy tunneling
+    let is_socks_proxy = proxy.is_some_and(|p| {
+        let s = p.scheme();
+        s == "socks5" || s == "socks4" || s == "socks5h" || s == "socks4a"
+    });
+
+    let tcp_stream = if is_socks_proxy {
+        let proxy_url = proxy.ok_or_else(|| Error::Http("no proxy URL".to_string()))?;
+        let socks_auth = proxy_url.credentials().map(|(u, p)| (u.to_string(), p.to_string()));
+
+        match proxy_url.scheme() {
+            "socks5" | "socks5h" => {
+                let auth_ref = socks_auth.as_ref().map(|(u, p)| (u.as_str(), p.as_str()));
+                crate::proxy::socks::connect_socks5(tcp_stream, &host, port, auth_ref).await?
+            }
+            "socks4" | "socks4a" => {
+                let user_id = socks_auth.as_ref().map_or("", |(u, _)| u.as_str());
+                crate::proxy::socks::connect_socks4(tcp_stream, &host, port, user_id).await?
+            }
+            _ => tcp_stream,
+        }
+    } else {
+        tcp_stream
+    };
+
     let response = match url.scheme() {
         "https" => {
             #[cfg(feature = "rustls")]
             {
-                let tls_stream_inner = if proxy.is_some() {
+                let tls_stream_inner = if proxy.is_some() && !is_socks_proxy {
                     if verbose {
                         #[allow(clippy::print_stderr)]
                         {
@@ -692,9 +717,12 @@ async fn do_single_request(
             }
         }
         "http" => {
-            // For HTTP through proxy, use absolute URL as request target
-            let request_target =
-                if proxy.is_some() { url.as_str().to_string() } else { url.request_target() };
+            // For HTTP through proxy (non-SOCKS), use absolute URL as request target
+            let request_target = if proxy.is_some() && !is_socks_proxy {
+                url.as_str().to_string()
+            } else {
+                url.request_target()
+            };
 
             let mut stream = PooledStream::Tcp(tcp_stream);
             let (resp, can_reuse) = crate::protocol::http::h1::request(
