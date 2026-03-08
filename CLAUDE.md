@@ -14,12 +14,12 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 14 — HTTP/1.1 Parser Hardening + Multipart Stress Tests
-**Last completed:** Phase 13 (robustness tests — HTTP errors, URL malformed, cookie stress) — 2026-03-08
-**Total tests:** 485
-**In progress:** H1 parser edge case tests, multipart form stress tests
+**Phase:** 16 — Fuzz Testing Harnesses + Protocol Integration Tests
+**Last completed:** Phase 15 (fail_on_error, H1 property tests) — 2026-03-08
+**Total tests:** 549
+**In progress:** Setting up cargo-fuzz harnesses, FTP/WebSocket integration tests
 **Blockers:** None
-**Next up:** Fuzz testing harnesses, WebSocket/FTP integration tests
+**Next up:** CLI end-to-end tests, FFI expansion
 
 ---
 
@@ -496,32 +496,49 @@ tests (18). Covers server drops, large bodies, unusual status codes, control
 characters, extreme URL lengths, IPv6, port bounds, 1000-cookie jars, deeply
 nested domains, path segment boundaries. 485 total tests passing.
 
-### Phase 14: HTTP/1.1 Parser Hardening + Multipart Stress Tests
+### Phase 14: HTTP/1.1 Parser Hardening + Multipart Stress Tests — COMPLETED (2026-03-08)
 
-**Scope:** Add direct H1 parser unit tests for uncovered code paths, multipart
-form edge cases, and response parsing stress tests.
+28 H1 parser edge case tests (chunked encoding variants, Content-Length edge
+cases, HEAD handling, Set-Cookie preservation, redirect detection, malformed
+responses). 19 multipart stress tests (100 fields, 100KB values/files, special
+chars, binary data, content type detection). 532 total tests passing.
 
-**Step 14.1: H1 parser additional unit tests**
-- Chunked encoding with trailing whitespace in chunk size
-- Chunked encoding with chunk extensions
-- Response with both Content-Length and Transfer-Encoding (chunked wins)
-- 204 No Content with Content-Length header (body ignored)
-- Response with connection: keep-alive header
-- Multiple Set-Cookie headers preserved
+### Phase 15: `fail_on_error` Feature + H1 Property Tests — COMPLETED (2026-03-08)
 
-**Step 14.2: Multipart form edge cases**
-- File with special characters in filename
-- Very large field value
-- Many fields (100+)
-- Binary content in form field
-- Empty file upload
+`fail_on_error` field/method on Easy handle (curl -f behavior): HTTP status >= 400
+returns Error. 8 integration tests (404, 200, 500, redirects, boundaries, toggle).
+10 H1 property tests (status codes, Content-Length, headers, HEAD, URLs, redirects,
+body_str, size_download). 549 total tests passing.
 
-**Step 14.3: HTTP parser proptest**
-- Property: any valid HTTP response parses without panic
-- Property: status codes 100-599 are all accepted
-- Property: Content-Length matches body length
+### Phase 16: Fuzz Testing Harnesses + Protocol Integration Tests
 
-**Exit criteria:** 520+ tests. All H1 parser branches covered.
+**Scope:** Set up cargo-fuzz for parsers, add integration tests for FTP and WebSocket
+protocols against mock servers, expand CLI end-to-end coverage.
+
+**Step 16.1: Fuzz testing harnesses**
+- Initialize `cargo fuzz init` in liburlx crate
+- `fuzz_targets/url_parser.rs` — fuzz URL parsing with arbitrary bytes
+- `fuzz_targets/http_parser.rs` — fuzz H1 response parsing with arbitrary bytes
+- `fuzz_targets/cookie_parser.rs` — fuzz Set-Cookie parsing
+- `fuzz_targets/chunked_parser.rs` — fuzz chunked encoding decoder
+- Verify each harness compiles and runs briefly
+
+**Step 16.2: FTP integration tests**
+- Mock FTP server (minimal: control + data channels)
+- Test FTP download, directory listing, login, passive mode
+- Test FTP URL credential extraction
+
+**Step 16.3: WebSocket integration tests**
+- Mock WebSocket upgrade server (hyper + tungstenite)
+- Test handshake, text/binary frames, ping/pong, close
+
+**Step 16.4: CLI end-to-end hardening**
+- Test --fail exit code behavior via CLI
+- Test --dump-header output format
+- Test --include output format
+- Test --write-out variable expansion
+
+**Exit criteria:** Fuzz harnesses compile. 580+ tests. FTP/WebSocket tested via servers.
 
 ---
 
