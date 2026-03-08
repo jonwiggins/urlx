@@ -256,7 +256,7 @@ pub fn compute_accept_key(key: &str) -> String {
     use base64::Engine;
 
     let mut input = key.to_string();
-    input.push_str("258EAFA5-E914-47DA-95CA-5AB5DC85B11B");
+    input.push_str("258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
 
     let hash = sha1_hash(input.as_bytes());
     base64::engine::general_purpose::STANDARD.encode(hash)
@@ -445,10 +445,10 @@ mod tests {
 
     #[test]
     fn compute_accept_key_known_value() {
-        // Verified against Python hashlib.sha1 + base64
+        // RFC 6455 Section 4.2.2 example
         let key = "dGhlIHNhbXBsZSBub25jZQ==";
         let accept = compute_accept_key(key);
-        assert_eq!(accept, "f8vENM2VEHgM0ADJnqrBtdJsNdM=");
+        assert_eq!(accept, "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
     }
 
     #[test]
