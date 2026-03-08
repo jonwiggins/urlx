@@ -11,6 +11,7 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod cookie;
 pub mod easy;
 pub mod error;
 pub mod multi;
@@ -18,6 +19,7 @@ pub mod protocol;
 pub mod tls;
 pub mod url;
 
+pub use cookie::CookieJar;
 pub use easy::Easy;
 pub use error::Error;
 pub use multi::Multi;

@@ -5,6 +5,7 @@
 
 use std::time::{Duration, Instant};
 
+use crate::cookie::CookieJar;
 use crate::error::Error;
 use crate::protocol::http::response::{Response, TransferInfo};
 use crate::url::Url;
@@ -27,6 +28,7 @@ pub struct Easy {
     timeout: Option<Duration>,
     proxy: Option<Url>,
     noproxy: Option<String>,
+    cookie_jar: Option<CookieJar>,
 }
 
 impl Easy {
@@ -46,6 +48,7 @@ impl Easy {
             timeout: None,
             proxy: None,
             noproxy: None,
+            cookie_jar: None,
         }
     }
 
@@ -136,6 +139,20 @@ impl Easy {
         self.accept_encoding = enable;
     }
 
+    /// Enable the cookie engine.
+    ///
+    /// When enabled, cookies from `Set-Cookie` response headers are stored
+    /// and automatically sent in subsequent requests (including redirects).
+    pub fn cookie_jar(&mut self, enable: bool) {
+        if enable {
+            if self.cookie_jar.is_none() {
+                self.cookie_jar = Some(CookieJar::new());
+            }
+        } else {
+            self.cookie_jar = None;
+        }
+    }
+
     /// Set the proxy URL.
     ///
     /// HTTP URLs are forwarded through the proxy. HTTPS URLs use
@@ -167,7 +184,7 @@ impl Easy {
     ///
     /// Returns errors for connection failures, TLS errors, HTTP protocol
     /// errors, timeouts, and other transfer problems.
-    pub fn perform(&self) -> Result<Response, Error> {
+    pub fn perform(&mut self) -> Result<Response, Error> {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -184,7 +201,7 @@ impl Easy {
     ///
     /// Returns errors for connection failures, TLS errors, HTTP protocol
     /// errors, timeouts, and other transfer problems.
-    pub async fn perform_async(&self) -> Result<Response, Error> {
+    pub async fn perform_async(&mut self) -> Result<Response, Error> {
         let url = self.url.as_ref().ok_or_else(|| Error::UrlParse("no URL set".to_string()))?;
 
         // Resolve proxy: explicit setting takes priority, then env vars
@@ -208,6 +225,7 @@ impl Easy {
             self.connect_timeout,
             effective_proxy,
             effective_noproxy,
+            &mut self.cookie_jar,
         );
 
         // Apply total transfer timeout if set
@@ -239,6 +257,7 @@ async fn perform_transfer(
     connect_timeout: Option<Duration>,
     proxy: Option<&Url>,
     noproxy: Option<&str>,
+    cookie_jar: &mut Option<CookieJar>,
 ) -> Result<Response, Error> {
     let transfer_start = Instant::now();
     let mut current_url = url.clone();
@@ -251,11 +270,25 @@ async fn perform_transfer(
         // Determine effective proxy for this URL
         let effective_proxy = proxy.filter(|_| !should_bypass_proxy(&current_url, noproxy));
 
+        // Build headers with cookies if cookie jar is enabled
+        let mut request_headers = headers.to_vec();
+        if let Some(ref jar) = cookie_jar {
+            let host = current_url.host_str().unwrap_or("");
+            let path = current_url.path();
+            let is_secure = current_url.scheme() == "https";
+            if let Some(cookie_header) = jar.cookie_header(host, path, is_secure) {
+                // Only add if user hasn't set a Cookie header
+                if !request_headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("cookie")) {
+                    request_headers.push(("Cookie".to_string(), cookie_header));
+                }
+            }
+        }
+
         let connect_start = Instant::now();
         let response = do_single_request(
             &current_url,
             &current_method,
-            headers,
+            &request_headers,
             current_body.as_deref(),
             verbose,
             accept_encoding,
@@ -264,6 +297,13 @@ async fn perform_transfer(
         )
         .await?;
         last_connect_time = connect_start.elapsed();
+
+        // Store cookies from response
+        if let Some(ref mut jar) = cookie_jar {
+            let host = current_url.host_str().unwrap_or("");
+            let path = current_url.path();
+            jar.store_from_headers(response.headers(), host, path);
+        }
 
         // Check for redirects
         if follow_redirects && response.is_redirect() {
@@ -691,7 +731,7 @@ mod tests {
 
     #[test]
     fn easy_perform_without_url() {
-        let easy = Easy::new();
+        let mut easy = Easy::new();
         let result = easy.perform();
         assert!(result.is_err());
     }
@@ -779,6 +819,22 @@ mod tests {
         assert_eq!(easy.headers.len(), 1);
         assert_eq!(easy.headers[0].0, "Authorization");
         assert_eq!(easy.headers[0].1, "Bearer my-token-123");
+    }
+
+    #[test]
+    fn easy_cookie_jar_enable() {
+        let mut easy = Easy::new();
+        assert!(easy.cookie_jar.is_none());
+        easy.cookie_jar(true);
+        assert!(easy.cookie_jar.is_some());
+    }
+
+    #[test]
+    fn easy_cookie_jar_disable() {
+        let mut easy = Easy::new();
+        easy.cookie_jar(true);
+        easy.cookie_jar(false);
+        assert!(easy.cookie_jar.is_none());
     }
 
     #[test]

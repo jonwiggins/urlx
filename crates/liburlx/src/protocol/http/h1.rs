@@ -182,7 +182,18 @@ pub fn parse_response(data: &[u8], effective_url: &str, is_head: bool) -> Result
     for header in parsed.headers.iter() {
         let name = header.name.to_lowercase();
         let value = String::from_utf8_lossy(header.value).to_string();
-        let _old = headers.insert(name, value);
+        // For set-cookie, append with newline to preserve multiple values
+        if name == "set-cookie" {
+            let _entry = headers
+                .entry(name)
+                .and_modify(|existing: &mut String| {
+                    existing.push('\n');
+                    existing.push_str(&value);
+                })
+                .or_insert(value);
+        } else {
+            let _old = headers.insert(name, value);
+        }
     }
 
     // HEAD responses have no body

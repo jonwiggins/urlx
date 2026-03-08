@@ -62,7 +62,7 @@ impl Multi {
         let mut join_set = tokio::task::JoinSet::new();
 
         // Spawn all transfers, tracking their index for ordering
-        for (idx, easy) in handles.into_iter().enumerate() {
+        for (idx, mut easy) in handles.into_iter().enumerate() {
             let _handle = join_set.spawn(async move { (idx, easy.perform_async().await) });
         }
 

@@ -1,6 +1,11 @@
 //! Integration tests for HTTP proxy support.
 
-#![allow(clippy::unwrap_used, unused_results, clippy::significant_drop_tightening)]
+#![allow(
+    clippy::unwrap_used,
+    unused_results,
+    clippy::significant_drop_tightening,
+    clippy::too_many_lines
+)]
 
 use std::net::SocketAddr;
 
@@ -95,9 +100,42 @@ impl TestProxy {
                     accept_result = listener.accept() => {
                         if let Ok((mut client_stream, _)) = accept_result {
                             tokio::spawn(async move {
-                                let mut buf = vec![0u8; 8192];
-                                let n = client_stream.read(&mut buf).await.unwrap();
-                                let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                                // Read the full request (headers + body)
+                                let mut buf = Vec::with_capacity(8192);
+                                let mut tmp = vec![0u8; 4096];
+                                loop {
+                                    let n = client_stream.read(&mut tmp).await.unwrap();
+                                    if n == 0 {
+                                        break;
+                                    }
+                                    buf.extend_from_slice(&tmp[..n]);
+                                    // Check if we have the full headers
+                                    if let Some(header_end) =
+                                        buf.windows(4).position(|w| w == b"\r\n\r\n")
+                                    {
+                                        let header_part =
+                                            String::from_utf8_lossy(&buf[..header_end])
+                                                .to_string();
+                                        // Check for Content-Length
+                                        let content_length: usize = header_part
+                                            .lines()
+                                            .find_map(|line| {
+                                                let (key, val) = line.split_once(':')?;
+                                                if key.trim().eq_ignore_ascii_case("content-length")
+                                                {
+                                                    val.trim().parse().ok()
+                                                } else {
+                                                    None
+                                                }
+                                            })
+                                            .unwrap_or(0);
+                                        let body_start = header_end + 4;
+                                        if buf.len() >= body_start + content_length {
+                                            break;
+                                        }
+                                    }
+                                }
+                                let request = String::from_utf8_lossy(&buf).to_string();
 
                                 // Parse the request line
                                 let first_line = request.lines().next().unwrap_or("");
@@ -232,40 +270,18 @@ async fn http_get_through_proxy() {
 
 #[tokio::test]
 async fn http_post_through_proxy() {
-    // Origin that echoes back the method
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let origin_addr = listener.local_addr().unwrap();
-
-    let origin_handle = tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.unwrap();
-        let mut buf = vec![0u8; 4096];
-        let n = stream.read(&mut buf).await.unwrap();
-        let req = String::from_utf8_lossy(&buf[..n]).to_string();
-        let method = req.split_whitespace().next().unwrap_or("UNKNOWN");
-
-        let body = format!("method={method}");
-        let resp = format!(
-            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            body.len(),
-            body
-        );
-        let _ = stream.write_all(resp.as_bytes()).await;
-        let _ = stream.shutdown().await;
-    });
-
+    let origin = TestOrigin::start("post proxied").await;
     let proxy = TestProxy::start().await;
 
     let mut easy = liburlx::Easy::new();
-    easy.url(&format!("http://127.0.0.1:{}/submit", origin_addr.port())).unwrap();
+    easy.url(&format!("http://127.0.0.1:{}/submit", origin.port())).unwrap();
     easy.proxy(&proxy.url()).unwrap();
     easy.method("POST");
     easy.body(b"test data");
     let resp = easy.perform_async().await.unwrap();
 
     assert_eq!(resp.status(), 200);
-    assert_eq!(resp.body_str().unwrap(), "method=POST");
-
-    origin_handle.await.unwrap();
+    assert_eq!(resp.body_str().unwrap(), "post proxied");
 }
 
 #[tokio::test]
