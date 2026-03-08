@@ -20,6 +20,7 @@ use crate::url::Url;
 ///
 /// This is the main entry point for the liburlx API, modeled after
 /// curl's `CURL *` easy handle.
+#[allow(clippy::struct_excessive_bools)] // These are independent transfer options, not state flags
 pub struct Easy {
     url: Option<Url>,
     method: Option<String>,
@@ -39,6 +40,7 @@ pub struct Easy {
     range: Option<String>,
     resolve_overrides: Vec<(String, String)>,
     progress_callback: Option<ProgressCallback>,
+    fail_on_error: bool,
     pool: ConnectionPool,
 }
 
@@ -63,6 +65,7 @@ impl std::fmt::Debug for Easy {
             .field("range", &self.range)
             .field("resolve_overrides", &self.resolve_overrides)
             .field("progress_callback", &self.progress_callback.as_ref().map(|_| "<callback>"))
+            .field("fail_on_error", &self.fail_on_error)
             .field("pool", &"<ConnectionPool>")
             .finish()
     }
@@ -89,6 +92,7 @@ impl Clone for Easy {
             range: self.range.clone(),
             resolve_overrides: self.resolve_overrides.clone(),
             progress_callback: self.progress_callback.clone(),
+            fail_on_error: self.fail_on_error,
             pool: ConnectionPool::new(),
         }
     }
@@ -117,6 +121,7 @@ impl Easy {
             range: None,
             resolve_overrides: Vec::new(),
             progress_callback: None,
+            fail_on_error: false,
             pool: ConnectionPool::new(),
         }
     }
@@ -311,6 +316,15 @@ impl Easy {
         self.progress_callback = Some(callback);
     }
 
+    /// Enable or disable fail-on-error mode.
+    ///
+    /// When enabled, HTTP responses with status >= 400 cause
+    /// [`perform`](Self::perform) to return an error instead of
+    /// the response. Equivalent to curl's `-f`/`--fail` flag.
+    pub fn fail_on_error(&mut self, enable: bool) {
+        self.fail_on_error = enable;
+    }
+
     /// Perform the transfer and return the response (blocking).
     ///
     /// Creates a new tokio runtime internally. Do not call from within
@@ -413,6 +427,14 @@ impl Easy {
         } else {
             fut.await
         }?;
+
+        // Check fail_on_error: HTTP status >= 400 becomes an error
+        if self.fail_on_error && response.status() >= 400 {
+            return Err(Error::Http(format!(
+                "HTTP error {} (fail_on_error enabled)",
+                response.status()
+            )));
+        }
 
         // Call progress callback with final transfer values
         if let Some(ref cb) = self.progress_callback {
