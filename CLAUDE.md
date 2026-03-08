@@ -14,11 +14,11 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 10 — Feature Completeness + Optimization
-**Last completed:** Phase 9 (hardening, edge cases, 382 tests) — 2026-03-08
-**In progress:** Feature gaps, optimization, polish
+**Phase:** 11 — Extended Protocol Testing + Polish
+**Last completed:** Phase 10 (gzip, cookie, file protocol integration tests, 392 tests) — 2026-03-08
+**In progress:** HTTP/2 integration tests, HSTS tests, WebSocket tests
 **Blockers:** None
-**Next up:** Gzip decompression integration tests, HTTP/2 behavioral tests
+**Next up:** README, crate publishing preparation
 
 ---
 
@@ -470,33 +470,32 @@ segments, host headers, long paths). 16 HTTP edge case integration tests
 (204/304 responses, binary data, long/many headers, status codes, PATCH/OPTIONS,
 query strings, timeouts). 382 total tests passing.
 
-### Phase 10: Feature Completeness + Optimization
+### Phase 10: Feature Completeness + Optimization — COMPLETED (2026-03-08)
 
-**Scope:** Fill remaining feature gaps, optimize hot paths.
+5 gzip decompression integration tests (compressed response, identity, Accept-Encoding
+header verification). 5 cookie engine integration tests (set/send, path matching,
+multiple cookies, overwrite). File protocol tests already existed from Phase 4b.
+392 total tests passing.
 
-**Step 10.1: Gzip decompression integration tests**
-- Test gzip-compressed response with --compressed flag
-- Test deflate-compressed response
-- Test identity (no compression) with --compressed
-- Verify Accept-Encoding header is sent correctly
+### Phase 11: Extended Protocol Testing + Polish
 
-**Step 10.2: Cookie engine integration tests**
-- Test cookie persistence across multiple Easy handle uses
-- Test cookie domain/path matching
-- Test cookie expiry (Max-Age)
-- Test Secure cookie flag
+**Scope:** Test remaining features, create README, prepare for publishing.
 
-**Step 10.3: File protocol tests**
-- Test file:// URL reading local files
-- Test file:// with percent-encoded paths
-- Test file:// error for missing files
+**Step 11.1: HSTS integration tests**
+- Test HTTP→HTTPS upgrade when HSTS is cached
+- Test includeSubDomains
+- Test HSTS not stored for HTTP responses
 
-**Step 10.4: Connection pooling verification**
-- Test connection reuse with keep-alive
-- Test pool eviction
+**Step 11.2: Connection pooling integration tests**
+- Test connection reuse reduces connect count
 - Test stale connection retry
 
-**Exit criteria:** 400+ tests. All major features have integration tests.
+**Step 11.3: README and documentation**
+- Create README.md with project overview, usage examples, feature list
+- Verify all public APIs have doc comments
+- Ensure `cargo doc` is clean
+
+**Exit criteria:** 400+ tests. README created. Ready for initial release.
 
 ---
 
