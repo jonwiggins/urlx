@@ -1,5 +1,6 @@
 [workspace]
 members = ["crates/liburlx", "crates/liburlx-ffi", "crates/urlx-cli"]
+exclude = ["crates/liburlx/fuzz"]
 resolver = "2"
 
 [workspace.package]

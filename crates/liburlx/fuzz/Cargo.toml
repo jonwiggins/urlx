@@ -1,0 +1,44 @@
+[package]
+name = "liburlx-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.liburlx]
+path = ".."
+
+[[bin]]
+name = "url_parser"
+path = "fuzz_targets/url_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "http_parser"
+path = "fuzz_targets/http_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cookie_parser"
+path = "fuzz_targets/cookie_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "hsts_parser"
+path = "fuzz_targets/hsts_parser.rs"
+test = false
+doc = false
+bench = false
