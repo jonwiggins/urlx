@@ -83,6 +83,19 @@ impl Url {
         self.inner.password()
     }
 
+    /// Returns user:password credentials if present in the URL.
+    ///
+    /// Returns `None` if no username is set (empty username counts as not set).
+    #[must_use]
+    pub fn credentials(&self) -> Option<(&str, &str)> {
+        let user = self.inner.username();
+        if user.is_empty() {
+            return None;
+        }
+        let pass = self.inner.password().unwrap_or("");
+        Some((user, pass))
+    }
+
     /// Returns the full URL as a string.
     #[must_use]
     pub fn as_str(&self) -> &str {

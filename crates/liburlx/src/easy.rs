@@ -527,9 +527,11 @@ async fn do_single_request(
     resolve_overrides: &[(String, String)],
     pool: &mut ConnectionPool,
 ) -> Result<Response, Error> {
-    // Handle file:// URLs directly (no network)
-    if url.scheme() == "file" {
-        return crate::protocol::file::read_file(url);
+    // Handle non-HTTP schemes directly
+    match url.scheme() {
+        "file" => return crate::protocol::file::read_file(url),
+        "ftp" => return crate::protocol::ftp::download(url).await,
+        _ => {}
     }
 
     let (host, port) = url.host_and_port()?;
