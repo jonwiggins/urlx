@@ -14,12 +14,12 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 16 — Fuzz Testing Harnesses + Protocol Integration Tests
-**Last completed:** Phase 15 (fail_on_error, H1 property tests) — 2026-03-08
-**Total tests:** 549
-**In progress:** Setting up cargo-fuzz harnesses, FTP/WebSocket integration tests
+**Phase:** 17 — Protocol Property Tests + CLI Integration Hardening
+**Last completed:** Phase 16 (fuzz harnesses, WS/FTP tests, WS GUID fix) — 2026-03-08
+**Total tests:** 594
+**In progress:** Property tests for protocols, CLI integration test expansion
 **Blockers:** None
-**Next up:** CLI end-to-end tests, FFI expansion
+**Next up:** HTTP/2 integration tests, FFI expansion
 
 ---
 
@@ -31,6 +31,7 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 - **2026-03-08:** Connection pool uses `PooledStream` enum (Tcp/Tls variants) with AsyncRead/AsyncWrite delegation, avoiding trait objects. Pool only stores non-proxied H1 connections; H2 multiplexing handles its own reuse.
 - **2026-03-08:** For keep-alive, responses with no Content-Length and no chunked encoding (e.g., 204 No Content) are treated as empty body to avoid hanging on `read_to_end`. Stale pooled connections trigger automatic retry with fresh connection.
 - **2026-03-08:** WebSocket SHA-1 implemented inline (minimal, ~50 lines) to avoid adding a dependency for a single use case. Not used for security purposes — only for RFC 6455 accept key computation.
+- **2026-03-08:** Found and fixed WebSocket accept key GUID typo (`5AB5DC85B11B` → `C5AB0DC85B11`). The existing unit test was written against the buggy implementation. Discovered via RFC 6455 example test in integration tests.
 
 ---
 
@@ -510,35 +511,41 @@ returns Error. 8 integration tests (404, 200, 500, redirects, boundaries, toggle
 10 H1 property tests (status codes, Content-Length, headers, HEAD, URLs, redirects,
 body_str, size_download). 549 total tests passing.
 
-### Phase 16: Fuzz Testing Harnesses + Protocol Integration Tests
+### Phase 16: Fuzz Testing + Protocol Integration Tests — COMPLETED (2026-03-08)
 
-**Scope:** Set up cargo-fuzz for parsers, add integration tests for FTP and WebSocket
-protocols against mock servers, expand CLI end-to-end coverage.
+4 cargo-fuzz harnesses (URL, HTTP, cookie, HSTS parsers) — all compile and run
+on nightly. 18 WebSocket frame stress tests (roundtrips, size edges, masking,
+multi-frame streams). 27 FTP protocol edge case tests (PASV/EPSV parsing,
+response reading, command formatting). Fixed RFC 6455 WebSocket accept key
+GUID bug. 594 total tests passing.
 
-**Step 16.1: Fuzz testing harnesses**
-- Initialize `cargo fuzz init` in liburlx crate
-- `fuzz_targets/url_parser.rs` — fuzz URL parsing with arbitrary bytes
-- `fuzz_targets/http_parser.rs` — fuzz H1 response parsing with arbitrary bytes
-- `fuzz_targets/cookie_parser.rs` — fuzz Set-Cookie parsing
-- `fuzz_targets/chunked_parser.rs` — fuzz chunked encoding decoder
-- Verify each harness compiles and runs briefly
+### Phase 17: Protocol Property Tests + CLI Integration Hardening
 
-**Step 16.2: FTP integration tests**
-- Mock FTP server (minimal: control + data channels)
-- Test FTP download, directory listing, login, passive mode
-- Test FTP URL credential extraction
+**Scope:** Expand property-based tests to cover more protocol parsers,
+add CLI integration tests for end-to-end behavior, add HTTP/2 integration tests.
 
-**Step 16.3: WebSocket integration tests**
-- Mock WebSocket upgrade server (hyper + tungstenite)
-- Test handshake, text/binary frames, ping/pong, close
+**Step 17.1: Property-based tests for WebSocket**
+- Property: any frame that encodes successfully can be decoded back
+- Property: masked frames decode to same payload as unmasked
+- Property: frame length encoding matches payload size
 
-**Step 16.4: CLI end-to-end hardening**
-- Test --fail exit code behavior via CLI
-- Test --dump-header output format
-- Test --include output format
-- Test --write-out variable expansion
+**Step 17.2: Property-based tests for FTP**
+- Property: PASV response with valid 6-tuple always parses
+- Property: EPSV response with valid port always parses
+- Property: FTP response code categories are mutually exclusive
 
-**Exit criteria:** Fuzz harnesses compile. 580+ tests. FTP/WebSocket tested via servers.
+**Step 17.3: HTTP/2 integration tests**
+- Test H2 multiplexed requests to test server
+- Test H2 ALPN negotiation
+- Test H2 large headers, large body
+
+**Step 17.4: CLI argument parsing hardening**
+- Test all flag combinations for parse correctness
+- Test write-out format with all variables
+- Test error messages for invalid arguments
+- Test multi-URL mode
+
+**Exit criteria:** 640+ tests. Property tests for all protocol parsers.
 
 ---
 
