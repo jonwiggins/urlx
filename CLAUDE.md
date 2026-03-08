@@ -14,12 +14,12 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 17 — Protocol Property Tests + CLI Integration Hardening
-**Last completed:** Phase 16 (fuzz harnesses, WS/FTP tests, WS GUID fix) — 2026-03-08
-**Total tests:** 594
-**In progress:** Property tests for protocols, CLI integration test expansion
+**Phase:** 18 — HTTP/2 Integration Tests + Connection Pool Hardening
+**Last completed:** Phase 17 (protocol proptests, CLI tests) — 2026-03-08
+**Total tests:** 634
+**In progress:** Planning Phase 18
 **Blockers:** None
-**Next up:** HTTP/2 integration tests, FFI expansion
+**Next up:** HTTP/2 tests, connection pool stress tests, transfer info accuracy
 
 ---
 
@@ -519,33 +519,40 @@ multi-frame streams). 27 FTP protocol edge case tests (PASV/EPSV parsing,
 response reading, command formatting). Fixed RFC 6455 WebSocket accept key
 GUID bug. 594 total tests passing.
 
-### Phase 17: Protocol Property Tests + CLI Integration Hardening
+### Phase 17: Protocol Property Tests + CLI Hardening — COMPLETED (2026-03-08)
 
-**Scope:** Expand property-based tests to cover more protocol parsers,
-add CLI integration tests for end-to-end behavior, add HTTP/2 integration tests.
+16 property-based tests (7 WebSocket, 4 FTP, 5 multipart). 22 new CLI
+argument parsing tests covering all flags, invalid inputs, combinations,
+write-out variables. 634 total tests passing.
 
-**Step 17.1: Property-based tests for WebSocket**
-- Property: any frame that encodes successfully can be decoded back
-- Property: masked frames decode to same payload as unmasked
-- Property: frame length encoding matches payload size
+### Phase 18: HTTP/2 Integration Tests + Connection Pool Hardening
 
-**Step 17.2: Property-based tests for FTP**
-- Property: PASV response with valid 6-tuple always parses
-- Property: EPSV response with valid port always parses
-- Property: FTP response code categories are mutually exclusive
+**Scope:** Test HTTP/2 protocol handling, connection pool behavior under
+stress, and transfer info timing accuracy.
 
-**Step 17.3: HTTP/2 integration tests**
-- Test H2 multiplexed requests to test server
-- Test H2 ALPN negotiation
-- Test H2 large headers, large body
+**Step 18.1: Connection pool stress tests**
+- Test pool key isolation (different hosts don't share connections)
+- Test pool capacity limits
+- Test concurrent access to pool
+- Test expired connection eviction
 
-**Step 17.4: CLI argument parsing hardening**
-- Test all flag combinations for parse correctness
-- Test write-out format with all variables
-- Test error messages for invalid arguments
-- Test multi-URL mode
+**Step 18.2: Transfer info and timing tests**
+- Test time_total is nonzero after transfer
+- Test time_connect is set for new connections
+- Test num_redirects counts correctly
+- Test size_download matches body length
 
-**Exit criteria:** 640+ tests. Property tests for all protocol parsers.
+**Step 18.3: Error type coverage tests**
+- Test all Error variants can be constructed and displayed
+- Test error conversion from IO, URL parse, TLS errors
+- Test error Send + Sync bounds
+
+**Step 18.4: Multi API stress tests**
+- Test many concurrent transfers (10+)
+- Test mixed success/failure in batch
+- Test Multi with empty handle list
+
+**Exit criteria:** 680+ tests. Pool, timing, and concurrency well-tested.
 
 ---
 
