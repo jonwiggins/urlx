@@ -14,11 +14,11 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 4c — HSTS + DNS Resolution + WebSocket foundation
-**Last completed:** Phase 4b (FILE Protocol + Multipart + Range) — 2026-03-08
-**In progress:** Phase 4c implementation
+**Phase:** 5 — Protocol Expansion (FTP, MQTT)
+**Last completed:** Phase 4c (HSTS + DNS Resolve + WebSocket) — 2026-03-08
+**In progress:** Phase 5 implementation
 **Blockers:** None
-**Next up:** Phase 5 (Protocol Expansion — FTP, MQTT, etc.)
+**Next up:** Phase 6 (Drop-in Replacement)
 
 ---
 
@@ -29,6 +29,7 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 - **2026-03-08:** cargo-deny v0.19 uses a simplified config format — `vulnerability`/`unmaintained`/`unlicensed`/`copyleft` keys were removed.
 - **2026-03-08:** Connection pool uses `PooledStream` enum (Tcp/Tls variants) with AsyncRead/AsyncWrite delegation, avoiding trait objects. Pool only stores non-proxied H1 connections; H2 multiplexing handles its own reuse.
 - **2026-03-08:** For keep-alive, responses with no Content-Length and no chunked encoding (e.g., 204 No Content) are treated as empty body to avoid hanging on `read_to_end`. Stale pooled connections trigger automatic retry with fresh connection.
+- **2026-03-08:** WebSocket SHA-1 implemented inline (minimal, ~50 lines) to avoid adding a dependency for a single use case. Not used for security purposes — only for RFC 6455 accept key computation.
 
 ---
 
@@ -406,43 +407,45 @@ with text fields and file uploads (MultipartForm API). Range request support
 with resume_from(). CLI flags: -F/--form, -r/--range, -C/--continue-at.
 185 tests passing.
 
-### Phase 4c: HSTS + DNS Resolution + WebSocket Foundation
+### Phase 4c: HSTS + DNS Resolution + WebSocket Foundation — COMPLETED (2026-03-08)
 
-**Scope:** Add remaining HTTP-adjacent features before protocol expansion.
+HSTS cache with Strict-Transport-Security parsing, auto HTTP→HTTPS upgrade,
+includeSubDomains support. DNS resolve overrides (Easy::resolve). WebSocket
+frame codec with RFC 6455 masking, SHA-1 accept key, text/binary/ping/pong/close
+frames. 208 tests passing.
 
-**Step 4c.1: HSTS enforcement**
-- Create `hsts.rs` module for Strict-Transport-Security header parsing
-- HSTS cache that upgrades HTTP→HTTPS for known HSTS hosts
-- Parse `max-age`, `includeSubDomains` directives
-- Integration tests: HSTS upgrade, subdomain inclusion, max-age expiry
-- Wire into Easy: `easy.hsts(true)` to enable
+### Phase 5: Protocol Expansion (FTP)
 
-**Step 4c.2: Custom DNS resolver interface**
-- Create `dns/mod.rs` with `Resolver` trait
-- `dns/system.rs` — System resolver (current behavior via `TcpStream::connect`)
-- `Easy::resolve(host, addr)` for manual DNS override (like curl's `--resolve`)
-- Integration tests: resolve override, DNS failure
+**Scope:** Implement FTP protocol, the most complex non-HTTP protocol in curl.
 
-**Step 4c.3: WebSocket protocol**
-- Create `protocol/ws.rs` for WebSocket upgrade handshake
-- HTTP/1.1 → WebSocket upgrade via Upgrade: websocket header
-- Frame encoding/decoding (text, binary, ping/pong, close)
-- `Easy::websocket()` to enable WS mode
-- Integration tests: connect, send/receive text, binary, close
+**Step 5.1: FTP control connection**
+- Create `protocol/ftp.rs` module
+- FTP command/response codec (status codes, multi-line responses)
+- Login sequence: USER/PASS/ACCT
+- QUIT command for clean disconnect
+- Unit tests for command parsing
 
-**Exit criteria:** HSTS auto-upgrades HTTP to HTTPS. DNS resolve overrides
-work. Basic WebSocket connections succeed.
+**Step 5.2: FTP passive mode data transfer**
+- PASV/EPSV commands for passive mode
+- Data connection establishment
+- LIST command for directory listing
+- RETR command for file download
+- Integration tests with mock FTP server
 
-### Phase 5: Protocol Expansion
+**Step 5.3: FTP file upload**
+- STOR command for file upload
+- APPE command for append
+- TYPE command for binary/ASCII mode
+- Integration tests: upload file, verify content
 
-### Phase 5: Protocol Expansion (FTP, MQTT, etc.)
+**Step 5.4: FTP resume and SIZE**
+- REST command for resume offset
+- SIZE command for file size
+- Resume download from offset
+- Integration tests
 
-**Write tests first for each protocol before implementing:**
-- FTP/FTPS (active, passive, upload, download, directory listing, resume)
-- MQTT (connect, publish, subscribe)
-- SCP/SFTP
-- SMTP/IMAP/POP3
-- LDAP
+**Exit criteria:** FTP downloads and uploads work. Directory listing works.
+Passive mode data connections work.
 
 ### Phase 6: Drop-in Replacement
 
