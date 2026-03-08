@@ -14,11 +14,11 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 7 — FFI Compatibility Layer
-**Last completed:** Phase 6b (MQTT + DICT + TFTP) — 2026-03-08
-**In progress:** FFI curl_easy_* function implementations
+**Phase:** 7b — CLI Completeness + Integration Tests
+**Last completed:** Phase 7a (FFI curl_easy_* C ABI layer) — 2026-03-08
+**In progress:** CLI enhancements and integration test suite
 **Blockers:** None
-**Next up:** CLI completeness, curl test suite porting
+**Next up:** Phase 8 (curl test suite porting, differential testing)
 
 ---
 
@@ -439,39 +439,55 @@ MQTT 3.1.1 client with CONNECT, PUBLISH, SUBSCRIBE. DICT client (RFC 2229)
 with DEFINE/MATCH. TFTP client (RFC 1350) for UDP file downloads. 26 unit tests
 across the three protocols. 213 total tests passing.
 
-### Phase 7a: FFI Compatibility Layer
+### Phase 7a: FFI Compatibility Layer — COMPLETED (2026-03-08)
 
-**Scope:** Build the `liburlx-ffi` C ABI layer to be a drop-in libcurl replacement.
+C ABI compatibility layer with curl_easy_init/cleanup, curl_easy_setopt (16 options),
+curl_easy_perform with write/header callbacks and catch_unwind panic safety,
+curl_easy_getinfo (6 info codes), curl_easy_strerror, curl_version. CURLcode/CURLoption/CURLINFO
+enums. 22 FFI unit tests. All unsafe blocks have SAFETY comments.
 
-**Step 7a.1: Core FFI functions**
-- `curl_easy_init()` / `curl_easy_cleanup()` — handle lifecycle
-- `curl_easy_setopt()` — CURLOPT_URL, CURLOPT_WRITEFUNCTION, CURLOPT_WRITEDATA
-- `curl_easy_perform()` — execute transfer
-- `curl_easy_getinfo()` — CURLINFO_RESPONSE_CODE, CURLINFO_CONTENT_TYPE
-- `curl_easy_strerror()` — error code to string
-- CURLcode error mapping
+### Phase 7b: CLI Completeness + Integration Tests
 
-**Step 7a.2: Option mapping**
-- Map key CURLOPT_* constants to Easy handle setters
-- CURLOPT_FOLLOWLOCATION, CURLOPT_HTTPHEADER, CURLOPT_POST, CURLOPT_POSTFIELDS
-- CURLOPT_USERAGENT, CURLOPT_TIMEOUT, CURLOPT_CONNECTTIMEOUT
-- CURLOPT_PROXY, CURLOPT_NOPROXY, CURLOPT_VERBOSE
+**Scope:** Expand CLI to handle more curl flags, add integration tests with real test servers.
 
-**Step 7a.3: Write callback**
-- Implement CURLOPT_WRITEFUNCTION with C function pointer callback
-- Buffer management for response body
+**Step 7b.1: Additional CLI flags**
+- `--data-raw` — POST data without @ interpretation
+- `--data-binary` — POST binary data from file
+- `-d @filename` — Read POST data from file
+- `-s`/`--silent` — Suppress progress and error messages
+- `-S`/`--show-error` — Show error even when silent
+- `-f`/`--fail` — Fail silently on HTTP errors (exit code 22)
+- `-D`/`--dump-header <file>` — Write response headers to file
+- `-i`/`--include` — Include response headers in output
+- `-k`/`--insecure` — Allow insecure TLS connections
+- `--max-redirs <num>` — Maximum number of redirects
+- `-A`/`--user-agent <name>` — Set User-Agent header
 
-**Exit criteria:** Simple C programs can link against liburlx-ffi and perform
-HTTP GET/POST requests using the standard curl_easy_* API.
+**Step 7b.2: Integration test infrastructure**
+- Build a simple HTTP test server using hyper
+- Test GET/POST/PUT/DELETE against local server
+- Test redirect following with local server
+- Test header sending/receiving
+- Test error conditions (connection refused, 404, 500)
+- Test timeout behavior
+- Test verbose output format
 
-### Phase 7b: CLI Completeness + Drop-in Testing
+**Step 7b.3: CLI unit tests**
+- Test argument parsing for all flags
+- Test write-out format string expansion
+- Test error exit codes
 
-**Scope:** Make urlx CLI handle more of curl's flags, port test cases.
+**Exit criteria:** urlx handles the 20 most common curl flags. Integration tests
+verify end-to-end behavior against local test servers. 250+ tests passing.
 
-- Add remaining common flags: --data-raw, --data-binary, --fail, --silent
-- Support @file for request body (-d @filename)
-- Config file parsing (.curlrc)
-- Port initial curl test cases for behavioral verification
+### Phase 8: Curl Test Suite Porting + Polish
+
+**Scope:** Port curl's behavioral tests, differential testing, documentation.
+
+- Port initial batch of curl's HTTP test cases
+- Set up differential testing framework (run same operation with urlx and curl)
+- C header generation via cbindgen
+- Documentation and README
 
 ---
 
