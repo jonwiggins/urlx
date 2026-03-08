@@ -14,12 +14,12 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 22 — HTTP Behavior Conformance + CLI Edge Cases
-**Last completed:** Phase 21 (FFI expansion, transfer info, protocol proptests, pool lifecycle) — 2026-03-08
-**Total tests:** 843
-**In progress:** Planning Phase 22
+**Phase:** 23 — HSTS Integration + Proxy Behavior + CLI Write-Out Expansion
+**Last completed:** Phase 22 (HTTP conformance, cookie persistence, multipart roundtrip) — 2026-03-08
+**Total tests:** 890
+**In progress:** Planning Phase 23
 **Blockers:** None
-**Next up:** HTTP conformance edge cases, CLI argument interaction tests, cookie persistence tests
+**Next up:** HSTS upgrade integration tests, proxy tunneling tests, CLI write-out expansion
 
 ---
 
@@ -553,38 +553,42 @@ error mapping, header lookup). 16 transfer info accuracy tests (timing, redirect
 counting, effective URL, size_download). 12 protocol property tests (SMTP, POP3,
 IMAP, MQTT). 10 pool lifecycle tests (reuse, isolation, error survival). 843 tests.
 
-### Phase 22: HTTP Behavior Conformance + CLI Edge Cases
+### Phase 22: HTTP Conformance + Cookie Persistence + Multipart — COMPLETED (2026-03-08)
 
-**Scope:** Test HTTP protocol conformance edge cases, CLI argument
-interactions, cookie persistence across requests, and multipart
-form data round-tripping.
+22 HTTP conformance tests (HEAD, 204/304, headers, binary/large body, methods,
+redirects 307/303). 6 cookie persistence tests (store/send, replacement, path
+scoping, disabled jar). 25 multipart tests (encoding, content-type detection,
+boundary, file data, binary). 890 total tests.
 
-**Step 22.1: HTTP conformance edge cases**
-- Test HTTP/1.0 vs HTTP/1.1 connection behavior
-- Test HEAD responses with Content-Length but no body
-- Test chunked encoding edge cases (zero-length chunks, trailer headers)
-- Test keep-alive vs close connection headers
-- Test case-insensitive header matching in responses
+### Phase 23: HSTS Integration + Proxy Behavior + CLI Write-Out Expansion
 
-**Step 22.2: CLI argument interaction tests**
-- Test flag combinations (-v with -s, -f with -o, -L with --max-redirs)
-- Test URL encoding/escaping in CLI arguments
-- Test stdin body reading (-d @-)
-- Test error output format with -S
+**Scope:** Test HSTS HTTP→HTTPS upgrade in transfers, proxy tunneling
+behavior, and expand CLI write-out variable testing.
 
-**Step 22.3: Cookie persistence integration tests**
-- Test cookies sent on subsequent requests to same origin
-- Test cookie domain scoping (subdomain cookies)
-- Test cookie path scoping
-- Test cookie expiry behavior
+**Step 23.1: HSTS upgrade integration tests**
+- Test HSTS header parsed from response enables upgrade
+- Test subsequent requests to same host use HTTPS
+- Test includeSubDomains behavior
+- Test HSTS max-age=0 removes entry
 
-**Step 22.4: Multipart form data verification**
-- Test boundary generation uniqueness
-- Test file upload content type detection
-- Test multi-field form encoding
-- Test large file upload handling
+**Step 23.2: Proxy behavior tests**
+- Test HTTP proxy forwards requests correctly
+- Test proxy auth header generation
+- Test noproxy bypass patterns
+- Test proxy URL validation
 
-**Exit criteria:** 910+ tests. HTTP edge cases well-covered.
+**Step 23.3: CLI write-out expansion**
+- Test all supported write-out variables
+- Test write-out with redirects
+- Test write-out format string combinations
+- Test write-out with error conditions
+
+**Step 23.4: Progress callback verification**
+- Test progress callback receives updates during transfer
+- Test progress info has correct download size
+- Test progress callback with multiple transfers
+
+**Exit criteria:** 960+ tests. HSTS, proxy, and CLI well-covered.
 
 ---
 
