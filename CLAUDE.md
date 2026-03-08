@@ -14,11 +14,11 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 6 — SMTP/IMAP/POP3 Protocol Handlers
-**Last completed:** Phase 5b (SOCKS proxy + progress callbacks) — 2026-03-08
-**In progress:** SMTP protocol handler
+**Phase:** 7 — FFI Compatibility Layer
+**Last completed:** Phase 6b (MQTT + DICT + TFTP) — 2026-03-08
+**In progress:** FFI curl_easy_* function implementations
 **Blockers:** None
-**Next up:** Phase 6b (MQTT + LDAP), Phase 7 (Drop-in Replacement)
+**Next up:** CLI completeness, curl test suite porting
 
 ---
 
@@ -427,50 +427,51 @@ support. Integrated into Easy handle (socks5://, socks4://, socks5h://, socks4a:
 proxy URLs). Progress callback API (ProgressInfo, ProgressCallback). CLI -#/--progress-bar
 flag with visual progress bar. 162 tests passing.
 
-### Phase 6a: SMTP/IMAP/POP3 Protocol Handlers
+### Phase 6a: SMTP/IMAP/POP3 — COMPLETED (2026-03-08)
 
-**Scope:** Email protocol foundations.
+SMTP client with EHLO/HELO, AUTH PLAIN, MAIL FROM/RCPT TO/DATA. IMAP4rev1
+client with LOGIN, SELECT, UID FETCH, mailbox listing. POP3 client with
+USER/PASS, LIST, RETR, dot-stuffing. 27 unit tests across the three protocols.
 
-**Step 6a.1: SMTP protocol handler**
-- `protocol/smtp.rs` — SMTP client for sending email
-- EHLO/HELO greeting, MAIL FROM, RCPT TO, DATA commands
-- STARTTLS upgrade support
-- AUTH PLAIN/LOGIN
-- Unit tests with mock SMTP server
+### Phase 6b: MQTT + DICT + TFTP — COMPLETED (2026-03-08)
 
-**Step 6a.2: IMAP protocol handler**
-- `protocol/imap.rs` — IMAP client for reading mailboxes
-- LOGIN, LIST, SELECT, FETCH commands
-- STARTTLS upgrade support
-- Unit tests with mock IMAP server
+MQTT 3.1.1 client with CONNECT, PUBLISH, SUBSCRIBE. DICT client (RFC 2229)
+with DEFINE/MATCH. TFTP client (RFC 1350) for UDP file downloads. 26 unit tests
+across the three protocols. 213 total tests passing.
 
-**Step 6a.3: POP3 protocol handler**
-- `protocol/pop3.rs` — POP3 client for retrieving email
-- USER/PASS auth, STAT, LIST, RETR, DELE commands
-- STARTTLS upgrade support
-- Unit tests with mock POP3 server
+### Phase 7a: FFI Compatibility Layer
 
-**Exit criteria:** All three email protocols have basic send/receive functionality.
-Unit tests verify protocol correctness.
+**Scope:** Build the `liburlx-ffi` C ABI layer to be a drop-in libcurl replacement.
 
-### Phase 6b: MQTT + Additional Protocols
+**Step 7a.1: Core FFI functions**
+- `curl_easy_init()` / `curl_easy_cleanup()` — handle lifecycle
+- `curl_easy_setopt()` — CURLOPT_URL, CURLOPT_WRITEFUNCTION, CURLOPT_WRITEDATA
+- `curl_easy_perform()` — execute transfer
+- `curl_easy_getinfo()` — CURLINFO_RESPONSE_CODE, CURLINFO_CONTENT_TYPE
+- `curl_easy_strerror()` — error code to string
+- CURLcode error mapping
 
-**Scope:** Remaining protocol handlers from curl's feature set.
+**Step 7a.2: Option mapping**
+- Map key CURLOPT_* constants to Easy handle setters
+- CURLOPT_FOLLOWLOCATION, CURLOPT_HTTPHEADER, CURLOPT_POST, CURLOPT_POSTFIELDS
+- CURLOPT_USERAGENT, CURLOPT_TIMEOUT, CURLOPT_CONNECTTIMEOUT
+- CURLOPT_PROXY, CURLOPT_NOPROXY, CURLOPT_VERBOSE
 
-- MQTT publish/subscribe (protocol/mqtt.rs)
-- LDAP basic query (protocol/ldap.rs)
-- TFTP simple file transfer (protocol/tftp.rs)
-- DICT dictionary lookup (protocol/dict.rs)
+**Step 7a.3: Write callback**
+- Implement CURLOPT_WRITEFUNCTION with C function pointer callback
+- Buffer management for response body
 
-### Phase 7: Drop-in Replacement
+**Exit criteria:** Simple C programs can link against liburlx-ffi and perform
+HTTP GET/POST requests using the standard curl_easy_* API.
 
-**The test suite IS the specification here:**
-- Port curl's 1,918 test cases to run against `liburlx-ffi`
-- Map all 291 CURLOPT_* options
-- Map all 118 CURLINFO_* codes
-- Map all 146 CURLE_* error codes
-- Build `.so`/`.dylib` that can replace libcurl
-- `urlx` CLI supports all ~250 of curl's command-line flags
+### Phase 7b: CLI Completeness + Drop-in Testing
+
+**Scope:** Make urlx CLI handle more of curl's flags, port test cases.
+
+- Add remaining common flags: --data-raw, --data-binary, --fail, --silent
+- Support @file for request body (-d @filename)
+- Config file parsing (.curlrc)
+- Port initial curl test cases for behavioral verification
 
 ---
 
