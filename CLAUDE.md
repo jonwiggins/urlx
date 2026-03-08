@@ -14,11 +14,11 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 5b — FTP Integration Tests + SOCKS Proxy
-**Last completed:** Phase 5a (FTP protocol handler) — 2026-03-08
-**In progress:** FTP integration tests, SOCKS proxy support
+**Phase:** 6 — SMTP/IMAP/POP3 Protocol Handlers
+**Last completed:** Phase 5b (SOCKS proxy + progress callbacks) — 2026-03-08
+**In progress:** SMTP protocol handler
 **Blockers:** None
-**Next up:** Phase 6 (Drop-in Replacement)
+**Next up:** Phase 6b (MQTT + LDAP), Phase 7 (Drop-in Replacement)
 
 ---
 
@@ -420,30 +420,49 @@ FTP control connection codec with multi-line response parsing. Login
 (USER/PASS), PASV passive mode, RETR download, LIST directory listing.
 URL credentials extraction. 215 tests passing.
 
-### Phase 5b: FTP Integration Tests + SOCKS Proxy + Progress Callbacks
+### Phase 5b: SOCKS Proxy + Progress Callbacks — COMPLETED (2026-03-08)
 
-**Scope:** Complete FTP testing and add remaining HTTP infrastructure.
+SOCKS4/SOCKS5 proxy handshake with username/password auth, SOCKS4a hostname
+support. Integrated into Easy handle (socks5://, socks4://, socks5h://, socks4a://
+proxy URLs). Progress callback API (ProgressInfo, ProgressCallback). CLI -#/--progress-bar
+flag with visual progress bar. 162 tests passing.
 
-**Step 5b.1: Mock FTP server for integration tests**
-- Build minimal FTP test server using tokio
-- Integration tests: anonymous login, download, directory listing
-- Test connection failure, login failure, file not found
+### Phase 6a: SMTP/IMAP/POP3 Protocol Handlers
 
-**Step 5b.2: SOCKS proxy support**
-- Create `proxy/socks.rs` for SOCKS4/SOCKS5 handshake
-- SOCKS5 with username/password auth
-- Wire into Easy: `easy.proxy("socks5://...")`
-- Integration tests with mock SOCKS server
+**Scope:** Email protocol foundations.
 
-**Step 5b.3: Progress callbacks**
-- `Easy::progress_callback(fn)` for transfer progress reporting
-- Track bytes uploaded/downloaded, total size, speed
-- CLI progress bar display
+**Step 6a.1: SMTP protocol handler**
+- `protocol/smtp.rs` — SMTP client for sending email
+- EHLO/HELO greeting, MAIL FROM, RCPT TO, DATA commands
+- STARTTLS upgrade support
+- AUTH PLAIN/LOGIN
+- Unit tests with mock SMTP server
 
-**Exit criteria:** FTP integration tests pass. SOCKS proxy works.
-Progress callbacks report transfer status.
+**Step 6a.2: IMAP protocol handler**
+- `protocol/imap.rs` — IMAP client for reading mailboxes
+- LOGIN, LIST, SELECT, FETCH commands
+- STARTTLS upgrade support
+- Unit tests with mock IMAP server
 
-### Phase 6: Drop-in Replacement
+**Step 6a.3: POP3 protocol handler**
+- `protocol/pop3.rs` — POP3 client for retrieving email
+- USER/PASS auth, STAT, LIST, RETR, DELE commands
+- STARTTLS upgrade support
+- Unit tests with mock POP3 server
+
+**Exit criteria:** All three email protocols have basic send/receive functionality.
+Unit tests verify protocol correctness.
+
+### Phase 6b: MQTT + Additional Protocols
+
+**Scope:** Remaining protocol handlers from curl's feature set.
+
+- MQTT publish/subscribe (protocol/mqtt.rs)
+- LDAP basic query (protocol/ldap.rs)
+- TFTP simple file transfer (protocol/tftp.rs)
+- DICT dictionary lookup (protocol/dict.rs)
+
+### Phase 7: Drop-in Replacement
 
 **The test suite IS the specification here:**
 - Port curl's 1,918 test cases to run against `liburlx-ffi`
