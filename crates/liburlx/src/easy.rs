@@ -396,6 +396,11 @@ async fn do_single_request(
     proxy: Option<&Url>,
     pool: &mut ConnectionPool,
 ) -> Result<Response, Error> {
+    // Handle file:// URLs directly (no network)
+    if url.scheme() == "file" {
+        return crate::protocol::file::read_file(url);
+    }
+
     let (host, port) = url.host_and_port()?;
     let host_header = url.host_header_value();
     let is_tls = url.scheme() == "https";

@@ -3,4 +3,5 @@
 //! Each protocol (HTTP, FTP, etc.) implements the transfer logic
 //! for its scheme.
 
+pub mod file;
 pub mod http;
