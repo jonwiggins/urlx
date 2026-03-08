@@ -14,6 +14,7 @@
 pub mod cookie;
 pub mod easy;
 pub mod error;
+pub mod hsts;
 pub mod multi;
 pub(crate) mod pool;
 pub mod protocol;

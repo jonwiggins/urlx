@@ -9,6 +9,7 @@ use std::path::Path;
 
 use crate::cookie::CookieJar;
 use crate::error::Error;
+use crate::hsts::HstsCache;
 use crate::pool::{ConnectionPool, PooledStream};
 use crate::protocol::http::multipart::MultipartForm;
 use crate::protocol::http::response::{Response, TransferInfo};
@@ -33,8 +34,10 @@ pub struct Easy {
     proxy: Option<Url>,
     noproxy: Option<String>,
     cookie_jar: Option<CookieJar>,
+    hsts_cache: Option<HstsCache>,
     multipart: Option<MultipartForm>,
     range: Option<String>,
+    resolve_overrides: Vec<(String, String)>,
     pool: ConnectionPool,
 }
 
@@ -54,8 +57,10 @@ impl Clone for Easy {
             proxy: self.proxy.clone(),
             noproxy: self.noproxy.clone(),
             cookie_jar: self.cookie_jar.clone(),
+            hsts_cache: self.hsts_cache.clone(),
             multipart: self.multipart.clone(),
             range: self.range.clone(),
+            resolve_overrides: self.resolve_overrides.clone(),
             pool: ConnectionPool::new(),
         }
     }
@@ -79,8 +84,10 @@ impl Easy {
             proxy: None,
             noproxy: None,
             cookie_jar: None,
+            hsts_cache: None,
             multipart: None,
             range: None,
+            resolve_overrides: Vec::new(),
             pool: ConnectionPool::new(),
         }
     }
@@ -208,6 +215,28 @@ impl Easy {
         self.noproxy = Some(noproxy.to_string());
     }
 
+    /// Enable HSTS (HTTP Strict Transport Security) enforcement.
+    ///
+    /// When enabled, `Strict-Transport-Security` response headers are cached
+    /// and subsequent HTTP requests to HSTS hosts are auto-upgraded to HTTPS.
+    pub fn hsts(&mut self, enable: bool) {
+        if enable {
+            if self.hsts_cache.is_none() {
+                self.hsts_cache = Some(HstsCache::new());
+            }
+        } else {
+            self.hsts_cache = None;
+        }
+    }
+
+    /// Add a DNS resolve override.
+    ///
+    /// Forces the given hostname to resolve to the specified address,
+    /// bypassing DNS. Similar to curl's `--resolve host:port:addr`.
+    pub fn resolve(&mut self, host: &str, addr: &str) {
+        self.resolve_overrides.push((host.to_lowercase(), addr.to_string()));
+    }
+
     /// Add a text field to the multipart form.
     ///
     /// When any form field or file is added, the request body is sent as
@@ -274,6 +303,22 @@ impl Easy {
     pub async fn perform_async(&mut self) -> Result<Response, Error> {
         let url = self.url.as_ref().ok_or_else(|| Error::UrlParse("no URL set".to_string()))?;
 
+        // HSTS: upgrade HTTP to HTTPS if the host is in the HSTS cache
+        let url = if url.scheme() == "http" {
+            if let Some(ref cache) = self.hsts_cache {
+                if cache.should_upgrade(url.host_str().unwrap_or("")) {
+                    let upgraded = url.as_str().replacen("http://", "https://", 1);
+                    Url::parse(&upgraded)?
+                } else {
+                    url.clone()
+                }
+            } else {
+                url.clone()
+            }
+        } else {
+            url.clone()
+        };
+
         // Build effective headers, body, and method considering multipart and range
         let mut headers = self.headers.clone();
         let (effective_method, effective_body);
@@ -308,7 +353,7 @@ impl Easy {
         let effective_noproxy = resolved_noproxy;
 
         let fut = perform_transfer(
-            url,
+            &url,
             Some(effective_method.as_str()),
             &headers,
             effective_body.as_deref(),
@@ -320,6 +365,8 @@ impl Easy {
             effective_proxy,
             effective_noproxy,
             &mut self.cookie_jar,
+            &mut self.hsts_cache,
+            &self.resolve_overrides,
             &mut self.pool,
         );
 
@@ -353,6 +400,8 @@ async fn perform_transfer(
     proxy: Option<&Url>,
     noproxy: Option<&str>,
     cookie_jar: &mut Option<CookieJar>,
+    hsts_cache: &mut Option<HstsCache>,
+    resolve_overrides: &[(String, String)],
     pool: &mut ConnectionPool,
 ) -> Result<Response, Error> {
     let transfer_start = Instant::now();
@@ -390,6 +439,7 @@ async fn perform_transfer(
             accept_encoding,
             connect_timeout,
             effective_proxy,
+            resolve_overrides,
             pool,
         )
         .await?;
@@ -400,6 +450,16 @@ async fn perform_transfer(
             let host = current_url.host_str().unwrap_or("");
             let path = current_url.path();
             jar.store_from_headers(response.headers(), host, path);
+        }
+
+        // Store HSTS headers from HTTPS responses
+        if current_url.scheme() == "https" {
+            if let Some(ref mut cache) = hsts_cache {
+                if let Some(sts_value) = response.header("strict-transport-security") {
+                    let host = current_url.host_str().unwrap_or("");
+                    cache.store(host, sts_value);
+                }
+            }
         }
 
         // Check for redirects
@@ -464,6 +524,7 @@ async fn do_single_request(
     accept_encoding: bool,
     connect_timeout: Option<Duration>,
     proxy: Option<&Url>,
+    resolve_overrides: &[(String, String)],
     pool: &mut ConnectionPool,
 ) -> Result<Response, Error> {
     // Handle file:// URLs directly (no network)
@@ -543,8 +604,14 @@ async fn do_single_request(
         }
     }
 
+    // Apply DNS resolve overrides
+    let resolved_host = resolve_overrides
+        .iter()
+        .find(|(h, _)| h == &connect_host.to_lowercase())
+        .map_or_else(|| connect_host.clone(), |(_, addr)| addr.clone());
+
     // Connect via TCP (with optional connect timeout)
-    let addr = format!("{connect_host}:{connect_port}");
+    let addr = format!("{resolved_host}:{connect_port}");
     let connect_fut = tokio::net::TcpStream::connect(&addr);
     let tcp_stream = if let Some(timeout_dur) = connect_timeout {
         tokio::time::timeout(timeout_dur, connect_fut)
