@@ -5,9 +5,12 @@
 
 use std::time::{Duration, Instant};
 
+use std::path::Path;
+
 use crate::cookie::CookieJar;
 use crate::error::Error;
 use crate::pool::{ConnectionPool, PooledStream};
+use crate::protocol::http::multipart::MultipartForm;
 use crate::protocol::http::response::{Response, TransferInfo};
 use crate::url::Url;
 
@@ -30,6 +33,8 @@ pub struct Easy {
     proxy: Option<Url>,
     noproxy: Option<String>,
     cookie_jar: Option<CookieJar>,
+    multipart: Option<MultipartForm>,
+    range: Option<String>,
     pool: ConnectionPool,
 }
 
@@ -49,6 +54,8 @@ impl Clone for Easy {
             proxy: self.proxy.clone(),
             noproxy: self.noproxy.clone(),
             cookie_jar: self.cookie_jar.clone(),
+            multipart: self.multipart.clone(),
+            range: self.range.clone(),
             pool: ConnectionPool::new(),
         }
     }
@@ -72,6 +79,8 @@ impl Easy {
             proxy: None,
             noproxy: None,
             cookie_jar: None,
+            multipart: None,
+            range: None,
             pool: ConnectionPool::new(),
         }
     }
@@ -199,6 +208,43 @@ impl Easy {
         self.noproxy = Some(noproxy.to_string());
     }
 
+    /// Add a text field to the multipart form.
+    ///
+    /// When any form field or file is added, the request body is sent as
+    /// `multipart/form-data` and the method defaults to POST.
+    pub fn form_field(&mut self, name: &str, value: &str) {
+        self.multipart.get_or_insert_with(MultipartForm::new).field(name, value);
+    }
+
+    /// Add a file to the multipart form.
+    ///
+    /// The file is read from disk when this method is called, not when
+    /// the transfer is performed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Http`] if the file cannot be read.
+    pub fn form_file(&mut self, name: &str, path: &Path) -> Result<(), Error> {
+        self.multipart.get_or_insert_with(MultipartForm::new).file(name, path)
+    }
+
+    /// Set a byte range for the request.
+    ///
+    /// Sends a `Range: bytes=<range>` header. Format examples:
+    /// - `"0-499"` — first 500 bytes
+    /// - `"500-"` — from byte 500 to end
+    /// - `"-500"` — last 500 bytes
+    pub fn range(&mut self, range: &str) {
+        self.range = Some(range.to_string());
+    }
+
+    /// Set resume download offset.
+    ///
+    /// Equivalent to `range("<offset>-")`.
+    pub fn resume_from(&mut self, offset: u64) {
+        self.range = Some(format!("{offset}-"));
+    }
+
     /// Perform the transfer and return the response (blocking).
     ///
     /// Creates a new tokio runtime internally. Do not call from within
@@ -228,6 +274,30 @@ impl Easy {
     pub async fn perform_async(&mut self) -> Result<Response, Error> {
         let url = self.url.as_ref().ok_or_else(|| Error::UrlParse("no URL set".to_string()))?;
 
+        // Build effective headers, body, and method considering multipart and range
+        let mut headers = self.headers.clone();
+        let (effective_method, effective_body);
+
+        if let Some(ref multipart) = self.multipart {
+            // Multipart form: encode body and set content-type header
+            effective_body = Some(multipart.encode());
+            if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("content-type")) {
+                headers.push(("Content-Type".to_string(), multipart.content_type()));
+            }
+            // Default to POST for multipart
+            effective_method = self.method.clone().unwrap_or_else(|| "POST".to_string());
+        } else {
+            effective_body = self.body.clone();
+            effective_method = self.method.clone().unwrap_or_else(|| "GET".to_string());
+        }
+
+        // Add Range header if set
+        if let Some(ref range) = self.range {
+            if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("range")) {
+                headers.push(("Range".to_string(), format!("bytes={range}")));
+            }
+        }
+
         // Resolve proxy: explicit setting takes priority, then env vars
         let env_proxy = if self.proxy.is_none() { proxy_from_env(url.scheme()) } else { None };
         let effective_proxy = self.proxy.as_ref().or(env_proxy.as_ref());
@@ -239,9 +309,9 @@ impl Easy {
 
         let fut = perform_transfer(
             url,
-            self.method.as_deref(),
-            &self.headers,
-            self.body.as_deref(),
+            Some(effective_method.as_str()),
+            &headers,
+            effective_body.as_deref(),
             self.follow_redirects,
             self.max_redirects,
             self.verbose,

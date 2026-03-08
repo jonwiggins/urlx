@@ -36,6 +36,9 @@ fn run(args: &[String]) -> ExitCode {
         eprintln!("  -w, --write-out <fmt>    Output format after transfer");
         eprintln!("  -x, --proxy <url>        Use proxy (e.g., http://proxy:8080)");
         eprintln!("      --noproxy <list>     Comma-separated list of hosts to bypass proxy");
+        eprintln!("  -F, --form <name=value>  Multipart form field (use @file for file upload)");
+        eprintln!("  -r, --range <range>      Byte range (e.g., 0-499, 500-, -500)");
+        eprintln!("  -C, --continue-at <off>  Resume download from byte offset");
         return ExitCode::FAILURE;
     }
 
@@ -164,6 +167,48 @@ fn run(args: &[String]) -> ExitCode {
                 } else {
                     // No password — use empty password (curl compat)
                     easy.basic_auth(&args[i], "");
+                }
+            }
+            "-F" | "--form" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("urlx: option -F requires an argument");
+                    return ExitCode::FAILURE;
+                }
+                if let Some((name, value)) = args[i].split_once('=') {
+                    if let Some(path) = value.strip_prefix('@') {
+                        if let Err(e) = easy.form_file(name, std::path::Path::new(path)) {
+                            eprintln!("urlx: error reading form file: {e}");
+                            return ExitCode::FAILURE;
+                        }
+                    } else {
+                        easy.form_field(name, value);
+                    }
+                } else {
+                    eprintln!("urlx: invalid form field format: {}", args[i]);
+                    eprintln!("  Use: -F name=value or -F name=@filename");
+                    return ExitCode::FAILURE;
+                }
+            }
+            "-r" | "--range" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("urlx: option -r requires an argument");
+                    return ExitCode::FAILURE;
+                }
+                easy.range(&args[i]);
+            }
+            "-C" | "--continue-at" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("urlx: option -C requires an argument");
+                    return ExitCode::FAILURE;
+                }
+                if let Ok(offset) = args[i].parse::<u64>() {
+                    easy.resume_from(offset);
+                } else {
+                    eprintln!("urlx: invalid offset value: {}", args[i]);
+                    return ExitCode::FAILURE;
                 }
             }
             arg if arg.starts_with('-') => {

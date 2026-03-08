@@ -24,6 +24,7 @@ pub use cookie::CookieJar;
 pub use easy::Easy;
 pub use error::Error;
 pub use multi::Multi;
+pub use protocol::http::multipart::MultipartForm;
 pub use protocol::http::response::{Response, TransferInfo};
 
 /// Convenience result type for liburlx operations.
