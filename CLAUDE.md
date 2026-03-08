@@ -14,11 +14,11 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 3a — HTTP/2 Support
-**Last completed:** Phase 2d (transfer info, --write-out) — 2026-03-08
-**In progress:** HTTP/2 via h2 crate, ALPN negotiation
+**Phase:** 3c — Concurrent Transfers (Multi API)
+**Last completed:** Phase 3b (HTTP proxy, CONNECT tunneling, env vars) — 2026-03-08
+**In progress:** Multi API for concurrent transfers
 **Blockers:** None
-**Next up:** Phase 3b (proxy support), Phase 3c (concurrent transfers)
+**Next up:** Phase 4 (Protocol Expansion)
 
 ---
 
@@ -356,133 +356,63 @@ Added POST/PUT/DELETE/HEAD/PATCH methods, custom headers, request body, redirect
 (301/302/303/307/308), verbose output, CLI flags (-X, -H, -d, -L, -I, -o, -v).
 16 integration tests with hyper-based test server. 67 total tests passing.
 
-### Phase 2b: Chunked Transfer Encoding + Content-Encoding Decompression (CURRENT)
-
-**Scope:** Handle chunked transfer encoding and compressed responses. Without these,
-many real-world HTTP responses are broken.
-
-**Step 2b.1: Chunked transfer encoding**
-- Add chunked decoding to `parse_response()` in h1.rs
-- Detect `Transfer-Encoding: chunked` header
-- Parse chunk size + data format (size\r\n data\r\n ... 0\r\n\r\n)
-- Unit tests for chunked parsing (single chunk, multiple chunks, empty, trailers)
-- Integration test with hyper (hyper sends chunked by default for streaming bodies)
-
-**Step 2b.2: Content-Encoding decompression**
-- Add `decompression` feature flag with deps: flate2, brotli, zstd
-- Send `Accept-Encoding: gzip, deflate, br, zstd` when decompression enabled
-- Detect `Content-Encoding` header and decompress body
-- Add `accept_encoding()` method to Easy API
-- Add `--compressed` CLI flag
-- Unit tests for each encoding
-- Integration test with gzip-compressed server response
-
-**Exit criteria:** Chunked responses and gzip/br/zstd compressed responses decode correctly.
-
 ### Phase 2b: Chunked Transfer Encoding + Decompression — COMPLETED (2026-03-08)
 
 Chunked Transfer-Encoding decoding in HTTP/1.1 parser. Content-Encoding decompression
 (gzip, deflate, brotli, zstd) behind `decompression` feature flag. `accept_encoding()`
 API method and `--compressed` CLI flag. 86 tests passing.
 
-### Phase 2c: Timeouts + Authentication (CURRENT)
-
-**Scope:** Add connect and transfer timeouts for robustness, plus Basic and Bearer
-HTTP authentication for API usage.
-
-**Step 2c.1: Connect timeout**
-- Add `connect_timeout()` setter to Easy API (Duration)
-- Wrap TCP connect with `tokio::time::timeout`
-- Unit test for timeout configuration
-- Integration test with non-routable address (10.255.255.1) for timeout behavior
-
-**Step 2c.2: Transfer timeout**
-- Add `timeout()` setter to Easy API (total transfer time limit)
-- Wrap entire transfer with `tokio::time::timeout`
-- Integration test with slow server
-
-**Step 2c.3: Basic authentication**
-- Add `basic_auth(user, password)` to Easy API
-- Generate `Authorization: Basic <base64>` header
-- CLI flags: `-u`/`--user` (user:password format)
-- Integration test verifying auth header is sent
-
-**Step 2c.4: Bearer authentication**
-- Add `bearer_token(token)` to Easy API
-- Generate `Authorization: Bearer <token>` header
-- Integration test
-
-**Exit criteria:** Timeouts prevent hangs. Basic/Bearer auth works with APIs.
-
 ### Phase 2c: Timeouts + Authentication — COMPLETED (2026-03-08)
 
 Connect timeout, total transfer timeout, Basic and Bearer authentication.
 CLI flags: --connect-timeout, -m/--max-time, -u/--user. 94 tests passing.
-
-### Phase 2d: Transfer Info + Write-Out (CURRENT)
-
-**Scope:** Add transfer timing/info queries and --write-out support for
-extracting response metadata. These are essential for scripting and debugging.
-
-**Step 2d.1: Transfer info on Response**
-- Add timing fields to Response (or separate TransferInfo struct)
-- Track: total_time, connect_time, response status code (already have)
-- Track: effective_url (already have), content_type, response_code
-- Track: size_download (body length)
-
-**Step 2d.2: --write-out / -w CLI support**
-- Parse format string with %{variable} placeholders
-- Support: http_code, url_effective, content_type, size_download,
-  time_total, time_connect, num_redirects
-- Add `-w`/`--write-out` flag to CLI
-
-**Exit criteria:** `urlx -w '%{http_code}\n' -o /dev/null` prints status code.
 
 ### Phase 2d: Transfer Info + Write-Out — COMPLETED (2026-03-08)
 
 TransferInfo with timing/redirect counts. CLI --write-out/-w with %{variable}
 format. 96 tests passing.
 
-### Phase 3a: HTTP/2 Support (CURRENT)
+### Phase 3a: HTTP/2 Support — COMPLETED (2026-03-08)
 
-**Scope:** Add HTTP/2 protocol support using the `h2` crate. HTTP/2 provides
-multiplexing, header compression, and better performance for modern APIs.
+HTTP/2 via h2 crate with ALPN negotiation. Automatic protocol selection based on
+TLS handshake. Feature-gated behind `http2` flag. 96 tests passing.
 
-**Step 3a.1: h2 dependency and feature flag**
-- Add `http2` feature flag with `dep:h2`
-- Feature-gate HTTP/2 code behind `http2` feature
-- Add h2 to default features
+### Phase 3b: HTTP Proxy Support — COMPLETED (2026-03-08)
 
-**Step 3a.2: ALPN negotiation**
-- Configure rustls to advertise both h2 and http/1.1 via ALPN
-- Detect negotiated protocol after TLS handshake
-- Route to h2 or h1 codec based on ALPN result
-
-**Step 3a.3: HTTP/2 request/response**
-- Implement h2 request sending using the h2 crate
-- Handle h2 response reading
-- Wire into do_single_request()
-- Support all HTTP methods, headers, body
-
-**Step 3a.4: Integration tests**
-- Test h2 request against a real h2 server (use hyper with http2 feature)
-- Verify ALPN negotiation works
-- Verify fallback to h1 when server doesn't support h2
-
-**Exit criteria:** HTTPS requests automatically use HTTP/2 when server supports it.
-
-### Phase 3b: HTTP Proxy Support
-
-- HTTP proxy (forward proxy for HTTP URLs)
-- HTTPS proxy (CONNECT tunneling for HTTPS URLs)
-- CLI: -x/--proxy flag
-- Environment variable support (http_proxy, https_proxy, no_proxy)
+HTTP forward proxy for plain HTTP URLs. HTTP CONNECT tunneling for HTTPS
+through proxy. Noproxy bypass with domain suffix matching and wildcard.
+Environment variable support (http_proxy, https_proxy, no_proxy). CLI
+flags: -x/--proxy, --noproxy. 113 tests passing.
 
 ### Phase 3c: Concurrent Transfers (Multi API)
 
-- Multi handle for running multiple transfers concurrently
-- Async-native API using tokio tasks
-- CLI: parallel URL support
+**Scope:** Add a Multi API for running multiple transfers concurrently
+using tokio's async runtime. This enables efficient parallel downloads
+and batch API requests.
+
+**Step 3c.1: Multi struct and API design**
+- Create `multi.rs` module with `Multi` struct
+- `Multi::new()` constructor
+- `Multi::add(easy: Easy)` to queue a transfer
+- `Multi::perform() -> Vec<Result<Response, Error>>` async method
+- Run all queued transfers concurrently via `tokio::spawn` / `JoinSet`
+
+**Step 3c.2: Unit tests**
+- Test adding multiple Easy handles
+- Test empty Multi performs with no error
+- Test concurrent transfers against test servers
+
+**Step 3c.3: Integration tests**
+- Multiple concurrent GET requests to different endpoints
+- Mix of successful and failing transfers
+- Verify all responses are collected
+
+**Step 3c.4: CLI parallel URL support**
+- Accept multiple URLs on command line
+- Execute them concurrently via Multi API
+- Output results in order
+
+**Exit criteria:** `urlx http://a.com http://b.com` fetches both URLs concurrently.
 
 ### Phase 4: Protocol Expansion
 
