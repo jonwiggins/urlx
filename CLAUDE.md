@@ -14,11 +14,11 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 9 — Hardening + Production Readiness
-**Last completed:** Phase 8 (C header generation, curl compat tests) — 2026-03-08
-**In progress:** Error handling hardening, edge cases, documentation
+**Phase:** 10 — Feature Completeness + Optimization
+**Last completed:** Phase 9 (hardening, edge cases, 382 tests) — 2026-03-08
+**In progress:** Feature gaps, optimization, polish
 **Blockers:** None
-**Next up:** Performance benchmarks, fuzz testing
+**Next up:** Gzip decompression integration tests, HTTP/2 behavioral tests
 
 ---
 
@@ -463,37 +463,40 @@ behavioral compatibility tests covering redirect semantics (301/302/303/307/308)
 cookie engine, relative URLs, effective URL tracking, auth, HEAD. Documentation
 builds cleanly with no warnings. 350 total tests passing.
 
-### Phase 9: Hardening + Production Readiness
+### Phase 9: Hardening + Production Readiness — COMPLETED (2026-03-08)
 
-**Scope:** Error handling improvements, edge case coverage, URL parsing hardening.
+16 URL parser edge case tests (percent-encoding, credentials, schemes, dot
+segments, host headers, long paths). 16 HTTP edge case integration tests
+(204/304 responses, binary data, long/many headers, status codes, PATCH/OPTIONS,
+query strings, timeouts). 382 total tests passing.
 
-**Step 9.1: URL parser edge cases**
-- Test IDN domains, punycode
-- Test percent-encoded characters in path/query
-- Test URLs with credentials (user:pass@host)
-- Test empty/missing components
-- Test file:// URLs with spaces and special characters
-- Test URL normalization (trailing slashes, double slashes)
+### Phase 10: Feature Completeness + Optimization
 
-**Step 9.2: HTTP parser edge cases**
-- Test chunked encoding edge cases (empty chunks, trailer headers)
-- Test malformed HTTP responses (missing status line, truncated headers)
-- Test very large headers / many headers
-- Test HTTP/1.0 vs HTTP/1.1 behavior differences
-- Test connection: close vs keep-alive
+**Scope:** Fill remaining feature gaps, optimize hot paths.
 
-**Step 9.3: Error handling review**
-- Ensure all error paths have tests
-- Verify error messages are actionable
-- Test error recovery (retry on stale connections)
-- Test graceful handling of server disconnects
+**Step 10.1: Gzip decompression integration tests**
+- Test gzip-compressed response with --compressed flag
+- Test deflate-compressed response
+- Test identity (no compression) with --compressed
+- Verify Accept-Encoding header is sent correctly
 
-**Step 9.4: Performance benchmarks**
-- Throughput benchmark for large downloads
-- Connection establishment latency benchmark
-- Concurrent transfer benchmark with Multi API
+**Step 10.2: Cookie engine integration tests**
+- Test cookie persistence across multiple Easy handle uses
+- Test cookie domain/path matching
+- Test cookie expiry (Max-Age)
+- Test Secure cookie flag
 
-**Exit criteria:** 380+ tests. All edge cases covered. Benchmark baselines established.
+**Step 10.3: File protocol tests**
+- Test file:// URL reading local files
+- Test file:// with percent-encoded paths
+- Test file:// error for missing files
+
+**Step 10.4: Connection pooling verification**
+- Test connection reuse with keep-alive
+- Test pool eviction
+- Test stale connection retry
+
+**Exit criteria:** 400+ tests. All major features have integration tests.
 
 ---
 
