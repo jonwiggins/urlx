@@ -105,6 +105,13 @@ impl Url {
         Ok((host, port))
     }
 
+    /// Returns the Host header value (includes port if non-default).
+    #[must_use]
+    pub fn host_header_value(&self) -> String {
+        let host = self.host_str().unwrap_or("");
+        self.inner.port().map_or_else(|| host.to_string(), |port| format!("{host}:{port}"))
+    }
+
     /// Returns the path and query suitable for an HTTP request line.
     #[must_use]
     pub fn request_target(&self) -> String {

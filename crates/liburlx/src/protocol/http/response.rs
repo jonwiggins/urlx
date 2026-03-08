@@ -67,6 +67,12 @@ impl Response {
     pub fn effective_url(&self) -> &str {
         &self.effective_url
     }
+
+    /// Returns true if this is a redirect response (3xx with Location header).
+    #[must_use]
+    pub fn is_redirect(&self) -> bool {
+        matches!(self.status, 301 | 302 | 303 | 307 | 308) && self.headers.contains_key("location")
+    }
 }
 
 #[cfg(test)]

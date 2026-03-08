@@ -11,16 +11,30 @@ use crate::url::Url;
 ///
 /// This is the main entry point for the liburlx API, modeled after
 /// curl's `CURL *` easy handle.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Easy {
     url: Option<Url>,
+    method: Option<String>,
+    headers: Vec<(String, String)>,
+    body: Option<Vec<u8>>,
+    follow_redirects: bool,
+    max_redirects: u32,
+    verbose: bool,
 }
 
 impl Easy {
     /// Create a new transfer handle.
     #[must_use]
     pub const fn new() -> Self {
-        Self { url: None }
+        Self {
+            url: None,
+            method: None,
+            headers: Vec::new(),
+            body: None,
+            follow_redirects: false,
+            max_redirects: 50,
+            verbose: false,
+        }
     }
 
     /// Set the URL to transfer.
@@ -33,21 +47,81 @@ impl Easy {
         Ok(())
     }
 
-    /// Perform the transfer and return the response.
+    /// Set the HTTP method (GET, POST, PUT, DELETE, HEAD, PATCH, OPTIONS).
+    pub fn method(&mut self, method: &str) {
+        self.method = Some(method.to_uppercase());
+    }
+
+    /// Returns true if no explicit method has been set.
+    #[must_use]
+    pub const fn method_is_default(&self) -> bool {
+        self.method.is_none()
+    }
+
+    /// Add a custom request header.
+    pub fn header(&mut self, name: &str, value: &str) {
+        self.headers.push((name.to_string(), value.to_string()));
+    }
+
+    /// Set the request body.
+    pub fn body(&mut self, data: &[u8]) {
+        self.body = Some(data.to_vec());
+    }
+
+    /// Enable or disable redirect following.
+    pub fn follow_redirects(&mut self, enable: bool) {
+        self.follow_redirects = enable;
+    }
+
+    /// Set maximum number of redirects to follow (default: 50).
+    pub fn max_redirects(&mut self, max: u32) {
+        self.max_redirects = max;
+    }
+
+    /// Enable or disable verbose output.
+    pub fn verbose(&mut self, enable: bool) {
+        self.verbose = enable;
+    }
+
+    /// Perform the transfer and return the response (blocking).
+    ///
+    /// Creates a new tokio runtime internally. Do not call from within
+    /// an existing async runtime — use [`perform_async`](Self::perform_async) instead.
     ///
     /// # Errors
     ///
     /// Returns errors for connection failures, TLS errors, HTTP protocol
     /// errors, timeouts, and other transfer problems.
     pub fn perform(&self) -> Result<Response, Error> {
-        let url = self.url.as_ref().ok_or_else(|| Error::UrlParse("no URL set".to_string()))?;
-
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|e| Error::Http(format!("failed to create runtime: {e}")))?;
 
-        rt.block_on(perform_async(url))
+        rt.block_on(self.perform_async())
+    }
+
+    /// Perform the transfer and return the response (async).
+    ///
+    /// Use this when you already have a tokio runtime running.
+    ///
+    /// # Errors
+    ///
+    /// Returns errors for connection failures, TLS errors, HTTP protocol
+    /// errors, timeouts, and other transfer problems.
+    pub async fn perform_async(&self) -> Result<Response, Error> {
+        let url = self.url.as_ref().ok_or_else(|| Error::UrlParse("no URL set".to_string()))?;
+
+        perform_transfer(
+            url,
+            self.method.as_deref(),
+            &self.headers,
+            self.body.as_deref(),
+            self.follow_redirects,
+            self.max_redirects,
+            self.verbose,
+        )
+        .await
     }
 }
 
@@ -58,9 +132,99 @@ impl Default for Easy {
 }
 
 /// Internal async transfer implementation.
-async fn perform_async(url: &Url) -> Result<Response, Error> {
+#[allow(clippy::too_many_arguments)]
+async fn perform_transfer(
+    url: &Url,
+    method: Option<&str>,
+    headers: &[(String, String)],
+    body: Option<&[u8]>,
+    follow_redirects: bool,
+    max_redirects: u32,
+    verbose: bool,
+) -> Result<Response, Error> {
+    let mut current_url = url.clone();
+    let mut current_method = method.unwrap_or("GET").to_string();
+    let mut current_body = body.map(<[u8]>::to_vec);
+    let mut redirects_followed: u32 = 0;
+
+    loop {
+        let response = do_single_request(
+            &current_url,
+            &current_method,
+            headers,
+            current_body.as_deref(),
+            verbose,
+        )
+        .await?;
+
+        // Check for redirects
+        if follow_redirects && response.is_redirect() {
+            if redirects_followed >= max_redirects {
+                return Err(Error::Http(format!("too many redirects (max {max_redirects})")));
+            }
+
+            if let Some(location) = response.header("location") {
+                // Resolve relative URLs against current URL
+                let next_url =
+                    if location.starts_with("http://") || location.starts_with("https://") {
+                        Url::parse(location)?
+                    } else {
+                        // Relative URL: build from current URL's base
+                        let base = current_url.as_str();
+                        Url::parse(&resolve_relative(base, location))?
+                    };
+
+                if verbose {
+                    #[allow(clippy::print_stderr)]
+                    {
+                        eprintln!("* Following redirect to {next_url}");
+                    }
+                }
+
+                // 303: always change to GET, drop body
+                // 301/302: change to GET for POST (curl compat), drop body
+                // 307/308: preserve method and body
+                // 303: always change to GET, drop body
+                // 301/302: change POST to GET (curl compat), drop body
+                // 307/308: preserve method and body
+                if response.status() == 303
+                    || ((response.status() == 301 || response.status() == 302)
+                        && current_method == "POST")
+                {
+                    current_method = "GET".to_string();
+                    current_body = None;
+                }
+
+                current_url = next_url;
+                redirects_followed += 1;
+                continue;
+            }
+        }
+
+        return Ok(response);
+    }
+}
+
+/// Perform a single HTTP request (no redirect handling).
+async fn do_single_request(
+    url: &Url,
+    method: &str,
+    headers: &[(String, String)],
+    body: Option<&[u8]>,
+    verbose: bool,
+) -> Result<Response, Error> {
     let (host, port) = url.host_and_port()?;
     let request_target = url.request_target();
+
+    // Host header should include port for non-default ports
+    let host_header = url.host_header_value();
+
+    if verbose {
+        #[allow(clippy::print_stderr)]
+        {
+            eprintln!("* Connecting to {host} port {port}");
+        }
+    }
 
     // Connect via TCP
     let addr = format!("{host}:{port}");
@@ -72,10 +236,13 @@ async fn perform_async(url: &Url) -> Result<Response, Error> {
             {
                 let tls = crate::tls::TlsConnector::new()?;
                 let mut tls_stream = tls.connect(tcp_stream, &host).await?;
-                crate::protocol::http::h1::get(
+                crate::protocol::http::h1::request(
                     &mut tls_stream,
-                    &host,
+                    method,
+                    &host_header,
                     &request_target,
+                    headers,
+                    body,
                     url.as_str(),
                 )
                 .await
@@ -87,10 +254,39 @@ async fn perform_async(url: &Url) -> Result<Response, Error> {
         }
         "http" => {
             let mut tcp_stream = tcp_stream;
-            crate::protocol::http::h1::get(&mut tcp_stream, &host, &request_target, url.as_str())
-                .await
+            crate::protocol::http::h1::request(
+                &mut tcp_stream,
+                method,
+                &host_header,
+                &request_target,
+                headers,
+                body,
+                url.as_str(),
+            )
+            .await
         }
         scheme => Err(Error::Http(format!("unsupported scheme: {scheme}"))),
+    }
+}
+
+/// Resolve a relative URL against a base URL.
+fn resolve_relative(base: &str, relative: &str) -> String {
+    if relative.starts_with('/') {
+        // Absolute path — keep scheme + authority from base
+        if let Some(idx) = base.find("://") {
+            let after_scheme = &base[idx + 3..];
+            if let Some(path_start) = after_scheme.find('/') {
+                let authority = &base[..idx + 3 + path_start];
+                return format!("{authority}{relative}");
+            }
+        }
+        format!("{base}{relative}")
+    } else {
+        // Relative path — replace last path segment
+        base.rfind('/').map_or_else(
+            || format!("{base}/{relative}"),
+            |idx| format!("{}{relative}", &base[..=idx]),
+        )
     }
 }
 
@@ -129,5 +325,57 @@ mod tests {
     fn easy_default() {
         let easy = Easy::default();
         assert!(easy.url.is_none());
+    }
+
+    #[test]
+    fn easy_set_method() {
+        let mut easy = Easy::new();
+        easy.method("POST");
+        assert_eq!(easy.method, Some("POST".to_string()));
+    }
+
+    #[test]
+    fn easy_method_uppercased() {
+        let mut easy = Easy::new();
+        easy.method("post");
+        assert_eq!(easy.method, Some("POST".to_string()));
+    }
+
+    #[test]
+    fn easy_add_header() {
+        let mut easy = Easy::new();
+        easy.header("Content-Type", "application/json");
+        assert_eq!(easy.headers.len(), 1);
+        assert_eq!(easy.headers[0], ("Content-Type".to_string(), "application/json".to_string()));
+    }
+
+    #[test]
+    fn easy_set_body() {
+        let mut easy = Easy::new();
+        easy.body(b"hello");
+        assert_eq!(easy.body, Some(b"hello".to_vec()));
+    }
+
+    #[test]
+    fn easy_follow_redirects() {
+        let mut easy = Easy::new();
+        easy.follow_redirects(true);
+        assert!(easy.follow_redirects);
+    }
+
+    #[test]
+    fn resolve_relative_absolute_path() {
+        assert_eq!(
+            resolve_relative("http://example.com/old/path", "/new/path"),
+            "http://example.com/new/path"
+        );
+    }
+
+    #[test]
+    fn resolve_relative_path() {
+        assert_eq!(
+            resolve_relative("http://example.com/dir/file", "other"),
+            "http://example.com/dir/other"
+        );
     }
 }

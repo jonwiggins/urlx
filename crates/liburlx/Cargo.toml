@@ -30,3 +30,6 @@ tokio-rustls = { version = "0.26", optional = true, default-features = false, fe
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"

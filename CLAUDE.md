@@ -12,6 +12,24 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ---
 
+## Current Status
+
+**Phase:** 2 — HTTP Feature Completeness
+**Last completed:** Phase 1 (HTTP GET with TLS, Easy API, CLI) — 2026-03-08
+**In progress:** HTTP methods, headers, redirects, integration tests
+**Blockers:** None
+**Next up:** Phase 3 — HTTP/2, Proxies, Concurrency
+
+---
+
+## Decision Log
+
+- **2026-03-08:** Workspace lint inheritance is all-or-nothing in Cargo. `unsafe_code = "deny"` is enforced via `#![deny(unsafe_code)]` in source files (liburlx, urlx-cli) rather than workspace lints, since liburlx-ffi needs to allow it and can't partially override workspace lints.
+- **2026-03-08:** `rustfmt.toml` uses only stable options (`edition`, `max_width`, `use_small_heuristics`). `imports_granularity` and `group_imports` are nightly-only and omitted.
+- **2026-03-08:** cargo-deny v0.19 uses a simplified config format — `vulnerability`/`unmaintained`/`unlicensed`/`copyleft` keys were removed.
+
+---
+
 ## Guiding Principles
 
 1. **Test-driven development is non-negotiable.** Every feature begins with a failing test. No code is merged without tests. Integration tests run against real protocol servers.
@@ -155,373 +173,9 @@ urlx/
 
 ---
 
-## Phase 0: Repository Setup & Guardrails
+## Phase 0: Repository Setup & Guardrails — COMPLETED (2026-03-08)
 
-**This phase MUST be completed before any feature work begins.** The agent's first task is always to set up the project skeleton with all quality gates in place.
-
-### Step 0.1: Initialize Workspace
-
-Create the Cargo workspace with all three crates. Every crate must compile (even if the library just exports an empty module). Verify with `cargo build --workspace`.
-
-### Step 0.2: Formatting — rustfmt
-
-Create `rustfmt.toml` at workspace root:
-
-```toml
-edition = "2021"
-max_width = 100
-use_small_heuristics = "Max"
-imports_granularity = "Module"
-group_imports = "StdExternalCrate"
-reorder_imports = true
-```
-
-All code must pass `cargo fmt --all -- --check`. No exceptions.
-
-### Step 0.3: Linting — Clippy
-
-Create `clippy.toml` at workspace root. Configure `Cargo.toml` at workspace level with strict lints:
-
-```toml
-[workspace.lints.rust]
-unsafe_code = "deny"              # Denied workspace-wide; liburlx-ffi overrides to "allow"
-missing_docs = "warn"
-unused_results = "warn"
-elided_lifetimes_in_paths = "warn"
-
-[workspace.lints.clippy]
-all = { level = "deny", priority = -1 }
-pedantic = { level = "warn", priority = -1 }
-nursery = { level = "warn", priority = -1 }
-unwrap_used = "deny"
-expect_used = "warn"
-panic = "deny"
-todo = "warn"
-dbg_macro = "deny"
-print_stdout = "warn"             # Use logging, not println (except CLI)
-print_stderr = "warn"
-cast_possible_truncation = "warn"
-cast_sign_loss = "warn"
-cast_possible_wrap = "warn"
-missing_errors_doc = "warn"
-missing_panics_doc = "warn"
-```
-
-Each crate's `Cargo.toml` inherits workspace lints:
-
-```toml
-[lints]
-workspace = true
-```
-
-The `liburlx-ffi` crate overrides the unsafe deny:
-
-```toml
-[lints]
-workspace = true
-
-[lints.rust]
-unsafe_code = "allow"  # Required for FFI — all uses must have SAFETY comments
-```
-
-The `urlx-cli` crate overrides print lints:
-
-```toml
-[lints.clippy]
-print_stdout = "allow"  # CLI tool needs stdout
-print_stderr = "allow"
-```
-
-All code must pass `cargo clippy --workspace --all-targets -- -D warnings`. No exceptions.
-
-### Step 0.4: Dependency Auditing — cargo-deny
-
-Create `deny.toml`:
-
-```toml
-[advisories]
-vulnerability = "deny"
-unmaintained = "warn"
-
-[licenses]
-allow = ["MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Unicode-3.0", "Zlib"]
-unlicensed = "deny"
-copyleft = "deny"
-
-[bans]
-multiple-versions = "warn"
-wildcards = "deny"
-
-[sources]
-unknown-registry = "deny"
-unknown-git = "deny"
-```
-
-### Step 0.5: Pre-commit Hooks
-
-Create `.pre-commit-config.yaml`:
-
-```yaml
-repos:
-  - repo: local
-    hooks:
-      - id: cargo-fmt
-        name: cargo fmt
-        entry: cargo fmt --all -- --check
-        language: system
-        types: [rust]
-        pass_filenames: false
-
-      - id: cargo-clippy
-        name: cargo clippy
-        entry: cargo clippy --workspace --all-targets -- -D warnings
-        language: system
-        types: [rust]
-        pass_filenames: false
-
-      - id: cargo-test
-        name: cargo test
-        entry: cargo test --workspace --lib
-        language: system
-        types: [rust]
-        pass_filenames: false
-
-      - id: cargo-deny
-        name: cargo deny
-        entry: cargo deny check
-        language: system
-        pass_filenames: false
-
-      - id: cargo-doc
-        name: cargo doc
-        entry: cargo doc --workspace --no-deps
-        language: system
-        types: [rust]
-        pass_filenames: false
-        env:
-          RUSTDOCFLAGS: "-D warnings"
-
-      - id: conventional-commit
-        name: conventional commit
-        entry: sh -c 'echo "$1" | grep -qE "^(feat|fix|refactor|test|docs|chore|ci|perf|build|style|revert)(\(.+\))?(!)?: .+"'
-        language: system
-        stages: [commit-msg]
-```
-
-Document in README that contributors run: `pip install pre-commit && pre-commit install --hook-type pre-commit --hook-type commit-msg`
-
-### Step 0.6: Conventional Commits
-
-All commits must follow the [Conventional Commits](https://www.conventionalcommits.org/) specification. This enables automated changelogs, semantic versioning, and makes git history machine-readable.
-
-**Format:**
-
-```
-<type>(<optional scope>): <description>
-
-[optional body]
-
-[optional footer(s)]
-```
-
-**Types:**
-
-| Type | When to use |
-|------|------------|
-| `feat` | New feature or capability (e.g., `feat(http): add chunked transfer encoding`) |
-| `fix` | Bug fix (e.g., `fix(url): handle trailing slash in path normalization`) |
-| `test` | Adding or updating tests only (e.g., `test(http): add redirect loop detection tests`) |
-| `refactor` | Code change that neither fixes a bug nor adds a feature |
-| `docs` | Documentation only (e.g., `docs: update CLAUDE.md with Phase 2 plan`) |
-| `chore` | Build process, tooling, dependency updates (e.g., `chore: bump rustls to 0.23`) |
-| `ci` | CI/CD changes (e.g., `ci: add Windows to test matrix`) |
-| `perf` | Performance improvement with benchmark proof |
-| `build` | Build system changes |
-| `style` | Formatting, whitespace (no code change) |
-| `revert` | Reverts a previous commit |
-
-**Scopes** correspond to crate or module names: `http`, `ftp`, `tls`, `url`, `cookie`, `dns`, `proxy`, `auth`, `ffi`, `cli`, `pool`, `filter`.
-
-**Breaking changes** use `!` after the type/scope: `feat(http)!: change Response body API to streaming`
-
-**Examples:**
-
-```
-feat(http): add HTTP/1.1 GET request support
-
-Implements basic GET requests with header parsing and body reading.
-Supports status codes 1xx-5xx, Content-Length and connection close.
-
-Closes #12
-```
-
-```
-test(url): add property-based tests for URL roundtripping
-
-Uses proptest to verify that any URL that parses successfully
-can be serialized and re-parsed to an identical result.
-```
-
-```
-fix(cookie): reject cookies with empty domain field
-
-curl rejects Set-Cookie headers where the domain attribute is
-present but empty. Match this behavior per curl test #380.
-```
-
-```
-docs: update CLAUDE.md — mark Phase 1 complete, add Phase 2 plan
-```
-
-The pre-commit `commit-msg` hook enforces the format locally. CI also validates commit messages on PRs.
-
-### Step 0.7: GitHub Actions CI
-
-Create `.github/workflows/ci.yml` that runs on every push and PR:
-
-```yaml
-name: CI
-
-on:
-  push:
-    branches: [main]
-  pull_request:
-
-env:
-  CARGO_TERM_COLOR: always
-  RUSTFLAGS: "-D warnings"
-  RUSTDOCFLAGS: "-D warnings"
-
-jobs:
-  commit-lint:
-    name: Commit message lint
-    runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - name: Validate conventional commits
-        run: |
-          commits=$(git log --format="%s" origin/${{ github.base_ref }}..HEAD)
-          regex="^(feat|fix|refactor|test|docs|chore|ci|perf|build|style|revert)(\(.+\))?(!)?: .+"
-          failed=0
-          while IFS= read -r msg; do
-            if ! echo "$msg" | grep -qE "$regex"; then
-              echo "❌ Bad commit message: $msg"
-              failed=1
-            fi
-          done <<< "$commits"
-          if [ "$failed" = "1" ]; then
-            echo ""
-            echo "Commit messages must follow Conventional Commits:"
-            echo "  <type>(<scope>): <description>"
-            echo "  Types: feat|fix|refactor|test|docs|chore|ci|perf|build|style|revert"
-            exit 1
-          fi
-          echo "✅ All commit messages valid"
-
-  check:
-    name: Check
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-      - name: Format
-        run: cargo fmt --all -- --check
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: Doc
-        run: cargo doc --workspace --no-deps
-
-  test:
-    name: Test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Unit tests
-        run: cargo test --workspace --lib
-      - name: Integration tests
-        run: cargo test --workspace --test '*'
-      - name: Doc tests
-        run: cargo test --workspace --doc
-
-  deny:
-    name: Dependency audit
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: EmbarkStudios/cargo-deny-action@v1
-
-  coverage:
-    name: Coverage
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Install cargo-tarpaulin
-        run: cargo install cargo-tarpaulin
-      - name: Generate coverage
-        run: cargo tarpaulin --workspace --out xml
-      - name: Upload coverage
-        uses: codecov/codecov-action@v4
-
-  msrv:
-    name: Minimum supported Rust version
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.75.0  # MSRV - update deliberately
-      - run: cargo check --workspace
-
-  fuzz:
-    name: Fuzz (scheduled)
-    runs-on: ubuntu-latest
-    if: github.event_name == 'schedule'
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
-      - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz
-      - name: Fuzz URL parser
-        run: cargo fuzz run url_parser -- -max_total_time=300
-      - name: Fuzz HTTP parser
-        run: cargo fuzz run http_parser -- -max_total_time=300
-```
-
-### Step 0.8: Fuzz Testing Harnesses
-
-Set up `cargo-fuzz` targets from day 1. Every parser must have a fuzz harness:
-
-- `fuzz/fuzz_targets/url_parser.rs` — fuzz the URL parser
-- `fuzz/fuzz_targets/http_parser.rs` — fuzz HTTP response parsing
-- `fuzz/fuzz_targets/cookie_parser.rs` — fuzz cookie parsing
-- `fuzz/fuzz_targets/header_parser.rs` — fuzz header parsing
-
-These are added as each parser is implemented. The CI runs them on a schedule.
-
-### Step 0.9: Verify All Gates Pass
-
-Before moving to Phase 1, confirm:
-
-- [ ] `cargo build --workspace` succeeds
-- [ ] `cargo fmt --all -- --check` passes
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings` passes
-- [ ] `cargo test --workspace` passes (even if tests are trivial)
-- [ ] `cargo doc --workspace --no-deps` passes with no warnings
-- [ ] `cargo deny check` passes
-- [ ] GitHub Actions CI is green (including commit lint job)
-- [ ] Pre-commit hooks are configured (including commit-msg hook)
-- [ ] A test commit using conventional format is accepted
-- [ ] A test commit with bad format is rejected by the hook
+Workspace initialized with three crates (liburlx, liburlx-ffi, urlx-cli). Guardrails configured: rustfmt, clippy with strict lints, cargo-deny, pre-commit hooks, GitHub Actions CI with commit linting, multi-OS testing, MSRV check. All gates pass.
 
 ---
 
@@ -689,51 +343,52 @@ These are compiled and run by a build script or test harness to verify ABI compa
 
 ## Implementation Phases
 
-### Phase 1: HTTP GET Works (after Phase 0)
+### Phase 1: HTTP GET Works — COMPLETED (2026-03-08)
 
-**Entry criteria:** Phase 0 complete, all guardrails green.
+URL parser wrapping `url` crate with curl-compatible scheme defaulting. HTTP/1.1 GET
+request/response codec using `httparse`. TLS via `rustls` + `tokio-rustls`. Blocking
+`Easy` API wrapping async internals. CLI prints response body. 40 unit tests. Both
+HTTP and HTTPS GET transfers work end-to-end against real servers.
 
-**Write tests first for:**
-- URL parsing (basic schemes, paths, queries, fragments, edge cases)
-- HTTP/1.1 GET request construction and response parsing
-- Status code handling (200, 404, 500)
-- Response header parsing
-- Response body reading
-- TLS handshake (HTTPS GET)
-- Connection establishment (TCP, Happy Eyeballs)
-- Basic error conditions (connection refused, DNS failure, timeout)
+### Phase 2: HTTP Feature Completeness (CURRENT)
 
-**Then implement:**
-- `liburlx` Easy API skeleton: `Easy::new()`, `easy.url()`, `easy.perform()`
-- URL parser (wrap `url` crate, add curl quirks)
-- TCP connector with Happy Eyeballs
-- TLS via rustls
-- HTTP/1.1 request/response codec
-- Basic error types
-- `urlx` CLI: `urlx https://example.com` prints response body
+**Scope:** Add HTTP methods beyond GET, request headers, request bodies, redirect following,
+and integration tests with real test servers. This is the highest-impact phase for
+making urlx actually useful.
 
-**Exit criteria:** `urlx https://httpbin.org/get` returns correct JSON. All tests green.
+**Step 2.1: Integration test infrastructure**
+- Create test server framework using `hyper` in `tests/`
+- Test server supports configurable responses per-path
+- Helper to start server on random port and return base URL
 
-### Phase 2: HTTP Feature Completeness
+**Step 2.2: HTTP methods**
+- Add `method()` setter to Easy API
+- Implement POST, PUT, DELETE, HEAD, PATCH, OPTIONS in h1 module
+- Add `body()` setter for request bodies
+- Integration tests for each method
 
-**Write tests first for:**
-- POST, PUT, DELETE, HEAD, PATCH, OPTIONS methods
-- Request headers (`-H` equivalent)
-- Request body (POST data, multipart form)
-- Redirect following (301, 302, 303, 307, 308) with limit
-- Basic, Digest, Bearer authentication
-- Cookie engine (set, store, send, file persistence)
-- Content-Encoding decompression (gzip, deflate, brotli, zstd)
-- Connection reuse / pooling
-- Timeouts (connect, transfer, total)
-- Progress callbacks
-- Transfer info queries (timing, IPs, sizes)
-- HSTS enforcement
-- `-w`/`--write-out` formatting in CLI
+**Step 2.3: Request headers**
+- Add `header()` / `headers()` setters to Easy API
+- Wire custom headers into h1 request construction
+- Integration tests verifying headers are sent
 
-**Then implement each.**
+**Step 2.4: Redirect following**
+- Implement 301, 302, 303, 307, 308 redirect following
+- Add `follow_redirects()` and `max_redirects()` to Easy API
+- 303 must change method to GET
+- 307/308 must preserve method and body
+- Integration tests for each redirect type + loop detection
 
-**Exit criteria:** Can replace curl for REST API testing workflows.
+**Step 2.5: CLI enhancements**
+- Add `-X`/`--request` for HTTP method
+- Add `-H`/`--header` for custom headers
+- Add `-d`/`--data` for POST body
+- Add `-L`/`--location` for redirect following
+- Add `-v`/`--verbose` for debug output
+- Add `-o`/`--output` for file output
+- Add `-I`/`--head` for HEAD requests
+
+**Exit criteria:** `urlx -X POST -d '{"key":"value"}' -H 'Content-Type: application/json' https://httpbin.org/post` works correctly.
 
 ### Phase 3: HTTP/2, Proxies, Concurrency
 
