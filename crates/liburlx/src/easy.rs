@@ -277,7 +277,7 @@ async fn perform_transfer(
 }
 
 /// Perform a single HTTP request (no redirect handling).
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn do_single_request(
     url: &Url,
     method: &str,
@@ -326,17 +326,54 @@ async fn do_single_request(
             #[cfg(feature = "rustls")]
             {
                 let tls = crate::tls::TlsConnector::new()?;
-                let mut tls_stream = tls.connect(tcp_stream, &host).await?;
-                crate::protocol::http::h1::request(
-                    &mut tls_stream,
-                    method,
-                    &host_header,
-                    &request_target,
-                    &effective_headers,
-                    body,
-                    url.as_str(),
-                )
-                .await?
+                let (tls_stream, alpn) = tls.connect(tcp_stream, &host).await?;
+
+                #[cfg(feature = "http2")]
+                if alpn == crate::tls::AlpnProtocol::H2 {
+                    if verbose {
+                        #[allow(clippy::print_stderr)]
+                        {
+                            eprintln!("* Using HTTP/2");
+                        }
+                    }
+                    crate::protocol::http::h2::request(
+                        tls_stream,
+                        method,
+                        &host_header,
+                        &request_target,
+                        &effective_headers,
+                        body,
+                        url.as_str(),
+                    )
+                    .await?
+                } else {
+                    let mut tls_stream = tls_stream;
+                    crate::protocol::http::h1::request(
+                        &mut tls_stream,
+                        method,
+                        &host_header,
+                        &request_target,
+                        &effective_headers,
+                        body,
+                        url.as_str(),
+                    )
+                    .await?
+                }
+
+                #[cfg(not(feature = "http2"))]
+                {
+                    let mut tls_stream = tls_stream;
+                    crate::protocol::http::h1::request(
+                        &mut tls_stream,
+                        method,
+                        &host_header,
+                        &request_target,
+                        &effective_headers,
+                        body,
+                        url.as_str(),
+                    )
+                    .await?
+                }
             }
             #[cfg(not(feature = "rustls"))]
             {

@@ -5,4 +5,6 @@
 
 pub mod decompress;
 pub mod h1;
+#[cfg(feature = "http2")]
+pub mod h2;
 pub mod response;

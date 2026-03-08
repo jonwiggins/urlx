@@ -14,11 +14,11 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 2d — HTTP Feature Completeness (transfer info + write-out)
-**Last completed:** Phase 2c (timeouts, Basic/Bearer auth) — 2026-03-08
-**In progress:** Transfer timing info, --write-out/-w support
+**Phase:** 3a — HTTP/2 Support
+**Last completed:** Phase 2d (transfer info, --write-out) — 2026-03-08
+**In progress:** HTTP/2 via h2 crate, ALPN negotiation
 **Blockers:** None
-**Next up:** Phase 3 (HTTP/2, Proxies, Concurrency)
+**Next up:** Phase 3b (proxy support), Phase 3c (concurrent transfers)
 
 ---
 
@@ -438,21 +438,51 @@ extracting response metadata. These are essential for scripting and debugging.
 
 **Exit criteria:** `urlx -w '%{http_code}\n' -o /dev/null` prints status code.
 
-### Phase 3: HTTP/2, Proxies, Concurrency
+### Phase 2d: Transfer Info + Write-Out — COMPLETED (2026-03-08)
 
-**Write tests first for:**
-- HTTP/2 (ALPN negotiation, multiplexing, server push)
-- HTTPS proxy (CONNECT tunneling)
-- HTTP proxy (non-CONNECT)
-- SOCKS4 and SOCKS5 proxy
-- Multi API (concurrent transfers)
-- WebSocket (ws/wss)
-- DNS-over-HTTPS
-- Rate limiting and retry
+TransferInfo with timing/redirect counts. CLI --write-out/-w with %{variable}
+format. 96 tests passing.
 
-**Then implement each.**
+### Phase 3a: HTTP/2 Support (CURRENT)
 
-**Exit criteria:** Production-ready for HTTP workloads with concurrency.
+**Scope:** Add HTTP/2 protocol support using the `h2` crate. HTTP/2 provides
+multiplexing, header compression, and better performance for modern APIs.
+
+**Step 3a.1: h2 dependency and feature flag**
+- Add `http2` feature flag with `dep:h2`
+- Feature-gate HTTP/2 code behind `http2` feature
+- Add h2 to default features
+
+**Step 3a.2: ALPN negotiation**
+- Configure rustls to advertise both h2 and http/1.1 via ALPN
+- Detect negotiated protocol after TLS handshake
+- Route to h2 or h1 codec based on ALPN result
+
+**Step 3a.3: HTTP/2 request/response**
+- Implement h2 request sending using the h2 crate
+- Handle h2 response reading
+- Wire into do_single_request()
+- Support all HTTP methods, headers, body
+
+**Step 3a.4: Integration tests**
+- Test h2 request against a real h2 server (use hyper with http2 feature)
+- Verify ALPN negotiation works
+- Verify fallback to h1 when server doesn't support h2
+
+**Exit criteria:** HTTPS requests automatically use HTTP/2 when server supports it.
+
+### Phase 3b: HTTP Proxy Support
+
+- HTTP proxy (forward proxy for HTTP URLs)
+- HTTPS proxy (CONNECT tunneling for HTTPS URLs)
+- CLI: -x/--proxy flag
+- Environment variable support (http_proxy, https_proxy, no_proxy)
+
+### Phase 3c: Concurrent Transfers (Multi API)
+
+- Multi handle for running multiple transfers concurrently
+- Async-native API using tokio tasks
+- CLI: parallel URL support
 
 ### Phase 4: Protocol Expansion
 

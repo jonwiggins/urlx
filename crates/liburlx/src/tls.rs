@@ -6,10 +6,19 @@
 mod rustls_impl {
     use std::sync::Arc;
 
-    use tokio::io::{AsyncRead, AsyncWrite};
     use tokio::net::TcpStream;
+    use tokio_rustls::client::TlsStream;
 
     use crate::error::Error;
+
+    /// The negotiated application protocol after TLS handshake.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum AlpnProtocol {
+        /// HTTP/2 was negotiated.
+        H2,
+        /// HTTP/1.1 was negotiated (or no ALPN).
+        Http11,
+    }
 
     /// A TLS connector backed by rustls.
     pub struct TlsConnector {
@@ -19,6 +28,8 @@ mod rustls_impl {
     impl TlsConnector {
         /// Create a new TLS connector with the default system root certificates.
         ///
+        /// Advertises both h2 and http/1.1 via ALPN when the `http2` feature is enabled.
+        ///
         /// # Errors
         ///
         /// Returns [`Error::Tls`] if the TLS configuration cannot be built.
@@ -26,14 +37,24 @@ mod rustls_impl {
             let root_store: rustls::RootCertStore =
                 webpki_roots::TLS_SERVER_ROOTS.iter().cloned().collect();
 
-            let config = rustls::ClientConfig::builder()
+            let mut config = rustls::ClientConfig::builder()
                 .with_root_certificates(root_store)
                 .with_no_client_auth();
+
+            // Advertise ALPN protocols
+            #[cfg(feature = "http2")]
+            {
+                config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+            }
+            #[cfg(not(feature = "http2"))]
+            {
+                config.alpn_protocols = vec![b"http/1.1".to_vec()];
+            }
 
             Ok(Self { config: Arc::new(config) })
         }
 
-        /// Wrap a TCP stream with TLS.
+        /// Wrap a TCP stream with TLS and return the stream and negotiated protocol.
         ///
         /// # Errors
         ///
@@ -42,7 +63,7 @@ mod rustls_impl {
             &self,
             stream: TcpStream,
             server_name: &str,
-        ) -> Result<impl AsyncRead + AsyncWrite + Unpin, Error> {
+        ) -> Result<(TlsStream<TcpStream>, AlpnProtocol), Error> {
             let server_name = rustls::pki_types::ServerName::try_from(server_name.to_string())
                 .map_err(|e| Error::Tls(Box::new(e)))?;
 
@@ -52,13 +73,21 @@ mod rustls_impl {
                 .await
                 .map_err(|e| Error::Tls(Box::new(e)))?;
 
-            Ok(tls_stream)
+            // Check ALPN result
+            let alpn = tls_stream
+                .get_ref()
+                .1
+                .alpn_protocol()
+                .and_then(|p| if p == b"h2" { Some(AlpnProtocol::H2) } else { None })
+                .unwrap_or(AlpnProtocol::Http11);
+
+            Ok((tls_stream, alpn))
         }
     }
 }
 
 #[cfg(feature = "rustls")]
-pub use rustls_impl::TlsConnector;
+pub use rustls_impl::{AlpnProtocol, TlsConnector};
 
 #[cfg(test)]
 mod tests {

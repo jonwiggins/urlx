@@ -10,10 +10,11 @@ license.workspace = true
 workspace = true
 
 [features]
-default = ["http", "rustls", "decompression"]
+default = ["http", "http2", "rustls", "decompression"]
 
 # Protocols
 http = []
+http2 = ["dep:h2"]
 
 # TLS backends
 rustls = ["dep:rustls", "dep:webpki-roots", "dep:tokio-rustls"]
@@ -25,6 +26,7 @@ decompression = ["dep:flate2", "dep:brotli", "dep:zstd"]
 thiserror.workspace = true
 tokio = { workspace = true, features = ["net", "io-util", "rt", "time", "sync", "macros"] }
 base64 = "0.22"
+h2 = { version = "0.4", optional = true }
 url = "2"
 http = "1"
 httparse = "1"
@@ -37,7 +39,7 @@ zstd = { version = "0.13", optional = true, default-features = false }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
-hyper = { version = "1", features = ["server", "http1"] }
+hyper = { version = "1", features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 flate2 = "1"
