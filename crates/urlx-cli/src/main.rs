@@ -34,6 +34,8 @@ fn run(args: &[String]) -> ExitCode {
         eprintln!("  -m, --max-time <s>       Maximum time for transfer in seconds");
         eprintln!("  -u, --user <user:pass>   HTTP Basic authentication");
         eprintln!("  -w, --write-out <fmt>    Output format after transfer");
+        eprintln!("  -x, --proxy <url>        Use proxy (e.g., http://proxy:8080)");
+        eprintln!("      --noproxy <list>     Comma-separated list of hosts to bypass proxy");
         return ExitCode::FAILURE;
     }
 
@@ -130,6 +132,25 @@ fn run(args: &[String]) -> ExitCode {
                     return ExitCode::FAILURE;
                 }
                 write_out = Some(args[i].clone());
+            }
+            "-x" | "--proxy" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("urlx: option -x requires an argument");
+                    return ExitCode::FAILURE;
+                }
+                if let Err(e) = easy.proxy(&args[i]) {
+                    eprintln!("urlx: invalid proxy URL: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+            "--noproxy" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("urlx: option --noproxy requires an argument");
+                    return ExitCode::FAILURE;
+                }
+                easy.noproxy(&args[i]);
             }
             "-u" | "--user" => {
                 i += 1;

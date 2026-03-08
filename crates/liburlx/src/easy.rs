@@ -25,6 +25,8 @@ pub struct Easy {
     accept_encoding: bool,
     connect_timeout: Option<Duration>,
     timeout: Option<Duration>,
+    proxy: Option<Url>,
+    noproxy: Option<String>,
 }
 
 impl Easy {
@@ -42,6 +44,8 @@ impl Easy {
             accept_encoding: false,
             connect_timeout: None,
             timeout: None,
+            proxy: None,
+            noproxy: None,
         }
     }
 
@@ -132,6 +136,28 @@ impl Easy {
         self.accept_encoding = enable;
     }
 
+    /// Set the proxy URL.
+    ///
+    /// HTTP URLs are forwarded through the proxy. HTTPS URLs use
+    /// HTTP CONNECT tunneling through the proxy.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UrlParse`] if the proxy URL is invalid.
+    pub fn proxy(&mut self, proxy_url: &str) -> Result<(), Error> {
+        self.proxy = Some(Url::parse(proxy_url)?);
+        Ok(())
+    }
+
+    /// Set the no-proxy list (comma-separated hostnames/domains).
+    ///
+    /// Hosts matching this list bypass the proxy. Supports domain
+    /// suffix matching (e.g., ".example.com" matches "foo.example.com").
+    /// Use "*" to bypass the proxy for all hosts.
+    pub fn noproxy(&mut self, noproxy: &str) {
+        self.noproxy = Some(noproxy.to_string());
+    }
+
     /// Perform the transfer and return the response (blocking).
     ///
     /// Creates a new tokio runtime internally. Do not call from within
@@ -161,6 +187,15 @@ impl Easy {
     pub async fn perform_async(&self) -> Result<Response, Error> {
         let url = self.url.as_ref().ok_or_else(|| Error::UrlParse("no URL set".to_string()))?;
 
+        // Resolve proxy: explicit setting takes priority, then env vars
+        let env_proxy = if self.proxy.is_none() { proxy_from_env(url.scheme()) } else { None };
+        let effective_proxy = self.proxy.as_ref().or(env_proxy.as_ref());
+
+        // Resolve noproxy: explicit setting takes priority, then env vars
+        let env_noproxy = if self.noproxy.is_none() { noproxy_from_env() } else { None };
+        let resolved_noproxy = self.noproxy.as_deref().or(env_noproxy.as_deref());
+        let effective_noproxy = resolved_noproxy;
+
         let fut = perform_transfer(
             url,
             self.method.as_deref(),
@@ -171,6 +206,8 @@ impl Easy {
             self.verbose,
             self.accept_encoding,
             self.connect_timeout,
+            effective_proxy,
+            effective_noproxy,
         );
 
         // Apply total transfer timeout if set
@@ -200,6 +237,8 @@ async fn perform_transfer(
     verbose: bool,
     accept_encoding: bool,
     connect_timeout: Option<Duration>,
+    proxy: Option<&Url>,
+    noproxy: Option<&str>,
 ) -> Result<Response, Error> {
     let transfer_start = Instant::now();
     let mut current_url = url.clone();
@@ -209,6 +248,9 @@ async fn perform_transfer(
     let mut last_connect_time;
 
     loop {
+        // Determine effective proxy for this URL
+        let effective_proxy = proxy.filter(|_| !should_bypass_proxy(&current_url, noproxy));
+
         let connect_start = Instant::now();
         let response = do_single_request(
             &current_url,
@@ -218,6 +260,7 @@ async fn perform_transfer(
             verbose,
             accept_encoding,
             connect_timeout,
+            effective_proxy,
         )
         .await?;
         last_connect_time = connect_start.elapsed();
@@ -286,11 +329,9 @@ async fn do_single_request(
     verbose: bool,
     accept_encoding: bool,
     connect_timeout: Option<Duration>,
+    proxy: Option<&Url>,
 ) -> Result<Response, Error> {
     let (host, port) = url.host_and_port()?;
-    let request_target = url.request_target();
-
-    // Host header should include port for non-default ports
     let host_header = url.host_header_value();
 
     // Build effective headers (add Accept-Encoding if decompression enabled)
@@ -302,15 +343,23 @@ async fn do_single_request(
         ));
     }
 
+    // Determine what to connect to: proxy or target directly
+    let (connect_host, connect_port) =
+        if let Some(proxy_url) = proxy { proxy_url.host_and_port()? } else { (host.clone(), port) };
+
     if verbose {
         #[allow(clippy::print_stderr)]
         {
-            eprintln!("* Connecting to {host} port {port}");
+            if proxy.is_some() {
+                eprintln!("* Connecting to proxy {connect_host} port {connect_port}");
+            } else {
+                eprintln!("* Connecting to {connect_host} port {connect_port}");
+            }
         }
     }
 
     // Connect via TCP (with optional connect timeout)
-    let addr = format!("{host}:{port}");
+    let addr = format!("{connect_host}:{connect_port}");
     let connect_fut = tokio::net::TcpStream::connect(&addr);
     let tcp_stream = if let Some(timeout_dur) = connect_timeout {
         tokio::time::timeout(timeout_dur, connect_fut)
@@ -325,8 +374,23 @@ async fn do_single_request(
         "https" => {
             #[cfg(feature = "rustls")]
             {
+                let tls_stream_inner = if proxy.is_some() {
+                    // CONNECT tunneling: establish tunnel through proxy first
+                    if verbose {
+                        #[allow(clippy::print_stderr)]
+                        {
+                            eprintln!("* Establishing tunnel to {host}:{port} via proxy");
+                        }
+                    }
+                    establish_connect_tunnel(tcp_stream, &host, port).await?
+                } else {
+                    tcp_stream
+                };
+
                 let tls = crate::tls::TlsConnector::new()?;
-                let (tls_stream, alpn) = tls.connect(tcp_stream, &host).await?;
+                let (tls_stream, alpn) = tls.connect(tls_stream_inner, &host).await?;
+
+                let request_target = url.request_target();
 
                 #[cfg(feature = "http2")]
                 if alpn == crate::tls::AlpnProtocol::H2 {
@@ -362,6 +426,7 @@ async fn do_single_request(
 
                 #[cfg(not(feature = "http2"))]
                 {
+                    let request_target = url.request_target();
                     let mut tls_stream = tls_stream;
                     crate::protocol::http::h1::request(
                         &mut tls_stream,
@@ -382,6 +447,9 @@ async fn do_single_request(
         }
         "http" => {
             let mut tcp_stream = tcp_stream;
+            // For HTTP through proxy, use absolute URL as request target
+            let request_target =
+                if proxy.is_some() { url.as_str().to_string() } else { url.request_target() };
             crate::protocol::http::h1::request(
                 &mut tcp_stream,
                 method,
@@ -413,6 +481,167 @@ async fn do_single_request(
     }
 
     Ok(response)
+}
+
+/// Establish an HTTP CONNECT tunnel through a proxy.
+///
+/// Sends a CONNECT request to the proxy and validates the 200 response
+/// before returning the raw TCP stream for TLS negotiation.
+async fn establish_connect_tunnel(
+    mut stream: tokio::net::TcpStream,
+    target_host: &str,
+    target_port: u16,
+) -> Result<tokio::net::TcpStream, Error> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let connect_req = format!(
+        "CONNECT {target_host}:{target_port} HTTP/1.1\r\n\
+         Host: {target_host}:{target_port}\r\n\
+         \r\n"
+    );
+
+    stream
+        .write_all(connect_req.as_bytes())
+        .await
+        .map_err(|e| Error::Http(format!("proxy CONNECT write failed: {e}")))?;
+
+    stream.flush().await.map_err(|e| Error::Http(format!("proxy CONNECT flush failed: {e}")))?;
+
+    // Read the proxy's response. We only need the status line + headers.
+    let mut buf = vec![0u8; 4096];
+    let mut total = 0;
+
+    loop {
+        let n = stream
+            .read(&mut buf[total..])
+            .await
+            .map_err(|e| Error::Http(format!("proxy CONNECT read failed: {e}")))?;
+
+        if n == 0 {
+            return Err(Error::Http("proxy closed connection during CONNECT".to_string()));
+        }
+
+        total += n;
+
+        // Check if we have received the full headers (ends with \r\n\r\n)
+        if let Some(end) = find_header_end(&buf[..total]) {
+            // Parse the status line
+            let header_str = std::str::from_utf8(&buf[..end])
+                .map_err(|_| Error::Http("invalid proxy CONNECT response encoding".into()))?;
+
+            let status_line = header_str
+                .lines()
+                .next()
+                .ok_or_else(|| Error::Http("empty proxy CONNECT response".into()))?;
+
+            // Parse "HTTP/1.x 200 ..."
+            let parts: Vec<&str> = status_line.splitn(3, ' ').collect();
+            if parts.len() < 2 {
+                return Err(Error::Http(format!(
+                    "malformed proxy CONNECT response: {status_line}"
+                )));
+            }
+
+            let status: u16 = parts[1].parse().map_err(|_| {
+                Error::Http(format!("invalid proxy CONNECT status code: {}", parts[1]))
+            })?;
+
+            if status != 200 {
+                return Err(Error::Http(format!(
+                    "proxy CONNECT failed with status {status}: {status_line}"
+                )));
+            }
+
+            // Tunnel established — return the stream for TLS
+            return Ok(stream);
+        }
+
+        if total >= buf.len() {
+            return Err(Error::Http("proxy CONNECT response too large".to_string()));
+        }
+    }
+}
+
+/// Find the end of HTTP headers (\r\n\r\n) in a buffer.
+fn find_header_end(data: &[u8]) -> Option<usize> {
+    data.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
+}
+
+/// Get proxy URL from environment variables.
+///
+/// Checks `http_proxy`/`HTTP_PROXY` for HTTP, `https_proxy`/`HTTPS_PROXY` for HTTPS.
+/// curl convention: lowercase takes priority for `http_proxy`.
+fn proxy_from_env(scheme: &str) -> Option<Url> {
+    let var_names = match scheme {
+        "https" => &["https_proxy", "HTTPS_PROXY"][..],
+        _ => &["http_proxy", "HTTP_PROXY"][..],
+    };
+
+    for var in var_names {
+        if let Ok(val) = std::env::var(var) {
+            if !val.is_empty() {
+                if let Ok(url) = Url::parse(&val) {
+                    return Some(url);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Get no-proxy list from environment variables.
+///
+/// Checks `no_proxy` and `NO_PROXY` (lowercase takes priority).
+fn noproxy_from_env() -> Option<String> {
+    for var in &["no_proxy", "NO_PROXY"] {
+        if let Ok(val) = std::env::var(var) {
+            if !val.is_empty() {
+                return Some(val);
+            }
+        }
+    }
+    None
+}
+
+/// Check if a host should bypass the proxy based on the noproxy list.
+fn should_bypass_proxy(url: &Url, noproxy: Option<&str>) -> bool {
+    let Some(noproxy) = noproxy else {
+        return false;
+    };
+
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+
+    for pattern in noproxy.split(',') {
+        let pattern = pattern.trim();
+        if pattern.is_empty() {
+            continue;
+        }
+
+        // "*" matches everything
+        if pattern == "*" {
+            return true;
+        }
+
+        // Exact match
+        if host.eq_ignore_ascii_case(pattern) {
+            return true;
+        }
+
+        // Domain suffix match (e.g., ".example.com" matches "foo.example.com")
+        if pattern.starts_with('.') && host.ends_with(pattern) {
+            return true;
+        }
+
+        // Also match without leading dot (e.g., "example.com" matches "foo.example.com")
+        if host.eq_ignore_ascii_case(pattern) || host.ends_with(&format!(".{pattern}")) {
+            return true;
+        }
+    }
+
+    false
 }
 
 /// Resolve a relative URL against a base URL.
@@ -550,6 +779,85 @@ mod tests {
         assert_eq!(easy.headers.len(), 1);
         assert_eq!(easy.headers[0].0, "Authorization");
         assert_eq!(easy.headers[0].1, "Bearer my-token-123");
+    }
+
+    #[test]
+    fn easy_proxy_set() {
+        let mut easy = Easy::new();
+        assert!(easy.proxy.is_none());
+        easy.proxy("http://proxy.example.com:8080").unwrap();
+        assert!(easy.proxy.is_some());
+        let proxy = easy.proxy.as_ref().unwrap();
+        assert_eq!(proxy.host_str(), Some("proxy.example.com"));
+        assert_eq!(proxy.port(), Some(8080));
+    }
+
+    #[test]
+    fn easy_proxy_invalid_url() {
+        let mut easy = Easy::new();
+        assert!(easy.proxy("").is_err());
+    }
+
+    #[test]
+    fn easy_noproxy_set() {
+        let mut easy = Easy::new();
+        assert!(easy.noproxy.is_none());
+        easy.noproxy("localhost,.example.com");
+        assert_eq!(easy.noproxy, Some("localhost,.example.com".to_string()));
+    }
+
+    #[test]
+    fn bypass_proxy_wildcard() {
+        let url = Url::parse("http://anything.com").unwrap();
+        assert!(should_bypass_proxy(&url, Some("*")));
+    }
+
+    #[test]
+    fn bypass_proxy_exact_match() {
+        let url = Url::parse("http://localhost/test").unwrap();
+        assert!(should_bypass_proxy(&url, Some("localhost")));
+    }
+
+    #[test]
+    fn bypass_proxy_domain_suffix() {
+        let url = Url::parse("http://api.example.com/test").unwrap();
+        assert!(should_bypass_proxy(&url, Some(".example.com")));
+    }
+
+    #[test]
+    fn bypass_proxy_domain_without_dot() {
+        let url = Url::parse("http://api.example.com/test").unwrap();
+        assert!(should_bypass_proxy(&url, Some("example.com")));
+    }
+
+    #[test]
+    fn bypass_proxy_no_match() {
+        let url = Url::parse("http://other.com/test").unwrap();
+        assert!(!should_bypass_proxy(&url, Some("example.com")));
+    }
+
+    #[test]
+    fn bypass_proxy_none() {
+        let url = Url::parse("http://example.com").unwrap();
+        assert!(!should_bypass_proxy(&url, None));
+    }
+
+    #[test]
+    fn bypass_proxy_multiple_entries() {
+        let url = Url::parse("http://internal.corp/api").unwrap();
+        assert!(should_bypass_proxy(&url, Some("localhost, .corp, 127.0.0.1")));
+    }
+
+    #[test]
+    fn find_header_end_found() {
+        let data = b"HTTP/1.1 200 OK\r\n\r\nbody";
+        assert_eq!(find_header_end(data), Some(19));
+    }
+
+    #[test]
+    fn find_header_end_not_found() {
+        let data = b"HTTP/1.1 200 OK\r\npartial";
+        assert_eq!(find_header_end(data), None);
     }
 
     #[test]
