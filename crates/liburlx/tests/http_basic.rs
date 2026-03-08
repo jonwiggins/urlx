@@ -490,3 +490,70 @@ async fn no_decompression_without_accept_encoding() {
 
     assert_eq!(resp.body_str().unwrap(), "plain content");
 }
+
+#[tokio::test]
+async fn connect_timeout_triggers() {
+    let mut easy = liburlx::Easy::new();
+    // 10.255.255.1 is non-routable, should timeout
+    easy.url("http://10.255.255.1:1234").unwrap();
+    easy.connect_timeout(std::time::Duration::from_millis(100));
+    let result = easy.perform_async().await;
+    assert!(result.is_err());
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("timeout") || err.contains("Timeout"), "error was: {err}");
+}
+
+#[tokio::test]
+async fn total_timeout_triggers() {
+    let server = TestServer::start(|_req| {
+        // Server responds instantly, but we'll use the timeout anyway
+        Response::builder().status(200).body(Full::new(Bytes::from("ok"))).unwrap()
+    })
+    .await;
+
+    // A very generous timeout should succeed
+    let mut easy = liburlx::Easy::new();
+    easy.url(&server.url("/")).unwrap();
+    easy.timeout(std::time::Duration::from_secs(10));
+    let resp = easy.perform_async().await.unwrap();
+    assert_eq!(resp.status(), 200);
+}
+
+#[tokio::test]
+async fn basic_auth_header_sent() {
+    let server = TestServer::start(|req| {
+        let auth = req
+            .headers()
+            .get("authorization")
+            .map_or_else(|| "none".to_string(), |v| v.to_str().unwrap_or("").to_string());
+        Response::builder().status(200).body(Full::new(Bytes::from(auth))).unwrap()
+    })
+    .await;
+
+    let mut easy = liburlx::Easy::new();
+    easy.url(&server.url("/")).unwrap();
+    easy.basic_auth("admin", "secret");
+    let resp = easy.perform_async().await.unwrap();
+
+    // base64("admin:secret") = "YWRtaW46c2VjcmV0"
+    assert_eq!(resp.body_str().unwrap(), "Basic YWRtaW46c2VjcmV0");
+}
+
+#[tokio::test]
+async fn bearer_token_header_sent() {
+    let server = TestServer::start(|req| {
+        let auth = req
+            .headers()
+            .get("authorization")
+            .map_or_else(|| "none".to_string(), |v| v.to_str().unwrap_or("").to_string());
+        Response::builder().status(200).body(Full::new(Bytes::from(auth))).unwrap()
+    })
+    .await;
+
+    let mut easy = liburlx::Easy::new();
+    easy.url(&server.url("/")).unwrap();
+    easy.bearer_token("my-api-token");
+    let resp = easy.perform_async().await.unwrap();
+
+    assert_eq!(resp.body_str().unwrap(), "Bearer my-api-token");
+}

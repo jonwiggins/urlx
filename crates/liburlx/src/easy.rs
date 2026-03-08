@@ -3,6 +3,8 @@
 //! The `Easy` handle is the primary way to perform URL transfers.
 //! It provides a blocking API that wraps the async internals.
 
+use std::time::Duration;
+
 use crate::error::Error;
 use crate::protocol::http::response::Response;
 use crate::url::Url;
@@ -21,6 +23,8 @@ pub struct Easy {
     max_redirects: u32,
     verbose: bool,
     accept_encoding: bool,
+    connect_timeout: Option<Duration>,
+    timeout: Option<Duration>,
 }
 
 impl Easy {
@@ -36,6 +40,8 @@ impl Easy {
             max_redirects: 50,
             verbose: false,
             accept_encoding: false,
+            connect_timeout: None,
+            timeout: None,
         }
     }
 
@@ -85,6 +91,39 @@ impl Easy {
         self.verbose = enable;
     }
 
+    /// Set the TCP connection timeout.
+    ///
+    /// If the connection is not established within this duration,
+    /// the transfer fails with [`Error::Timeout`].
+    pub fn connect_timeout(&mut self, duration: Duration) {
+        self.connect_timeout = Some(duration);
+    }
+
+    /// Set the total transfer timeout.
+    ///
+    /// If the entire transfer (connect + request + response) takes
+    /// longer than this duration, it fails with [`Error::Timeout`].
+    pub fn timeout(&mut self, duration: Duration) {
+        self.timeout = Some(duration);
+    }
+
+    /// Set Basic authentication credentials.
+    ///
+    /// Adds an `Authorization: Basic <base64>` header to the request.
+    pub fn basic_auth(&mut self, user: &str, password: &str) {
+        use base64::Engine;
+        let credentials = format!("{user}:{password}");
+        let encoded = base64::engine::general_purpose::STANDARD.encode(credentials.as_bytes());
+        self.header("Authorization", &format!("Basic {encoded}"));
+    }
+
+    /// Set Bearer token authentication.
+    ///
+    /// Adds an `Authorization: Bearer <token>` header to the request.
+    pub fn bearer_token(&mut self, token: &str) {
+        self.header("Authorization", &format!("Bearer {token}"));
+    }
+
     /// Enable automatic Content-Encoding decompression.
     ///
     /// When enabled, sends `Accept-Encoding` header and decompresses
@@ -122,7 +161,7 @@ impl Easy {
     pub async fn perform_async(&self) -> Result<Response, Error> {
         let url = self.url.as_ref().ok_or_else(|| Error::UrlParse("no URL set".to_string()))?;
 
-        perform_transfer(
+        let fut = perform_transfer(
             url,
             self.method.as_deref(),
             &self.headers,
@@ -131,8 +170,15 @@ impl Easy {
             self.max_redirects,
             self.verbose,
             self.accept_encoding,
-        )
-        .await
+            self.connect_timeout,
+        );
+
+        // Apply total transfer timeout if set
+        if let Some(timeout) = self.timeout {
+            tokio::time::timeout(timeout, fut).await.map_err(|_| Error::Timeout(timeout))?
+        } else {
+            fut.await
+        }
     }
 }
 
@@ -153,6 +199,7 @@ async fn perform_transfer(
     max_redirects: u32,
     verbose: bool,
     accept_encoding: bool,
+    connect_timeout: Option<Duration>,
 ) -> Result<Response, Error> {
     let mut current_url = url.clone();
     let mut current_method = method.unwrap_or("GET").to_string();
@@ -167,6 +214,7 @@ async fn perform_transfer(
             current_body.as_deref(),
             verbose,
             accept_encoding,
+            connect_timeout,
         )
         .await?;
 
@@ -227,6 +275,7 @@ async fn do_single_request(
     body: Option<&[u8]>,
     verbose: bool,
     accept_encoding: bool,
+    connect_timeout: Option<Duration>,
 ) -> Result<Response, Error> {
     let (host, port) = url.host_and_port()?;
     let request_target = url.request_target();
@@ -250,9 +299,17 @@ async fn do_single_request(
         }
     }
 
-    // Connect via TCP
+    // Connect via TCP (with optional connect timeout)
     let addr = format!("{host}:{port}");
-    let tcp_stream = tokio::net::TcpStream::connect(&addr).await.map_err(Error::Connect)?;
+    let connect_fut = tokio::net::TcpStream::connect(&addr);
+    let tcp_stream = if let Some(timeout_dur) = connect_timeout {
+        tokio::time::timeout(timeout_dur, connect_fut)
+            .await
+            .map_err(|_| Error::Timeout(timeout_dur))?
+            .map_err(Error::Connect)?
+    } else {
+        connect_fut.await.map_err(Error::Connect)?
+    };
 
     let response = match url.scheme() {
         "https" => {
@@ -411,6 +468,41 @@ mod tests {
         assert!(!easy.accept_encoding);
         easy.accept_encoding(true);
         assert!(easy.accept_encoding);
+    }
+
+    #[test]
+    fn easy_connect_timeout() {
+        let mut easy = Easy::new();
+        assert!(easy.connect_timeout.is_none());
+        easy.connect_timeout(Duration::from_secs(5));
+        assert_eq!(easy.connect_timeout, Some(Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn easy_timeout() {
+        let mut easy = Easy::new();
+        assert!(easy.timeout.is_none());
+        easy.timeout(Duration::from_secs(30));
+        assert_eq!(easy.timeout, Some(Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn easy_basic_auth() {
+        let mut easy = Easy::new();
+        easy.basic_auth("user", "pass");
+        assert_eq!(easy.headers.len(), 1);
+        assert_eq!(easy.headers[0].0, "Authorization");
+        // base64("user:pass") = "dXNlcjpwYXNz"
+        assert_eq!(easy.headers[0].1, "Basic dXNlcjpwYXNz");
+    }
+
+    #[test]
+    fn easy_bearer_token() {
+        let mut easy = Easy::new();
+        easy.bearer_token("my-token-123");
+        assert_eq!(easy.headers.len(), 1);
+        assert_eq!(easy.headers[0].0, "Authorization");
+        assert_eq!(easy.headers[0].1, "Bearer my-token-123");
     }
 
     #[test]

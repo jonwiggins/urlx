@@ -24,6 +24,7 @@ decompression = ["dep:flate2", "dep:brotli", "dep:zstd"]
 [dependencies]
 thiserror.workspace = true
 tokio = { workspace = true, features = ["net", "io-util", "rt", "time", "sync", "macros"] }
+base64 = "0.22"
 url = "2"
 http = "1"
 httparse = "1"

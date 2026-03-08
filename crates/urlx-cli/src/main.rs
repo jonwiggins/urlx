@@ -30,6 +30,9 @@ fn run(args: &[String]) -> ExitCode {
         eprintln!("  -o, --output <file>      Write output to file");
         eprintln!("  -v, --verbose            Verbose output");
         eprintln!("      --compressed         Request compressed response and decompress");
+        eprintln!("      --connect-timeout <s> Maximum time for connection in seconds");
+        eprintln!("  -m, --max-time <s>       Maximum time for transfer in seconds");
+        eprintln!("  -u, --user <user:pass>   HTTP Basic authentication");
         return ExitCode::FAILURE;
     }
 
@@ -91,6 +94,45 @@ fn run(args: &[String]) -> ExitCode {
             }
             "--compressed" => {
                 easy.accept_encoding(true);
+            }
+            "--connect-timeout" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("urlx: option --connect-timeout requires an argument");
+                    return ExitCode::FAILURE;
+                }
+                if let Ok(secs) = args[i].parse::<f64>() {
+                    easy.connect_timeout(std::time::Duration::from_secs_f64(secs));
+                } else {
+                    eprintln!("urlx: invalid timeout value: {}", args[i]);
+                    return ExitCode::FAILURE;
+                }
+            }
+            "-m" | "--max-time" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("urlx: option -m requires an argument");
+                    return ExitCode::FAILURE;
+                }
+                if let Ok(secs) = args[i].parse::<f64>() {
+                    easy.timeout(std::time::Duration::from_secs_f64(secs));
+                } else {
+                    eprintln!("urlx: invalid timeout value: {}", args[i]);
+                    return ExitCode::FAILURE;
+                }
+            }
+            "-u" | "--user" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("urlx: option -u requires an argument");
+                    return ExitCode::FAILURE;
+                }
+                if let Some((user, pass)) = args[i].split_once(':') {
+                    easy.basic_auth(user, pass);
+                } else {
+                    // No password — use empty password (curl compat)
+                    easy.basic_auth(&args[i], "");
+                }
             }
             arg if arg.starts_with('-') => {
                 eprintln!("urlx: unknown option: {arg}");

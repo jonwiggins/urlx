@@ -14,11 +14,11 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 2b — HTTP Feature Completeness (chunked encoding + decompression)
-**Last completed:** Phase 2a (HTTP methods, headers, redirects, CLI flags) — 2026-03-08
-**In progress:** Chunked transfer encoding, Content-Encoding decompression
+**Phase:** 2c — HTTP Feature Completeness (timeouts + auth)
+**Last completed:** Phase 2b (chunked encoding, gzip/br/zstd decompression) — 2026-03-08
+**In progress:** Connect/transfer timeouts, Basic/Bearer authentication
 **Blockers:** None
-**Next up:** Phase 2c (timeouts, auth), then Phase 3
+**Next up:** Phase 2d (cookie engine, connection pooling), then Phase 3
 
 ---
 
@@ -378,6 +378,41 @@ many real-world HTTP responses are broken.
 - Integration test with gzip-compressed server response
 
 **Exit criteria:** Chunked responses and gzip/br/zstd compressed responses decode correctly.
+
+### Phase 2b: Chunked Transfer Encoding + Decompression — COMPLETED (2026-03-08)
+
+Chunked Transfer-Encoding decoding in HTTP/1.1 parser. Content-Encoding decompression
+(gzip, deflate, brotli, zstd) behind `decompression` feature flag. `accept_encoding()`
+API method and `--compressed` CLI flag. 86 tests passing.
+
+### Phase 2c: Timeouts + Authentication (CURRENT)
+
+**Scope:** Add connect and transfer timeouts for robustness, plus Basic and Bearer
+HTTP authentication for API usage.
+
+**Step 2c.1: Connect timeout**
+- Add `connect_timeout()` setter to Easy API (Duration)
+- Wrap TCP connect with `tokio::time::timeout`
+- Unit test for timeout configuration
+- Integration test with non-routable address (10.255.255.1) for timeout behavior
+
+**Step 2c.2: Transfer timeout**
+- Add `timeout()` setter to Easy API (total transfer time limit)
+- Wrap entire transfer with `tokio::time::timeout`
+- Integration test with slow server
+
+**Step 2c.3: Basic authentication**
+- Add `basic_auth(user, password)` to Easy API
+- Generate `Authorization: Basic <base64>` header
+- CLI flags: `-u`/`--user` (user:password format)
+- Integration test verifying auth header is sent
+
+**Step 2c.4: Bearer authentication**
+- Add `bearer_token(token)` to Easy API
+- Generate `Authorization: Bearer <token>` header
+- Integration test
+
+**Exit criteria:** Timeouts prevent hangs. Basic/Bearer auth works with APIs.
 
 ### Phase 3: HTTP/2, Proxies, Concurrency
 
