@@ -29,6 +29,7 @@ fn run(args: &[String]) -> ExitCode {
         eprintln!("  -I, --head               Send HEAD request");
         eprintln!("  -o, --output <file>      Write output to file");
         eprintln!("  -v, --verbose            Verbose output");
+        eprintln!("      --compressed         Request compressed response and decompress");
         return ExitCode::FAILURE;
     }
 
@@ -87,6 +88,9 @@ fn run(args: &[String]) -> ExitCode {
             }
             "-v" | "--verbose" => {
                 easy.verbose(true);
+            }
+            "--compressed" => {
+                easy.accept_encoding(true);
             }
             arg if arg.starts_with('-') => {
                 eprintln!("urlx: unknown option: {arg}");

@@ -90,6 +90,66 @@ where
     parse_response(&buf, url, is_head)
 }
 
+/// Decode a chunked transfer-encoded body.
+///
+/// Format: each chunk is `<hex-size>[;extensions]\r\n<data>\r\n`,
+/// terminated by a zero-length chunk `0\r\n\r\n`.
+///
+/// # Errors
+///
+/// Returns [`Error::Http`] if the chunked encoding is malformed.
+fn decode_chunked(data: &[u8]) -> Result<Vec<u8>, Error> {
+    let mut body = Vec::new();
+    let mut pos = 0;
+
+    loop {
+        // Find the end of the chunk size line
+        let line_end = find_crlf(data, pos)
+            .ok_or_else(|| Error::Http("incomplete chunked encoding: missing chunk size".into()))?;
+
+        // Parse the chunk size (hex, possibly with extensions after ';')
+        let size_str = std::str::from_utf8(&data[pos..line_end])
+            .map_err(|_| Error::Http("invalid chunk size encoding".into()))?;
+        let size_str = size_str.split(';').next().unwrap_or(size_str).trim();
+
+        let chunk_size = usize::from_str_radix(size_str, 16)
+            .map_err(|e| Error::Http(format!("invalid chunk size '{size_str}': {e}")))?;
+
+        // Move past the size line's \r\n
+        pos = line_end + 2;
+
+        // Zero-length chunk = end of body
+        if chunk_size == 0 {
+            break;
+        }
+
+        // Read chunk data
+        let chunk_end = pos + chunk_size;
+        if chunk_end > data.len() {
+            // Partial chunk — take what we have
+            body.extend_from_slice(&data[pos..]);
+            break;
+        }
+        body.extend_from_slice(&data[pos..chunk_end]);
+
+        // Skip the trailing \r\n after chunk data
+        pos = chunk_end + 2;
+        if pos > data.len() {
+            break;
+        }
+    }
+
+    Ok(body)
+}
+
+/// Find the position of `\r\n` starting at `offset`.
+fn find_crlf(data: &[u8], offset: usize) -> Option<usize> {
+    if data.len() < offset + 2 {
+        return None;
+    }
+    data[offset..].windows(2).position(|w| w == b"\r\n").map(|p| offset + p)
+}
+
 /// Parse a raw HTTP/1.1 response into a `Response`.
 ///
 /// # Errors
@@ -133,8 +193,13 @@ pub fn parse_response(data: &[u8], effective_url: &str, is_head: bool) -> Result
     // Determine body boundaries
     let body_data = &data[header_len..];
 
-    // Handle Content-Length
-    let body = if let Some(cl) = headers.get("content-length") {
+    // Handle Transfer-Encoding: chunked
+    let is_chunked =
+        headers.get("transfer-encoding").is_some_and(|te| te.eq_ignore_ascii_case("chunked"));
+
+    let body = if is_chunked {
+        decode_chunked(body_data)?
+    } else if let Some(cl) = headers.get("content-length") {
         let content_length: usize =
             cl.parse().map_err(|e| Error::Http(format!("invalid Content-Length: {e}")))?;
         if body_data.len() < content_length {
@@ -223,6 +288,62 @@ mod tests {
         assert_eq!(resp.status(), 301);
         assert!(resp.is_redirect());
         assert_eq!(resp.header("location"), Some("http://example.com/new"));
+    }
+
+    #[test]
+    fn parse_chunked_single_chunk() {
+        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
+        let resp = parse_response(raw, "http://example.com", false).unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.body_str().unwrap(), "hello");
+    }
+
+    #[test]
+    fn parse_chunked_multiple_chunks() {
+        let raw =
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
+        let resp = parse_response(raw, "http://example.com", false).unwrap();
+        assert_eq!(resp.body_str().unwrap(), "hello world");
+    }
+
+    #[test]
+    fn parse_chunked_empty_body() {
+        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n";
+        let resp = parse_response(raw, "http://example.com", false).unwrap();
+        assert!(resp.body().is_empty());
+    }
+
+    #[test]
+    fn parse_chunked_with_chunk_extensions() {
+        // Chunk extensions after the size are allowed by HTTP spec
+        let raw =
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5;ext=val\r\nhello\r\n0\r\n\r\n";
+        let resp = parse_response(raw, "http://example.com", false).unwrap();
+        assert_eq!(resp.body_str().unwrap(), "hello");
+    }
+
+    #[test]
+    fn parse_chunked_with_trailers() {
+        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\nTrailer: value\r\n\r\n";
+        let resp = parse_response(raw, "http://example.com", false).unwrap();
+        assert_eq!(resp.body_str().unwrap(), "hello");
+    }
+
+    #[test]
+    fn parse_chunked_hex_sizes() {
+        // Chunk sizes are in hex
+        let raw =
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\na\r\n0123456789\r\n0\r\n\r\n";
+        let resp = parse_response(raw, "http://example.com", false).unwrap();
+        assert_eq!(resp.body_str().unwrap(), "0123456789");
+    }
+
+    #[test]
+    fn parse_chunked_uppercase_hex() {
+        let raw =
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nA\r\n0123456789\r\n0\r\n\r\n";
+        let resp = parse_response(raw, "http://example.com", false).unwrap();
+        assert_eq!(resp.body_str().unwrap(), "0123456789");
     }
 
     #[tokio::test]

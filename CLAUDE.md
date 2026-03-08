@@ -14,11 +14,11 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 2 — HTTP Feature Completeness
-**Last completed:** Phase 1 (HTTP GET with TLS, Easy API, CLI) — 2026-03-08
-**In progress:** HTTP methods, headers, redirects, integration tests
+**Phase:** 2b — HTTP Feature Completeness (chunked encoding + decompression)
+**Last completed:** Phase 2a (HTTP methods, headers, redirects, CLI flags) — 2026-03-08
+**In progress:** Chunked transfer encoding, Content-Encoding decompression
 **Blockers:** None
-**Next up:** Phase 3 — HTTP/2, Proxies, Concurrency
+**Next up:** Phase 2c (timeouts, auth), then Phase 3
 
 ---
 
@@ -350,45 +350,34 @@ request/response codec using `httparse`. TLS via `rustls` + `tokio-rustls`. Bloc
 `Easy` API wrapping async internals. CLI prints response body. 40 unit tests. Both
 HTTP and HTTPS GET transfers work end-to-end against real servers.
 
-### Phase 2: HTTP Feature Completeness (CURRENT)
+### Phase 2a: HTTP Methods, Headers, Redirects, CLI — COMPLETED (2026-03-08)
 
-**Scope:** Add HTTP methods beyond GET, request headers, request bodies, redirect following,
-and integration tests with real test servers. This is the highest-impact phase for
-making urlx actually useful.
+Added POST/PUT/DELETE/HEAD/PATCH methods, custom headers, request body, redirect following
+(301/302/303/307/308), verbose output, CLI flags (-X, -H, -d, -L, -I, -o, -v).
+16 integration tests with hyper-based test server. 67 total tests passing.
 
-**Step 2.1: Integration test infrastructure**
-- Create test server framework using `hyper` in `tests/`
-- Test server supports configurable responses per-path
-- Helper to start server on random port and return base URL
+### Phase 2b: Chunked Transfer Encoding + Content-Encoding Decompression (CURRENT)
 
-**Step 2.2: HTTP methods**
-- Add `method()` setter to Easy API
-- Implement POST, PUT, DELETE, HEAD, PATCH, OPTIONS in h1 module
-- Add `body()` setter for request bodies
-- Integration tests for each method
+**Scope:** Handle chunked transfer encoding and compressed responses. Without these,
+many real-world HTTP responses are broken.
 
-**Step 2.3: Request headers**
-- Add `header()` / `headers()` setters to Easy API
-- Wire custom headers into h1 request construction
-- Integration tests verifying headers are sent
+**Step 2b.1: Chunked transfer encoding**
+- Add chunked decoding to `parse_response()` in h1.rs
+- Detect `Transfer-Encoding: chunked` header
+- Parse chunk size + data format (size\r\n data\r\n ... 0\r\n\r\n)
+- Unit tests for chunked parsing (single chunk, multiple chunks, empty, trailers)
+- Integration test with hyper (hyper sends chunked by default for streaming bodies)
 
-**Step 2.4: Redirect following**
-- Implement 301, 302, 303, 307, 308 redirect following
-- Add `follow_redirects()` and `max_redirects()` to Easy API
-- 303 must change method to GET
-- 307/308 must preserve method and body
-- Integration tests for each redirect type + loop detection
+**Step 2b.2: Content-Encoding decompression**
+- Add `decompression` feature flag with deps: flate2, brotli, zstd
+- Send `Accept-Encoding: gzip, deflate, br, zstd` when decompression enabled
+- Detect `Content-Encoding` header and decompress body
+- Add `accept_encoding()` method to Easy API
+- Add `--compressed` CLI flag
+- Unit tests for each encoding
+- Integration test with gzip-compressed server response
 
-**Step 2.5: CLI enhancements**
-- Add `-X`/`--request` for HTTP method
-- Add `-H`/`--header` for custom headers
-- Add `-d`/`--data` for POST body
-- Add `-L`/`--location` for redirect following
-- Add `-v`/`--verbose` for debug output
-- Add `-o`/`--output` for file output
-- Add `-I`/`--head` for HEAD requests
-
-**Exit criteria:** `urlx -X POST -d '{"key":"value"}' -H 'Content-Type: application/json' https://httpbin.org/post` works correctly.
+**Exit criteria:** Chunked responses and gzip/br/zstd compressed responses decode correctly.
 
 ### Phase 3: HTTP/2, Proxies, Concurrency
 

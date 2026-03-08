@@ -3,6 +3,7 @@
 #![allow(clippy::unwrap_used, unused_results, clippy::significant_drop_tightening)]
 
 use std::convert::Infallible;
+use std::io::Write as _;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -412,4 +413,80 @@ async fn redirect_with_absolute_url() {
 
     assert_eq!(resp.status(), 200);
     assert_eq!(resp.body_str().unwrap(), "final destination");
+}
+
+#[tokio::test]
+async fn chunked_response_is_decoded() {
+    let server = TestServer::start(|_req| {
+        // hyper uses chunked encoding when Content-Length is not set and body is non-empty
+        Response::builder()
+            .status(200)
+            .body(Full::new(Bytes::from("chunked body content")))
+            .unwrap()
+    })
+    .await;
+
+    let mut easy = liburlx::Easy::new();
+    easy.url(&server.url("/")).unwrap();
+    let resp = easy.perform_async().await.unwrap();
+
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.body_str().unwrap(), "chunked body content");
+}
+
+#[tokio::test]
+async fn gzip_decompression() {
+    let server = TestServer::start(|req| {
+        // Only compress if client accepts gzip
+        let accepts_gzip = req
+            .headers()
+            .get("accept-encoding")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.contains("gzip"));
+
+        if accepts_gzip {
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+            encoder.write_all(b"compressed content").unwrap();
+            let compressed = encoder.finish().unwrap();
+
+            Response::builder()
+                .status(200)
+                .header("content-encoding", "gzip")
+                .header("content-length", compressed.len().to_string())
+                .body(Full::new(Bytes::from(compressed)))
+                .unwrap()
+        } else {
+            Response::builder()
+                .status(200)
+                .header("content-length", "18")
+                .body(Full::new(Bytes::from("compressed content")))
+                .unwrap()
+        }
+    })
+    .await;
+
+    // With accept_encoding enabled, response should be decompressed
+    let mut easy = liburlx::Easy::new();
+    easy.url(&server.url("/")).unwrap();
+    easy.accept_encoding(true);
+    let resp = easy.perform_async().await.unwrap();
+
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.body_str().unwrap(), "compressed content");
+}
+
+#[tokio::test]
+async fn no_decompression_without_accept_encoding() {
+    let server = TestServer::start(|_req| {
+        Response::builder().status(200).body(Full::new(Bytes::from("plain content"))).unwrap()
+    })
+    .await;
+
+    // Without accept_encoding, no Accept-Encoding header is sent
+    let mut easy = liburlx::Easy::new();
+    easy.url(&server.url("/")).unwrap();
+    let resp = easy.perform_async().await.unwrap();
+
+    assert_eq!(resp.body_str().unwrap(), "plain content");
 }

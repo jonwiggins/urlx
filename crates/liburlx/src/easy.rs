@@ -20,6 +20,7 @@ pub struct Easy {
     follow_redirects: bool,
     max_redirects: u32,
     verbose: bool,
+    accept_encoding: bool,
 }
 
 impl Easy {
@@ -34,6 +35,7 @@ impl Easy {
             follow_redirects: false,
             max_redirects: 50,
             verbose: false,
+            accept_encoding: false,
         }
     }
 
@@ -83,6 +85,14 @@ impl Easy {
         self.verbose = enable;
     }
 
+    /// Enable automatic Content-Encoding decompression.
+    ///
+    /// When enabled, sends `Accept-Encoding` header and decompresses
+    /// gzip, deflate, brotli, and zstd response bodies.
+    pub fn accept_encoding(&mut self, enable: bool) {
+        self.accept_encoding = enable;
+    }
+
     /// Perform the transfer and return the response (blocking).
     ///
     /// Creates a new tokio runtime internally. Do not call from within
@@ -120,6 +130,7 @@ impl Easy {
             self.follow_redirects,
             self.max_redirects,
             self.verbose,
+            self.accept_encoding,
         )
         .await
     }
@@ -141,6 +152,7 @@ async fn perform_transfer(
     follow_redirects: bool,
     max_redirects: u32,
     verbose: bool,
+    accept_encoding: bool,
 ) -> Result<Response, Error> {
     let mut current_url = url.clone();
     let mut current_method = method.unwrap_or("GET").to_string();
@@ -154,6 +166,7 @@ async fn perform_transfer(
             headers,
             current_body.as_deref(),
             verbose,
+            accept_encoding,
         )
         .await?;
 
@@ -206,18 +219,29 @@ async fn perform_transfer(
 }
 
 /// Perform a single HTTP request (no redirect handling).
+#[allow(clippy::too_many_arguments)]
 async fn do_single_request(
     url: &Url,
     method: &str,
     headers: &[(String, String)],
     body: Option<&[u8]>,
     verbose: bool,
+    accept_encoding: bool,
 ) -> Result<Response, Error> {
     let (host, port) = url.host_and_port()?;
     let request_target = url.request_target();
 
     // Host header should include port for non-default ports
     let host_header = url.host_header_value();
+
+    // Build effective headers (add Accept-Encoding if decompression enabled)
+    let mut effective_headers: Vec<(String, String)> = headers.to_vec();
+    if accept_encoding && !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("accept-encoding")) {
+        effective_headers.push((
+            "Accept-Encoding".to_string(),
+            crate::protocol::http::decompress::accepted_encodings().to_string(),
+        ));
+    }
 
     if verbose {
         #[allow(clippy::print_stderr)]
@@ -230,7 +254,7 @@ async fn do_single_request(
     let addr = format!("{host}:{port}");
     let tcp_stream = tokio::net::TcpStream::connect(&addr).await.map_err(Error::Connect)?;
 
-    match url.scheme() {
+    let response = match url.scheme() {
         "https" => {
             #[cfg(feature = "rustls")]
             {
@@ -241,15 +265,15 @@ async fn do_single_request(
                     method,
                     &host_header,
                     &request_target,
-                    headers,
+                    &effective_headers,
                     body,
                     url.as_str(),
                 )
-                .await
+                .await?
             }
             #[cfg(not(feature = "rustls"))]
             {
-                Err(Error::Http("HTTPS support requires the 'rustls' feature".to_string()))
+                return Err(Error::Http("HTTPS support requires the 'rustls' feature".to_string()));
             }
         }
         "http" => {
@@ -259,14 +283,32 @@ async fn do_single_request(
                 method,
                 &host_header,
                 &request_target,
-                headers,
+                &effective_headers,
                 body,
                 url.as_str(),
             )
-            .await
+            .await?
         }
-        scheme => Err(Error::Http(format!("unsupported scheme: {scheme}"))),
+        scheme => return Err(Error::Http(format!("unsupported scheme: {scheme}"))),
+    };
+
+    // Decompress body if Content-Encoding is present and we requested compression
+    if accept_encoding {
+        if let Some(encoding) = response.header("content-encoding") {
+            if encoding != "identity" {
+                let decompressed =
+                    crate::protocol::http::decompress::decompress(response.body(), encoding)?;
+                return Ok(Response::new(
+                    response.status(),
+                    response.headers().clone(),
+                    decompressed,
+                    response.effective_url().to_string(),
+                ));
+            }
+        }
     }
+
+    Ok(response)
 }
 
 /// Resolve a relative URL against a base URL.
@@ -361,6 +403,14 @@ mod tests {
         let mut easy = Easy::new();
         easy.follow_redirects(true);
         assert!(easy.follow_redirects);
+    }
+
+    #[test]
+    fn easy_accept_encoding() {
+        let mut easy = Easy::new();
+        assert!(!easy.accept_encoding);
+        easy.accept_encoding(true);
+        assert!(easy.accept_encoding);
     }
 
     #[test]
