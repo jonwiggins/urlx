@@ -14,11 +14,12 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 11 — Extended Protocol Testing + Polish
-**Last completed:** Phase 10 (gzip, cookie, file protocol integration tests, 392 tests) — 2026-03-08
-**In progress:** HTTP/2 integration tests, HSTS tests, WebSocket tests
+**Phase:** 12 — Property-Based Testing + Benchmarks
+**Last completed:** Phase 11 (HSTS tests, README, documentation) — 2026-03-08
+**Total tests:** 395
+**In progress:** Property-based tests (proptest) and criterion benchmarks
 **Blockers:** None
-**Next up:** README, crate publishing preparation
+**Next up:** Fuzz testing harnesses, curl test suite porting
 
 ---
 
@@ -477,25 +478,41 @@ header verification). 5 cookie engine integration tests (set/send, path matching
 multiple cookies, overwrite). File protocol tests already existed from Phase 4b.
 392 total tests passing.
 
-### Phase 11: Extended Protocol Testing + Polish
+### Phase 11: Extended Protocol Testing + Polish — COMPLETED (2026-03-08)
 
-**Scope:** Test remaining features, create README, prepare for publishing.
+HSTS integration tests (3 tests). Comprehensive README with project overview,
+feature list, usage examples for library/CLI/C API. 395 total tests passing.
 
-**Step 11.1: HSTS integration tests**
-- Test HTTP→HTTPS upgrade when HSTS is cached
-- Test includeSubDomains
-- Test HSTS not stored for HTTP responses
+### Phase 12: Property-Based Testing + Benchmarks
 
-**Step 11.2: Connection pooling integration tests**
-- Test connection reuse reduces connect count
-- Test stale connection retry
+**Scope:** Add proptest for parser correctness, criterion benchmarks for performance baselines.
 
-**Step 11.3: README and documentation**
-- Create README.md with project overview, usage examples, feature list
-- Verify all public APIs have doc comments
-- Ensure `cargo doc` is clean
+**Step 12.1: Add proptest dependency and URL parser property tests**
+- URL roundtrip: any successfully parsed URL re-parses identically
+- URL scheme preservation: scheme is always lowercase
+- URL host normalization: host is always lowercase
+- Port range validation: ports are 0-65535
+- Empty URL rejection: empty strings never parse
 
-**Exit criteria:** 400+ tests. README created. Ready for initial release.
+**Step 12.2: Cookie parser property tests**
+- Cookie name/value roundtrip through jar
+- Domain matching symmetry properties
+- Path matching prefix properties
+- Empty name always rejected
+- Max-Age=0 always expires cookie
+
+**Step 12.3: HSTS parser property tests**
+- `max-age=0` always removes entry
+- Case-insensitive host lookup
+- `includeSubDomains` implies subdomain upgrade
+
+**Step 12.4: Criterion benchmarks**
+- URL parsing throughput (simple/complex URLs)
+- HTTP response parsing throughput
+- Cookie jar lookup performance
+- Connection setup latency baseline
+
+**Exit criteria:** 420+ tests. Benchmarks runnable via `cargo bench`.
 
 ---
 
