@@ -39,10 +39,12 @@ fn run(args: &[String]) -> ExitCode {
         eprintln!("  -F, --form <name=value>  Multipart form field (use @file for file upload)");
         eprintln!("  -r, --range <range>      Byte range (e.g., 0-499, 500-, -500)");
         eprintln!("  -C, --continue-at <off>  Resume download from byte offset");
+        eprintln!("  -#, --progress-bar       Display transfer progress bar");
         return ExitCode::FAILURE;
     }
 
     let mut easy = liburlx::Easy::new();
+    let mut show_progress = false;
     let mut urls: Vec<String> = Vec::new();
     let mut output_file: Option<String> = None;
     let mut write_out: Option<String> = None;
@@ -211,6 +213,9 @@ fn run(args: &[String]) -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             }
+            "-#" | "--progress-bar" => {
+                show_progress = true;
+            }
             arg if arg.starts_with('-') => {
                 eprintln!("urlx: unknown option: {arg}");
                 return ExitCode::FAILURE;
@@ -235,9 +240,39 @@ fn run(args: &[String]) -> ExitCode {
         }
     }
 
+    if show_progress {
+        easy.progress_callback(liburlx::make_progress_callback(|info| {
+            let pct = if info.dl_total > 0 {
+                (info.dl_now * 100) / info.dl_total
+            } else {
+                0
+            };
+            let bar_width: usize = 40;
+            #[allow(clippy::cast_possible_truncation)]
+            let filled = ((pct as usize) * bar_width) / 100;
+            let empty = bar_width.saturating_sub(filled);
+            eprint!(
+                "\r[{}{}] {}% ({} bytes)",
+                "#".repeat(filled),
+                " ".repeat(empty),
+                pct,
+                info.dl_now,
+            );
+            true
+        }));
+    }
+
     match easy.perform() {
-        Ok(response) => output_response(&response, output_file.as_deref(), write_out.as_deref()),
+        Ok(response) => {
+            if show_progress {
+                eprintln!();
+            }
+            output_response(&response, output_file.as_deref(), write_out.as_deref())
+        }
         Err(e) => {
+            if show_progress {
+                eprintln!();
+            }
             eprintln!("urlx: {e}");
             ExitCode::FAILURE
         }
