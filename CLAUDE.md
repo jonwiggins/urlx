@@ -14,9 +14,9 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 5 — Protocol Expansion (FTP, MQTT)
-**Last completed:** Phase 4c (HSTS + DNS Resolve + WebSocket) — 2026-03-08
-**In progress:** Phase 5 implementation
+**Phase:** 5b — FTP Integration Tests + SOCKS Proxy
+**Last completed:** Phase 5a (FTP protocol handler) — 2026-03-08
+**In progress:** FTP integration tests, SOCKS proxy support
 **Blockers:** None
 **Next up:** Phase 6 (Drop-in Replacement)
 
@@ -414,38 +414,34 @@ includeSubDomains support. DNS resolve overrides (Easy::resolve). WebSocket
 frame codec with RFC 6455 masking, SHA-1 accept key, text/binary/ping/pong/close
 frames. 208 tests passing.
 
-### Phase 5: Protocol Expansion (FTP)
+### Phase 5a: FTP Protocol Handler — COMPLETED (2026-03-08)
 
-**Scope:** Implement FTP protocol, the most complex non-HTTP protocol in curl.
+FTP control connection codec with multi-line response parsing. Login
+(USER/PASS), PASV passive mode, RETR download, LIST directory listing.
+URL credentials extraction. 215 tests passing.
 
-**Step 5.1: FTP control connection**
-- Create `protocol/ftp.rs` module
-- FTP command/response codec (status codes, multi-line responses)
-- Login sequence: USER/PASS/ACCT
-- QUIT command for clean disconnect
-- Unit tests for command parsing
+### Phase 5b: FTP Integration Tests + SOCKS Proxy + Progress Callbacks
 
-**Step 5.2: FTP passive mode data transfer**
-- PASV/EPSV commands for passive mode
-- Data connection establishment
-- LIST command for directory listing
-- RETR command for file download
-- Integration tests with mock FTP server
+**Scope:** Complete FTP testing and add remaining HTTP infrastructure.
 
-**Step 5.3: FTP file upload**
-- STOR command for file upload
-- APPE command for append
-- TYPE command for binary/ASCII mode
-- Integration tests: upload file, verify content
+**Step 5b.1: Mock FTP server for integration tests**
+- Build minimal FTP test server using tokio
+- Integration tests: anonymous login, download, directory listing
+- Test connection failure, login failure, file not found
 
-**Step 5.4: FTP resume and SIZE**
-- REST command for resume offset
-- SIZE command for file size
-- Resume download from offset
-- Integration tests
+**Step 5b.2: SOCKS proxy support**
+- Create `proxy/socks.rs` for SOCKS4/SOCKS5 handshake
+- SOCKS5 with username/password auth
+- Wire into Easy: `easy.proxy("socks5://...")`
+- Integration tests with mock SOCKS server
 
-**Exit criteria:** FTP downloads and uploads work. Directory listing works.
-Passive mode data connections work.
+**Step 5b.3: Progress callbacks**
+- `Easy::progress_callback(fn)` for transfer progress reporting
+- Track bytes uploaded/downloaded, total size, speed
+- CLI progress bar display
+
+**Exit criteria:** FTP integration tests pass. SOCKS proxy works.
+Progress callbacks report transfer status.
 
 ### Phase 6: Drop-in Replacement
 
