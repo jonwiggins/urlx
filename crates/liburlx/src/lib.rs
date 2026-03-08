@@ -17,6 +17,7 @@ pub mod error;
 pub mod hsts;
 pub mod multi;
 pub(crate) mod pool;
+pub mod progress;
 pub mod protocol;
 pub mod proxy;
 pub mod tls;
@@ -26,6 +27,7 @@ pub use cookie::CookieJar;
 pub use easy::Easy;
 pub use error::Error;
 pub use multi::Multi;
+pub use progress::{make_progress_callback, ProgressCallback, ProgressInfo};
 pub use protocol::http::multipart::MultipartForm;
 pub use protocol::http::response::{Response, TransferInfo};
 

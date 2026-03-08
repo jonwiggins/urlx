@@ -11,6 +11,7 @@ use crate::cookie::CookieJar;
 use crate::error::Error;
 use crate::hsts::HstsCache;
 use crate::pool::{ConnectionPool, PooledStream};
+use crate::progress::{call_progress, ProgressCallback, ProgressInfo};
 use crate::protocol::http::multipart::MultipartForm;
 use crate::protocol::http::response::{Response, TransferInfo};
 use crate::url::Url;
@@ -19,7 +20,6 @@ use crate::url::Url;
 ///
 /// This is the main entry point for the liburlx API, modeled after
 /// curl's `CURL *` easy handle.
-#[derive(Debug)]
 pub struct Easy {
     url: Option<Url>,
     method: Option<String>,
@@ -38,7 +38,37 @@ pub struct Easy {
     multipart: Option<MultipartForm>,
     range: Option<String>,
     resolve_overrides: Vec<(String, String)>,
+    progress_callback: Option<ProgressCallback>,
     pool: ConnectionPool,
+}
+
+impl std::fmt::Debug for Easy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Easy")
+            .field("url", &self.url)
+            .field("method", &self.method)
+            .field("headers", &self.headers)
+            .field("body", &self.body.as_ref().map(|b| format!("<{} bytes>", b.len())))
+            .field("follow_redirects", &self.follow_redirects)
+            .field("max_redirects", &self.max_redirects)
+            .field("verbose", &self.verbose)
+            .field("accept_encoding", &self.accept_encoding)
+            .field("connect_timeout", &self.connect_timeout)
+            .field("timeout", &self.timeout)
+            .field("proxy", &self.proxy)
+            .field("noproxy", &self.noproxy)
+            .field("cookie_jar", &self.cookie_jar.as_ref().map(|_| "<CookieJar>"))
+            .field("hsts_cache", &self.hsts_cache.as_ref().map(|_| "<HstsCache>"))
+            .field("multipart", &self.multipart)
+            .field("range", &self.range)
+            .field("resolve_overrides", &self.resolve_overrides)
+            .field(
+                "progress_callback",
+                &self.progress_callback.as_ref().map(|_| "<callback>"),
+            )
+            .field("pool", &"<ConnectionPool>")
+            .finish()
+    }
 }
 
 impl Clone for Easy {
@@ -61,6 +91,7 @@ impl Clone for Easy {
             multipart: self.multipart.clone(),
             range: self.range.clone(),
             resolve_overrides: self.resolve_overrides.clone(),
+            progress_callback: self.progress_callback.clone(),
             pool: ConnectionPool::new(),
         }
     }
@@ -88,6 +119,7 @@ impl Easy {
             multipart: None,
             range: None,
             resolve_overrides: Vec::new(),
+            progress_callback: None,
             pool: ConnectionPool::new(),
         }
     }
@@ -274,6 +306,14 @@ impl Easy {
         self.range = Some(format!("{offset}-"));
     }
 
+    /// Set a progress callback for transfer monitoring.
+    ///
+    /// The callback receives a [`ProgressInfo`] with download/upload progress
+    /// and should return `true` to continue or `false` to abort the transfer.
+    pub fn progress_callback(&mut self, callback: ProgressCallback) {
+        self.progress_callback = Some(callback);
+    }
+
     /// Perform the transfer and return the response (blocking).
     ///
     /// Creates a new tokio runtime internally. Do not call from within
@@ -371,11 +411,27 @@ impl Easy {
         );
 
         // Apply total transfer timeout if set
-        if let Some(timeout) = self.timeout {
+        let response = if let Some(timeout) = self.timeout {
             tokio::time::timeout(timeout, fut).await.map_err(|_| Error::Timeout(timeout))?
         } else {
             fut.await
+        }?;
+
+        // Call progress callback with final transfer values
+        if let Some(ref cb) = self.progress_callback {
+            let ul_total = effective_body.as_ref().map_or(0, |b| b.len() as u64);
+            let info = ProgressInfo {
+                dl_total: response.body().len() as u64,
+                dl_now: response.body().len() as u64,
+                ul_total,
+                ul_now: ul_total,
+            };
+            if !call_progress(cb, &info) {
+                return Err(Error::Http("transfer aborted by progress callback".to_string()));
+            }
         }
+
+        Ok(response)
     }
 }
 
