@@ -14,11 +14,11 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 4b — FILE Protocol + Multipart Uploads + Range Requests
-**Last completed:** Phase 4a (Connection Pooling + Cookie Engine) — 2026-03-08
-**In progress:** Phase 4b implementation
+**Phase:** 4c — HSTS + DNS Resolution + WebSocket foundation
+**Last completed:** Phase 4b (FILE Protocol + Multipart + Range) — 2026-03-08
+**In progress:** Phase 4c implementation
 **Blockers:** None
-**Next up:** Phase 4c (Protocol Expansion)
+**Next up:** Phase 5 (Protocol Expansion — FTP, MQTT, etc.)
 
 ---
 
@@ -399,38 +399,43 @@ Max-Age expiry, and automatic cookie injection/storage. Connection
 pooling via PooledStream enum with streaming h1 response reading
 (Content-Length and chunked). Stale connection retry. 154 tests passing.
 
-### Phase 4b: FILE Protocol + Multipart Uploads + Range Requests
+### Phase 4b: FILE Protocol + Multipart Uploads + Range Requests — COMPLETED (2026-03-08)
 
-**Scope:** Add `file://` protocol and key HTTP upload/download features.
+FILE protocol handler with percent-decoding. Multipart form-data encoder
+with text fields and file uploads (MultipartForm API). Range request support
+with resume_from(). CLI flags: -F/--form, -r/--range, -C/--continue-at.
+185 tests passing.
 
-**Step 4b.1: FILE protocol handler**
-- Add `file` feature flag to Cargo.toml
-- Create `protocol/file.rs` module
-- Read local files via `file:///path/to/file` URLs
-- Return file contents as response body with appropriate Content-Type
-- Handle non-existent files as errors
-- Integration tests: read existing file, non-existent file, binary file
-- CLI: `urlx file:///etc/hosts` prints file contents
+### Phase 4c: HSTS + DNS Resolution + WebSocket Foundation
 
-**Step 4b.2: Multipart form uploads**
-- Create `protocol/http/multipart.rs` module
-- Build `multipart/form-data` request bodies from field/file entries
-- Generate random boundary strings
-- `Easy::form_field(name, value)` and `Easy::form_file(name, path)` API
-- CLI: `-F`/`--form` flag (e.g., `urlx -F "file=@image.png" URL`)
-- Integration tests: single field, multiple fields, file upload
+**Scope:** Add remaining HTTP-adjacent features before protocol expansion.
 
-**Step 4b.3: Range requests / resume downloads**
-- `Easy::range(start, end)` API for `Range` header
-- `Easy::resume_from(offset)` for download resumption
-- CLI: `-r`/`--range` and `-C`/`--continue-at` flags
-- Server-side 206 Partial Content handling
-- Integration tests: partial download, resume from offset
+**Step 4c.1: HSTS enforcement**
+- Create `hsts.rs` module for Strict-Transport-Security header parsing
+- HSTS cache that upgrades HTTP→HTTPS for known HSTS hosts
+- Parse `max-age`, `includeSubDomains` directives
+- Integration tests: HSTS upgrade, subdomain inclusion, max-age expiry
+- Wire into Easy: `easy.hsts(true)` to enable
 
-**Exit criteria:** `file://` reads local files. Multipart uploads work.
-Range/resume downloads work.
+**Step 4c.2: Custom DNS resolver interface**
+- Create `dns/mod.rs` with `Resolver` trait
+- `dns/system.rs` — System resolver (current behavior via `TcpStream::connect`)
+- `Easy::resolve(host, addr)` for manual DNS override (like curl's `--resolve`)
+- Integration tests: resolve override, DNS failure
 
-### Phase 4c: Protocol Expansion
+**Step 4c.3: WebSocket protocol**
+- Create `protocol/ws.rs` for WebSocket upgrade handshake
+- HTTP/1.1 → WebSocket upgrade via Upgrade: websocket header
+- Frame encoding/decoding (text, binary, ping/pong, close)
+- `Easy::websocket()` to enable WS mode
+- Integration tests: connect, send/receive text, binary, close
+
+**Exit criteria:** HSTS auto-upgrades HTTP to HTTPS. DNS resolve overrides
+work. Basic WebSocket connections succeed.
+
+### Phase 5: Protocol Expansion
+
+### Phase 5: Protocol Expansion (FTP, MQTT, etc.)
 
 **Write tests first for each protocol before implementing:**
 - FTP/FTPS (active, passive, upload, download, directory listing, resume)
@@ -439,7 +444,7 @@ Range/resume downloads work.
 - SMTP/IMAP/POP3
 - LDAP
 
-### Phase 5: Drop-in Replacement
+### Phase 6: Drop-in Replacement
 
 **The test suite IS the specification here:**
 - Port curl's 1,918 test cases to run against `liburlx-ffi`
