@@ -33,11 +33,13 @@ fn run(args: &[String]) -> ExitCode {
         eprintln!("      --connect-timeout <s> Maximum time for connection in seconds");
         eprintln!("  -m, --max-time <s>       Maximum time for transfer in seconds");
         eprintln!("  -u, --user <user:pass>   HTTP Basic authentication");
+        eprintln!("  -w, --write-out <fmt>    Output format after transfer");
         return ExitCode::FAILURE;
     }
 
     let mut easy = liburlx::Easy::new();
     let mut output_file: Option<String> = None;
+    let mut write_out: Option<String> = None;
     let mut i = 1;
 
     while i < args.len() {
@@ -121,6 +123,14 @@ fn run(args: &[String]) -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             }
+            "-w" | "--write-out" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("urlx: option -w requires an argument");
+                    return ExitCode::FAILURE;
+                }
+                write_out = Some(args[i].clone());
+            }
             "-u" | "--user" => {
                 i += 1;
                 if i >= args.len() {
@@ -162,6 +172,13 @@ fn run(args: &[String]) -> ExitCode {
                 eprintln!("urlx: write error: {e}");
                 return ExitCode::FAILURE;
             }
+
+            // Write-out formatting
+            if let Some(ref fmt) = write_out {
+                let output = format_write_out(fmt, &response);
+                print!("{output}");
+            }
+
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -169,4 +186,27 @@ fn run(args: &[String]) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Format a --write-out string by replacing %{variable} placeholders.
+fn format_write_out(fmt: &str, response: &liburlx::Response) -> String {
+    let info = response.transfer_info();
+    let mut result = fmt.to_string();
+
+    // Replace known variables
+    result = result.replace("%{http_code}", &response.status().to_string());
+    result = result.replace("%{response_code}", &response.status().to_string());
+    result = result.replace("%{url_effective}", response.effective_url());
+    result = result.replace("%{content_type}", response.content_type().unwrap_or(""));
+    result = result.replace("%{size_download}", &response.size_download().to_string());
+    result = result.replace("%{time_total}", &format!("{:.6}", info.time_total.as_secs_f64()));
+    result = result.replace("%{time_connect}", &format!("{:.6}", info.time_connect.as_secs_f64()));
+    result = result.replace("%{num_redirects}", &info.num_redirects.to_string());
+
+    // Handle escape sequences
+    result = result.replace("\\n", "\n");
+    result = result.replace("\\t", "\t");
+    result = result.replace("\\r", "\r");
+
+    result
 }

@@ -19,7 +19,7 @@ pub mod url;
 
 pub use easy::Easy;
 pub use error::Error;
-pub use protocol::http::response::Response;
+pub use protocol::http::response::{Response, TransferInfo};
 
 /// Convenience result type for liburlx operations.
 pub type Result<T> = std::result::Result<T, Error>;

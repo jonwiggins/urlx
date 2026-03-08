@@ -557,3 +557,43 @@ async fn bearer_token_header_sent() {
 
     assert_eq!(resp.body_str().unwrap(), "Bearer my-api-token");
 }
+
+#[tokio::test]
+async fn transfer_info_is_populated() {
+    let server = TestServer::start(|_req| {
+        Response::builder().status(200).body(Full::new(Bytes::from("info test"))).unwrap()
+    })
+    .await;
+
+    let mut easy = liburlx::Easy::new();
+    easy.url(&server.url("/")).unwrap();
+    let resp = easy.perform_async().await.unwrap();
+
+    let info = resp.transfer_info();
+    assert!(info.time_total.as_nanos() > 0, "time_total should be > 0");
+    assert_eq!(info.num_redirects, 0);
+    assert_eq!(resp.size_download(), 9); // "info test" = 9 bytes
+}
+
+#[tokio::test]
+async fn transfer_info_counts_redirects() {
+    let server = TestServer::start(|req| {
+        if req.uri().path() == "/start" {
+            Response::builder()
+                .status(302)
+                .header("location", "/end")
+                .body(Full::new(Bytes::new()))
+                .unwrap()
+        } else {
+            Response::builder().status(200).body(Full::new(Bytes::from("done"))).unwrap()
+        }
+    })
+    .await;
+
+    let mut easy = liburlx::Easy::new();
+    easy.url(&server.url("/start")).unwrap();
+    easy.follow_redirects(true);
+    let resp = easy.perform_async().await.unwrap();
+
+    assert_eq!(resp.transfer_info().num_redirects, 1);
+}

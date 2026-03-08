@@ -3,10 +3,10 @@
 //! The `Easy` handle is the primary way to perform URL transfers.
 //! It provides a blocking API that wraps the async internals.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::error::Error;
-use crate::protocol::http::response::Response;
+use crate::protocol::http::response::{Response, TransferInfo};
 use crate::url::Url;
 
 /// A handle for performing a single URL transfer.
@@ -201,12 +201,15 @@ async fn perform_transfer(
     accept_encoding: bool,
     connect_timeout: Option<Duration>,
 ) -> Result<Response, Error> {
+    let transfer_start = Instant::now();
     let mut current_url = url.clone();
     let mut current_method = method.unwrap_or("GET").to_string();
     let mut current_body = body.map(<[u8]>::to_vec);
     let mut redirects_followed: u32 = 0;
+    let mut last_connect_time;
 
     loop {
+        let connect_start = Instant::now();
         let response = do_single_request(
             &current_url,
             &current_method,
@@ -217,6 +220,7 @@ async fn perform_transfer(
             connect_timeout,
         )
         .await?;
+        last_connect_time = connect_start.elapsed();
 
         // Check for redirects
         if follow_redirects && response.is_redirect() {
@@ -262,6 +266,12 @@ async fn perform_transfer(
             }
         }
 
+        let mut response = response;
+        response.set_transfer_info(TransferInfo {
+            time_connect: last_connect_time,
+            time_total: transfer_start.elapsed(),
+            num_redirects: redirects_followed,
+        });
         return Ok(response);
     }
 }

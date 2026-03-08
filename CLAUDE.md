@@ -14,11 +14,11 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 2c — HTTP Feature Completeness (timeouts + auth)
-**Last completed:** Phase 2b (chunked encoding, gzip/br/zstd decompression) — 2026-03-08
-**In progress:** Connect/transfer timeouts, Basic/Bearer authentication
+**Phase:** 2d — HTTP Feature Completeness (transfer info + write-out)
+**Last completed:** Phase 2c (timeouts, Basic/Bearer auth) — 2026-03-08
+**In progress:** Transfer timing info, --write-out/-w support
 **Blockers:** None
-**Next up:** Phase 2d (cookie engine, connection pooling), then Phase 3
+**Next up:** Phase 3 (HTTP/2, Proxies, Concurrency)
 
 ---
 
@@ -413,6 +413,30 @@ HTTP authentication for API usage.
 - Integration test
 
 **Exit criteria:** Timeouts prevent hangs. Basic/Bearer auth works with APIs.
+
+### Phase 2c: Timeouts + Authentication — COMPLETED (2026-03-08)
+
+Connect timeout, total transfer timeout, Basic and Bearer authentication.
+CLI flags: --connect-timeout, -m/--max-time, -u/--user. 94 tests passing.
+
+### Phase 2d: Transfer Info + Write-Out (CURRENT)
+
+**Scope:** Add transfer timing/info queries and --write-out support for
+extracting response metadata. These are essential for scripting and debugging.
+
+**Step 2d.1: Transfer info on Response**
+- Add timing fields to Response (or separate TransferInfo struct)
+- Track: total_time, connect_time, response status code (already have)
+- Track: effective_url (already have), content_type, response_code
+- Track: size_download (body length)
+
+**Step 2d.2: --write-out / -w CLI support**
+- Parse format string with %{variable} placeholders
+- Support: http_code, url_effective, content_type, size_download,
+  time_total, time_connect, num_redirects
+- Add `-w`/`--write-out` flag to CLI
+
+**Exit criteria:** `urlx -w '%{http_code}\n' -o /dev/null` prints status code.
 
 ### Phase 3: HTTP/2, Proxies, Concurrency
 

@@ -1,6 +1,18 @@
 //! HTTP response representation.
 
 use std::collections::HashMap;
+use std::time::Duration;
+
+/// Transfer timing and metadata information.
+#[derive(Debug, Clone, Default)]
+pub struct TransferInfo {
+    /// Time from start until TCP connection was established.
+    pub time_connect: Duration,
+    /// Total time for the entire transfer.
+    pub time_total: Duration,
+    /// Number of redirects followed.
+    pub num_redirects: u32,
+}
 
 /// An HTTP response with status, headers, and body.
 #[derive(Debug, Clone)]
@@ -13,18 +25,32 @@ pub struct Response {
     body: Vec<u8>,
     /// The effective URL after any redirects.
     effective_url: String,
+    /// Transfer timing and metadata.
+    info: TransferInfo,
 }
 
 impl Response {
     /// Create a new response.
     #[must_use]
-    pub const fn new(
+    pub fn new(
         status: u16,
         headers: HashMap<String, String>,
         body: Vec<u8>,
         effective_url: String,
     ) -> Self {
-        Self { status, headers, body, effective_url }
+        Self { status, headers, body, effective_url, info: TransferInfo::default() }
+    }
+
+    /// Create a new response with transfer info.
+    #[must_use]
+    pub const fn with_info(
+        status: u16,
+        headers: HashMap<String, String>,
+        body: Vec<u8>,
+        effective_url: String,
+        info: TransferInfo,
+    ) -> Self {
+        Self { status, headers, body, effective_url, info }
     }
 
     /// Returns the HTTP status code.
@@ -72,6 +98,29 @@ impl Response {
     #[must_use]
     pub fn is_redirect(&self) -> bool {
         matches!(self.status, 301 | 302 | 303 | 307 | 308) && self.headers.contains_key("location")
+    }
+
+    /// Returns the Content-Type header value, if present.
+    #[must_use]
+    pub fn content_type(&self) -> Option<&str> {
+        self.header("content-type")
+    }
+
+    /// Returns the size of the response body in bytes.
+    #[must_use]
+    pub fn size_download(&self) -> usize {
+        self.body.len()
+    }
+
+    /// Returns the transfer timing and metadata.
+    #[must_use]
+    pub const fn transfer_info(&self) -> &TransferInfo {
+        &self.info
+    }
+
+    /// Set the transfer info on this response.
+    pub fn set_transfer_info(&mut self, info: TransferInfo) {
+        self.info = info;
     }
 }
 
