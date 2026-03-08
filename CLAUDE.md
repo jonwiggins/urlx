@@ -14,11 +14,11 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 8 — Curl Test Suite Porting + Polish
-**Last completed:** Phase 7b (CLI completeness + integration tests) — 2026-03-08
-**In progress:** C header generation, curl behavioral test porting
+**Phase:** 9 — Hardening + Production Readiness
+**Last completed:** Phase 8 (C header generation, curl compat tests) — 2026-03-08
+**In progress:** Error handling hardening, edge cases, documentation
 **Blockers:** None
-**Next up:** Differential testing, documentation
+**Next up:** Performance benchmarks, fuzz testing
 
 ---
 
@@ -455,30 +455,45 @@ CLI expanded with 10 new flags: -s/--silent, -S/--show-error, -f/--fail (exit 22
 tests covering GET/POST/PUT/DELETE/HEAD, headers, status codes, redirects,
 timeouts, auth, encoding, ranges, multi-transfers. 336 total tests passing.
 
-### Phase 8: Curl Test Suite Porting + Polish
+### Phase 8: Curl Test Suite Porting + Polish — COMPLETED (2026-03-08)
 
-**Scope:** C header generation, behavioral tests, documentation.
+C header generation via cbindgen with libcurl-compatible urlx.h (CURLcode,
+CURLoption, CURLINFO enums, curl_easy_* functions, CURL typedef). 14 curl
+behavioral compatibility tests covering redirect semantics (301/302/303/307/308),
+cookie engine, relative URLs, effective URL tracking, auth, HEAD. Documentation
+builds cleanly with no warnings. 350 total tests passing.
 
-**Step 8.1: C header generation**
-- Set up cbindgen to generate urlx.h from liburlx-ffi
-- Configure cbindgen.toml for libcurl-compatible header output
-- Verify header compiles with a C test program
+### Phase 9: Hardening + Production Readiness
 
-**Step 8.2: Behavioral compatibility tests**
-- Port curl's basic HTTP GET test cases (verify status, body, headers)
-- Port redirect behavior tests (301/302/303/307/308 semantics)
-- Port POST data handling tests
-- Port authentication tests (Basic, Bearer)
-- Test cookie engine behavior against curl
+**Scope:** Error handling improvements, edge case coverage, URL parsing hardening.
 
-**Step 8.3: Documentation**
-- Crate-level documentation for liburlx, liburlx-ffi, urlx-cli
-- Module-level docs for all public modules
-- README with usage examples, build instructions, feature list
-- Verify `cargo doc --workspace --no-deps` passes cleanly
+**Step 9.1: URL parser edge cases**
+- Test IDN domains, punycode
+- Test percent-encoded characters in path/query
+- Test URLs with credentials (user:pass@host)
+- Test empty/missing components
+- Test file:// URLs with spaces and special characters
+- Test URL normalization (trailing slashes, double slashes)
 
-**Exit criteria:** C header generated and compilable. Key curl behavioral
-tests ported. Documentation complete. 350+ tests passing.
+**Step 9.2: HTTP parser edge cases**
+- Test chunked encoding edge cases (empty chunks, trailer headers)
+- Test malformed HTTP responses (missing status line, truncated headers)
+- Test very large headers / many headers
+- Test HTTP/1.0 vs HTTP/1.1 behavior differences
+- Test connection: close vs keep-alive
+
+**Step 9.3: Error handling review**
+- Ensure all error paths have tests
+- Verify error messages are actionable
+- Test error recovery (retry on stale connections)
+- Test graceful handling of server disconnects
+
+**Step 9.4: Performance benchmarks**
+- Throughput benchmark for large downloads
+- Connection establishment latency benchmark
+- Concurrent transfer benchmark with Multi API
+
+**Exit criteria:** 380+ tests. All edge cases covered. Benchmark baselines established.
 
 ---
 
