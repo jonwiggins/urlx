@@ -6,4 +6,7 @@
 pub mod file;
 pub mod ftp;
 pub mod http;
+pub mod imap;
+pub mod pop3;
+pub mod smtp;
 pub mod ws;
