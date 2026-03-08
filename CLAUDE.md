@@ -14,10 +14,10 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 12 — Property-Based Testing + Benchmarks
-**Last completed:** Phase 11 (HSTS tests, README, documentation) — 2026-03-08
-**Total tests:** 395
-**In progress:** Property-based tests (proptest) and criterion benchmarks
+**Phase:** 13 — Robustness Testing + Error Path Hardening
+**Last completed:** Phase 12 (proptest, criterion benchmarks) — 2026-03-08
+**Total tests:** 421
+**In progress:** Error path testing, protocol error handling, stress tests
 **Blockers:** None
 **Next up:** Fuzz testing harnesses, curl test suite porting
 
@@ -483,36 +483,45 @@ multiple cookies, overwrite). File protocol tests already existed from Phase 4b.
 HSTS integration tests (3 tests). Comprehensive README with project overview,
 feature list, usage examples for library/CLI/C API. 395 total tests passing.
 
-### Phase 12: Property-Based Testing + Benchmarks
+### Phase 12: Property-Based Testing + Benchmarks — COMPLETED (2026-03-08)
 
-**Scope:** Add proptest for parser correctness, criterion benchmarks for performance baselines.
+26 property-based tests via proptest (URL parser, cookie engine, HSTS cache).
+Criterion benchmarks for URL parsing, cookie jar, and HSTS cache throughput.
+421 total tests passing. Benchmarks runnable via `cargo bench -p liburlx`.
 
-**Step 12.1: Add proptest dependency and URL parser property tests**
-- URL roundtrip: any successfully parsed URL re-parses identically
-- URL scheme preservation: scheme is always lowercase
-- URL host normalization: host is always lowercase
-- Port range validation: ports are 0-65535
-- Empty URL rejection: empty strings never parse
+### Phase 13: Robustness Testing + Error Path Hardening
 
-**Step 12.2: Cookie parser property tests**
-- Cookie name/value roundtrip through jar
-- Domain matching symmetry properties
-- Path matching prefix properties
-- Empty name always rejected
-- Max-Age=0 always expires cookie
+**Scope:** Test error paths, malformed inputs, protocol edge cases, and stress scenarios.
 
-**Step 12.3: HSTS parser property tests**
-- `max-age=0` always removes entry
-- Case-insensitive host lookup
-- `includeSubDomains` implies subdomain upgrade
+**Step 13.1: HTTP protocol error handling tests**
+- Server drops connection mid-response
+- Malformed HTTP status line
+- Invalid Content-Length (negative, overflow)
+- Missing Content-Length with connection close
+- Chunked encoding with invalid chunk size
+- Header-only response (no body at all)
 
-**Step 12.4: Criterion benchmarks**
-- URL parsing throughput (simple/complex URLs)
-- HTTP response parsing throughput
-- Cookie jar lookup performance
-- Connection setup latency baseline
+**Step 13.2: Cookie jar stress tests**
+- Very long cookie names and values
+- Many cookies (1000+) for a single domain
+- Cookie with special characters in value
+- Deeply nested subdomain matching
 
-**Exit criteria:** 420+ tests. Benchmarks runnable via `cargo bench`.
+**Step 13.3: URL parser malformed input tests**
+- URLs with null bytes
+- URLs with control characters
+- Extremely long URLs (100KB+)
+- URLs with only scheme (e.g., "http://")
+- IPv6 addresses (various formats)
+- Internationalized domain names
+
+**Step 13.4: Transfer error recovery tests**
+- Connection reset during transfer
+- DNS resolution failure
+- TLS handshake errors
+- Proxy connection refused
+
+**Exit criteria:** 460+ tests. All error paths tested with expected error types.
 
 ---
 
