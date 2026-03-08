@@ -14,11 +14,11 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 4a — Connection Pooling + Cookie Engine
-**Last completed:** Phase 3c (Multi API for concurrent transfers) — 2026-03-08
-**In progress:** Connection pooling for HTTP keep-alive
+**Phase:** 4b — FILE Protocol + Multipart Uploads + Range Requests
+**Last completed:** Phase 4a (Connection Pooling + Cookie Engine) — 2026-03-08
+**In progress:** Phase 4b implementation
 **Blockers:** None
-**Next up:** Phase 4b (FILE protocol, WebSocket)
+**Next up:** Phase 4c (Protocol Expansion)
 
 ---
 
@@ -27,6 +27,8 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 - **2026-03-08:** Workspace lint inheritance is all-or-nothing in Cargo. `unsafe_code = "deny"` is enforced via `#![deny(unsafe_code)]` in source files (liburlx, urlx-cli) rather than workspace lints, since liburlx-ffi needs to allow it and can't partially override workspace lints.
 - **2026-03-08:** `rustfmt.toml` uses only stable options (`edition`, `max_width`, `use_small_heuristics`). `imports_granularity` and `group_imports` are nightly-only and omitted.
 - **2026-03-08:** cargo-deny v0.19 uses a simplified config format — `vulnerability`/`unmaintained`/`unlicensed`/`copyleft` keys were removed.
+- **2026-03-08:** Connection pool uses `PooledStream` enum (Tcp/Tls variants) with AsyncRead/AsyncWrite delegation, avoiding trait objects. Pool only stores non-proxied H1 connections; H2 multiplexing handles its own reuse.
+- **2026-03-08:** For keep-alive, responses with no Content-Length and no chunked encoding (e.g., 204 No Content) are treated as empty body to avoid hanging on `read_to_end`. Stale pooled connections trigger automatic retry with fresh connection.
 
 ---
 
@@ -390,37 +392,43 @@ Multi handle with JoinSet-based concurrent execution. Preserves result
 ordering. Blocking `perform_blocking()` wrapper. CLI multi-URL support.
 123 tests passing.
 
-### Phase 4a: Connection Pooling + Cookie Engine
+### Phase 4a: Connection Pooling + Cookie Engine — COMPLETED (2026-03-08)
 
-**Scope:** Fill in remaining HTTP feature gaps before expanding to new protocols.
+Cookie engine with RFC 6265 Set-Cookie parsing, domain/path matching,
+Max-Age expiry, and automatic cookie injection/storage. Connection
+pooling via PooledStream enum with streaming h1 response reading
+(Content-Length and chunked). Stale connection retry. 154 tests passing.
 
-**Step 4a.1: Connection pooling (HTTP keep-alive)**
-- Create `pool.rs` module with `ConnectionPool`
-- Pool keyed by (host, port, scheme)
-- Reuse TCP/TLS connections for subsequent requests to same host
-- Support `Connection: keep-alive` (HTTP/1.1 default)
-- Remove `Connection: close` from default headers
-- Unit tests for pool operations
-- Integration test verifying connection reuse
+### Phase 4b: FILE Protocol + Multipart Uploads + Range Requests
 
-**Step 4a.2: Cookie engine**
-- Create `cookie.rs` module with `CookieJar`
-- Parse `Set-Cookie` response headers
-- Send matching cookies in `Cookie` request header
-- Domain/path matching per RFC 6265
-- Cookie expiration (Max-Age, Expires)
-- `cookie_jar()` method on Easy to enable cookie handling
-- Integration tests with Set-Cookie/Cookie round-trip
+**Scope:** Add `file://` protocol and key HTTP upload/download features.
 
-**Exit criteria:** Connections are reused across requests. Cookies are
-stored and sent automatically.
+**Step 4b.1: FILE protocol handler**
+- Add `file` feature flag to Cargo.toml
+- Create `protocol/file.rs` module
+- Read local files via `file:///path/to/file` URLs
+- Return file contents as response body with appropriate Content-Type
+- Handle non-existent files as errors
+- Integration tests: read existing file, non-existent file, binary file
+- CLI: `urlx file:///etc/hosts` prints file contents
 
-### Phase 4b: FILE Protocol + Additional HTTP Features
+**Step 4b.2: Multipart form uploads**
+- Create `protocol/http/multipart.rs` module
+- Build `multipart/form-data` request bodies from field/file entries
+- Generate random boundary strings
+- `Easy::form_field(name, value)` and `Easy::form_file(name, path)` API
+- CLI: `-F`/`--form` flag (e.g., `urlx -F "file=@image.png" URL`)
+- Integration tests: single field, multiple fields, file upload
 
-- `file://` protocol handler (read local files)
-- Multipart form uploads (POST with `Content-Type: multipart/form-data`)
-- Range requests / resume downloads
-- HSTS enforcement
+**Step 4b.3: Range requests / resume downloads**
+- `Easy::range(start, end)` API for `Range` header
+- `Easy::resume_from(offset)` for download resumption
+- CLI: `-r`/`--range` and `-C`/`--continue-at` flags
+- Server-side 206 Partial Content handling
+- Integration tests: partial download, resume from offset
+
+**Exit criteria:** `file://` reads local files. Multipart uploads work.
+Range/resume downloads work.
 
 ### Phase 4c: Protocol Expansion
 
