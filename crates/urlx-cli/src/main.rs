@@ -40,6 +40,7 @@ fn run(args: &[String]) -> ExitCode {
     }
 
     let mut easy = liburlx::Easy::new();
+    let mut urls: Vec<String> = Vec::new();
     let mut output_file: Option<String> = None;
     let mut write_out: Option<String> = None;
     let mut i = 1;
@@ -170,42 +171,108 @@ fn run(args: &[String]) -> ExitCode {
                 return ExitCode::FAILURE;
             }
             url => {
-                if let Err(e) = easy.url(url) {
-                    eprintln!("urlx: error parsing URL: {e}");
-                    return ExitCode::FAILURE;
-                }
+                urls.push(url.to_string());
             }
         }
         i += 1;
     }
 
-    match easy.perform() {
-        Ok(response) => {
-            if let Some(ref path) = output_file {
-                match std::fs::write(path, response.body()) {
-                    Ok(()) => {}
-                    Err(e) => {
-                        eprintln!("urlx: error writing to {path}: {e}");
-                        return ExitCode::FAILURE;
-                    }
-                }
-            } else if let Err(e) = std::io::stdout().write_all(response.body()) {
-                eprintln!("urlx: write error: {e}");
-                return ExitCode::FAILURE;
-            }
+    // Multiple URLs: use Multi API for concurrent transfers
+    if urls.len() > 1 {
+        return run_multi(&easy, &urls, output_file.as_deref(), write_out.as_deref());
+    }
 
-            // Write-out formatting
-            if let Some(ref fmt) = write_out {
-                let output = format_write_out(fmt, &response);
-                print!("{output}");
-            }
-
-            ExitCode::SUCCESS
+    // Single URL: use Easy API
+    if let Some(url) = urls.first() {
+        if let Err(e) = easy.url(url) {
+            eprintln!("urlx: error parsing URL: {e}");
+            return ExitCode::FAILURE;
         }
+    }
+
+    match easy.perform() {
+        Ok(response) => output_response(&response, output_file.as_deref(), write_out.as_deref()),
         Err(e) => {
             eprintln!("urlx: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Output a single response to stdout or file.
+fn output_response(
+    response: &liburlx::Response,
+    output_file: Option<&str>,
+    write_out: Option<&str>,
+) -> ExitCode {
+    if let Some(path) = output_file {
+        if let Err(e) = std::fs::write(path, response.body()) {
+            eprintln!("urlx: error writing to {path}: {e}");
+            return ExitCode::FAILURE;
+        }
+    } else if let Err(e) = std::io::stdout().write_all(response.body()) {
+        eprintln!("urlx: write error: {e}");
+        return ExitCode::FAILURE;
+    }
+
+    if let Some(fmt) = write_out {
+        let output = format_write_out(fmt, response);
+        print!("{output}");
+    }
+
+    ExitCode::SUCCESS
+}
+
+/// Run multiple URLs concurrently using the Multi API.
+fn run_multi(
+    template: &liburlx::Easy,
+    urls: &[String],
+    _output_file: Option<&str>,
+    write_out: Option<&str>,
+) -> ExitCode {
+    let mut multi = liburlx::Multi::new();
+
+    for url in urls {
+        let mut easy = template.clone();
+        if let Err(e) = easy.url(url) {
+            eprintln!("urlx: error parsing URL '{url}': {e}");
+            return ExitCode::FAILURE;
+        }
+        multi.add(easy);
+    }
+
+    let results = match multi.perform_blocking() {
+        Ok(results) => results,
+        Err(e) => {
+            eprintln!("urlx: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut any_failed = false;
+
+    for (i, result) in results.into_iter().enumerate() {
+        match result {
+            Ok(response) => {
+                if let Err(e) = std::io::stdout().write_all(response.body()) {
+                    eprintln!("urlx: write error: {e}");
+                    any_failed = true;
+                }
+                if let Some(fmt) = write_out {
+                    let output = format_write_out(fmt, &response);
+                    print!("{output}");
+                }
+            }
+            Err(e) => {
+                eprintln!("urlx: transfer {} ({}): {e}", i + 1, urls[i]);
+                any_failed = true;
+            }
+        }
+    }
+
+    if any_failed {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
     }
 }
 

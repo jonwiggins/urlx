@@ -13,12 +13,14 @@
 
 pub mod easy;
 pub mod error;
+pub mod multi;
 pub mod protocol;
 pub mod tls;
 pub mod url;
 
 pub use easy::Easy;
 pub use error::Error;
+pub use multi::Multi;
 pub use protocol::http::response::{Response, TransferInfo};
 
 /// Convenience result type for liburlx operations.
