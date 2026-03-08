@@ -62,10 +62,7 @@ impl std::fmt::Debug for Easy {
             .field("multipart", &self.multipart)
             .field("range", &self.range)
             .field("resolve_overrides", &self.resolve_overrides)
-            .field(
-                "progress_callback",
-                &self.progress_callback.as_ref().map(|_| "<callback>"),
-            )
+            .field("progress_callback", &self.progress_callback.as_ref().map(|_| "<callback>"))
             .field("pool", &"<ConnectionPool>")
             .finish()
     }

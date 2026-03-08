@@ -242,11 +242,7 @@ fn run(args: &[String]) -> ExitCode {
 
     if show_progress {
         easy.progress_callback(liburlx::make_progress_callback(|info| {
-            let pct = if info.dl_total > 0 {
-                (info.dl_now * 100) / info.dl_total
-            } else {
-                0
-            };
+            let pct = if info.dl_total > 0 { (info.dl_now * 100) / info.dl_total } else { 0 };
             let bar_width: usize = 40;
             #[allow(clippy::cast_possible_truncation)]
             let filled = ((pct as usize) * bar_width) / 100;
