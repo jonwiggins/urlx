@@ -1,0 +1,36 @@
+# cbindgen configuration for liburlx-ffi
+# Generates a C header that is compatible with libcurl's API
+
+language = "C"
+include_guard = "URLX_H"
+tab_width = 4
+style = "both"
+cpp_compat = true
+
+header = "/* urlx — libcurl-compatible C API */"
+after_includes = "typedef void CURL;"
+trailer = ""
+
+[parse]
+parse_deps = false
+
+[export]
+include = [
+    "CURLcode",
+    "CURLoption",
+    "CURLINFO",
+]
+
+[export.rename]
+# Maintain libcurl naming conventions
+
+[fn]
+prefix = ""
+postfix = ""
+
+[enum]
+rename_variants = "None"
+
+[defines]
+# Make CURL an alias for void* (opaque handle)
+"CURL" = "void"
