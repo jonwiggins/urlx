@@ -14,12 +14,12 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 13 — Robustness Testing + Error Path Hardening
-**Last completed:** Phase 12 (proptest, criterion benchmarks) — 2026-03-08
-**Total tests:** 421
-**In progress:** Error path testing, protocol error handling, stress tests
+**Phase:** 14 — HTTP/1.1 Parser Hardening + Multipart Stress Tests
+**Last completed:** Phase 13 (robustness tests — HTTP errors, URL malformed, cookie stress) — 2026-03-08
+**Total tests:** 485
+**In progress:** H1 parser edge case tests, multipart form stress tests
 **Blockers:** None
-**Next up:** Fuzz testing harnesses, curl test suite porting
+**Next up:** Fuzz testing harnesses, WebSocket/FTP integration tests
 
 ---
 
@@ -489,39 +489,39 @@ feature list, usage examples for library/CLI/C API. 395 total tests passing.
 Criterion benchmarks for URL parsing, cookie jar, and HSTS cache throughput.
 421 total tests passing. Benchmarks runnable via `cargo bench -p liburlx`.
 
-### Phase 13: Robustness Testing + Error Path Hardening
+### Phase 13: Robustness Testing + Error Path Hardening — COMPLETED (2026-03-08)
 
-**Scope:** Test error paths, malformed inputs, protocol edge cases, and stress scenarios.
+64 new tests: HTTP error paths (14), URL malformed inputs (32), cookie stress
+tests (18). Covers server drops, large bodies, unusual status codes, control
+characters, extreme URL lengths, IPv6, port bounds, 1000-cookie jars, deeply
+nested domains, path segment boundaries. 485 total tests passing.
 
-**Step 13.1: HTTP protocol error handling tests**
-- Server drops connection mid-response
-- Malformed HTTP status line
-- Invalid Content-Length (negative, overflow)
-- Missing Content-Length with connection close
-- Chunked encoding with invalid chunk size
-- Header-only response (no body at all)
+### Phase 14: HTTP/1.1 Parser Hardening + Multipart Stress Tests
 
-**Step 13.2: Cookie jar stress tests**
-- Very long cookie names and values
-- Many cookies (1000+) for a single domain
-- Cookie with special characters in value
-- Deeply nested subdomain matching
+**Scope:** Add direct H1 parser unit tests for uncovered code paths, multipart
+form edge cases, and response parsing stress tests.
 
-**Step 13.3: URL parser malformed input tests**
-- URLs with null bytes
-- URLs with control characters
-- Extremely long URLs (100KB+)
-- URLs with only scheme (e.g., "http://")
-- IPv6 addresses (various formats)
-- Internationalized domain names
+**Step 14.1: H1 parser additional unit tests**
+- Chunked encoding with trailing whitespace in chunk size
+- Chunked encoding with chunk extensions
+- Response with both Content-Length and Transfer-Encoding (chunked wins)
+- 204 No Content with Content-Length header (body ignored)
+- Response with connection: keep-alive header
+- Multiple Set-Cookie headers preserved
 
-**Step 13.4: Transfer error recovery tests**
-- Connection reset during transfer
-- DNS resolution failure
-- TLS handshake errors
-- Proxy connection refused
+**Step 14.2: Multipart form edge cases**
+- File with special characters in filename
+- Very large field value
+- Many fields (100+)
+- Binary content in form field
+- Empty file upload
 
-**Exit criteria:** 460+ tests. All error paths tested with expected error types.
+**Step 14.3: HTTP parser proptest**
+- Property: any valid HTTP response parses without panic
+- Property: status codes 100-599 are all accepted
+- Property: Content-Length matches body length
+
+**Exit criteria:** 520+ tests. All H1 parser branches covered.
 
 ---
 
