@@ -14,12 +14,12 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 20 — Protocol Codec Hardening + Differential Testing
-**Last completed:** Phase 19 (Easy API coverage, URL normalization) — 2026-03-08
-**Total tests:** 740
-**In progress:** Planning Phase 20
+**Phase:** 21 — FFI Expansion + Transfer Info Hardening
+**Last completed:** Phase 20 (SMTP/IMAP/POP3/MQTT edge case tests) — 2026-03-08
+**Total tests:** 793
+**In progress:** Planning Phase 21
 **Blockers:** None
-**Next up:** Differential testing framework, protocol codec fuzz improvements
+**Next up:** FFI option coverage, transfer info accuracy tests, property-based protocol tests
 
 ---
 
@@ -539,35 +539,44 @@ method/body interactions, auth, proxy, form, range, resolve). 33 URL
 normalization tests (scheme/host casing, default scheme, path/port/query/
 fragment handling, credentials, host_and_port, request target). 740 tests.
 
-### Phase 20: Protocol Codec Hardening + SMTP/IMAP/POP3 Integration Tests
+### Phase 20: Protocol Codec Hardening — COMPLETED (2026-03-08)
 
-**Scope:** Add integration tests for email protocols, harden protocol
-codec edge cases, expand differential testing.
+15 SMTP tests (response reading, multiline EHLO, status categories, send_command).
+6 IMAP tests (ImapResponse OK/NO/BAD, case-insensitive, data, debug).
+21 POP3 tests (response reading, multiline, dot-stuffing, send_command, struct).
+11 MQTT tests (PacketType values, equality, debug, clone). 793 total tests.
 
-**Step 20.1: SMTP protocol edge cases**
-- Test EHLO/HELO response parsing
-- Test AUTH PLAIN encoding
-- Test MAIL FROM/RCPT TO/DATA flow
-- Test multi-line SMTP responses
+### Phase 21: FFI Expansion + Transfer Info Hardening
 
-**Step 20.2: IMAP protocol edge cases**
-- Test LOGIN response parsing
-- Test SELECT mailbox response
-- Test UID FETCH with various flags
-- Test untagged vs tagged responses
+**Scope:** Expand FFI option coverage, harden transfer info queries,
+add property-based tests for remaining protocol codecs, test FFI
+error handling paths.
 
-**Step 20.3: POP3 protocol edge cases**
-- Test USER/PASS flow
-- Test LIST parsing
-- Test RETR with dot-stuffing
-- Test multi-line POP3 responses
+**Step 21.1: FFI option expansion tests**
+- Test curl_easy_setopt with additional CURLOPT_* codes
+- Test curl_easy_getinfo with additional CURLINFO_* codes
+- Test FFI null pointer handling on all entry points
+- Test FFI error string completeness
 
-**Step 20.4: MQTT protocol edge cases**
-- Test CONNECT packet encoding
-- Test PUBLISH packet with various QoS levels
-- Test SUBSCRIBE packet encoding
+**Step 21.2: Transfer info accuracy tests**
+- Test timing info (namelookup, connect, starttransfer, total)
+- Test redirect info (count, url) across redirect chains
+- Test size info (upload, download, headers) accuracy
+- Test effective URL tracking through redirects
 
-**Exit criteria:** 790+ tests. Email protocol codecs well-tested.
+**Step 21.3: Property-based SMTP/IMAP/POP3 tests**
+- SMTP response code categories (2xx/3xx/4xx/5xx)
+- IMAP tag generation and response parsing
+- POP3 response format (+OK/-ERR) roundtripping
+- MQTT packet type exhaustive coverage
+
+**Step 21.4: Connection pool lifecycle tests**
+- Test pool eviction under connection limits
+- Test pool behavior with mixed HTTP/HTTPS connections
+- Test pool key generation correctness
+- Test pool connection reuse counting
+
+**Exit criteria:** 860+ tests. FFI layer well-tested, transfer info verified.
 
 ---
 
