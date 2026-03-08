@@ -713,4 +713,291 @@ mod tests {
         let args = vec!["urlx".to_string(), "-X".to_string()];
         assert!(parse_args(&args).is_none());
     }
+
+    #[test]
+    fn parse_args_multiple_urls() {
+        let args = vec!["urlx".to_string(), "http://a.com".to_string(), "http://b.com".to_string()];
+        let opts = parse_args(&args).unwrap();
+        assert_eq!(opts.urls.len(), 2);
+        assert_eq!(opts.urls[0], "http://a.com");
+        assert_eq!(opts.urls[1], "http://b.com");
+    }
+
+    #[test]
+    fn parse_args_all_http_methods() {
+        for method in ["GET", "POST", "PUT", "DELETE", "HEAD", "PATCH"] {
+            let args = vec![
+                "urlx".to_string(),
+                "-X".to_string(),
+                method.to_string(),
+                "http://x.com".to_string(),
+            ];
+            assert!(parse_args(&args).is_some(), "method {method} should parse");
+        }
+    }
+
+    #[test]
+    fn parse_args_header_invalid_format() {
+        let args = vec![
+            "urlx".to_string(),
+            "-H".to_string(),
+            "NoColonHere".to_string(),
+            "http://x.com".to_string(),
+        ];
+        assert!(parse_args(&args).is_none());
+    }
+
+    #[test]
+    fn parse_args_compressed() {
+        let args = vec!["urlx".to_string(), "--compressed".to_string(), "http://x.com".to_string()];
+        let opts = parse_args(&args);
+        assert!(opts.is_some());
+    }
+
+    #[test]
+    fn parse_args_connect_timeout() {
+        let args = vec![
+            "urlx".to_string(),
+            "--connect-timeout".to_string(),
+            "5.5".to_string(),
+            "http://x.com".to_string(),
+        ];
+        let opts = parse_args(&args);
+        assert!(opts.is_some());
+    }
+
+    #[test]
+    fn parse_args_connect_timeout_invalid() {
+        let args = vec![
+            "urlx".to_string(),
+            "--connect-timeout".to_string(),
+            "not-a-number".to_string(),
+            "http://x.com".to_string(),
+        ];
+        assert!(parse_args(&args).is_none());
+    }
+
+    #[test]
+    fn parse_args_max_time() {
+        let args = vec![
+            "urlx".to_string(),
+            "-m".to_string(),
+            "10".to_string(),
+            "http://x.com".to_string(),
+        ];
+        let opts = parse_args(&args);
+        assert!(opts.is_some());
+    }
+
+    #[test]
+    fn parse_args_max_redirs_invalid() {
+        let args = vec![
+            "urlx".to_string(),
+            "--max-redirs".to_string(),
+            "abc".to_string(),
+            "http://x.com".to_string(),
+        ];
+        assert!(parse_args(&args).is_none());
+    }
+
+    #[test]
+    fn parse_args_proxy() {
+        let args = vec![
+            "urlx".to_string(),
+            "-x".to_string(),
+            "http://proxy:8080".to_string(),
+            "http://x.com".to_string(),
+        ];
+        let opts = parse_args(&args);
+        assert!(opts.is_some());
+    }
+
+    #[test]
+    fn parse_args_form_field() {
+        let args = vec![
+            "urlx".to_string(),
+            "-F".to_string(),
+            "name=value".to_string(),
+            "http://x.com".to_string(),
+        ];
+        let opts = parse_args(&args);
+        assert!(opts.is_some());
+    }
+
+    #[test]
+    fn parse_args_form_invalid() {
+        let args = vec![
+            "urlx".to_string(),
+            "-F".to_string(),
+            "noequalssign".to_string(),
+            "http://x.com".to_string(),
+        ];
+        assert!(parse_args(&args).is_none());
+    }
+
+    #[test]
+    fn parse_args_range() {
+        let args = vec![
+            "urlx".to_string(),
+            "-r".to_string(),
+            "0-499".to_string(),
+            "http://x.com".to_string(),
+        ];
+        let opts = parse_args(&args);
+        assert!(opts.is_some());
+    }
+
+    #[test]
+    fn parse_args_continue_at() {
+        let args = vec![
+            "urlx".to_string(),
+            "-C".to_string(),
+            "1024".to_string(),
+            "http://x.com".to_string(),
+        ];
+        let opts = parse_args(&args);
+        assert!(opts.is_some());
+    }
+
+    #[test]
+    fn parse_args_continue_at_invalid() {
+        let args = vec![
+            "urlx".to_string(),
+            "-C".to_string(),
+            "not-a-number".to_string(),
+            "http://x.com".to_string(),
+        ];
+        assert!(parse_args(&args).is_none());
+    }
+
+    #[test]
+    fn parse_args_progress_bar() {
+        let args = vec!["urlx".to_string(), "-#".to_string(), "http://x.com".to_string()];
+        let opts = parse_args(&args).unwrap();
+        assert!(opts.show_progress);
+    }
+
+    #[test]
+    fn parse_args_verbose() {
+        let args = vec!["urlx".to_string(), "-v".to_string(), "http://x.com".to_string()];
+        let opts = parse_args(&args);
+        assert!(opts.is_some());
+    }
+
+    #[test]
+    fn parse_args_combined_flags() {
+        let args = vec![
+            "urlx".to_string(),
+            "-s".to_string(),
+            "-S".to_string(),
+            "-f".to_string(),
+            "-L".to_string(),
+            "-i".to_string(),
+            "http://x.com".to_string(),
+        ];
+        let opts = parse_args(&args).unwrap();
+        assert!(opts.silent);
+        assert!(opts.show_error);
+        assert!(opts.fail_on_error);
+        assert!(opts.include_headers);
+    }
+
+    #[test]
+    fn parse_args_write_out() {
+        let args = vec![
+            "urlx".to_string(),
+            "-w".to_string(),
+            "%{http_code}\\n".to_string(),
+            "http://x.com".to_string(),
+        ];
+        let opts = parse_args(&args).unwrap();
+        assert_eq!(opts.write_out.as_deref(), Some("%{http_code}\\n"));
+    }
+
+    #[test]
+    fn parse_args_output_file() {
+        let args = vec![
+            "urlx".to_string(),
+            "-o".to_string(),
+            "output.txt".to_string(),
+            "http://x.com".to_string(),
+        ];
+        let opts = parse_args(&args).unwrap();
+        assert_eq!(opts.output_file.as_deref(), Some("output.txt"));
+    }
+
+    #[test]
+    fn parse_args_noproxy() {
+        let args = vec![
+            "urlx".to_string(),
+            "--noproxy".to_string(),
+            "localhost,127.0.0.1".to_string(),
+            "http://x.com".to_string(),
+        ];
+        let opts = parse_args(&args);
+        assert!(opts.is_some());
+    }
+
+    #[test]
+    fn parse_args_user_without_colon() {
+        let args = vec![
+            "urlx".to_string(),
+            "-u".to_string(),
+            "admin".to_string(),
+            "http://x.com".to_string(),
+        ];
+        let opts = parse_args(&args);
+        assert!(opts.is_some());
+    }
+
+    #[test]
+    fn format_write_out_all_variables() {
+        let mut headers = std::collections::HashMap::new();
+        let _old = headers.insert("content-type".to_string(), "text/html".to_string());
+        let response = liburlx::Response::new(
+            201,
+            headers,
+            b"body".to_vec(),
+            "http://example.com/page".to_string(),
+        );
+        let result = format_write_out(
+            "%{http_code} %{response_code} %{url_effective} %{content_type} %{size_download}",
+            &response,
+        );
+        assert!(result.contains("201"));
+        assert!(result.contains("http://example.com/page"));
+        assert!(result.contains("text/html"));
+        assert!(result.contains('4')); // body length
+    }
+
+    #[test]
+    fn format_write_out_escape_r() {
+        let response = liburlx::Response::new(
+            200,
+            std::collections::HashMap::new(),
+            Vec::new(),
+            String::new(),
+        );
+        let result = format_write_out("a\\rb", &response);
+        assert_eq!(result, "a\rb");
+    }
+
+    #[test]
+    fn format_write_out_no_content_type() {
+        let response = liburlx::Response::new(
+            200,
+            std::collections::HashMap::new(),
+            Vec::new(),
+            String::new(),
+        );
+        let result = format_write_out("%{content_type}", &response);
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn run_no_args_returns_failure() {
+        let args = vec!["urlx".to_string()];
+        let code = run(&args);
+        assert_ne!(code, ExitCode::SUCCESS);
+    }
 }
