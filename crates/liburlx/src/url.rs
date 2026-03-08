@@ -274,4 +274,114 @@ mod tests {
         assert_eq!(url.host_str(), Some("[::1]"));
         assert_eq!(url.port(), Some(8080));
     }
+
+    // --- Edge cases ---
+
+    #[test]
+    fn parse_percent_encoded_path() {
+        let url = Url::parse("http://example.com/hello%20world").unwrap();
+        assert_eq!(url.path(), "/hello%20world");
+    }
+
+    #[test]
+    fn parse_percent_encoded_query() {
+        let url = Url::parse("http://example.com/path?q=hello%20world").unwrap();
+        assert_eq!(url.query(), Some("q=hello%20world"));
+    }
+
+    #[test]
+    fn parse_credentials_in_url() {
+        let url = Url::parse("http://admin:secret@example.com/").unwrap();
+        let (user, pass) = url.credentials().unwrap();
+        assert_eq!(user, "admin");
+        assert_eq!(pass, "secret");
+    }
+
+    #[test]
+    fn parse_credentials_username_only() {
+        let url = Url::parse("http://admin@example.com/").unwrap();
+        let (user, pass) = url.credentials().unwrap();
+        assert_eq!(user, "admin");
+        assert_eq!(pass, "");
+    }
+
+    #[test]
+    fn parse_no_credentials() {
+        let url = Url::parse("http://example.com/").unwrap();
+        assert!(url.credentials().is_none());
+    }
+
+    #[test]
+    fn parse_ftp_scheme() {
+        let url = Url::parse("ftp://files.example.com/pub/readme.txt").unwrap();
+        assert_eq!(url.scheme(), "ftp");
+        assert_eq!(url.host_str(), Some("files.example.com"));
+        assert_eq!(url.path(), "/pub/readme.txt");
+        assert_eq!(url.port_or_default(), Some(21));
+    }
+
+    #[test]
+    fn parse_file_url() {
+        let url = Url::parse("file:///tmp/test.txt").unwrap();
+        assert_eq!(url.scheme(), "file");
+        assert_eq!(url.path(), "/tmp/test.txt");
+    }
+
+    #[test]
+    fn parse_url_with_special_query_chars() {
+        let url = Url::parse("http://example.com/search?q=a&b=c&d=e").unwrap();
+        assert_eq!(url.query(), Some("q=a&b=c&d=e"));
+    }
+
+    #[test]
+    fn parse_path_with_dots() {
+        let url = Url::parse("http://example.com/a/b/../c").unwrap();
+        // URL crate normalizes .. segments
+        assert_eq!(url.path(), "/a/c");
+    }
+
+    #[test]
+    fn parse_trailing_slash() {
+        let url = Url::parse("http://example.com/path/").unwrap();
+        assert_eq!(url.path(), "/path/");
+    }
+
+    #[test]
+    fn parse_double_slash_in_path() {
+        let url = Url::parse("http://example.com//path").unwrap();
+        assert_eq!(url.path(), "//path");
+    }
+
+    #[test]
+    fn host_header_default_port_omitted() {
+        let url = Url::parse("http://example.com/").unwrap();
+        assert_eq!(url.host_header_value(), "example.com");
+    }
+
+    #[test]
+    fn host_header_custom_port_included() {
+        let url = Url::parse("http://example.com:8080/").unwrap();
+        assert_eq!(url.host_header_value(), "example.com:8080");
+    }
+
+    #[test]
+    fn parse_long_path() {
+        let long_path = "/a".repeat(500);
+        let url_str = format!("http://example.com{long_path}");
+        let url = Url::parse(&url_str).unwrap();
+        assert_eq!(url.path().len(), 1000);
+    }
+
+    #[test]
+    fn parse_empty_path() {
+        let url = Url::parse("http://example.com").unwrap();
+        assert_eq!(url.path(), "/");
+    }
+
+    #[test]
+    fn parse_url_with_port_zero() {
+        // Port 0 is technically valid in a URL (means auto-assign)
+        let url = Url::parse("http://example.com:0/").unwrap();
+        assert_eq!(url.port(), Some(0));
+    }
 }
