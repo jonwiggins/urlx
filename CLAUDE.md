@@ -14,12 +14,12 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 18 — HTTP/2 Integration Tests + Connection Pool Hardening
-**Last completed:** Phase 17 (protocol proptests, CLI tests) — 2026-03-08
-**Total tests:** 634
-**In progress:** Planning Phase 18
+**Phase:** 19 — Easy API Completeness + Transfer Options
+**Last completed:** Phase 18 (response/error/Multi stress tests) — 2026-03-08
+**Total tests:** 677
+**In progress:** Planning Phase 19
 **Blockers:** None
-**Next up:** HTTP/2 tests, connection pool stress tests, transfer info accuracy
+**Next up:** Easy option coverage, cookie file persistence, HSTS preload
 
 ---
 
@@ -525,34 +525,41 @@ GUID bug. 594 total tests passing.
 argument parsing tests covering all flags, invalid inputs, combinations,
 write-out variables. 634 total tests passing.
 
-### Phase 18: HTTP/2 Integration Tests + Connection Pool Hardening
+### Phase 18: Response/Error/Multi Stress Tests — COMPLETED (2026-03-08)
 
-**Scope:** Test HTTP/2 protocol handling, connection pool behavior under
-stress, and transfer info timing accuracy.
+22 response tests (field preservation, body operations, headers, redirects,
+content type, size_download, large bodies). 20 error coverage tests (all
+variants, display, debug, source chain, Send+Sync). 6 Multi API stress
+tests (concurrent transfers, mixed results, body sizes). 677 total tests.
 
-**Step 18.1: Connection pool stress tests**
-- Test pool key isolation (different hosts don't share connections)
-- Test pool capacity limits
-- Test concurrent access to pool
-- Test expired connection eviction
+### Phase 19: Easy API Completeness + Transfer Options
 
-**Step 18.2: Transfer info and timing tests**
-- Test time_total is nonzero after transfer
-- Test time_connect is set for new connections
-- Test num_redirects counts correctly
-- Test size_download matches body length
+**Scope:** Expand Easy API option coverage, add cookie file persistence,
+HSTS preload list support, and missing curl option mappings.
 
-**Step 18.3: Error type coverage tests**
-- Test all Error variants can be constructed and displayed
-- Test error conversion from IO, URL parse, TLS errors
-- Test error Send + Sync bounds
+**Step 19.1: Cookie file persistence tests**
+- Test cookie jar save to file and reload
+- Test cookie jar file format compatibility
+- Test expired cookies not persisted
 
-**Step 18.4: Multi API stress tests**
-- Test many concurrent transfers (10+)
-- Test mixed success/failure in batch
-- Test Multi with empty handle list
+**Step 19.2: Easy API option edge cases**
+- Test setting URL after perform (reset behavior)
+- Test cloned Easy handles are independent
+- Test multiple perform calls on same handle
+- Test method/header/body interactions
 
-**Exit criteria:** 680+ tests. Pool, timing, and concurrency well-tested.
+**Step 19.3: URL parser additional edge cases**
+- Test IDN domain handling
+- Test punycode conversion
+- Test URL normalization (dot segments, empty path)
+
+**Step 19.4: HTTP response edge cases**
+- Test responses with no reason phrase
+- Test HTTP/1.0 vs HTTP/1.1 version parsing
+- Test responses with invalid Content-Length
+- Test oversized headers
+
+**Exit criteria:** 720+ tests. Easy API fully exercised.
 
 ---
 
