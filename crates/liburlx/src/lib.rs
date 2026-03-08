@@ -11,18 +11,15 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod easy;
 pub mod error;
+pub mod protocol;
+pub mod tls;
+pub mod url;
 
+pub use easy::Easy;
 pub use error::Error;
+pub use protocol::http::response::Response;
 
 /// Convenience result type for liburlx operations.
 pub type Result<T> = std::result::Result<T, Error>;
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn library_loads() {
-        // Smoke test: the library compiles and loads
-        assert_eq!(2 + 2, 4);
-    }
-}

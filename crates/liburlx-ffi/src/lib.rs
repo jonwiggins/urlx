@@ -21,6 +21,7 @@ pub extern "C" fn urlx_version() -> *const std::ffi::c_char {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

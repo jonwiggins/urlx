@@ -1,0 +1,7 @@
+//! HTTP/1.1 protocol implementation.
+//!
+//! Handles request construction, response parsing, and body reading
+//! for HTTP and HTTPS transfers.
+
+pub mod h1;
+pub mod response;
