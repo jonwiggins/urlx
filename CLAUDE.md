@@ -14,12 +14,12 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 23 — Planning
-**Last completed:** Phase 22 (FFI Callbacks & MIME API) — 2026-03-09
-**Total tests:** 1,819
-**In progress:** Planning Phase 23
+**Phase:** 24 — Planning
+**Last completed:** Phase 23 (URL API & FFI Expansion) — 2026-03-09
+**Total tests:** 1,840
+**In progress:** Planning Phase 24
 **Blockers:** None
-**Next up:** Phase 23 — URL API & FFI Expansion
+**Next up:** Phase 24 — CLI Expansion II
 
 ### Completeness Summary (updated Phase 20 review)
 
@@ -36,7 +36,7 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 | FTP | 70% | Session API, upload, resume, dir ops, FEAT; no FTPS or active mode |
 | SSH/SFTP/SCP | 0% | Not implemented |
 | Multi API | 55% | Connection limiting, message queue, share interface, pipelining config; no poll/socket/timer callbacks |
-| FFI (libcurl C ABI) | ~38% | 79 options, 17 info codes, 25 error codes, 26 functions |
+| FFI (libcurl C ABI) | ~42% | 87 options, 20 info codes, 25 error codes, 32 functions |
 | CLI | ~34% | ~84 of ~250 flags |
 | Connection | 80% | Pool, TCP_NODELAY, keepalive, Unix sockets, interface/port binding |
 | Transfer control | 80% | Rate limiting enforced in transfer engine (max recv/send speed, low speed timeout) |
@@ -81,6 +81,8 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 - **2026-03-09:** `CURLOPT_PROGRESSFUNCTION` and `CURLOPT_XFERINFOFUNCTION` share the same data pointer (`CURLOPT_PROGRESSDATA` = 10057). The xferinfo callback takes precedence over the progress callback (matching libcurl behavior). Both are only invoked when `CURLOPT_NOPROGRESS` is set to 0.
 - **2026-03-09:** `CURLINFO_PRIVATE` is handled before the response check in `curl_easy_getinfo` since it doesn't require a completed transfer — it's stored directly on the `EasyHandle` struct, not on the response.
 - **2026-03-09:** `curl_share_setopt` lock/unlock function callbacks (options 3/4) are accepted but ignored. The Rust `Share` type uses `Arc<Mutex>` internally, making external locking unnecessary.
+- **2026-03-09:** `curl_url_*` API uses an FFI-specific `UrlHandle` struct with mutable component storage, since the core `Url` type is immutable. Components are stored individually and reassembled on `curl_url_get(CURLUPART_URL)`. Strings returned by `curl_url_get` are allocated via `CString::into_raw` and must be freed with `curl_free`.
+- **2026-03-09:** `CURLOPT_NOSIGNAL`, `CURLOPT_AUTOREFERER`, `CURLOPT_LOCALPORTRANGE`, and `CURLOPT_AWS_SIGV4` are accepted as no-ops. NOSIGNAL is irrelevant (tokio doesn't use signals), AUTOREFERER is not yet implemented, LOCALPORTRANGE supplements LOCALPORT (which is implemented), and AWS_SIGV4 auth is configured through separate credential setters.
 
 ---
 
@@ -250,11 +252,12 @@ Built from scratch over 20 phases. All features below are implemented and tested
 - **Transfer control:** Rate limiting enforced in transfer engine via `SpeedLimits` and `RateLimiter`. Max recv/send speed throttling (token bucket, 16KB chunks). Low speed enforcement aborts with `Error::SpeedLimit` after timeout.
 - **Response:** Status, headers, body, trailers, effective_url, TransferInfo (6 timing fields + speed/size metrics).
 
-**FFI Layer (liburlx-ffi) — 79 CURLOPT, 17 CURLINFO, 25 CURLcode, 26 functions:**
-- Functions: curl_easy_init/cleanup/duphandle/reset/setopt/perform/getinfo/strerror, curl_slist_append/free_all, curl_multi_init/cleanup/add_handle/remove_handle/perform, curl_version, curl_mime_init/addpart/name/data/filename/type/free, curl_share_init/cleanup/setopt/strerror.
+**FFI Layer (liburlx-ffi) — 87 CURLOPT, 20 CURLINFO, 25 CURLcode, 32 functions:**
+- Functions: curl_easy_init/cleanup/duphandle/reset/setopt/perform/getinfo/strerror, curl_slist_append/free_all, curl_multi_init/cleanup/add_handle/remove_handle/perform, curl_version, curl_mime_init/addpart/name/data/filename/type/free, curl_share_init/cleanup/setopt/strerror, curl_url/url_cleanup/url_dup/url_set/url_get, curl_free.
 - Callbacks: WRITEFUNCTION, READFUNCTION (with CURL_READFUNC_ABORT), HEADERFUNCTION, DEBUGFUNCTION, PROGRESSFUNCTION, XFERINFOFUNCTION, SEEKFUNCTION.
-- Options: CURLOPT_PRIVATE, CURLOPT_SHARE, CURLOPT_MIMEPOST, CURLOPT_NOPROGRESS.
-- Enums: CURLSHcode (6 variants), CURLSHoption (4 variants).
+- Options: CURLOPT_PRIVATE, CURLOPT_SHARE, CURLOPT_MIMEPOST, CURLOPT_NOPROGRESS, CURLOPT_REFERER, CURLOPT_HTTP_VERSION, CURLOPT_XOAUTH2_BEARER, CURLOPT_RESUME_FROM_LARGE, CURLOPT_NOSIGNAL, CURLOPT_AUTOREFERER, CURLOPT_LOCALPORTRANGE, CURLOPT_AWS_SIGV4.
+- Enums: CURLSHcode (6), CURLSHoption (4), CURLUcode (10), CURLUPart (11).
+- URL API: Mutable UrlHandle with component-level get/set (scheme, user, password, host, port, path, query, fragment).
 - Memory: Box<[u8]>-based slist string allocation (exact-size, no capacity mismatch). catch_unwind on all FFI boundaries.
 
 **CLI (urlx) — ~84 flags:**
@@ -271,7 +274,7 @@ Built from scratch over 20 phases. All features below are implemented and tested
 - Features: .curlrc-style config file parser, protocol restriction, max filesize enforcement (exit 63), libcurl C code generation, retry logic (408/429/5xx).
 
 **Testing — 1,788 tests (0 failures):**
-- Unit: 455 (liburlx) + 112 (FFI) + 134 (CLI) = 701
+- Unit: 455 (liburlx) + 133 (FFI) + 134 (CLI) = 722
 - Integration: 1,048 (hyper-based test servers)
 - Property-based: 60 (proptest — URL, cookie, FTP, HTTP, HSTS, multipart, protocols, WebSocket)
 - Doc tests: 3
@@ -280,7 +283,7 @@ Built from scratch over 20 phases. All features below are implemented and tested
 
 **Guardrails:** Zero TODO/FIXME/HACK. Zero `unwrap()` in production code. `#![deny(unsafe_code)]` in liburlx and urlx-cli. GitHub Actions CI (fmt, clippy, test on 3 OS, doc, cargo-deny, MSRV 1.83, commit lint). Pre-commit hooks (fmt, clippy, test, deny, doc, conventional commit).
 
-**Known gaps (as of Phase 22):** Trace file writing not fully wired. HTTP/3 QUIC transport not implemented. SSH/SFTP/SCP not implemented. FTPS not implemented. Poll/socket/timer Multi APIs not implemented. Missing FFI: curl_url_*, CURLOPT_HTTPPOST (deprecated).
+**Known gaps (as of Phase 23):** Trace file writing not fully wired. HTTP/3 QUIC transport not implemented. SSH/SFTP/SCP not implemented. FTPS not implemented. Poll/socket/timer Multi APIs not implemented. Missing FFI: CURLOPT_HTTPPOST (deprecated).
 
 ---
 
@@ -296,14 +299,9 @@ Added 10 FFI functions (curl_mime_init/addpart/name/data/filename/type/free, cur
 
 ---
 
-### Phase 23: URL API & FFI Expansion
+### Phase 23: URL API & FFI Expansion (completed 2026-03-09)
 
-**Goal:** Add curl_url_* API and expand FFI option coverage.
-
-- `curl_url` / `curl_url_cleanup` / `curl_url_set` / `curl_url_get` / `curl_url_dup`
-- Target 85+ CURLOPT options
-- Target 20+ CURLINFO codes
-- CURLOPT_HTTPPOST (deprecated but still used)
+Added curl_url_* API (6 functions: curl_url/cleanup/dup/set/get + curl_free), CURLUcode/CURLUPart enums, mutable UrlHandle with component-level get/set. Added 8 new CURLOPT options (REFERER, HTTP_VERSION, XOAUTH2_BEARER, RESUME_FROM_LARGE, AWS_SIGV4, NOSIGNAL, AUTOREFERER, LOCALPORTRANGE), 3 new CURLINFO codes (HTTP_VERSION, PRIMARY_PORT, SCHEME). 21 new FFI tests. Total: 1,840 tests.
 
 ---
 
