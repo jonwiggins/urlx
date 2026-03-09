@@ -36,11 +36,19 @@ proptest! {
     }
 
     /// Port values are in the valid range 0-65535.
+    /// Default ports (80 for HTTP, 443 for HTTPS) are normalized to None by the url crate.
     #[test]
     fn port_in_valid_range(port in 0u16..=65535u16) {
         let url_str = format!("http://example.com:{port}/");
         let parsed = liburlx::Url::parse(&url_str).unwrap();
-        prop_assert_eq!(parsed.port(), Some(port));
+        if port == 80 {
+            // Default HTTP port is normalized away
+            prop_assert_eq!(parsed.port(), None);
+        } else {
+            prop_assert_eq!(parsed.port(), Some(port));
+        }
+        // port_or_default always returns the port
+        prop_assert_eq!(parsed.port_or_default(), Some(port));
     }
 
     /// URLs with query strings preserve the query.
