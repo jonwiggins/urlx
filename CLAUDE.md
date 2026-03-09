@@ -14,12 +14,12 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 27 — Test Deduplication + Coverage Gaps
-**Last completed:** Phase 26 (shared TestServer, E2E workflows) — 2026-03-08
-**Total tests:** 1044
-**In progress:** Planning Phase 27
+**Phase:** 28 — Fail-on-Error Integration + Transfer Robustness
+**Last completed:** Phase 27 (TestServer dedup, CookieJar/URL coverage) — 2026-03-08
+**Total tests:** 1087
+**In progress:** Planning Phase 28
 **Blockers:** None
-**Next up:** Deduplicate TestServer from existing files, fill remaining coverage gaps
+**Next up:** Integration tests for fail_on_error edge cases, transfer timeout scenarios
 
 ---
 
@@ -587,30 +587,36 @@ accumulation, Multi concurrent, HEAD, custom headers, fail_on_error+redirect,
 large body integrity, bearer token). 15 error recovery tests (4xx/5xx codes,
 binary/JSON content, connection refused, no URL, fail_on_error). 1044 total tests.
 
-### Phase 27: Test Deduplication + Coverage Gaps
+### Phase 27: Test Deduplication + Coverage Gaps — COMPLETED (2026-03-08)
 
-**Scope:** Migrate existing test files to use the shared TestServer module
-(reducing ~800 lines of duplication across 19 files), and fill remaining
-coverage gaps in CookieJar public API and URL edge cases.
+Migrated 18 test files to shared common::TestServer, removing ~610 lines of
+duplication. 20 CookieJar API tests (construction, store_cookies, cookie_header,
+secure filtering, replacement, remove_expired, clone). 23 URL edge case tests
+(IPv6, fragments, queries, credentials, paths, ports, host methods, roundtrip).
+1087 total tests.
 
-**Step 27.1: Migrate test files to shared TestServer**
-- Update files that duplicate TestServer to use `mod common; use common::TestServer;`
-- Remove inline TestServer structs from each migrated file
-- Verify all tests still pass after migration
+### Phase 28: Fail-on-Error Integration + Transfer Robustness
 
-**Step 27.2: CookieJar public API tests**
-- Test `CookieJar::new()`, `len()`, `is_empty()`
-- Test `store_cookies` with domain/path matching
-- Test `cookie_header` generation
-- Test `remove_expired` cleanup
+**Scope:** Add integration tests for fail_on_error edge cases with real
+servers, transfer timeout scenarios, and HSTS upgrade integration tests.
 
-**Step 27.3: URL edge case tests**
-- IPv6 address URLs
-- Credentials with special characters
-- Fragment-only URLs
-- Extremely long paths
+**Step 28.1: fail_on_error integration tests**
+- fail_on_error with 4xx vs 2xx boundary (399 passes, 400 fails)
+- fail_on_error with redirect chain ending in error
+- fail_on_error disabled preserves error status responses
+- fail_on_error with chunked response body
 
-**Exit criteria:** 1070+ tests. TestServer deduplication complete across all files.
+**Step 28.2: Transfer timeout scenarios**
+- Slow server response triggers timeout
+- Connect timeout vs transfer timeout distinction
+- Timeout error message contains duration
+
+**Step 28.3: HSTS upgrade integration**
+- HTTP → HTTPS upgrade when HSTS cached
+- No upgrade without HSTS header
+- includeSubDomains upgrade for subdomains
+
+**Exit criteria:** 1110+ tests. Edge cases for fail_on_error and timeouts covered.
 
 ---
 
