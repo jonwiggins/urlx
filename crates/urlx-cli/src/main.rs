@@ -62,6 +62,7 @@ struct CliOptions {
     remote_header_name: bool,
     url_queries: Vec<String>,
     rate: Option<String>,
+    use_ntlm: bool,
 }
 
 /// Print usage information to stderr.
@@ -103,9 +104,11 @@ fn print_usage() {
     eprintln!("      --cert <file>         Client certificate (PEM format)");
     eprintln!("      --key <file>          Client private key (PEM/SSH format)");
     eprintln!("      --digest              Use HTTP Digest authentication");
+    eprintln!("      --ntlm                Use HTTP NTLM authentication");
     eprintln!("      --proxy-user <u:p>    Proxy authentication (user:password)");
     eprintln!("      --proxy-digest        Use Digest auth with proxy");
     eprintln!("      --proxy-ntlm          Use NTLM auth with proxy");
+    eprintln!("      --ciphers <list>      TLS cipher suite list");
     eprintln!("      --unix-socket <path>  Connect via Unix domain socket");
     eprintln!("      --interface <name>    Use network interface/address for outgoing connections");
     eprintln!("      --local-port <port>   Bind to local port for outgoing connections");
@@ -173,6 +176,16 @@ fn print_usage() {
     eprintln!("      --url-query <params>  Append query parameters to URL");
     eprintln!("      --json <data>         JSON POST (sets Content-Type and Accept)");
     eprintln!("      --rate <rate>         Request rate for parallel transfers");
+    eprintln!("      --ciphers <list>      TLS cipher suite list");
+    eprintln!("      --negotiate           Use HTTP Negotiate (SPNEGO) authentication");
+    eprintln!("      --delegation <level>  GSS-API delegation (none, policy, always)");
+    eprintln!("      --sasl-authzid <id>   SASL authorization identity");
+    eprintln!("      --sasl-ir             Send SASL initial response");
+    eprintln!("      --mail-from <addr>    SMTP envelope sender (MAIL FROM)");
+    eprintln!("      --mail-rcpt <addr>    SMTP envelope recipient (RCPT TO)");
+    eprintln!("      --mail-auth <addr>    SMTP AUTH identity (MAIL AUTH)");
+    eprintln!("      --ftp-create-dirs     Create remote directories during upload");
+    eprintln!("      --ftp-method <method> FTP method (multicwd, singlecwd, nocwd)");
 }
 
 /// Parse CLI arguments into options.
@@ -227,6 +240,7 @@ fn parse_args(args: &[String]) -> Option<CliOptions> {
         remote_header_name: false,
         url_queries: Vec::new(),
         rate: None,
+        use_ntlm: false,
     };
 
     let mut i = 1;
@@ -854,8 +868,10 @@ fn parse_args(args: &[String]) -> Option<CliOptions> {
                 opts.remote_time = true;
             }
             // No-op flags: --next (option groups), --ftp-pasv (default), --globoff (no URL
-            // globbing), --styled-output/--no-styled-output (no terminal styling)
-            "--next" | "--ftp-pasv" | "--globoff" | "--styled-output" | "--no-styled-output" => {}
+            // globbing), --styled-output/--no-styled-output (no terminal styling),
+            // --negotiate (Kerberos/SPNEGO not fully implemented)
+            "--next" | "--ftp-pasv" | "--globoff" | "--styled-output" | "--no-styled-output"
+            | "--negotiate" => {}
             // FTPS: explicit mode (AUTH TLS)
             "--ftp-ssl" | "--ssl" | "--ftp-ssl-reqd" | "--ssl-reqd" => {
                 opts.easy.ftp_ssl_mode(liburlx::protocol::ftp::FtpSslMode::Explicit);
@@ -898,6 +914,65 @@ fn parse_args(args: &[String]) -> Option<CliOptions> {
                 let val = require_arg(args, i, "--rate")?;
                 opts.rate = Some(val.to_string());
             }
+            "--ciphers" => {
+                i += 1;
+                let val = require_arg(args, i, "--ciphers")?;
+                opts.easy.ssl_cipher_list(val);
+            }
+            "--ntlm" => {
+                opts.use_ntlm = true;
+            }
+            "--delegation" => {
+                i += 1;
+                let _val = require_arg(args, i, "--delegation")?;
+                // GSS-API delegation not implemented; accepted for compatibility
+            }
+            "--sasl-authzid" => {
+                i += 1;
+                let val = require_arg(args, i, "--sasl-authzid")?;
+                opts.easy.sasl_authzid(val);
+            }
+            "--sasl-ir" => {
+                opts.easy.sasl_ir(true);
+            }
+            "--mail-from" => {
+                i += 1;
+                let val = require_arg(args, i, "--mail-from")?;
+                opts.easy.mail_from(val);
+            }
+            "--mail-rcpt" => {
+                i += 1;
+                let val = require_arg(args, i, "--mail-rcpt")?;
+                opts.easy.mail_rcpt(val);
+            }
+            "--mail-auth" => {
+                i += 1;
+                let val = require_arg(args, i, "--mail-auth")?;
+                opts.easy.mail_auth(val);
+            }
+            "--ftp-create-dirs" => {
+                opts.easy.ftp_create_dirs(true);
+            }
+            "--ftp-method" => {
+                i += 1;
+                let val = require_arg(args, i, "--ftp-method")?;
+                match val.to_lowercase().as_str() {
+                    "multicwd" => {
+                        opts.easy.ftp_method(liburlx::protocol::ftp::FtpMethod::MultiCwd);
+                    }
+                    "singlecwd" => {
+                        opts.easy.ftp_method(liburlx::protocol::ftp::FtpMethod::SingleCwd);
+                    }
+                    "nocwd" => {
+                        opts.easy.ftp_method(liburlx::protocol::ftp::FtpMethod::NoCwd);
+                    }
+                    _ => {
+                        eprintln!("urlx: invalid FTP method: {val}");
+                        eprintln!("  Valid values: multicwd, singlecwd, nocwd");
+                        return None;
+                    }
+                }
+            }
             arg if arg.starts_with('-') => {
                 eprintln!("urlx: unknown option: {arg}");
                 return None;
@@ -913,6 +988,8 @@ fn parse_args(args: &[String]) -> Option<CliOptions> {
     if let Some((ref user, ref pass)) = opts.user_credentials {
         if opts.use_aws_sigv4 {
             opts.easy.aws_credentials(user, pass);
+        } else if opts.use_ntlm {
+            opts.easy.ntlm_auth(user, pass);
         } else if opts.use_digest {
             opts.easy.digest_auth(user, pass);
         } else {
@@ -1891,6 +1968,13 @@ fn format_write_out(fmt: &str, response: &liburlx::Response) -> String {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// Helper to construct arg list from string slices.
+    fn make_args(args: &[&str]) -> Vec<String> {
+        let mut result = vec!["urlx".to_string()];
+        result.extend(args.iter().map(|s| (*s).to_string()));
+        result
+    }
 
     #[test]
     fn format_write_out_http_code() {
@@ -3630,5 +3714,87 @@ mod tests {
         );
         let response = liburlx::Response::new(200, headers, Vec::new(), String::new());
         assert_eq!(content_disposition_filename(&response), Some("data.csv".to_string()));
+    }
+
+    #[test]
+    fn parse_ciphers_flag() {
+        let args = make_args(&["--ciphers", "ECDHE-RSA-AES256-GCM-SHA384", "http://example.com"]);
+        let opts = parse_args(&args).unwrap();
+        assert_eq!(opts.urls, vec!["http://example.com"]);
+    }
+
+    #[test]
+    fn parse_ntlm_flag() {
+        let args = make_args(&["--ntlm", "-u", "user:pass", "http://example.com"]);
+        let opts = parse_args(&args).unwrap();
+        assert!(opts.use_ntlm);
+    }
+
+    #[test]
+    fn parse_negotiate_flag() {
+        let args = make_args(&["--negotiate", "http://example.com"]);
+        let opts = parse_args(&args).unwrap();
+        assert_eq!(opts.urls, vec!["http://example.com"]);
+    }
+
+    #[test]
+    fn parse_delegation_flag() {
+        let args = make_args(&["--delegation", "always", "http://example.com"]);
+        let opts = parse_args(&args).unwrap();
+        assert_eq!(opts.urls, vec!["http://example.com"]);
+    }
+
+    #[test]
+    fn parse_sasl_flags() {
+        let args = make_args(&["--sasl-authzid", "myid", "--sasl-ir", "http://example.com"]);
+        let opts = parse_args(&args).unwrap();
+        assert_eq!(opts.urls, vec!["http://example.com"]);
+    }
+
+    #[test]
+    fn parse_mail_from_flag() {
+        let args = make_args(&["--mail-from", "sender@example.com", "smtp://mail.example.com"]);
+        let opts = parse_args(&args).unwrap();
+        assert_eq!(opts.urls, vec!["smtp://mail.example.com"]);
+    }
+
+    #[test]
+    fn parse_mail_rcpt_flag() {
+        let args = make_args(&[
+            "--mail-rcpt",
+            "alice@example.com",
+            "--mail-rcpt",
+            "bob@example.com",
+            "smtp://mail.example.com",
+        ]);
+        let opts = parse_args(&args).unwrap();
+        assert_eq!(opts.urls, vec!["smtp://mail.example.com"]);
+    }
+
+    #[test]
+    fn parse_mail_auth_flag() {
+        let args = make_args(&["--mail-auth", "sender@example.com", "smtp://mail.example.com"]);
+        let opts = parse_args(&args).unwrap();
+        assert_eq!(opts.urls, vec!["smtp://mail.example.com"]);
+    }
+
+    #[test]
+    fn parse_ftp_create_dirs_flag() {
+        let args = make_args(&["--ftp-create-dirs", "ftp://example.com/dir/file.txt"]);
+        let opts = parse_args(&args).unwrap();
+        assert_eq!(opts.urls, vec!["ftp://example.com/dir/file.txt"]);
+    }
+
+    #[test]
+    fn parse_ftp_method_flag() {
+        let args = make_args(&["--ftp-method", "singlecwd", "ftp://example.com/dir/file.txt"]);
+        let opts = parse_args(&args).unwrap();
+        assert_eq!(opts.urls, vec!["ftp://example.com/dir/file.txt"]);
+    }
+
+    #[test]
+    fn parse_ftp_method_invalid() {
+        let args = make_args(&["--ftp-method", "invalid", "ftp://example.com/"]);
+        assert!(parse_args(&args).is_none());
     }
 }

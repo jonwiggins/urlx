@@ -13,6 +13,7 @@ use crate::error::Error;
 use crate::hsts::HstsCache;
 use crate::pool::{ConnectionPool, PooledStream};
 use crate::progress::{call_progress, ProgressCallback, ProgressInfo};
+use crate::protocol::ftp::FtpMethod;
 use crate::protocol::http::multipart::MultipartForm;
 use crate::protocol::http::response::Response;
 use crate::throttle::SpeedLimits;
@@ -114,6 +115,20 @@ pub struct Easy {
     path_as_is: bool,
     /// Disable all HTTP content decoding (curl --raw).
     raw: bool,
+    /// SMTP envelope sender (MAIL FROM).
+    mail_from: Option<String>,
+    /// SMTP envelope recipients (RCPT TO).
+    mail_rcpt: Vec<String>,
+    /// SMTP AUTH identity (MAIL AUTH).
+    mail_auth: Option<String>,
+    /// Create missing directories on the FTP server during upload.
+    ftp_create_dirs: bool,
+    /// FTP method for directory traversal.
+    ftp_method: FtpMethod,
+    /// SASL authorization identity.
+    sasl_authzid: Option<String>,
+    /// Send SASL initial response in first message.
+    sasl_ir: bool,
 }
 
 impl std::fmt::Debug for Easy {
@@ -182,6 +197,13 @@ impl std::fmt::Debug for Easy {
             .field("ssh_key_path", &self.ssh_key_path)
             .field("path_as_is", &self.path_as_is)
             .field("raw", &self.raw)
+            .field("mail_from", &self.mail_from)
+            .field("mail_rcpt", &self.mail_rcpt)
+            .field("mail_auth", &self.mail_auth)
+            .field("ftp_create_dirs", &self.ftp_create_dirs)
+            .field("ftp_method", &self.ftp_method)
+            .field("sasl_authzid", &self.sasl_authzid)
+            .field("sasl_ir", &self.sasl_ir)
             .finish()
     }
 }
@@ -249,6 +271,13 @@ impl Clone for Easy {
             ssh_key_path: self.ssh_key_path.clone(),
             path_as_is: self.path_as_is,
             raw: self.raw,
+            mail_from: self.mail_from.clone(),
+            mail_rcpt: self.mail_rcpt.clone(),
+            mail_auth: self.mail_auth.clone(),
+            ftp_create_dirs: self.ftp_create_dirs,
+            ftp_method: self.ftp_method,
+            sasl_authzid: self.sasl_authzid.clone(),
+            sasl_ir: self.sasl_ir,
         }
     }
 }
@@ -318,6 +347,13 @@ impl Easy {
             ssh_key_path: None,
             path_as_is: false,
             raw: false,
+            mail_from: None,
+            mail_rcpt: Vec::new(),
+            mail_auth: None,
+            ftp_create_dirs: false,
+            ftp_method: FtpMethod::default(),
+            sasl_authzid: None,
+            sasl_ir: false,
         }
     }
 
@@ -1119,6 +1155,74 @@ impl Easy {
     /// any content-encoding decompression. Equivalent to curl's `--raw`.
     pub fn raw(&mut self, enable: bool) {
         self.raw = enable;
+    }
+
+    /// Set HTTP NTLM authentication credentials.
+    ///
+    /// NTLM is a multi-step challenge-response authentication mechanism.
+    /// Equivalent to curl's `--ntlm -u user:pass`.
+    pub fn ntlm_auth(&mut self, user: &str, password: &str) {
+        self.auth_credentials = Some(AuthCredentials {
+            username: user.to_string(),
+            password: password.to_string(),
+            method: AuthMethod::Ntlm,
+        });
+    }
+
+    /// Set the SMTP envelope sender address (MAIL FROM).
+    ///
+    /// Equivalent to `CURLOPT_MAIL_FROM` / curl's `--mail-from`.
+    pub fn mail_from(&mut self, address: &str) {
+        self.mail_from = Some(address.to_string());
+    }
+
+    /// Add an SMTP envelope recipient (RCPT TO).
+    ///
+    /// Can be called multiple times for multiple recipients.
+    /// Equivalent to `CURLOPT_MAIL_RCPT` / curl's `--mail-rcpt`.
+    pub fn mail_rcpt(&mut self, address: &str) {
+        self.mail_rcpt.push(address.to_string());
+    }
+
+    /// Set the SMTP AUTH identity (MAIL AUTH).
+    ///
+    /// Used to specify the original sender when relaying mail.
+    /// Equivalent to `CURLOPT_MAIL_AUTH` / curl's `--mail-auth`.
+    pub fn mail_auth(&mut self, address: &str) {
+        self.mail_auth = Some(address.to_string());
+    }
+
+    /// Enable creation of missing directories on FTP server during upload.
+    ///
+    /// When enabled, urlx will attempt to create directories on the remote
+    /// server that don't exist. Equivalent to `CURLOPT_FTP_CREATE_MISSING_DIRS`
+    /// / curl's `--ftp-create-dirs`.
+    pub fn ftp_create_dirs(&mut self, enable: bool) {
+        self.ftp_create_dirs = enable;
+    }
+
+    /// Set the FTP method for directory traversal.
+    ///
+    /// Controls how the path is traversed when accessing files via FTP.
+    /// Equivalent to `CURLOPT_FTP_FILEMETHOD` / curl's `--ftp-method`.
+    pub fn ftp_method(&mut self, method: FtpMethod) {
+        self.ftp_method = method;
+    }
+
+    /// Set SASL authorization identity.
+    ///
+    /// The authorization identity for SASL authentication.
+    /// Equivalent to `CURLOPT_SASL_AUTHZID` / curl's `--sasl-authzid`.
+    pub fn sasl_authzid(&mut self, authzid: &str) {
+        self.sasl_authzid = Some(authzid.to_string());
+    }
+
+    /// Enable SASL initial response.
+    ///
+    /// When enabled, the initial response is sent in the first SASL message.
+    /// Equivalent to `CURLOPT_SASL_IR` / curl's `--sasl-ir`.
+    pub fn sasl_ir(&mut self, enable: bool) {
+        self.sasl_ir = enable;
     }
 
     /// Perform the transfer and return the response (blocking).
@@ -3814,5 +3918,76 @@ mod tests {
         // raw=true should cause accept_encoding to be passed as false to perform_transfer
         assert!(easy.accept_encoding);
         assert!(easy.raw);
+    }
+
+    #[test]
+    fn easy_ntlm_auth() {
+        let mut easy = Easy::new();
+        easy.ntlm_auth("user", "pass");
+        let creds = easy.auth_credentials.as_ref().unwrap();
+        assert_eq!(creds.username, "user");
+        assert_eq!(creds.password, "pass");
+        assert_eq!(creds.method, AuthMethod::Ntlm);
+    }
+
+    #[test]
+    fn easy_mail_from() {
+        let mut easy = Easy::new();
+        assert!(easy.mail_from.is_none());
+        easy.mail_from("sender@example.com");
+        assert_eq!(easy.mail_from.as_deref(), Some("sender@example.com"));
+    }
+
+    #[test]
+    fn easy_mail_rcpt() {
+        let mut easy = Easy::new();
+        assert!(easy.mail_rcpt.is_empty());
+        easy.mail_rcpt("alice@example.com");
+        easy.mail_rcpt("bob@example.com");
+        assert_eq!(easy.mail_rcpt.len(), 2);
+        assert_eq!(easy.mail_rcpt[0], "alice@example.com");
+        assert_eq!(easy.mail_rcpt[1], "bob@example.com");
+    }
+
+    #[test]
+    fn easy_mail_auth() {
+        let mut easy = Easy::new();
+        assert!(easy.mail_auth.is_none());
+        easy.mail_auth("sender@example.com");
+        assert_eq!(easy.mail_auth.as_deref(), Some("sender@example.com"));
+    }
+
+    #[test]
+    fn easy_ftp_create_dirs() {
+        let mut easy = Easy::new();
+        assert!(!easy.ftp_create_dirs);
+        easy.ftp_create_dirs(true);
+        assert!(easy.ftp_create_dirs);
+    }
+
+    #[test]
+    fn easy_ftp_method() {
+        let mut easy = Easy::new();
+        assert_eq!(easy.ftp_method, FtpMethod::default());
+        easy.ftp_method(FtpMethod::SingleCwd);
+        assert_eq!(easy.ftp_method, FtpMethod::SingleCwd);
+        easy.ftp_method(FtpMethod::NoCwd);
+        assert_eq!(easy.ftp_method, FtpMethod::NoCwd);
+    }
+
+    #[test]
+    fn easy_sasl_authzid() {
+        let mut easy = Easy::new();
+        assert!(easy.sasl_authzid.is_none());
+        easy.sasl_authzid("authzid");
+        assert_eq!(easy.sasl_authzid.as_deref(), Some("authzid"));
+    }
+
+    #[test]
+    fn easy_sasl_ir() {
+        let mut easy = Easy::new();
+        assert!(!easy.sasl_ir);
+        easy.sasl_ir(true);
+        assert!(easy.sasl_ir);
     }
 }

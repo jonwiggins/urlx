@@ -114,6 +114,21 @@ impl FtpResponse {
     }
 }
 
+/// FTP method for traversing directories.
+///
+/// Controls how curl traverses the FTP path to reach the target file.
+/// Equivalent to `CURLOPT_FTP_FILEMETHOD`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FtpMethod {
+    /// Default multi-CWD: change directory one level at a time.
+    #[default]
+    MultiCwd,
+    /// Single CWD: use one CWD with the full path.
+    SingleCwd,
+    /// No CWD: use SIZE/RETR on the full path without changing directory.
+    NoCwd,
+}
+
 /// Transfer mode for FTP data connections.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransferType {
@@ -1360,6 +1375,20 @@ mod tests {
         assert_eq!(FtpSslMode::Implicit, FtpSslMode::Implicit);
         assert_ne!(FtpSslMode::None, FtpSslMode::Explicit);
         assert_ne!(FtpSslMode::Explicit, FtpSslMode::Implicit);
+    }
+
+    #[test]
+    fn ftp_method_default() {
+        assert_eq!(FtpMethod::default(), FtpMethod::MultiCwd);
+    }
+
+    #[test]
+    fn ftp_method_equality() {
+        assert_eq!(FtpMethod::MultiCwd, FtpMethod::MultiCwd);
+        assert_eq!(FtpMethod::SingleCwd, FtpMethod::SingleCwd);
+        assert_eq!(FtpMethod::NoCwd, FtpMethod::NoCwd);
+        assert_ne!(FtpMethod::MultiCwd, FtpMethod::SingleCwd);
+        assert_ne!(FtpMethod::SingleCwd, FtpMethod::NoCwd);
     }
 
     #[test]
