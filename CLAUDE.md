@@ -318,7 +318,7 @@ Built from scratch over 29 phases. All features below are implemented and tested
 - Fuzz harnesses: 4 (URL, HTTP, cookie, HSTS parsers)
 - Benchmarks: 3 (throughput, latency, concurrency via criterion)
 
-**Guardrails:** Zero TODO/FIXME/HACK. Zero `unwrap()` in production code. `#![deny(unsafe_code)]` in liburlx and urlx-cli. GitHub Actions CI (fmt, clippy, test on 3 OS, doc, cargo-deny, MSRV 1.83, commit lint). Pre-commit hooks (fmt, clippy, test, deny, doc, conventional commit).
+**Guardrails:** Zero TODO/FIXME/HACK. Zero `unwrap()` in production code. `#![deny(unsafe_code)]` in liburlx and urlx-cli. GitHub Actions CI (fmt, clippy, test on 3 OS, doc, cargo-deny, MSRV 1.85, commit lint). Pre-commit hooks (fmt, clippy, test, deny, doc, conventional commit).
 
 **Known gaps (as of Phase 36):** HTTP/3 missing connection pooling and server push. HTTP/2 missing stream priority/dependency. SSH known_hosts verification not implemented. Socket/timer callbacks stored but not actively invoked (tokio manages I/O). Missing FFI: CURLOPT_HTTPPOST (deprecated). URL globbing not yet implemented. No async DNS resolver (hickory-dns). No cookie public suffix list. NTLM auth is skeleton only. No PAC proxy auto-config. `--rate` stored but not enforced. `--path-as-is` stored but URL crate still normalizes paths.
 

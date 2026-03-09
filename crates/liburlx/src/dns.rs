@@ -45,7 +45,7 @@ impl DnsCache {
     /// Set the TTL for new entries added to the cache.
     ///
     /// Does not affect already-cached entries.
-    pub fn set_ttl(&mut self, ttl: Duration) {
+    pub const fn set_ttl(&mut self, ttl: Duration) {
         self.ttl = ttl;
     }
 

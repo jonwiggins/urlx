@@ -151,7 +151,7 @@ impl CookieJar {
     /// Remove expired cookies.
     pub fn remove_expired(&mut self) {
         let now = SystemTime::now();
-        self.cookies.retain(|c| c.expires.map_or(true, |exp| now <= exp));
+        self.cookies.retain(|c| c.expires.is_none_or(|exp| now <= exp));
         self.rebuild_index();
     }
 

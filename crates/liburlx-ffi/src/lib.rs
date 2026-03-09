@@ -2924,7 +2924,7 @@ pub unsafe extern "C" fn curl_multi_info_read(
     // Push to the end and return pointer to last element.
     m.msg_queue.push(msg);
     let last_idx = m.msg_queue.len() - 1;
-    &m.msg_queue[last_idx]
+    &raw const m.msg_queue[last_idx]
 }
 
 /// `curl_multi_setopt` — set options on a multi handle.
@@ -3117,7 +3117,7 @@ pub unsafe extern "C" fn curl_multi_poll(
 ///
 /// `multi` must be from `curl_multi_init`.
 #[no_mangle]
-pub unsafe extern "C" fn curl_multi_wakeup(multi: *mut c_void) -> CURLMcode {
+pub const unsafe extern "C" fn curl_multi_wakeup(multi: *mut c_void) -> CURLMcode {
     if multi.is_null() {
         return CURLMcode::CURLM_BAD_HANDLE;
     }
@@ -3713,7 +3713,7 @@ mod tests {
     #[test]
     fn easy_setopt_verbose() {
         let handle = curl_easy_init();
-        let code = unsafe { curl_easy_setopt(handle, 41, 1 as *const c_void) };
+        let code = unsafe { curl_easy_setopt(handle, 41, std::ptr::dangling::<c_void>()) };
         assert_eq!(code, CURLcode::CURLE_OK);
         unsafe { curl_easy_cleanup(handle) };
     }
@@ -3721,7 +3721,7 @@ mod tests {
     #[test]
     fn easy_setopt_follow_redirects() {
         let handle = curl_easy_init();
-        let code = unsafe { curl_easy_setopt(handle, 52, 1 as *const c_void) };
+        let code = unsafe { curl_easy_setopt(handle, 52, std::ptr::dangling::<c_void>()) };
         assert_eq!(code, CURLcode::CURLE_OK);
         unsafe { curl_easy_cleanup(handle) };
     }
@@ -3846,7 +3846,7 @@ mod tests {
     #[test]
     fn easy_setopt_nobody() {
         let handle = curl_easy_init();
-        let code = unsafe { curl_easy_setopt(handle, 44, 1 as *const c_void) };
+        let code = unsafe { curl_easy_setopt(handle, 44, std::ptr::dangling::<c_void>()) };
         assert_eq!(code, CURLcode::CURLE_OK);
         unsafe { curl_easy_cleanup(handle) };
     }
@@ -3894,10 +3894,10 @@ mod tests {
     fn easy_setopt_tcp_options() {
         let handle = curl_easy_init();
         // TCP_NODELAY = 121
-        let code = unsafe { curl_easy_setopt(handle, 121, 1 as *const c_void) };
+        let code = unsafe { curl_easy_setopt(handle, 121, std::ptr::dangling::<c_void>()) };
         assert_eq!(code, CURLcode::CURLE_OK);
         // TCP_KEEPALIVE = 213
-        let code = unsafe { curl_easy_setopt(handle, 213, 1 as *const c_void) };
+        let code = unsafe { curl_easy_setopt(handle, 213, std::ptr::dangling::<c_void>()) };
         assert_eq!(code, CURLcode::CURLE_OK);
         unsafe { curl_easy_cleanup(handle) };
     }
@@ -3905,7 +3905,7 @@ mod tests {
     #[test]
     fn easy_setopt_fail_on_error() {
         let handle = curl_easy_init();
-        let code = unsafe { curl_easy_setopt(handle, 45, 1 as *const c_void) };
+        let code = unsafe { curl_easy_setopt(handle, 45, std::ptr::dangling::<c_void>()) };
         assert_eq!(code, CURLcode::CURLE_OK);
         unsafe { curl_easy_cleanup(handle) };
     }
@@ -3931,7 +3931,7 @@ mod tests {
     #[test]
     fn easy_setopt_httpget() {
         let handle = curl_easy_init();
-        let code = unsafe { curl_easy_setopt(handle, 80, 1 as *const c_void) };
+        let code = unsafe { curl_easy_setopt(handle, 80, std::ptr::dangling::<c_void>()) };
         assert_eq!(code, CURLcode::CURLE_OK);
         unsafe { curl_easy_cleanup(handle) };
     }
@@ -3939,7 +3939,7 @@ mod tests {
     #[test]
     fn easy_setopt_upload() {
         let handle = curl_easy_init();
-        let code = unsafe { curl_easy_setopt(handle, 46, 1 as *const c_void) };
+        let code = unsafe { curl_easy_setopt(handle, 46, std::ptr::dangling::<c_void>()) };
         assert_eq!(code, CURLcode::CURLE_OK);
         unsafe { curl_easy_cleanup(handle) };
     }
@@ -4150,7 +4150,7 @@ mod tests {
     fn easy_setopt_fresh_connect() {
         let handle = curl_easy_init();
         // CURLOPT_FRESH_CONNECT = 74
-        let code = unsafe { curl_easy_setopt(handle, 74, 1_usize as *const c_void) };
+        let code = unsafe { curl_easy_setopt(handle, 74, std::ptr::dangling::<c_void>()) };
         assert_eq!(code, CURLcode::CURLE_OK);
         unsafe { curl_easy_cleanup(handle) };
     }
@@ -4159,7 +4159,7 @@ mod tests {
     fn easy_setopt_forbid_reuse() {
         let handle = curl_easy_init();
         // CURLOPT_FORBID_REUSE = 75
-        let code = unsafe { curl_easy_setopt(handle, 75, 1_usize as *const c_void) };
+        let code = unsafe { curl_easy_setopt(handle, 75, std::ptr::dangling::<c_void>()) };
         assert_eq!(code, CURLcode::CURLE_OK);
         unsafe { curl_easy_cleanup(handle) };
     }
@@ -4240,7 +4240,7 @@ mod tests {
     fn easy_setopt_ssl_sessionid_cache() {
         let handle = curl_easy_init();
         // CURLOPT_SSL_SESSIONID_CACHE = 150
-        let code = unsafe { curl_easy_setopt(handle, 150, 1_usize as *const c_void) };
+        let code = unsafe { curl_easy_setopt(handle, 150, std::ptr::dangling::<c_void>()) };
         assert_eq!(code, CURLcode::CURLE_OK);
         // Disable it
         let code = unsafe { curl_easy_setopt(handle, 150, ptr::null()) };
@@ -4271,7 +4271,7 @@ mod tests {
     fn easy_setopt_proxyauth() {
         let handle = curl_easy_init();
         // CURLOPT_PROXYAUTH = 111, bitmask 1=Basic
-        let code = unsafe { curl_easy_setopt(handle, 111, 1_usize as *const c_void) };
+        let code = unsafe { curl_easy_setopt(handle, 111, std::ptr::dangling::<c_void>()) };
         assert_eq!(code, CURLcode::CURLE_OK);
         unsafe { curl_easy_cleanup(handle) };
     }
@@ -4300,7 +4300,7 @@ mod tests {
     fn easy_setopt_proxy_ssl_verifypeer() {
         let handle = curl_easy_init();
         // CURLOPT_PROXY_SSL_VERIFYPEER = 248
-        let code = unsafe { curl_easy_setopt(handle, 248, 1_usize as *const c_void) };
+        let code = unsafe { curl_easy_setopt(handle, 248, std::ptr::dangling::<c_void>()) };
         assert_eq!(code, CURLcode::CURLE_OK);
         unsafe { curl_easy_cleanup(handle) };
     }
@@ -4462,7 +4462,7 @@ mod tests {
     fn easy_setopt_unrestricted_auth() {
         let handle = curl_easy_init();
         // CURLOPT_UNRESTRICTED_AUTH = 105
-        let code = unsafe { curl_easy_setopt(handle, 105, 1usize as *const c_void) };
+        let code = unsafe { curl_easy_setopt(handle, 105, std::ptr::dangling::<c_void>()) };
         assert_eq!(code, CURLcode::CURLE_OK);
         unsafe { curl_easy_cleanup(handle) };
     }
@@ -4471,7 +4471,7 @@ mod tests {
     fn easy_setopt_ignore_content_length() {
         let handle = curl_easy_init();
         // CURLOPT_IGNORE_CONTENT_LENGTH = 136
-        let code = unsafe { curl_easy_setopt(handle, 136, 1usize as *const c_void) };
+        let code = unsafe { curl_easy_setopt(handle, 136, std::ptr::dangling::<c_void>()) };
         assert_eq!(code, CURLcode::CURLE_OK);
         unsafe { curl_easy_cleanup(handle) };
     }
@@ -4549,7 +4549,7 @@ mod tests {
         assert!(!h.noprogress);
 
         // Set back to 1 (true) to disable progress
-        let code = unsafe { curl_easy_setopt(handle, 43, 1 as *const c_void) };
+        let code = unsafe { curl_easy_setopt(handle, 43, std::ptr::dangling::<c_void>()) };
         assert_eq!(code, CURLcode::CURLE_OK);
         let h = unsafe { &*handle.cast::<EasyHandle>() };
         assert!(h.noprogress);
@@ -4602,7 +4602,7 @@ mod tests {
     #[test]
     fn easy_getinfo_private_default_null() {
         let handle = curl_easy_init();
-        let mut out: *mut c_void = 1 as *mut c_void;
+        let mut out: *mut c_void = std::ptr::dangling_mut::<c_void>();
         // CURLINFO_PRIVATE before setting — should be null
         let result = unsafe {
             curl_easy_getinfo(handle, 0x10_0015, ptr::from_mut(&mut out).cast::<c_void>())
@@ -4925,7 +4925,7 @@ mod tests {
 
         // Get scheme
         let mut part: *mut c_char = ptr::null_mut();
-        let code = unsafe { curl_url_get(handle, 1, &mut part, 0) };
+        let code = unsafe { curl_url_get(handle, 1, &raw mut part, 0) };
         assert_eq!(code, CURLUcode::CURLUE_OK);
         assert!(!part.is_null());
         let scheme = unsafe { CStr::from_ptr(part) }.to_str().unwrap();
@@ -4934,7 +4934,7 @@ mod tests {
 
         // Get host
         let mut part: *mut c_char = ptr::null_mut();
-        let code = unsafe { curl_url_get(handle, 5, &mut part, 0) };
+        let code = unsafe { curl_url_get(handle, 5, &raw mut part, 0) };
         assert_eq!(code, CURLUcode::CURLUE_OK);
         let host = unsafe { CStr::from_ptr(part) }.to_str().unwrap();
         assert_eq!(host, "example.com");
@@ -4942,7 +4942,7 @@ mod tests {
 
         // Get path
         let mut part: *mut c_char = ptr::null_mut();
-        let code = unsafe { curl_url_get(handle, 7, &mut part, 0) };
+        let code = unsafe { curl_url_get(handle, 7, &raw mut part, 0) };
         assert_eq!(code, CURLUcode::CURLUE_OK);
         let path = unsafe { CStr::from_ptr(part) }.to_str().unwrap();
         assert_eq!(path, "/path");
@@ -4950,7 +4950,7 @@ mod tests {
 
         // Get query
         let mut part: *mut c_char = ptr::null_mut();
-        let code = unsafe { curl_url_get(handle, 8, &mut part, 0) };
+        let code = unsafe { curl_url_get(handle, 8, &raw mut part, 0) };
         assert_eq!(code, CURLUcode::CURLUE_OK);
         let query = unsafe { CStr::from_ptr(part) }.to_str().unwrap();
         assert_eq!(query, "q=1");
@@ -4958,7 +4958,7 @@ mod tests {
 
         // Get fragment
         let mut part: *mut c_char = ptr::null_mut();
-        let code = unsafe { curl_url_get(handle, 9, &mut part, 0) };
+        let code = unsafe { curl_url_get(handle, 9, &raw mut part, 0) };
         assert_eq!(code, CURLUcode::CURLUE_OK);
         let frag = unsafe { CStr::from_ptr(part) }.to_str().unwrap();
         assert_eq!(frag, "frag");
@@ -4977,7 +4977,7 @@ mod tests {
 
         // Get reassembled URL
         let mut part: *mut c_char = ptr::null_mut();
-        let code = unsafe { curl_url_get(handle, 0, &mut part, 0) };
+        let code = unsafe { curl_url_get(handle, 0, &raw mut part, 0) };
         assert_eq!(code, CURLUcode::CURLUE_OK);
         let url = unsafe { CStr::from_ptr(part) }.to_str().unwrap();
         assert_eq!(url, "https://example.com:8080/api/v1");
@@ -4993,14 +4993,14 @@ mod tests {
         let _ = unsafe { curl_url_set(handle, 0, url.as_ptr(), 0) };
 
         let mut part: *mut c_char = ptr::null_mut();
-        let code = unsafe { curl_url_get(handle, 2, &mut part, 0) };
+        let code = unsafe { curl_url_get(handle, 2, &raw mut part, 0) };
         assert_eq!(code, CURLUcode::CURLUE_OK);
         let user = unsafe { CStr::from_ptr(part) }.to_str().unwrap();
         assert_eq!(user, "user");
         unsafe { curl_free(part.cast::<c_void>()) };
 
         let mut part: *mut c_char = ptr::null_mut();
-        let code = unsafe { curl_url_get(handle, 3, &mut part, 0) };
+        let code = unsafe { curl_url_get(handle, 3, &raw mut part, 0) };
         assert_eq!(code, CURLUcode::CURLUE_OK);
         let pass = unsafe { CStr::from_ptr(part) }.to_str().unwrap();
         assert_eq!(pass, "pass");
@@ -5034,7 +5034,7 @@ mod tests {
         assert_eq!(code, CURLUcode::CURLUE_OK);
 
         let mut part: *mut c_char = ptr::null_mut();
-        let code = unsafe { curl_url_get(handle, 8, &mut part, 0) };
+        let code = unsafe { curl_url_get(handle, 8, &raw mut part, 0) };
         assert_eq!(code, CURLUcode::CURLUE_OK);
         assert!(part.is_null()); // Query was cleared
 
@@ -5044,7 +5044,7 @@ mod tests {
     #[test]
     fn url_get_null_handle() {
         let mut part: *mut c_char = ptr::null_mut();
-        let code = unsafe { curl_url_get(ptr::null_mut(), 0, &mut part, 0) };
+        let code = unsafe { curl_url_get(ptr::null_mut(), 0, &raw mut part, 0) };
         assert_eq!(code, CURLUcode::CURLUE_BAD_HANDLE);
     }
 
@@ -5058,7 +5058,7 @@ mod tests {
     fn url_get_unknown_part() {
         let handle = curl_url();
         let mut part: *mut c_char = ptr::null_mut();
-        let code = unsafe { curl_url_get(handle, 99, &mut part, 0) };
+        let code = unsafe { curl_url_get(handle, 99, &raw mut part, 0) };
         assert_eq!(code, CURLUcode::CURLUE_UNKNOWN_PART);
         unsafe { curl_url_cleanup(handle) };
     }
@@ -5073,7 +5073,7 @@ mod tests {
 
         // Verify dup has same scheme
         let mut part: *mut c_char = ptr::null_mut();
-        let code = unsafe { curl_url_get(dup, 1, &mut part, 0) };
+        let code = unsafe { curl_url_get(dup, 1, &raw mut part, 0) };
         assert_eq!(code, CURLUcode::CURLUE_OK);
         let scheme = unsafe { CStr::from_ptr(part) }.to_str().unwrap();
         assert_eq!(scheme, "https");
@@ -5125,7 +5125,7 @@ mod tests {
     fn easy_setopt_nosignal() {
         let handle = curl_easy_init();
         // CURLOPT_NOSIGNAL = 99
-        let code = unsafe { curl_easy_setopt(handle, 99, 1 as *const c_void) };
+        let code = unsafe { curl_easy_setopt(handle, 99, std::ptr::dangling::<c_void>()) };
         assert_eq!(code, CURLcode::CURLE_OK);
         unsafe { curl_easy_cleanup(handle) };
     }
@@ -5134,7 +5134,7 @@ mod tests {
     fn easy_setopt_autoreferer() {
         let handle = curl_easy_init();
         // CURLOPT_AUTOREFERER = 58
-        let code = unsafe { curl_easy_setopt(handle, 58, 1 as *const c_void) };
+        let code = unsafe { curl_easy_setopt(handle, 58, std::ptr::dangling::<c_void>()) };
         assert_eq!(code, CURLcode::CURLE_OK);
         unsafe { curl_easy_cleanup(handle) };
     }
@@ -5173,7 +5173,7 @@ mod tests {
     fn multi_info_read_empty() {
         let multi = curl_multi_init();
         let mut msgs_in_queue: c_long = 99;
-        let msg = unsafe { curl_multi_info_read(multi, &mut msgs_in_queue) };
+        let msg = unsafe { curl_multi_info_read(multi, &raw mut msgs_in_queue) };
         assert!(msg.is_null());
         assert_eq!(msgs_in_queue, 0);
         let _ = unsafe { curl_multi_cleanup(multi) };
@@ -5182,7 +5182,7 @@ mod tests {
     #[test]
     fn multi_info_read_null_handle() {
         let mut msgs_in_queue: c_long = 99;
-        let msg = unsafe { curl_multi_info_read(ptr::null_mut(), &mut msgs_in_queue) };
+        let msg = unsafe { curl_multi_info_read(ptr::null_mut(), &raw mut msgs_in_queue) };
         assert!(msg.is_null());
         assert_eq!(msgs_in_queue, 0);
     }
@@ -5331,7 +5331,7 @@ mod tests {
     fn multi_timeout_no_work() {
         let multi = curl_multi_init();
         let mut timeout_ms: c_long = 99;
-        let code = unsafe { curl_multi_timeout(multi, &mut timeout_ms) };
+        let code = unsafe { curl_multi_timeout(multi, &raw mut timeout_ms) };
         assert_eq!(code, CURLMcode::CURLM_OK);
         assert_eq!(timeout_ms, -1); // No work
         let _ = unsafe { curl_multi_cleanup(multi) };
@@ -5340,7 +5340,7 @@ mod tests {
     #[test]
     fn multi_timeout_null_handle() {
         let mut timeout_ms: c_long = 0;
-        let code = unsafe { curl_multi_timeout(ptr::null_mut(), &mut timeout_ms) };
+        let code = unsafe { curl_multi_timeout(ptr::null_mut(), &raw mut timeout_ms) };
         assert_eq!(code, CURLMcode::CURLM_BAD_HANDLE);
     }
 
@@ -5361,7 +5361,7 @@ mod tests {
         let _ = unsafe { curl_multi_add_handle(multi, easy) };
 
         let mut timeout_ms: c_long = 0;
-        let code = unsafe { curl_multi_timeout(multi, &mut timeout_ms) };
+        let code = unsafe { curl_multi_timeout(multi, &raw mut timeout_ms) };
         assert_eq!(code, CURLMcode::CURLM_OK);
         assert_eq!(timeout_ms, 100); // Transfers pending
 
@@ -5389,7 +5389,13 @@ mod tests {
         let multi = curl_multi_init();
         let mut max_fd: c_long = 99;
         let code = unsafe {
-            curl_multi_fdset(multi, ptr::null_mut(), ptr::null_mut(), ptr::null_mut(), &mut max_fd)
+            curl_multi_fdset(
+                multi,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                &raw mut max_fd,
+            )
         };
         assert_eq!(code, CURLMcode::CURLM_OK);
         assert_eq!(max_fd, -1); // No fds exposed
@@ -5405,7 +5411,7 @@ mod tests {
                 ptr::null_mut(),
                 ptr::null_mut(),
                 ptr::null_mut(),
-                &mut max_fd,
+                &raw mut max_fd,
             )
         };
         assert_eq!(code, CURLMcode::CURLM_BAD_HANDLE);
@@ -5430,7 +5436,7 @@ mod tests {
     #[test]
     fn multi_socket_action_null_handle() {
         let mut running: c_long = 0;
-        let code = unsafe { curl_multi_socket_action(ptr::null_mut(), 0, 0, &mut running) };
+        let code = unsafe { curl_multi_socket_action(ptr::null_mut(), 0, 0, &raw mut running) };
         assert_eq!(code, CURLMcode::CURLM_BAD_HANDLE);
     }
 
@@ -5439,7 +5445,7 @@ mod tests {
         let multi = curl_multi_init();
         let mut running: c_long = 99;
         // Socket 5 with no action — should report 0 running handles
-        let code = unsafe { curl_multi_socket_action(multi, 5, 0, &mut running) };
+        let code = unsafe { curl_multi_socket_action(multi, 5, 0, &raw mut running) };
         assert_eq!(code, CURLMcode::CURLM_OK);
         assert_eq!(running, 0);
         let _ = unsafe { curl_multi_cleanup(multi) };
@@ -5472,14 +5478,16 @@ mod tests {
     #[test]
     fn multi_wait_null_handle() {
         let mut numfds: c_long = 0;
-        let code = unsafe { curl_multi_wait(ptr::null_mut(), ptr::null_mut(), 0, 0, &mut numfds) };
+        let code =
+            unsafe { curl_multi_wait(ptr::null_mut(), ptr::null_mut(), 0, 0, &raw mut numfds) };
         assert_eq!(code, CURLMcode::CURLM_BAD_HANDLE);
     }
 
     #[test]
     fn multi_poll_null_handle() {
         let mut numfds: c_long = 0;
-        let code = unsafe { curl_multi_poll(ptr::null_mut(), ptr::null_mut(), 0, 0, &mut numfds) };
+        let code =
+            unsafe { curl_multi_poll(ptr::null_mut(), ptr::null_mut(), 0, 0, &raw mut numfds) };
         assert_eq!(code, CURLMcode::CURLM_BAD_HANDLE);
     }
 
@@ -5534,7 +5542,7 @@ mod tests {
     fn curl_unescape_simple() {
         let input = c"hello%20world";
         let mut outlen: c_long = 0;
-        let result = unsafe { curl_unescape(input.as_ptr(), 0, &mut outlen) };
+        let result = unsafe { curl_unescape(input.as_ptr(), 0, &raw mut outlen) };
         assert!(!result.is_null());
         let s = unsafe { CStr::from_ptr(result) }.to_str().unwrap();
         assert_eq!(s, "hello world");
@@ -5562,7 +5570,7 @@ mod tests {
     fn curl_unescape_with_length() {
         let input = c"%41%42%43DEF";
         let mut outlen: c_long = 0;
-        let result = unsafe { curl_unescape(input.as_ptr(), 9, &mut outlen) };
+        let result = unsafe { curl_unescape(input.as_ptr(), 9, &raw mut outlen) };
         assert!(!result.is_null());
         let s = unsafe { CStr::from_ptr(result) }.to_str().unwrap();
         assert_eq!(s, "ABC");
@@ -5589,7 +5597,7 @@ mod tests {
         let handle = curl_easy_init();
         let input = c"test%20value";
         let mut outlen: c_long = 0;
-        let result = unsafe { curl_easy_unescape(handle, input.as_ptr(), 0, &mut outlen) };
+        let result = unsafe { curl_easy_unescape(handle, input.as_ptr(), 0, &raw mut outlen) };
         assert!(!result.is_null());
         let s = unsafe { CStr::from_ptr(result) }.to_str().unwrap();
         assert_eq!(s, "test value");
@@ -5685,7 +5693,7 @@ mod tests {
     fn easy_setopt_path_as_is() {
         let handle = curl_easy_init();
         // CURLOPT_PATH_AS_IS = 234
-        let code = unsafe { curl_easy_setopt(handle, 234, 1 as *const c_void) };
+        let code = unsafe { curl_easy_setopt(handle, 234, std::ptr::dangling::<c_void>()) };
         assert_eq!(code, CURLcode::CURLE_OK);
         unsafe { curl_easy_cleanup(handle) };
     }
@@ -5712,7 +5720,7 @@ mod tests {
     fn easy_setopt_transfer_encoding() {
         let handle = curl_easy_init();
         // CURLOPT_TRANSFER_ENCODING = 207
-        let code = unsafe { curl_easy_setopt(handle, 207, 1 as *const c_void) };
+        let code = unsafe { curl_easy_setopt(handle, 207, std::ptr::dangling::<c_void>()) };
         assert_eq!(code, CURLcode::CURLE_OK);
         unsafe { curl_easy_cleanup(handle) };
     }
@@ -5721,7 +5729,7 @@ mod tests {
     fn easy_setopt_dns_shuffle_addresses() {
         let handle = curl_easy_init();
         // CURLOPT_DNS_SHUFFLE_ADDRESSES = 275
-        let code = unsafe { curl_easy_setopt(handle, 275, 1 as *const c_void) };
+        let code = unsafe { curl_easy_setopt(handle, 275, std::ptr::dangling::<c_void>()) };
         assert_eq!(code, CURLcode::CURLE_OK);
         unsafe { curl_easy_cleanup(handle) };
     }
@@ -5730,7 +5738,7 @@ mod tests {
     fn easy_setopt_httpproxytunnel() {
         let handle = curl_easy_init();
         // CURLOPT_HTTPPROXYTUNNEL = 61
-        let code = unsafe { curl_easy_setopt(handle, 61, 1 as *const c_void) };
+        let code = unsafe { curl_easy_setopt(handle, 61, std::ptr::dangling::<c_void>()) };
         assert_eq!(code, CURLcode::CURLE_OK);
         unsafe { curl_easy_cleanup(handle) };
     }
@@ -5973,7 +5981,7 @@ mod tests {
             "http://example.com".to_string(),
         ));
 
-        let mut val: *const c_char = 1 as *const c_char;
+        let mut val: *const c_char = std::ptr::dangling::<c_char>();
         let result = unsafe {
             curl_easy_getinfo(handle, 0x10_0031, ptr::from_mut(&mut val).cast::<c_void>())
         };

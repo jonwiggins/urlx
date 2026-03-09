@@ -105,14 +105,14 @@ impl Multi {
     /// simultaneously active transfers. Excess transfers are queued
     /// and started as earlier ones complete.
     /// Equivalent to `CURLMOPT_MAX_TOTAL_CONNECTIONS`.
-    pub fn max_total_connections(&mut self, max: usize) {
+    pub const fn max_total_connections(&mut self, max: usize) {
         self.max_total_connections = Some(max);
     }
 
     /// Set the maximum number of concurrent connections per host.
     ///
     /// Equivalent to `CURLMOPT_MAX_HOST_CONNECTIONS`.
-    pub fn max_host_connections(&mut self, max: usize) {
+    pub const fn max_host_connections(&mut self, max: usize) {
         self.max_host_connections = Some(max);
     }
 
@@ -121,7 +121,7 @@ impl Multi {
     /// When set to [`PipeliningMode::Multiplex`], HTTP/2 multiplexing is
     /// preferred for connections to the same host.
     /// Equivalent to `CURLMOPT_PIPELINING`.
-    pub fn pipelining(&mut self, mode: PipeliningMode) {
+    pub const fn pipelining(&mut self, mode: PipeliningMode) {
         self.pipelining = mode;
     }
 

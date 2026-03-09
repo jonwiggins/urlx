@@ -449,7 +449,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WebSocketStream<S> {
     }
 
     /// Get a mutable reference to the underlying stream.
-    pub fn get_mut(&mut self) -> &mut S {
+    pub const fn get_mut(&mut self) -> &mut S {
         &mut self.stream
     }
 

@@ -393,7 +393,7 @@ impl Easy {
     /// This is used as a hint for progress reporting and for setting
     /// `Content-Length` when streaming uploads. Equivalent to
     /// `CURLOPT_INFILESIZE_LARGE`.
-    pub fn infilesize(&mut self, size: u64) {
+    pub const fn infilesize(&mut self, size: u64) {
         self.infilesize = Some(size);
     }
 
@@ -415,17 +415,17 @@ impl Easy {
     }
 
     /// Enable or disable redirect following.
-    pub fn follow_redirects(&mut self, enable: bool) {
+    pub const fn follow_redirects(&mut self, enable: bool) {
         self.follow_redirects = enable;
     }
 
     /// Set maximum number of redirects to follow (default: 50).
-    pub fn max_redirects(&mut self, max: u32) {
+    pub const fn max_redirects(&mut self, max: u32) {
         self.max_redirects = max;
     }
 
     /// Enable or disable verbose output.
-    pub fn verbose(&mut self, enable: bool) {
+    pub const fn verbose(&mut self, enable: bool) {
         self.verbose = enable;
     }
 
@@ -445,7 +445,7 @@ impl Easy {
     ///
     /// If the connection is not established within this duration,
     /// the transfer fails with [`Error::Timeout`].
-    pub fn connect_timeout(&mut self, duration: Duration) {
+    pub const fn connect_timeout(&mut self, duration: Duration) {
         self.connect_timeout = Some(duration);
     }
 
@@ -453,7 +453,7 @@ impl Easy {
     ///
     /// If the entire transfer (connect + request + response) takes
     /// longer than this duration, it fails with [`Error::Timeout`].
-    pub fn timeout(&mut self, duration: Duration) {
+    pub const fn timeout(&mut self, duration: Duration) {
         self.timeout = Some(duration);
     }
 
@@ -478,7 +478,7 @@ impl Easy {
     ///
     /// When enabled, sends `Accept-Encoding` header and decompresses
     /// gzip, deflate, brotli, and zstd response bodies.
-    pub fn accept_encoding(&mut self, enable: bool) {
+    pub const fn accept_encoding(&mut self, enable: bool) {
         self.accept_encoding = enable;
     }
 
@@ -759,7 +759,7 @@ impl Easy {
     /// When enabled, HTTP responses with status >= 400 cause
     /// [`perform`](Self::perform) to return an error instead of
     /// the response. Equivalent to curl's `-f`/`--fail` flag.
-    pub fn fail_on_error(&mut self, enable: bool) {
+    pub const fn fail_on_error(&mut self, enable: bool) {
         self.fail_on_error = enable;
     }
 
@@ -770,7 +770,7 @@ impl Easy {
     /// Equivalent to curl's `-k` / `--insecure` flag or `CURLOPT_SSL_VERIFYPEER`.
     ///
     /// **WARNING: Disabling verification makes the connection insecure.**
-    pub fn ssl_verify_peer(&mut self, enable: bool) {
+    pub const fn ssl_verify_peer(&mut self, enable: bool) {
         self.tls_config.verify_peer = enable;
     }
 
@@ -780,7 +780,7 @@ impl Easy {
     /// server's hostname. Equivalent to `CURLOPT_SSL_VERIFYHOST`.
     ///
     /// **WARNING: Disabling verification makes the connection insecure.**
-    pub fn ssl_verify_host(&mut self, enable: bool) {
+    pub const fn ssl_verify_host(&mut self, enable: bool) {
         self.tls_config.verify_host = enable;
     }
 
@@ -812,14 +812,14 @@ impl Easy {
     /// Set the minimum TLS version to allow.
     ///
     /// Equivalent to curl's `--tlsv1.2` or `--tlsv1.3`.
-    pub fn ssl_min_version(&mut self, version: crate::tls::TlsVersion) {
+    pub const fn ssl_min_version(&mut self, version: crate::tls::TlsVersion) {
         self.tls_config.min_tls_version = Some(version);
     }
 
     /// Set the maximum TLS version to allow.
     ///
     /// Equivalent to curl's `--tls-max`.
-    pub fn ssl_max_version(&mut self, version: crate::tls::TlsVersion) {
+    pub const fn ssl_max_version(&mut self, version: crate::tls::TlsVersion) {
         self.tls_config.max_tls_version = Some(version);
     }
 
@@ -845,7 +845,7 @@ impl Easy {
     ///
     /// When enabled, TLS session tickets are used for faster reconnections.
     /// Equivalent to `CURLOPT_SSL_SESSIONID_CACHE`.
-    pub fn ssl_session_cache(&mut self, enable: bool) {
+    pub const fn ssl_session_cache(&mut self, enable: bool) {
         self.tls_config.session_cache = enable;
     }
 
@@ -853,7 +853,7 @@ impl Easy {
     ///
     /// When enabled (the default), small packets are sent immediately without
     /// waiting to coalesce. Equivalent to `CURLOPT_TCP_NODELAY`.
-    pub fn tcp_nodelay(&mut self, enable: bool) {
+    pub const fn tcp_nodelay(&mut self, enable: bool) {
         self.tcp_nodelay = enable;
     }
 
@@ -862,7 +862,7 @@ impl Easy {
     /// When set, TCP keepalive probes are sent after the connection has been
     /// idle for the specified duration. Equivalent to `CURLOPT_TCP_KEEPALIVE`
     /// and `CURLOPT_TCP_KEEPIDLE`.
-    pub fn tcp_keepalive(&mut self, idle: Duration) {
+    pub const fn tcp_keepalive(&mut self, idle: Duration) {
         self.tcp_keepalive = Some(idle);
     }
 
@@ -877,7 +877,7 @@ impl Easy {
     /// Bind to a specific local port for outgoing connections.
     ///
     /// Equivalent to curl's `--local-port` or `CURLOPT_LOCALPORT`.
-    pub fn local_port(&mut self, port: u16) {
+    pub const fn local_port(&mut self, port: u16) {
         self.local_port = Some(port);
     }
 
@@ -887,7 +887,7 @@ impl Easy {
     /// connection attempts. This provides simple load distribution across
     /// multiple IPs for the same hostname.
     /// Equivalent to curl's `--dns-shuffle`.
-    pub fn dns_shuffle(&mut self, enable: bool) {
+    pub const fn dns_shuffle(&mut self, enable: bool) {
         self.dns_shuffle = enable;
     }
 
@@ -897,7 +897,7 @@ impl Easy {
     /// The default is 60 seconds (matching curl). Setting to zero disables
     /// DNS caching (every request triggers a new lookup).
     /// Equivalent to `CURLOPT_DNS_CACHE_TIMEOUT`.
-    pub fn dns_cache_timeout(&mut self, duration: Duration) {
+    pub const fn dns_cache_timeout(&mut self, duration: Duration) {
         self.dns_cache_timeout = Some(duration);
         self.dns_cache.set_ttl(duration);
     }
@@ -909,7 +909,7 @@ impl Easy {
     /// A shorter timeout prefers IPv4 more aggressively; a longer timeout
     /// gives IPv6 more time to succeed.
     /// Equivalent to `CURLOPT_HAPPY_EYEBALLS_TIMEOUT_MS`.
-    pub fn happy_eyeballs_timeout(&mut self, duration: Duration) {
+    pub const fn happy_eyeballs_timeout(&mut self, duration: Duration) {
         self.happy_eyeballs_timeout = Some(duration);
     }
 
@@ -962,7 +962,7 @@ impl Easy {
     /// By default, auth credentials are stripped when a redirect crosses to
     /// a different host. Setting this to `true` keeps them on all redirects.
     /// Equivalent to `CURLOPT_UNRESTRICTED_AUTH`.
-    pub fn unrestricted_auth(&mut self, enable: bool) {
+    pub const fn unrestricted_auth(&mut self, enable: bool) {
         self.unrestricted_auth = enable;
     }
 
@@ -971,7 +971,7 @@ impl Easy {
     /// When enabled, the response body is read until EOF rather than
     /// using the Content-Length header to determine body size.
     /// Equivalent to `CURLOPT_IGNORE_CONTENT_LENGTH`.
-    pub fn ignore_content_length(&mut self, enable: bool) {
+    pub const fn ignore_content_length(&mut self, enable: bool) {
         self.ignore_content_length = enable;
     }
 
@@ -1005,7 +1005,7 @@ impl Easy {
     /// - [`HttpVersion::Http2`]: prefer HTTP/2 (same as default for HTTPS)
     ///
     /// Equivalent to `CURLOPT_HTTP_VERSION`.
-    pub fn http_version(&mut self, version: HttpVersion) {
+    pub const fn http_version(&mut self, version: HttpVersion) {
         self.http_version = version;
     }
 
@@ -1017,21 +1017,21 @@ impl Easy {
     /// responds with an error status, the body is not sent.
     ///
     /// Equivalent to `CURLOPT_EXPECT_100_TIMEOUT_MS`.
-    pub fn expect_100_timeout(&mut self, timeout: Duration) {
+    pub const fn expect_100_timeout(&mut self, timeout: Duration) {
         self.expect_100_timeout = Some(timeout);
     }
 
     /// Set the maximum download speed in bytes per second.
     ///
     /// Equivalent to `CURLOPT_MAX_RECV_SPEED_LARGE`.
-    pub fn max_recv_speed(&mut self, bytes_per_sec: u64) {
+    pub const fn max_recv_speed(&mut self, bytes_per_sec: u64) {
         self.max_recv_speed = Some(bytes_per_sec);
     }
 
     /// Set the maximum upload speed in bytes per second.
     ///
     /// Equivalent to `CURLOPT_MAX_SEND_SPEED_LARGE`.
-    pub fn max_send_speed(&mut self, bytes_per_sec: u64) {
+    pub const fn max_send_speed(&mut self, bytes_per_sec: u64) {
         self.max_send_speed = Some(bytes_per_sec);
     }
 
@@ -1042,7 +1042,7 @@ impl Easy {
     /// the transfer is aborted.
     ///
     /// Equivalent to `CURLOPT_LOW_SPEED_LIMIT`.
-    pub fn low_speed_limit(&mut self, bytes_per_sec: u32) {
+    pub const fn low_speed_limit(&mut self, bytes_per_sec: u32) {
         self.low_speed_limit = Some(bytes_per_sec);
     }
 
@@ -1053,7 +1053,7 @@ impl Easy {
     /// the transfer is aborted with a timeout error.
     ///
     /// Equivalent to `CURLOPT_LOW_SPEED_TIME`.
-    pub fn low_speed_time(&mut self, duration: Duration) {
+    pub const fn low_speed_time(&mut self, duration: Duration) {
         self.low_speed_time = Some(duration);
     }
 
@@ -1063,7 +1063,7 @@ impl Easy {
     /// than reusing a pooled connection.
     ///
     /// Equivalent to `CURLOPT_FRESH_CONNECT`.
-    pub fn fresh_connect(&mut self, enable: bool) {
+    pub const fn fresh_connect(&mut self, enable: bool) {
         self.fresh_connect = enable;
     }
 
@@ -1073,7 +1073,7 @@ impl Easy {
     /// rather than being returned to the connection pool for reuse.
     ///
     /// Equivalent to `CURLOPT_FORBID_REUSE`.
-    pub fn forbid_reuse(&mut self, enable: bool) {
+    pub const fn forbid_reuse(&mut self, enable: bool) {
         self.forbid_reuse = enable;
     }
 
@@ -1082,7 +1082,7 @@ impl Easy {
     /// By default, curl changes POST to GET on 301 redirects.
     /// When this is enabled, POST is preserved.
     /// Equivalent to curl's `--post301` or `CURLOPT_POSTREDIR` bit 0.
-    pub fn post301(&mut self, enable: bool) {
+    pub const fn post301(&mut self, enable: bool) {
         self.post301 = enable;
     }
 
@@ -1091,7 +1091,7 @@ impl Easy {
     /// By default, curl changes POST to GET on 302 redirects.
     /// When this is enabled, POST is preserved.
     /// Equivalent to curl's `--post302` or `CURLOPT_POSTREDIR` bit 1.
-    pub fn post302(&mut self, enable: bool) {
+    pub const fn post302(&mut self, enable: bool) {
         self.post302 = enable;
     }
 
@@ -1100,7 +1100,7 @@ impl Easy {
     /// By default, curl changes POST to GET on 303 redirects.
     /// When this is enabled, POST is preserved.
     /// Equivalent to curl's `--post303` or `CURLOPT_POSTREDIR` bit 2.
-    pub fn post303(&mut self, enable: bool) {
+    pub const fn post303(&mut self, enable: bool) {
         self.post303 = enable;
     }
 
@@ -1118,7 +1118,7 @@ impl Easy {
     /// - `Implicit`: connect directly over TLS (port 990)
     ///
     /// Equivalent to curl's `--ftp-ssl` (explicit) or `--ftp-ssl-reqd`.
-    pub fn ftp_ssl_mode(&mut self, mode: crate::protocol::ftp::FtpSslMode) {
+    pub const fn ftp_ssl_mode(&mut self, mode: crate::protocol::ftp::FtpSslMode) {
         self.ftp_ssl_mode = mode;
     }
 
@@ -1145,7 +1145,7 @@ impl Easy {
     /// Don't normalize `..` and `.` path segments in the URL.
     ///
     /// Equivalent to curl's `--path-as-is` / `CURLOPT_PATH_AS_IS`.
-    pub fn path_as_is(&mut self, enable: bool) {
+    pub const fn path_as_is(&mut self, enable: bool) {
         self.path_as_is = enable;
     }
 
@@ -1153,7 +1153,7 @@ impl Easy {
     ///
     /// When enabled, the response body is returned as-is without
     /// any content-encoding decompression. Equivalent to curl's `--raw`.
-    pub fn raw(&mut self, enable: bool) {
+    pub const fn raw(&mut self, enable: bool) {
         self.raw = enable;
     }
 
@@ -1197,7 +1197,7 @@ impl Easy {
     /// When enabled, urlx will attempt to create directories on the remote
     /// server that don't exist. Equivalent to `CURLOPT_FTP_CREATE_MISSING_DIRS`
     /// / curl's `--ftp-create-dirs`.
-    pub fn ftp_create_dirs(&mut self, enable: bool) {
+    pub const fn ftp_create_dirs(&mut self, enable: bool) {
         self.ftp_create_dirs = enable;
     }
 
@@ -1205,7 +1205,7 @@ impl Easy {
     ///
     /// Controls how the path is traversed when accessing files via FTP.
     /// Equivalent to `CURLOPT_FTP_FILEMETHOD` / curl's `--ftp-method`.
-    pub fn ftp_method(&mut self, method: FtpMethod) {
+    pub const fn ftp_method(&mut self, method: FtpMethod) {
         self.ftp_method = method;
     }
 
@@ -1221,7 +1221,7 @@ impl Easy {
     ///
     /// When enabled, the initial response is sent in the first SASL message.
     /// Equivalent to `CURLOPT_SASL_IR` / curl's `--sasl-ir`.
-    pub fn sasl_ir(&mut self, enable: bool) {
+    pub const fn sasl_ir(&mut self, enable: bool) {
         self.sasl_ir = enable;
     }
 

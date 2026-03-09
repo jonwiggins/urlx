@@ -207,7 +207,7 @@ impl Response {
     }
 
     /// Set the transfer info on this response.
-    pub fn set_transfer_info(&mut self, info: TransferInfo) {
+    pub const fn set_transfer_info(&mut self, info: TransferInfo) {
         self.info = info;
     }
 
