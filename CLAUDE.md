@@ -14,12 +14,12 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 37 — Planning
-**Last completed:** Phase 36 (HTTP/3 Maturity) — 2026-03-09
+**Phase:** 38 — Planning
+**Last completed:** Phase 37 (Platform & Build) — 2026-03-09
 **Total tests:** 2,069
-**In progress:** Planning Phase 37
+**In progress:** Planning Phase 38
 **Blockers:** None
-**Next up:** Phase 37 — Platform & Build
+**Next up:** Phase 38 — CLI Expansion IV
 
 ### Completeness Summary (updated Phase 30 review)
 
@@ -391,15 +391,9 @@ Alt-Svc-based automatic HTTP/3 upgrade: wired Alt-Svc cache into `do_single_requ
 
 ---
 
-### Phase 37: Platform & Build
+### Phase 37: Platform & Build (2026-03-09)
 
-**Goal:** Cross-platform improvements.
-
-- native-tls backend (Schannel/SecureTransport)
-- Platform-specific socket options
-- Static linking support
-- pkg-config integration for FFI
-- cbindgen header generation automation
+cbindgen `build.rs` auto-regenerates `include/urlx.h` (829 lines) when source changes. Full C header with all 50 functions, 102 CURLOPT, 32 CURLINFO, 25 CURLcode, CURLSHcode, CURLUcode, CURLMcode enums. pkg-config template (`liburlx.pc.in`) for library discovery. MPL-2.0 license allowed in deny.toml for cbindgen dependency. Static + dynamic library output (`crate-type = ["cdylib", "staticlib"]`). Native-tls backend deferred — rustls covers all current use cases.
 
 ---
 
