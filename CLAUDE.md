@@ -14,12 +14,12 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 33 — CLI Expansion III
-**Last completed:** Phase 32 (HTTPS Proxy & Trace Output) — 2026-03-09
-**Total tests:** 1,958
-**In progress:** Phase 33 — CLI Expansion III
+**Phase:** 34 — FFI Expansion II
+**Last completed:** Phase 33 (CLI Expansion III) — 2026-03-09
+**Total tests:** 1,981
+**In progress:** Phase 34 — FFI Expansion II
 **Blockers:** None
-**Next up:** Phase 33 — CLI Expansion III
+**Next up:** Phase 34 — FFI Expansion II
 
 ### Completeness Summary (updated Phase 30 review)
 
@@ -37,7 +37,7 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 | SSH/SFTP/SCP | 60% | SFTP download/upload/list, SCP download/upload, password + pubkey auth; no known_hosts |
 | Multi API | 75% | Connection limiting, message queue, share, pipelining, wait/poll/wakeup/fdset/socket_action/timeout/info_read |
 | FFI (libcurl C ABI) | ~48% | 86 options, 22 info codes, 25 error codes, 43 functions |
-| CLI | ~37% | ~92 of ~250 flags |
+| CLI | ~40% | ~100 of ~250 flags |
 | Connection | 80% | Pool, TCP_NODELAY, keepalive, Unix sockets, interface/port binding |
 | Transfer control | 80% | Rate limiting enforced in transfer engine (max recv/send speed, low speed timeout) |
 | Performance | — | Hot-path string allocation optimizations, criterion benchmarks |
@@ -287,21 +287,22 @@ Built from scratch over 29 phases. All features below are implemented and tested
 - URL API: Mutable UrlHandle with component-level get/set (scheme, user, password, host, port, path, query, fragment).
 - Memory: Box<[u8]>-based slist string allocation (exact-size, no capacity mismatch). catch_unwind on all FFI boundaries.
 
-**CLI (urlx) — ~92 long flags + short aliases:**
-- HTTP: -X, -H, -d, --data-raw, --data-binary, --data-urlencode, -L, --max-redirs, -I, -A, -e, -G, -F, -r, -C, --compressed, --http1.0, --http1.1, --http2, --http3, --expect100-timeout, --post301, --post302, --post303.
-- Output: -o, -O, -D, -i, -w, --create-dirs, -v, -s, -S, -f, -#, -R/--remote-time.
+**CLI (urlx) — ~100 long flags + short aliases:**
+- HTTP: -X, -H, -d, --data-raw, --data-binary, --data-urlencode, -L, --max-redirs, -I, -A, -e, -G, -F, -r, -C, --compressed, --http1.0, --http1.1, --http2, --http3, --expect100-timeout, --post301, --post302, --post303, --json, --raw, --path-as-is, --url-query.
+- Output: -o, -O, -J/--remote-header-name, -D, -i, -w, --create-dirs, -v, -s, -S, -f, -#, -R/--remote-time, --styled-output, --no-styled-output.
 - Auth: -u, --digest, --bearer, --aws-sigv4, -b, -c, --netrc, --netrc-file, --netrc-optional.
 - TLS/SSH: -k, --cacert, --cert, --key (TLS client key + SSH identity), --tlsv1.2, --tlsv1.3, --tls-max, --pinnedpubkey.
 - Proxy: -x, --noproxy, --socks5-hostname, --proxy-user, --proxy-digest, --proxy-ntlm, --proxy-header.
 - Transfer: -m, --connect-timeout, --retry/--retry-delay/--retry-max-time, --limit-rate, --speed-limit, --speed-time, -T, --unrestricted-auth, --ignore-content-length.
 - Connection: --tcp-nodelay, --tcp-keepalive, --no-keepalive, --unix-socket, --interface, --local-port, --resolve.
 - DNS: --dns-shuffle, --dns-servers, --doh-url, --happy-eyeballs-timeout-ms.
-- Concurrency: -Z, --parallel-max.
+- Concurrency: -Z, --parallel-max, --rate.
 - Debug/Config: --trace, --trace-ascii, --trace-time, --stderr, -K/--config, --libcurl, --proto, --proto-redir, --max-filesize, --hsts, --next.
 - FTP: --ftp-pasv, --ftp-ssl, --ssl, --ftp-ssl-reqd, --ssl-reqd, --ftp-port.
-- Features: .curlrc-style config file parser, protocol restriction, max filesize enforcement (exit 63), libcurl C code generation, retry logic (408/429/5xx), netrc credential lookup.
+- Features: .curlrc-style config file parser, protocol restriction, max filesize enforcement (exit 63), libcurl C code generation, retry logic (408/429/5xx), netrc credential lookup, Content-Disposition filename extraction, URL query parameter appending.
+- Misc: --globoff (no-op, no URL globbing).
 
-**Testing — 1,958 tests (0 failures):**
+**Testing — 1,981 tests (0 failures):**
 - Unit + integration tests across all crates
 - Integration: 1,048 (hyper-based test servers)
 - Property-based: 60 (proptest — URL, cookie, FTP, HTTP, HSTS, multipart, protocols, WebSocket)
@@ -311,7 +312,7 @@ Built from scratch over 29 phases. All features below are implemented and tested
 
 **Guardrails:** Zero TODO/FIXME/HACK. Zero `unwrap()` in production code. `#![deny(unsafe_code)]` in liburlx and urlx-cli. GitHub Actions CI (fmt, clippy, test on 3 OS, doc, cargo-deny, MSRV 1.83, commit lint). Pre-commit hooks (fmt, clippy, test, deny, doc, conventional commit).
 
-**Known gaps (as of Phase 32):** HTTP/3 missing 0-RTT and Alt-Svc-based upgrade from HTTP/2. HTTP/2 missing stream priority/dependency. SSH known_hosts verification not implemented. Socket/timer callbacks stored but not actively invoked (tokio manages I/O). Missing FFI: CURLOPT_HTTPPOST (deprecated). URL globbing (--glob) not yet implemented. No async DNS resolver (hickory-dns). No cookie public suffix list. NTLM auth is skeleton only. No PAC proxy auto-config.
+**Known gaps (as of Phase 33):** HTTP/3 missing 0-RTT and Alt-Svc-based upgrade from HTTP/2. HTTP/2 missing stream priority/dependency. SSH known_hosts verification not implemented. Socket/timer callbacks stored but not actively invoked (tokio manages I/O). Missing FFI: CURLOPT_HTTPPOST (deprecated). URL globbing not yet implemented. No async DNS resolver (hickory-dns). No cookie public suffix list. NTLM auth is skeleton only. No PAC proxy auto-config. `--rate` stored but not enforced. `--path-as-is` stored but URL crate still normalizes paths.
 
 ---
 
@@ -359,18 +360,9 @@ HTTPS proxy tunnel (TLS-in-TLS via `connect_generic<S>`), trace file writing (`-
 
 ---
 
-### Phase 33: CLI Expansion III
+### Phase 33: CLI Expansion III (2026-03-09)
 
-**Goal:** Continue CLI toward full curl parity.
-
-- `--globoff` / URL globbing support
-- `--path-as-is` (don't normalize dots in path)
-- `--raw` (disable HTTP decoding)
-- `--remote-header-name` (Content-Disposition filename)
-- `--styled-output` / `--no-styled-output`
-- `--url-query` (append query parameters)
-- `--json` (shorthand for JSON POST)
-- `--rate` (request rate limiting for parallel)
+Added 10 CLI flags: `--json` (JSON POST shorthand — sets Content-Type/Accept + POST), `--url-query` (append query params to URL with encoding), `-J`/`--remote-header-name` (use Content-Disposition filename for -O), `--raw` (disable HTTP content decoding), `--path-as-is` (no dot normalization in URL path), `--globoff` (no-op), `--rate` (parallel request rate — stored), `--styled-output`/`--no-styled-output` (no-op). Added Easy API `path_as_is()` and `raw()` methods. `raw` disables accept_encoding in perform_transfer. `content_disposition_filename()` extracts filename from quoted/unquoted Content-Disposition headers. `append_url_queries()` handles encoding. 20 new tests.
 
 ---
 
