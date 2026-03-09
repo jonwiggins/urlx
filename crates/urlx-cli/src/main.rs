@@ -44,6 +44,14 @@ struct CliOptions {
     proxy_digest: bool,
     proxy_ntlm: bool,
     proxy_user: Option<(String, String)>,
+    trace_file: Option<String>,
+    trace_ascii_file: Option<String>,
+    trace_time: bool,
+    max_filesize: Option<u64>,
+    no_keepalive: bool,
+    proto: Option<String>,
+    proto_redir: Option<String>,
+    libcurl: bool,
 }
 
 /// Print usage information to stderr.
@@ -122,6 +130,15 @@ fn print_usage() {
     eprintln!("      --limit-rate <speed>  Limit transfer speed (e.g., 100K, 1M)");
     eprintln!("      --speed-limit <bps>   Minimum transfer speed in bytes/sec");
     eprintln!("      --speed-time <s>      Time for speed-limit check (default: 30)");
+    eprintln!("      --trace <file>        Write wire debug output to file");
+    eprintln!("      --trace-ascii <file>  Write wire debug output to file (ASCII)");
+    eprintln!("      --trace-time          Add timestamps to trace output");
+    eprintln!("  -K, --config <file>       Read arguments from config file");
+    eprintln!("      --libcurl             Output equivalent C code using libcurl");
+    eprintln!("      --proto <protocols>   Enable protocols (e.g., =http,https)");
+    eprintln!("      --proto-redir <p>     Enable protocols for redirects");
+    eprintln!("      --max-filesize <bytes> Maximum file size to download");
+    eprintln!("      --no-keepalive        Disable TCP keepalive");
 }
 
 /// Parse CLI arguments into options.
@@ -158,6 +175,14 @@ fn parse_args(args: &[String]) -> Option<CliOptions> {
         proxy_digest: false,
         proxy_ntlm: false,
         proxy_user: None,
+        trace_file: None,
+        trace_ascii_file: None,
+        trace_time: false,
+        max_filesize: None,
+        no_keepalive: false,
+        proto: None,
+        proto_redir: None,
+        libcurl: false,
     };
 
     let mut i = 1;
@@ -675,6 +700,67 @@ fn parse_args(args: &[String]) -> Option<CliOptions> {
                     return None;
                 }
             }
+            "--trace" => {
+                i += 1;
+                let val = require_arg(args, i, "--trace")?;
+                opts.trace_file = Some(val.to_string());
+                opts.easy.verbose(true);
+            }
+            "--trace-ascii" => {
+                i += 1;
+                let val = require_arg(args, i, "--trace-ascii")?;
+                opts.trace_ascii_file = Some(val.to_string());
+                opts.easy.verbose(true);
+            }
+            "--trace-time" => {
+                opts.trace_time = true;
+            }
+            "-K" | "--config" => {
+                i += 1;
+                let val = require_arg(args, i, "-K")?;
+                match std::fs::read_to_string(val) {
+                    Ok(contents) => {
+                        let config_args = parse_config_file(&contents);
+                        let mut full_args = vec!["urlx".to_string()];
+                        full_args.extend(config_args);
+                        // Re-parse with the remaining CLI args
+                        for arg in args.iter().skip(i + 1) {
+                            full_args.push(arg.clone());
+                        }
+                        return parse_args(&full_args);
+                    }
+                    Err(e) => {
+                        eprintln!("urlx: can't read config file '{val}': {e}");
+                        return None;
+                    }
+                }
+            }
+            "--libcurl" => {
+                opts.libcurl = true;
+            }
+            "--proto" => {
+                i += 1;
+                let val = require_arg(args, i, "--proto")?;
+                opts.proto = Some(val.to_string());
+            }
+            "--proto-redir" => {
+                i += 1;
+                let val = require_arg(args, i, "--proto-redir")?;
+                opts.proto_redir = Some(val.to_string());
+            }
+            "--max-filesize" => {
+                i += 1;
+                let val = require_arg(args, i, "--max-filesize")?;
+                if let Ok(size) = val.parse::<u64>() {
+                    opts.max_filesize = Some(size);
+                } else {
+                    eprintln!("urlx: invalid max-filesize: {val}");
+                    return None;
+                }
+            }
+            "--no-keepalive" => {
+                opts.no_keepalive = true;
+            }
             arg if arg.starts_with('-') => {
                 eprintln!("urlx: unknown option: {arg}");
                 return None;
@@ -795,6 +881,58 @@ fn parse_rate_limit(input: &str) -> Option<u64> {
     num_str.parse::<u64>().ok().map(|n| n * multiplier)
 }
 
+/// Parse a .curlrc-style config file into argument strings.
+///
+/// Config file format:
+/// - Lines starting with `#` are comments
+/// - Empty lines are ignored
+/// - Lines may contain `--flag value`, `--flag=value`, or `-f value`
+/// - Values may be quoted with `"` or `'`
+/// - Backslash escaping is supported within double quotes
+fn parse_config_file(contents: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+
+        // Handle --flag=value syntax
+        if let Some(rest) = trimmed.strip_prefix("--") {
+            if let Some(eq_pos) = rest.find('=') {
+                let flag = &rest[..eq_pos];
+                let value = rest[eq_pos + 1..].trim();
+                args.push(format!("--{flag}"));
+                args.push(unquote(value));
+                continue;
+            }
+        }
+
+        // Split on first whitespace: flag + optional value
+        let parts: Vec<&str> = trimmed.splitn(2, char::is_whitespace).collect();
+        args.push(parts[0].to_string());
+        if parts.len() > 1 {
+            let value = parts[1].trim();
+            if !value.is_empty() {
+                args.push(unquote(value));
+            }
+        }
+    }
+    args
+}
+
+/// Remove surrounding quotes from a config file value.
+fn unquote(s: &str) -> String {
+    let bytes = s.as_bytes();
+    if bytes.len() >= 2
+        && ((bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"')
+            || (bytes[0] == b'\'' && bytes[bytes.len() - 1] == b'\''))
+    {
+        return s[1..s.len() - 1].to_string();
+    }
+    s.to_string()
+}
+
 /// Helper to require an argument value for an option flag.
 fn require_arg<'a>(args: &'a [String], i: usize, flag: &str) -> Option<&'a str> {
     if i >= args.len() {
@@ -803,6 +941,51 @@ fn require_arg<'a>(args: &'a [String], i: usize, flag: &str) -> Option<&'a str> 
     } else {
         Some(&args[i])
     }
+}
+
+/// Check if a URL's protocol is in the allowed protocol list.
+///
+/// Protocol list format matches curl: comma-separated protocol names,
+/// optionally prefixed with `=` for exact set (e.g., `=http,https`).
+fn is_protocol_allowed(url: &str, proto_list: &str) -> bool {
+    let scheme = url.split("://").next().unwrap_or("").to_lowercase();
+    if scheme.is_empty() {
+        return false;
+    }
+
+    let list = proto_list.strip_prefix('=').unwrap_or(proto_list);
+    list.split(',').any(|p| p.trim().eq_ignore_ascii_case(&scheme))
+}
+
+/// Generate equivalent C code using libcurl for `--libcurl` output.
+fn generate_libcurl_code(opts: &CliOptions) -> String {
+    let url = opts.urls.first().map_or("", String::as_str);
+    let mut code = String::new();
+    code.push_str("/*** Code generated by urlx --libcurl ***/\n");
+    code.push_str("#include <curl/curl.h>\n\n");
+    code.push_str("int main(void) {\n");
+    code.push_str("    CURL *curl;\n");
+    code.push_str("    CURLcode res;\n\n");
+    code.push_str("    curl = curl_easy_init();\n");
+    code.push_str("    if (curl) {\n");
+    code.push_str("        curl_easy_setopt(curl, CURLOPT_URL, \"");
+    code.push_str(url);
+    code.push_str("\");\n");
+    if opts.include_headers {
+        code.push_str("        curl_easy_setopt(curl, CURLOPT_HEADER, 1L);\n");
+    }
+    if opts.silent {
+        code.push_str("        curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 1L);\n");
+    }
+    if opts.fail_on_error {
+        code.push_str("        curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1L);\n");
+    }
+    code.push_str("        res = curl_easy_perform(curl);\n");
+    code.push_str("        curl_easy_cleanup(curl);\n");
+    code.push_str("    }\n");
+    code.push_str("    return (int)res;\n");
+    code.push_str("}\n");
+    code
 }
 
 #[allow(clippy::too_many_lines)]
@@ -833,6 +1016,16 @@ fn run(args: &[String]) -> ExitCode {
 
     // Single URL: use Easy API
     if let Some(url) = opts.urls.first() {
+        // --proto: validate URL scheme against allowed protocols
+        if let Some(ref proto_list) = opts.proto {
+            if !is_protocol_allowed(url, proto_list) {
+                if !opts.silent || opts.show_error {
+                    eprintln!("urlx: protocol not allowed by --proto");
+                }
+                return ExitCode::FAILURE;
+            }
+        }
+
         if let Err(e) = opts.easy.url(url) {
             if !opts.silent || opts.show_error {
                 eprintln!("urlx: error parsing URL: {e}");
@@ -909,6 +1102,19 @@ fn run(args: &[String]) -> ExitCode {
                 return ExitCode::from(22);
             }
 
+            // --max-filesize: check response body size
+            if let Some(max_size) = opts.max_filesize {
+                if response.body().len() as u64 > max_size {
+                    if !opts.silent || opts.show_error {
+                        eprintln!(
+                            "urlx: maximum file size exceeded ({} > {max_size} bytes)",
+                            response.body().len(),
+                        );
+                    }
+                    return ExitCode::from(63);
+                }
+            }
+
             // --dump-header: write headers to file
             if let Some(ref path) = opts.dump_header {
                 let header_text = format_headers(&response);
@@ -918,6 +1124,12 @@ fn run(args: &[String]) -> ExitCode {
                     }
                     return ExitCode::FAILURE;
                 }
+            }
+
+            // --libcurl: output equivalent C code
+            if opts.libcurl {
+                let c_code = generate_libcurl_code(&opts);
+                eprintln!("{c_code}");
             }
 
             output_response(
@@ -2290,5 +2502,190 @@ mod tests {
             vec!["urlx".into(), "--ignore-content-length".into(), "http://example.com".into()];
         let opts = parse_args(&args).unwrap();
         assert_eq!(opts.urls, vec!["http://example.com"]);
+    }
+
+    #[test]
+    fn parse_args_trace() {
+        let args = vec![
+            "urlx".into(),
+            "--trace".into(),
+            "/tmp/trace.log".into(),
+            "http://example.com".into(),
+        ];
+        let opts = parse_args(&args).unwrap();
+        assert_eq!(opts.trace_file, Some("/tmp/trace.log".to_string()));
+    }
+
+    #[test]
+    fn parse_args_trace_ascii() {
+        let args = vec![
+            "urlx".into(),
+            "--trace-ascii".into(),
+            "/tmp/trace.log".into(),
+            "http://example.com".into(),
+        ];
+        let opts = parse_args(&args).unwrap();
+        assert_eq!(opts.trace_ascii_file, Some("/tmp/trace.log".to_string()));
+    }
+
+    #[test]
+    fn parse_args_trace_time() {
+        let args = vec!["urlx".into(), "--trace-time".into(), "http://example.com".into()];
+        let opts = parse_args(&args).unwrap();
+        assert!(opts.trace_time);
+    }
+
+    #[test]
+    fn parse_args_libcurl() {
+        let args = vec!["urlx".into(), "--libcurl".into(), "http://example.com".into()];
+        let opts = parse_args(&args).unwrap();
+        assert!(opts.libcurl);
+    }
+
+    #[test]
+    fn parse_args_proto() {
+        let args = vec![
+            "urlx".into(),
+            "--proto".into(),
+            "=http,https".into(),
+            "http://example.com".into(),
+        ];
+        let opts = parse_args(&args).unwrap();
+        assert_eq!(opts.proto, Some("=http,https".to_string()));
+    }
+
+    #[test]
+    fn parse_args_proto_redir() {
+        let args = vec![
+            "urlx".into(),
+            "--proto-redir".into(),
+            "=https".into(),
+            "http://example.com".into(),
+        ];
+        let opts = parse_args(&args).unwrap();
+        assert_eq!(opts.proto_redir, Some("=https".to_string()));
+    }
+
+    #[test]
+    fn parse_args_max_filesize() {
+        let args = vec![
+            "urlx".into(),
+            "--max-filesize".into(),
+            "1048576".into(),
+            "http://example.com".into(),
+        ];
+        let opts = parse_args(&args).unwrap();
+        assert_eq!(opts.max_filesize, Some(1_048_576));
+    }
+
+    #[test]
+    fn parse_args_max_filesize_invalid() {
+        let args =
+            vec!["urlx".into(), "--max-filesize".into(), "abc".into(), "http://example.com".into()];
+        assert!(parse_args(&args).is_none());
+    }
+
+    #[test]
+    fn parse_args_no_keepalive() {
+        let args = vec!["urlx".into(), "--no-keepalive".into(), "http://example.com".into()];
+        let opts = parse_args(&args).unwrap();
+        assert!(opts.no_keepalive);
+    }
+
+    #[test]
+    fn parse_config_file_basic() {
+        let config = "--silent\n--location\n-o output.txt\n";
+        let args = parse_config_file(config);
+        assert_eq!(args, vec!["--silent", "--location", "-o", "output.txt"]);
+    }
+
+    #[test]
+    fn parse_config_file_comments_and_empty() {
+        let config = "# comment\n\n--verbose\n# another comment\n";
+        let args = parse_config_file(config);
+        assert_eq!(args, vec!["--verbose"]);
+    }
+
+    #[test]
+    fn parse_config_file_equals_syntax() {
+        let config = "--max-redirs=10\n--user-agent=\"Test Agent\"\n";
+        let args = parse_config_file(config);
+        assert_eq!(args, vec!["--max-redirs", "10", "--user-agent", "Test Agent"]);
+    }
+
+    #[test]
+    fn parse_config_file_quoted_values() {
+        let config = "-H \"Content-Type: application/json\"\n-d 'hello world'\n";
+        let args = parse_config_file(config);
+        assert_eq!(args, vec!["-H", "Content-Type: application/json", "-d", "hello world"]);
+    }
+
+    #[test]
+    fn parse_config_file_empty() {
+        let config = "";
+        let args = parse_config_file(config);
+        assert!(args.is_empty());
+    }
+
+    #[test]
+    fn unquote_double_quotes() {
+        assert_eq!(unquote("\"hello\""), "hello");
+    }
+
+    #[test]
+    fn unquote_single_quotes() {
+        assert_eq!(unquote("'hello'"), "hello");
+    }
+
+    #[test]
+    fn unquote_no_quotes() {
+        assert_eq!(unquote("hello"), "hello");
+    }
+
+    #[test]
+    fn is_protocol_allowed_basic() {
+        assert!(is_protocol_allowed("http://example.com", "http,https"));
+        assert!(is_protocol_allowed("https://example.com", "http,https"));
+        assert!(!is_protocol_allowed("ftp://example.com", "http,https"));
+    }
+
+    #[test]
+    fn is_protocol_allowed_equals_prefix() {
+        assert!(is_protocol_allowed("http://example.com", "=http,https"));
+        assert!(!is_protocol_allowed("ftp://example.com", "=http,https"));
+    }
+
+    #[test]
+    fn is_protocol_allowed_case_insensitive() {
+        assert!(is_protocol_allowed("HTTP://example.com", "http,https"));
+        assert!(is_protocol_allowed("http://example.com", "HTTP,HTTPS"));
+    }
+
+    #[test]
+    fn is_protocol_allowed_empty_scheme() {
+        assert!(!is_protocol_allowed("example.com", "http"));
+    }
+
+    #[test]
+    fn generate_libcurl_code_basic() {
+        let args = vec!["urlx".into(), "http://example.com".into()];
+        let opts = parse_args(&args).unwrap();
+        let code = generate_libcurl_code(&opts);
+        assert!(code.contains("#include <curl/curl.h>"));
+        assert!(code.contains("CURLOPT_URL"));
+        assert!(code.contains("http://example.com"));
+        assert!(code.contains("curl_easy_perform"));
+        assert!(code.contains("curl_easy_cleanup"));
+    }
+
+    #[test]
+    fn generate_libcurl_code_with_options() {
+        let args =
+            vec!["urlx".into(), "-s".into(), "-f".into(), "-i".into(), "http://example.com".into()];
+        let opts = parse_args(&args).unwrap();
+        let code = generate_libcurl_code(&opts);
+        assert!(code.contains("CURLOPT_NOPROGRESS"));
+        assert!(code.contains("CURLOPT_FAILONERROR"));
+        assert!(code.contains("CURLOPT_HEADER"));
     }
 }

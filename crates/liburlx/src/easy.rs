@@ -1373,7 +1373,8 @@ async fn perform_transfer(
         if let Some(alt_svc_value) = response.header("alt-svc") {
             let scheme = current_url.scheme();
             let host = current_url.host_str().unwrap_or("");
-            let port = current_url.port_or_default().unwrap_or(if scheme == "https" { 443 } else { 80 });
+            let port =
+                current_url.port_or_default().unwrap_or(if scheme == "https" { 443 } else { 80 });
             let origin = format!("{scheme}://{host}:{port}");
             let entries = crate::protocol::http::altsvc::parse_alt_svc(alt_svc_value);
             if entries.is_empty() && alt_svc_value.trim() == "clear" {
