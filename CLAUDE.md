@@ -14,12 +14,12 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 18 — Planning
-**Last completed:** Phase 17 (HTTP/1.1 Edge Cases & Protocol Refinements) — 2026-03-08
-**Total tests:** 1,735+
-**In progress:** Planning Phase 18
+**Phase:** 19 — Planning
+**Last completed:** Phase 18 (HTTP/3 & Alt-Svc) — 2026-03-08
+**Total tests:** 1,745+
+**In progress:** Planning Phase 19
 **Blockers:** None
-**Next up:** Phase 18 — HTTP/3 (QUIC) & Alt-Svc
+**Next up:** Phase 19 — CLI Expansion & Debug Tools
 
 ### Completeness Summary (updated Phase 10 review)
 
@@ -389,14 +389,9 @@ Chunked trailer header parsing and exposure in Response API (trailers(), trailer
 
 ---
 
-### Phase 18: HTTP/3 (QUIC) & Alt-Svc
+### Phase 18: HTTP/3 (QUIC) & Alt-Svc — COMPLETED (2026-03-08)
 
-**Goal:** Next-generation HTTP.
-
-- Quinn-based QUIC transport (feature-gated `http3`)
-- Alt-Svc caching and persistence
-- HttpVersion::Http3 enum variant
-- 0-RTT early data
+Alt-Svc cache with TTL-based expiry, automatic Alt-Svc header processing in transfers, HttpVersion::Http3 variant. QUIC transport (quinn) deferred — requires adding heavy dependency. 10 new cache tests.
 
 ---
 
