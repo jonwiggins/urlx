@@ -1,7 +1,9 @@
 //! WebSocket protocol handler.
 //!
 //! Implements the WebSocket handshake (RFC 6455) and frame encoding/decoding
-//! for text, binary, ping, pong, and close frames.
+//! for text, binary, ping, pong, and close frames. Provides a higher-level
+//! [`WebSocketStream`] that handles control frames (auto-pong, close with
+//! status codes) and reassembles fragmented messages.
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -40,11 +42,83 @@ impl Opcode {
     }
 }
 
+/// WebSocket close status codes (RFC 6455 Section 7.4.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u16)]
+pub enum CloseCode {
+    /// Normal closure (1000).
+    Normal = 1000,
+    /// Endpoint going away (1001).
+    GoingAway = 1001,
+    /// Protocol error (1002).
+    ProtocolError = 1002,
+    /// Unsupported data type (1003).
+    Unsupported = 1003,
+    /// No status code present (1005) — must not be sent in a frame.
+    NoStatus = 1005,
+    /// Abnormal closure (1006) — must not be sent in a frame.
+    Abnormal = 1006,
+    /// Invalid payload data (1007).
+    InvalidPayload = 1007,
+    /// Policy violation (1008).
+    PolicyViolation = 1008,
+    /// Message too big (1009).
+    MessageTooBig = 1009,
+    /// Missing expected extension (1010).
+    MissingExtension = 1010,
+    /// Internal server error (1011).
+    InternalError = 1011,
+}
+
+impl CloseCode {
+    /// Convert a raw u16 to a `CloseCode`, returning `None` for unknown codes.
+    #[must_use]
+    pub const fn from_u16(val: u16) -> Option<Self> {
+        match val {
+            1000 => Some(Self::Normal),
+            1001 => Some(Self::GoingAway),
+            1002 => Some(Self::ProtocolError),
+            1003 => Some(Self::Unsupported),
+            1005 => Some(Self::NoStatus),
+            1006 => Some(Self::Abnormal),
+            1007 => Some(Self::InvalidPayload),
+            1008 => Some(Self::PolicyViolation),
+            1009 => Some(Self::MessageTooBig),
+            1010 => Some(Self::MissingExtension),
+            1011 => Some(Self::InternalError),
+            _ => None,
+        }
+    }
+
+    /// Returns the numeric code value.
+    #[must_use]
+    pub const fn as_u16(self) -> u16 {
+        self as u16
+    }
+}
+
+/// A high-level WebSocket message (reassembled from frames).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Message {
+    /// A text message (UTF-8).
+    Text(String),
+    /// A binary message.
+    Binary(Vec<u8>),
+    /// A close message with optional status code and reason.
+    Close(Option<u16>, Option<String>),
+    /// A ping message.
+    Ping(Vec<u8>),
+    /// A pong message.
+    Pong(Vec<u8>),
+}
+
 /// A WebSocket frame.
 #[derive(Debug, Clone)]
 pub struct Frame {
     /// Whether this is the final fragment.
     pub fin: bool,
+    /// RSV1 bit (used by permessage-deflate extension).
+    pub rsv1: bool,
     /// The frame opcode.
     pub opcode: Opcode,
     /// The frame payload.
@@ -55,31 +129,62 @@ impl Frame {
     /// Create a text frame.
     #[must_use]
     pub fn text(data: &str) -> Self {
-        Self { fin: true, opcode: Opcode::Text, payload: data.as_bytes().to_vec() }
+        Self { fin: true, rsv1: false, opcode: Opcode::Text, payload: data.as_bytes().to_vec() }
     }
 
     /// Create a binary frame.
     #[must_use]
     pub fn binary(data: &[u8]) -> Self {
-        Self { fin: true, opcode: Opcode::Binary, payload: data.to_vec() }
+        Self { fin: true, rsv1: false, opcode: Opcode::Binary, payload: data.to_vec() }
     }
 
-    /// Create a close frame.
+    /// Create a close frame with no status code.
     #[must_use]
     pub const fn close() -> Self {
-        Self { fin: true, opcode: Opcode::Close, payload: Vec::new() }
+        Self { fin: true, rsv1: false, opcode: Opcode::Close, payload: Vec::new() }
+    }
+
+    /// Create a close frame with a status code and optional reason.
+    #[must_use]
+    pub fn close_with_code(code: u16, reason: &str) -> Self {
+        let mut payload = Vec::with_capacity(2 + reason.len());
+        payload.extend_from_slice(&code.to_be_bytes());
+        payload.extend_from_slice(reason.as_bytes());
+        Self { fin: true, rsv1: false, opcode: Opcode::Close, payload }
     }
 
     /// Create a ping frame.
     #[must_use]
     pub fn ping(data: &[u8]) -> Self {
-        Self { fin: true, opcode: Opcode::Ping, payload: data.to_vec() }
+        Self { fin: true, rsv1: false, opcode: Opcode::Ping, payload: data.to_vec() }
     }
 
     /// Create a pong frame.
     #[must_use]
     pub fn pong(data: &[u8]) -> Self {
-        Self { fin: true, opcode: Opcode::Pong, payload: data.to_vec() }
+        Self { fin: true, rsv1: false, opcode: Opcode::Pong, payload: data.to_vec() }
+    }
+
+    /// Extract the close status code from a close frame payload.
+    ///
+    /// Returns `None` if the payload is too short (< 2 bytes) or this is not a close frame.
+    #[must_use]
+    pub fn close_code(&self) -> Option<u16> {
+        if self.opcode != Opcode::Close || self.payload.len() < 2 {
+            return None;
+        }
+        Some(u16::from_be_bytes([self.payload[0], self.payload[1]]))
+    }
+
+    /// Extract the close reason string from a close frame payload.
+    ///
+    /// Returns `None` if the payload has no reason text or this is not a close frame.
+    #[must_use]
+    pub fn close_reason(&self) -> Option<&str> {
+        if self.opcode != Opcode::Close || self.payload.len() <= 2 {
+            return None;
+        }
+        std::str::from_utf8(&self.payload[2..]).ok()
     }
 
     /// Get the payload as a UTF-8 string (for text frames).
@@ -99,8 +204,11 @@ impl Frame {
     pub fn encode(&self, mask: bool) -> Vec<u8> {
         let mut buf = Vec::new();
 
-        // First byte: FIN bit + opcode
-        let first = if self.fin { 0x80 } else { 0x00 } | (self.opcode as u8);
+        // First byte: FIN bit + RSV1 + opcode
+        let mut first = if self.fin { 0x80 } else { 0x00 } | (self.opcode as u8);
+        if self.rsv1 {
+            first |= 0x40;
+        }
         buf.push(first);
 
         // Second byte: MASK bit + payload length
@@ -142,6 +250,215 @@ impl Frame {
     }
 }
 
+/// A WebSocket stream that handles control frames and message reassembly.
+///
+/// Wraps a raw `AsyncRead + AsyncWrite` stream and provides:
+/// - Automatic pong responses to ping frames
+/// - Close frame status code handling
+/// - Fragmented message reassembly (continuation frames)
+pub struct WebSocketStream<S> {
+    stream: S,
+    /// Whether we have sent a close frame.
+    close_sent: bool,
+    /// Whether we have received a close frame.
+    close_received: bool,
+    /// Whether this is a client (frames are masked) or server.
+    is_client: bool,
+    /// Buffer for reassembling fragmented messages.
+    fragment_buf: Vec<u8>,
+    /// Opcode of the first fragment in a fragmented message.
+    fragment_opcode: Option<Opcode>,
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> WebSocketStream<S> {
+    /// Create a new client-side WebSocket stream.
+    #[allow(clippy::missing_const_for_fn)]
+    pub fn new_client(stream: S) -> Self {
+        Self {
+            stream,
+            close_sent: false,
+            close_received: false,
+            is_client: true,
+            fragment_buf: Vec::new(),
+            fragment_opcode: None,
+        }
+    }
+
+    /// Create a new server-side WebSocket stream (unmasked frames).
+    #[allow(clippy::missing_const_for_fn)]
+    pub fn new_server(stream: S) -> Self {
+        Self {
+            stream,
+            close_sent: false,
+            close_received: false,
+            is_client: false,
+            fragment_buf: Vec::new(),
+            fragment_opcode: None,
+        }
+    }
+
+    /// Returns true if a close frame has been received.
+    #[must_use]
+    pub const fn is_close_received(&self) -> bool {
+        self.close_received
+    }
+
+    /// Returns true if a close frame has been sent.
+    #[must_use]
+    pub const fn is_close_sent(&self) -> bool {
+        self.close_sent
+    }
+
+    /// Returns true if the connection is fully closed (both sides sent close).
+    #[must_use]
+    pub const fn is_closed(&self) -> bool {
+        self.close_sent && self.close_received
+    }
+
+    /// Read the next application-level message.
+    ///
+    /// Control frames (ping, pong, close) are handled automatically:
+    /// - Ping frames are answered with a pong
+    /// - Close frames trigger a close response
+    /// - Pong frames are returned as `Message::Pong`
+    /// - Fragmented messages are reassembled before returning
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on I/O failure or protocol violation.
+    pub async fn read_message(&mut self) -> Result<Message, Error> {
+        loop {
+            let frame = read_frame(&mut self.stream).await?;
+
+            match frame.opcode {
+                Opcode::Ping => {
+                    // Auto-respond with pong carrying the same payload
+                    let pong = Frame::pong(&frame.payload);
+                    write_frame_masked(&mut self.stream, &pong, self.is_client).await?;
+                    return Ok(Message::Ping(frame.payload));
+                }
+                Opcode::Pong => {
+                    return Ok(Message::Pong(frame.payload));
+                }
+                Opcode::Close => {
+                    self.close_received = true;
+                    let code = frame.close_code();
+                    let reason = frame.close_reason().map(String::from);
+
+                    // If we haven't sent a close yet, echo the close back
+                    if !self.close_sent {
+                        let reply =
+                            code.map_or_else(Frame::close, |c| Frame::close_with_code(c, ""));
+                        write_frame_masked(&mut self.stream, &reply, self.is_client).await?;
+                        self.close_sent = true;
+                    }
+
+                    return Ok(Message::Close(code, reason));
+                }
+                Opcode::Text | Opcode::Binary => {
+                    if frame.fin {
+                        // Complete single-frame message
+                        return if frame.opcode == Opcode::Text {
+                            let text = String::from_utf8(frame.payload).map_err(|e| {
+                                Error::Http(format!("invalid UTF-8 in WebSocket text frame: {e}"))
+                            })?;
+                            Ok(Message::Text(text))
+                        } else {
+                            Ok(Message::Binary(frame.payload))
+                        };
+                    }
+                    // Start of a fragmented message
+                    self.fragment_opcode = Some(frame.opcode);
+                    self.fragment_buf = frame.payload;
+                }
+                Opcode::Continuation => {
+                    if self.fragment_opcode.is_none() {
+                        return Err(Error::Http(
+                            "received continuation frame without initial fragment".to_string(),
+                        ));
+                    }
+                    self.fragment_buf.extend_from_slice(&frame.payload);
+
+                    if frame.fin {
+                        // Reassemble complete message
+                        let opcode = self.fragment_opcode.take();
+                        let data = std::mem::take(&mut self.fragment_buf);
+                        return match opcode {
+                            Some(Opcode::Text) => {
+                                let text = String::from_utf8(data).map_err(|e| {
+                                    Error::Http(format!(
+                                        "invalid UTF-8 in WebSocket text message: {e}"
+                                    ))
+                                })?;
+                                Ok(Message::Text(text))
+                            }
+                            Some(Opcode::Binary) => Ok(Message::Binary(data)),
+                            _ => Err(Error::Http("unexpected fragment opcode".to_string())),
+                        };
+                    }
+                }
+            }
+        }
+    }
+
+    /// Send a text message.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on I/O failure.
+    pub async fn send_text(&mut self, data: &str) -> Result<(), Error> {
+        let frame = Frame::text(data);
+        write_frame_masked(&mut self.stream, &frame, self.is_client).await
+    }
+
+    /// Send a binary message.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on I/O failure.
+    pub async fn send_binary(&mut self, data: &[u8]) -> Result<(), Error> {
+        let frame = Frame::binary(data);
+        write_frame_masked(&mut self.stream, &frame, self.is_client).await
+    }
+
+    /// Send a ping frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on I/O failure.
+    pub async fn send_ping(&mut self, data: &[u8]) -> Result<(), Error> {
+        let frame = Frame::ping(data);
+        write_frame_masked(&mut self.stream, &frame, self.is_client).await
+    }
+
+    /// Send a close frame with an optional status code and reason.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on I/O failure.
+    pub async fn send_close(&mut self, code: Option<u16>, reason: &str) -> Result<(), Error> {
+        let frame = code.map_or_else(Frame::close, |c| Frame::close_with_code(c, reason));
+        write_frame_masked(&mut self.stream, &frame, self.is_client).await?;
+        self.close_sent = true;
+        Ok(())
+    }
+
+    /// Get a reference to the underlying stream.
+    pub const fn get_ref(&self) -> &S {
+        &self.stream
+    }
+
+    /// Get a mutable reference to the underlying stream.
+    pub fn get_mut(&mut self) -> &mut S {
+        &mut self.stream
+    }
+
+    /// Consume the `WebSocketStream` and return the underlying stream.
+    pub fn into_inner(self) -> S {
+        self.stream
+    }
+}
+
 /// Read a WebSocket frame from a stream.
 ///
 /// # Errors
@@ -155,6 +472,7 @@ pub async fn read_frame<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Frame, E
         .map_err(|e| Error::Http(format!("WebSocket read error: {e}")))?;
 
     let fin = header[0] & 0x80 != 0;
+    let rsv1 = header[0] & 0x40 != 0;
     let opcode_val = header[0] & 0x0F;
     let opcode = Opcode::from_u8(opcode_val)
         .ok_or_else(|| Error::Http(format!("unknown WebSocket opcode: {opcode_val:#x}")))?;
@@ -205,7 +523,7 @@ pub async fn read_frame<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Frame, E
         }
     }
 
-    Ok(Frame { fin, opcode, payload })
+    Ok(Frame { fin, rsv1, opcode, payload })
 }
 
 /// Write a WebSocket frame to a stream (client-side, always masked).
@@ -217,7 +535,20 @@ pub async fn write_frame<S: AsyncWrite + Unpin>(
     stream: &mut S,
     frame: &Frame,
 ) -> Result<(), Error> {
-    let encoded = frame.encode(true); // Client frames are always masked
+    write_frame_masked(stream, frame, true).await
+}
+
+/// Write a WebSocket frame to a stream with configurable masking.
+///
+/// # Errors
+///
+/// Returns an error if the write fails.
+async fn write_frame_masked<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    frame: &Frame,
+    mask: bool,
+) -> Result<(), Error> {
+    let encoded = frame.encode(mask);
     stream
         .write_all(&encoded)
         .await
@@ -471,7 +802,208 @@ mod tests {
 
     #[test]
     fn frame_as_text_invalid_utf8() {
-        let frame = Frame { fin: true, opcode: Opcode::Text, payload: vec![0xFF, 0xFE] };
+        let frame =
+            Frame { fin: true, rsv1: false, opcode: Opcode::Text, payload: vec![0xFF, 0xFE] };
         assert!(frame.as_text().is_err());
+    }
+
+    // --- Close frame status codes ---
+
+    #[test]
+    fn close_frame_with_code() {
+        let frame = Frame::close_with_code(1000, "normal closure");
+        assert_eq!(frame.opcode, Opcode::Close);
+        assert_eq!(frame.close_code(), Some(1000));
+        assert_eq!(frame.close_reason(), Some("normal closure"));
+    }
+
+    #[test]
+    fn close_frame_with_code_no_reason() {
+        let frame = Frame::close_with_code(1001, "");
+        assert_eq!(frame.close_code(), Some(1001));
+        assert_eq!(frame.close_reason(), None); // empty reason → None
+    }
+
+    #[test]
+    fn close_frame_empty_no_code() {
+        let frame = Frame::close();
+        assert_eq!(frame.close_code(), None);
+        assert_eq!(frame.close_reason(), None);
+    }
+
+    #[test]
+    fn close_code_on_non_close_frame() {
+        let frame = Frame::text("hello");
+        assert_eq!(frame.close_code(), None);
+    }
+
+    #[test]
+    fn close_code_roundtrip_encode_decode() {
+        let frame = Frame::close_with_code(1002, "protocol error");
+        let encoded = frame.encode(false);
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let decoded = rt.block_on(async {
+            let mut cursor = std::io::Cursor::new(encoded);
+            read_frame(&mut cursor).await.unwrap()
+        });
+        assert_eq!(decoded.close_code(), Some(1002));
+        assert_eq!(decoded.close_reason(), Some("protocol error"));
+    }
+
+    #[test]
+    fn close_code_enum_roundtrip() {
+        assert_eq!(CloseCode::from_u16(1000), Some(CloseCode::Normal));
+        assert_eq!(CloseCode::from_u16(1001), Some(CloseCode::GoingAway));
+        assert_eq!(CloseCode::from_u16(1007), Some(CloseCode::InvalidPayload));
+        assert_eq!(CloseCode::from_u16(1011), Some(CloseCode::InternalError));
+        assert_eq!(CloseCode::from_u16(9999), None);
+        assert_eq!(CloseCode::Normal.as_u16(), 1000);
+    }
+
+    // --- RSV1 bit ---
+
+    #[test]
+    fn rsv1_bit_encoded() {
+        let mut frame = Frame::text("hi");
+        frame.rsv1 = true;
+        let encoded = frame.encode(false);
+        // First byte: FIN(0x80) + RSV1(0x40) + opcode(0x01) = 0xC1
+        assert_eq!(encoded[0], 0xC1);
+    }
+
+    #[tokio::test]
+    async fn rsv1_bit_decoded() {
+        let mut frame = Frame::text("hi");
+        frame.rsv1 = true;
+        let encoded = frame.encode(false);
+        let mut cursor = std::io::Cursor::new(encoded);
+        let decoded = read_frame(&mut cursor).await.unwrap();
+        assert!(decoded.rsv1);
+        assert_eq!(decoded.as_text().unwrap(), "hi");
+    }
+
+    // --- WebSocketStream ---
+
+    #[tokio::test]
+    async fn ws_stream_text_roundtrip() {
+        let (client_stream, server_stream) = tokio::io::duplex(4096);
+        let mut client = WebSocketStream::new_client(client_stream);
+        let mut server = WebSocketStream::new_server(server_stream);
+
+        client.send_text("hello").await.unwrap();
+        let msg = server.read_message().await.unwrap();
+        assert_eq!(msg, Message::Text("hello".to_string()));
+    }
+
+    #[tokio::test]
+    async fn ws_stream_binary_roundtrip() {
+        let (client_stream, server_stream) = tokio::io::duplex(4096);
+        let mut client = WebSocketStream::new_client(client_stream);
+        let mut server = WebSocketStream::new_server(server_stream);
+
+        client.send_binary(b"\x00\x01\x02").await.unwrap();
+        let msg = server.read_message().await.unwrap();
+        assert_eq!(msg, Message::Binary(vec![0, 1, 2]));
+    }
+
+    #[tokio::test]
+    async fn ws_stream_ping_auto_pong() {
+        let (client_stream, server_stream) = tokio::io::duplex(4096);
+        let mut client = WebSocketStream::new_client(client_stream);
+        let mut server = WebSocketStream::new_server(server_stream);
+
+        // Server sends ping to client
+        let outgoing = Frame::ping(b"heartbeat");
+        write_frame_masked(&mut server.stream, &outgoing, false).await.unwrap();
+
+        // Client reads message → gets Ping, auto-sends Pong
+        let msg = client.read_message().await.unwrap();
+        assert_eq!(msg, Message::Ping(b"heartbeat".to_vec()));
+
+        // Server reads the auto-pong
+        let response = read_frame(&mut server.stream).await.unwrap();
+        assert_eq!(response.opcode, Opcode::Pong);
+        assert_eq!(response.payload, b"heartbeat");
+    }
+
+    #[tokio::test]
+    async fn ws_stream_close_handshake() {
+        let (client_stream, server_stream) = tokio::io::duplex(4096);
+        let mut client = WebSocketStream::new_client(client_stream);
+        let mut server = WebSocketStream::new_server(server_stream);
+
+        // Client initiates close
+        client.send_close(Some(1000), "goodbye").await.unwrap();
+        assert!(client.is_close_sent());
+
+        // Server receives close and auto-responds
+        let msg = server.read_message().await.unwrap();
+        assert_eq!(msg, Message::Close(Some(1000), Some("goodbye".to_string())));
+        assert!(server.is_close_received());
+        assert!(server.is_close_sent()); // auto-responded
+        assert!(server.is_closed());
+
+        // Client reads the close response
+        let close_frame = read_frame(&mut client.stream).await.unwrap();
+        assert_eq!(close_frame.opcode, Opcode::Close);
+        assert_eq!(close_frame.close_code(), Some(1000));
+    }
+
+    #[tokio::test]
+    async fn ws_stream_fragmented_text() {
+        let (client_stream, server_stream) = tokio::io::duplex(4096);
+        let mut server = WebSocketStream::new_server(server_stream);
+
+        // Manually write fragmented frames from client side
+        let frag1 =
+            Frame { fin: false, rsv1: false, opcode: Opcode::Text, payload: b"hel".to_vec() };
+        let frag2 = Frame {
+            fin: false,
+            rsv1: false,
+            opcode: Opcode::Continuation,
+            payload: b"lo ".to_vec(),
+        };
+        let frag3 = Frame {
+            fin: true,
+            rsv1: false,
+            opcode: Opcode::Continuation,
+            payload: b"world".to_vec(),
+        };
+
+        let mut client_raw = client_stream;
+        write_frame_masked(&mut client_raw, &frag1, true).await.unwrap();
+        write_frame_masked(&mut client_raw, &frag2, true).await.unwrap();
+        write_frame_masked(&mut client_raw, &frag3, true).await.unwrap();
+
+        let msg = server.read_message().await.unwrap();
+        assert_eq!(msg, Message::Text("hello world".to_string()));
+    }
+
+    #[tokio::test]
+    async fn ws_stream_fragmented_binary() {
+        let (client_stream, server_stream) = tokio::io::duplex(4096);
+        let mut server = WebSocketStream::new_server(server_stream);
+
+        let frag1 = Frame { fin: false, rsv1: false, opcode: Opcode::Binary, payload: vec![1, 2] };
+        let frag2 =
+            Frame { fin: true, rsv1: false, opcode: Opcode::Continuation, payload: vec![3, 4] };
+
+        let mut client_raw = client_stream;
+        write_frame_masked(&mut client_raw, &frag1, true).await.unwrap();
+        write_frame_masked(&mut client_raw, &frag2, true).await.unwrap();
+
+        let msg = server.read_message().await.unwrap();
+        assert_eq!(msg, Message::Binary(vec![1, 2, 3, 4]));
+    }
+
+    #[tokio::test]
+    async fn ws_stream_close_no_code() {
+        let (client_stream, server_stream) = tokio::io::duplex(4096);
+        let mut client = WebSocketStream::new_client(client_stream);
+        let mut server = WebSocketStream::new_server(server_stream);
+
+        client.send_close(None, "").await.unwrap();
+        let msg = server.read_message().await.unwrap();
+        assert_eq!(msg, Message::Close(None, None));
     }
 }
