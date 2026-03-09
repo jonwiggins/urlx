@@ -14,34 +14,34 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 40 — Planning
-**Last completed:** Phase 39 (Differential Testing) — 2026-03-09
-**Total tests:** 2,131
-**In progress:** Planning Phase 40
+**Phase:** 41 — Planning
+**Last completed:** Phase 40 (Completeness Review IV) — 2026-03-09
+**Total tests:** 1,933
+**In progress:** Planning Phase 41
 **Blockers:** None
-**Next up:** Phase 40 — 1.0 Release Preparation (mandatory review)
+**Next up:** Phase 41 — URL Globbing & Request Chaining
 
-### Completeness Summary (updated Phase 30 review)
+### Completeness Summary (updated Phase 40 review)
 
 | Feature Area | Parity | Notes |
 |---|---|---|
 | HTTP/1.1 | 97% | Expect, HTTP/1.0, trailer headers; no chunked upload |
-| HTTP/2 | 75% | Works with server push collection; no stream priority/dependency |
-| HTTP/3 | 55% | QUIC transport via quinn, h3 request/response, rate limiting, Alt-Svc upgrade, 0-RTT; no connection pooling or server push |
-| TLS | 85% | rustls with insecure mode, custom CA, client certs, pinning, version selection, cipher list, session cache |
-| Authentication | 60% | Basic, Bearer, Digest (MD5/SHA-256), AWS SigV4, NTLM skeleton |
-| Cookie engine | 92% | Netscape file format read/write, domain-indexed jar; no public suffix list |
-| Proxy | 90% | HTTP + SOCKS + HTTPS proxy tunnel (TLS-in-TLS) + proxy Basic/Digest/NTLM auth, proxy TLS config; no PAC |
-| DNS | 75% | Cache with configurable TTL, Happy Eyeballs, DNS shuffle, DNS server config, DoH URL config; no async resolver |
-| FTP | 85% | Session API, upload, resume, dir ops, FEAT, explicit/implicit FTPS, active mode (PORT/EPRT) |
-| SSH/SFTP/SCP | 60% | SFTP download/upload/list, SCP download/upload, password + pubkey auth; no known_hosts |
-| Multi API | 75% | Connection limiting, message queue, share, pipelining, wait/poll/wakeup/fdset/socket_action/timeout/info_read |
-| FFI (libcurl C ABI) | ~55% | 102 options, 32 info codes, 25 error codes, 50 functions |
-| CLI | ~44% | ~112 of ~250 flags |
+| HTTP/2 | 75% | Works with server push; no stream priority/dependency |
+| HTTP/3 | 55% | QUIC via quinn, Alt-Svc upgrade, 0-RTT; no connection pooling or server push |
+| TLS | 85% | rustls, insecure mode, CA/client certs, pinning, version selection, cipher list, session cache |
+| Authentication | 60% | Basic, Bearer, Digest, AWS SigV4, NTLM skeleton, SASL options |
+| Cookie engine | 92% | Netscape file format, domain-indexed jar; no public suffix list |
+| Proxy | 90% | HTTP + SOCKS + HTTPS tunnel (TLS-in-TLS), proxy auth; no PAC |
+| DNS | 75% | Cache, Happy Eyeballs, shuffle, custom servers, DoH URL; no async resolver |
+| FTP | 87% | Full session API, FTPS (explicit/implicit), active mode, FtpMethod; no MLST |
+| SSH/SFTP/SCP | 60% | SFTP/SCP download/upload, password + pubkey auth; no known_hosts |
+| WebSocket | 85% | RFC 6455, CloseCode, Message, WebSocketStream, fragmentation; no permessage-deflate |
+| Multi API | 75% | Connection limiting, share, pipelining, FFI event loop stubs |
+| FFI (libcurl C ABI) | ~55% | 102 CURLOPT, 30 CURLINFO, 25 CURLcode, 49 functions, cbindgen header |
+| CLI | ~48% | ~120 of ~250 flags |
 | Connection | 80% | Pool, TCP_NODELAY, keepalive, Unix sockets, interface/port binding |
-| Transfer control | 80% | Rate limiting enforced in transfer engine (max recv/send speed, low speed timeout) |
-| Performance | — | Hot-path string allocation optimizations, criterion benchmarks |
-| Overall | ~60% | ~92% for basic HTTP/HTTPS use cases |
+| Transfer control | 80% | Rate limiting enforced (max recv/send speed, low speed timeout) |
+| Overall | ~62% | ~92% for basic HTTP/HTTPS use cases |
 
 ---
 
@@ -259,46 +259,45 @@ urlx/
 
 ## Implementation Phases
 
-### Phase 0: Cumulative Summary (Phases 1-29, completed 2026-03-09)
+### Phase 0: Cumulative Summary (Phases 1-39, completed 2026-03-09)
 
-Built from scratch over 29 phases. All features below are implemented and tested.
+Built from scratch over 39 phases. All features below are implemented and tested. ~54K lines of Rust across all crates and tests.
 
-**Core Library (liburlx) — 79 Easy methods, 14 Multi methods:**
-- **HTTP/1.x:** Full request/response codec (all methods), chunked transfer encoding with trailer header parsing, Content-Encoding decompression (gzip, deflate, brotli, zstd), redirects (301/302/303/307/308), Expect: 100-continue, HTTP/1.0 mode, header deduplication (last wins), ignore-content-length (read to EOF), auth stripping on cross-origin redirects (unrestricted_auth option).
+**Core Library (liburlx) — 91 Easy methods, 14 Multi methods:**
+- **HTTP/1.x:** Full request/response codec (all methods), chunked transfer encoding with trailer header parsing, Content-Encoding decompression (gzip, deflate, brotli, zstd), redirects (301/302/303/307/308 with post301/302/303 method preservation), Expect: 100-continue, HTTP/1.0 mode, header deduplication (last wins), ignore-content-length (read to EOF), auth stripping on cross-origin redirects (unrestricted_auth option), raw mode (disable content decoding), path_as_is.
 - **HTTP/2:** Via h2 crate with ALPN negotiation. `HttpVersion` enum (None/Http10/Http11/Http2/Http3). Server push collection via `push_promises()` stream — `PushedResponse` struct with URL, status, headers, body.
-- **TLS:** rustls + tokio-rustls. `TlsConfig` with verify_peer/host, CA cert, client cert/key, version selection (TLS 1.2/1.3), certificate pinning (SHA-256 SPKI), cipher list, session cache. Inline DER parser for SPKI extraction.
-- **Authentication:** Basic, Bearer, Digest (MD5/SHA-256 with qop=auth), AWS SigV4 (inline HMAC-SHA256), NTLM skeleton (SHA-256-based, sufficient for proxy auth testing).
+- **TLS:** rustls + tokio-rustls. `TlsConfig` with verify_peer/host, CA cert, client cert/key, version selection (TLS 1.2/1.3), certificate pinning (SHA-256 SPKI), cipher list, session cache. Inline DER parser for SPKI extraction. `TlsConnector::new_no_alpn()` for non-HTTP TLS (FTP, SMTP).
+- **Authentication:** Basic, Bearer, Digest (MD5/SHA-256 with qop=auth), AWS SigV4 (inline HMAC-SHA256), NTLM skeleton (SHA-256-based, sufficient for proxy auth testing). SASL authzid/ir options.
 - **Cookie engine:** RFC 6265 parsing, domain/path matching, Netscape file format persistence (read/write), HttpOnly, Secure, SameSite (stored). Domain-indexed jar (HashMap by domain for O(1) lookup). No public suffix list.
 - **HSTS cache:** STS parsing, HTTP→HTTPS upgrade, includeSubDomains.
 - **Proxy:** HTTP forward, HTTP CONNECT tunnel (with Digest/NTLM 407 challenge-response), HTTPS proxy tunnel (TLS-in-TLS via `connect_generic<S>`), SOCKS4/4a/5 with auth, noproxy bypass, proxy TLS config.
 - **Connection:** Pool with stale retry, TCP_NODELAY (default on), TCP keepalive (socket2), Unix domain sockets, interface/port binding, Happy Eyeballs (250ms, configurable).
 - **DNS:** Cache with configurable TTL, shuffle (inline xorshift32), custom server addresses, DoH URL config. No async resolver.
-- **FTP:** Session-based API — STOR, APPE, REST, FEAT, MKD/RMD/DELE, RNFR/RNTO, SITE, PWD/CWD, SIZE, MLSD, TYPE A/I. Explicit FTPS (AUTH TLS + PBSZ 0 + PROT P, RFC 4217), implicit FTPS (port 990, direct TLS). Active mode (PORT for IPv4, EPRT for IPv4/IPv6). `FtpStream` enum (Plain/Tls) with `AsyncRead`/`AsyncWrite` delegation. `ftps://` URL scheme with default port 990. `TlsConnector::new_no_alpn()` for non-HTTP TLS.
-- **SSH/SFTP/SCP:** Via russh + russh-sftp (pure-Rust, async). `SshSession` with password and public key auth. SFTP download/upload/list via `SftpSession`. SCP download/upload via exec channel with SCP protocol parsing. Auto-discovery of `~/.ssh/id_{ed25519,rsa,ecdsa}` keys. Feature-gated behind `ssh` (optional). `sftp://` and `scp://` URL schemes with default port 22. `Error::Ssh` variant.
-- **HTTP/3:** Via quinn 0.11 + h3 0.0.8 + h3-quinn 0.0.10 for QUIC transport (feature-gated `http3`). QUIC client config with ALPN "h3", insecure cert verifier for -k mode. Rate-limited body send/recv. Wired into easy.rs dispatch for `HttpVersion::Http3`. Alt-Svc-based automatic HTTP/3 upgrade with port override. 0-RTT connection via `into_0rtt()` with full handshake fallback. No connection pooling or server push.
-- **Other protocols:** WebSocket (RFC 6455), SMTP, IMAP, POP3, MQTT 3.1.1, DICT, TFTP, FILE.
+- **FTP:** Session-based API — STOR, APPE, REST, FEAT, MKD/RMD/DELE, RNFR/RNTO, SITE, PWD/CWD, SIZE, MLSD, TYPE A/I. Explicit FTPS (AUTH TLS + PBSZ 0 + PROT P, RFC 4217), implicit FTPS (port 990). Active mode (PORT/EPRT). `FtpMethod` enum (MultiCwd/SingleCwd/NoCwd). `ftp_create_dirs` option.
+- **SSH/SFTP/SCP:** Via russh + russh-sftp (pure-Rust, async). `SshSession` with password and public key auth. SFTP download/upload/list. SCP download/upload via exec channel. Auto-discovery of `~/.ssh/id_{ed25519,rsa,ecdsa}` keys. Feature-gated behind `ssh`.
+- **HTTP/3:** Via quinn 0.11 + h3 0.0.8 + h3-quinn 0.0.10 (feature-gated `http3`). QUIC with ALPN "h3", insecure cert verifier for -k mode. Rate-limited body send/recv. Alt-Svc-based automatic HTTP/3 upgrade with port override. 0-RTT via `into_0rtt()` with fallback. No connection pooling or server push.
+- **WebSocket:** RFC 6455 with `CloseCode` enum (11 status codes), `Message` enum (Text/Binary/Close/Ping/Pong), `WebSocketStream<S>` with auto pong, close handshake, fragmented message reassembly, client/server masking modes. RSV1 bit for future permessage-deflate.
+- **Other protocols:** SMTP (with mail_from/mail_rcpt/mail_auth), IMAP, POP3, MQTT 3.1.1, DICT, TFTP, FILE.
 - **Multi API:** JoinSet-based concurrency, connection limiting (semaphore), message queue, Share interface (DNS cache + cookie jar), PipeliningMode (Nothing/Multiplex). FFI event loop: wait/poll/wakeup, fdset, socket_action, timeout, info_read, setopt, strerror.
 - **Alt-Svc:** Header parsing (RFC 7838), TTL-based cache, automatic processing in transfers.
 - **Transfer control:** Rate limiting enforced in transfer engine via `SpeedLimits` and `RateLimiter`. Max recv/send speed throttling (token bucket, 16KB chunks). Low speed enforcement aborts with `Error::SpeedLimit` after timeout.
-- **Performance:** Hot-path string allocation elimination — cookie domain matching, DNS cache keys, response header lookup, decompression encoding dispatch, multipart content type guessing all use `eq_ignore_ascii_case` instead of `to_lowercase()`. Criterion benchmarks for URL parsing, cookie jar, HSTS cache, DNS cache, response headers, and cookie domain matching.
+- **Performance:** Hot-path string allocation elimination, `eq_ignore_ascii_case` over `to_lowercase()`. Criterion benchmarks for URL parsing, cookie jar, HSTS cache, DNS cache, response headers, cookie domain matching.
 - **Response:** Status, headers, body, trailers, effective_url, TransferInfo (6 timing fields + speed/size metrics).
 
-**FFI Layer (liburlx-ffi) — 102 CURLOPT, 32 CURLINFO, 25 CURLcode, 50 functions:**
-- Functions: curl_easy_init/cleanup/duphandle/reset/setopt/perform/getinfo/strerror/escape/unescape, curl_slist_append/free_all, curl_multi_init/cleanup/add_handle/remove_handle/perform/info_read/setopt/timeout/wait/poll/wakeup/fdset/socket_action/strerror, curl_version, curl_mime_init/addpart/name/data/filename/type/free, curl_share_init/cleanup/setopt/strerror, curl_url/url_cleanup/url_dup/url_set/url_get, curl_free, curl_escape/unescape, curl_getdate, curl_formadd/formfree.
+**FFI Layer (liburlx-ffi) — 102 CURLOPT, 30 CURLINFO, 25 CURLcode, 49 functions:**
+- Functions: curl_easy_init/cleanup/duphandle/reset/setopt/perform/getinfo/strerror/escape/unescape, curl_slist_append/free_all, curl_multi_init/cleanup/add_handle/remove_handle/perform/info_read/setopt/timeout/wait/poll/wakeup/fdset/socket_action/strerror, curl_version, curl_mime_init/addpart/name/data/filename/type/free, curl_share_init/cleanup/setopt/strerror, curl_url/url_cleanup/url_dup/url_set/url_get, curl_free, curl_getdate, curl_formadd/formfree.
 - Callbacks: WRITEFUNCTION, READFUNCTION (with CURL_READFUNC_ABORT), HEADERFUNCTION, DEBUGFUNCTION, PROGRESSFUNCTION, XFERINFOFUNCTION, SEEKFUNCTION.
-- Options: 102 CURLOPT including PRIVATE, SHARE, MIMEPOST, NOPROGRESS, REFERER, HTTP_VERSION, XOAUTH2_BEARER, RESUME_FROM_LARGE, NOSIGNAL, AUTOREFERER, LOCALPORTRANGE, AWS_SIGV4, ERRORBUFFER, STDERR, COOKIELIST, PROXY_CAINFO, HSTS, PROTOCOLS_STR, REDIR_PROTOCOLS_STR, HTTPPROXYTUNNEL, MAXFILESIZE, MAXFILESIZE_LARGE, POSTREDIR, TRANSFER_ENCODING, EXPECT_100_TIMEOUT_MS, PATH_AS_IS, DNS_SHUFFLE_ADDRESSES, PROXY_SSL_VERIFYHOST.
-- CURLINFO: 32 codes including FILETIME, CONTENT_LENGTH_DOWNLOAD/UPLOAD, OS_ERRNO, PRIMARY_IP, NUM_CONNECTS, LOCAL_IP/PORT, REDIRECT_URL, CONDITION_UNMET.
-- Multi options: CURLMoption (SOCKETFUNCTION, SOCKETDATA, PIPELINING, TIMERFUNCTION, TIMERDATA, MAXCONNECTS, MAX_HOST_CONNECTIONS, MAX_TOTAL_CONNECTIONS).
 - Enums: CURLSHcode (6), CURLSHoption (4), CURLUcode (10), CURLUPart (11), CURLMcode (6), CURLMSG (1), CURLMoption (8).
-- URL API: Mutable UrlHandle with component-level get/set (scheme, user, password, host, port, path, query, fragment).
-- Utility: URL percent-encoding/decoding (RFC 3986), HTTP date parsing (RFC 2822/850/asctime), curl_formadd stub (returns DISABLED).
-- Memory: Box<[u8]>-based slist string allocation (exact-size, no capacity mismatch). catch_unwind on all FFI boundaries.
+- URL API: Mutable UrlHandle with component-level get/set.
+- Utility: URL percent-encoding/decoding (RFC 3986), HTTP date parsing (RFC 2822/850/asctime), curl_formadd stub (DISABLED).
+- Build: cbindgen auto-generates `include/urlx.h` (829 lines). pkg-config template. Static + dynamic library output.
+- Memory: Box<[u8]>-based slist string allocation (exact-size). catch_unwind on all FFI boundaries.
 
-**CLI (urlx) — ~112 long flags + short aliases:**
+**CLI (urlx) — ~120 long flags + short aliases:**
 - HTTP: -X, -H, -d, --data-raw, --data-binary, --data-urlencode, -L, --max-redirs, -I, -A, -e, -G, -F, -r, -C, --compressed, --http1.0, --http1.1, --http2, --http3, --expect100-timeout, --post301, --post302, --post303, --json, --raw, --path-as-is, --url-query.
 - Output: -o, -O, -J/--remote-header-name, -D, -i, -w, --create-dirs, -v, -s, -S, -f, -#, -R/--remote-time, --styled-output, --no-styled-output.
 - Auth: -u, --digest, --ntlm, --negotiate, --bearer, --aws-sigv4, -b, -c, --netrc, --netrc-file, --netrc-optional, --delegation, --sasl-authzid, --sasl-ir.
-- TLS/SSH: -k, --cacert, --cert, --key (TLS client key + SSH identity), --tlsv1.2, --tlsv1.3, --tls-max, --pinnedpubkey, --ciphers.
+- TLS/SSH: -k, --cacert, --cert, --key, --tlsv1.2, --tlsv1.3, --tls-max, --pinnedpubkey, --ciphers.
 - Proxy: -x, --noproxy, --socks5-hostname, --proxy-user, --proxy-digest, --proxy-ntlm, --proxy-header.
 - Transfer: -m, --connect-timeout, --retry/--retry-delay/--retry-max-time, --limit-rate, --speed-limit, --speed-time, -T, --unrestricted-auth, --ignore-content-length.
 - Connection: --tcp-nodelay, --tcp-keepalive, --no-keepalive, --unix-socket, --interface, --local-port, --resolve.
@@ -307,120 +306,176 @@ Built from scratch over 29 phases. All features below are implemented and tested
 - Debug/Config: --trace, --trace-ascii, --trace-time, --stderr, -K/--config, --libcurl, --proto, --proto-redir, --max-filesize, --hsts, --next.
 - FTP: --ftp-pasv, --ftp-ssl, --ssl, --ftp-ssl-reqd, --ssl-reqd, --ftp-port, --ftp-create-dirs, --ftp-method.
 - SMTP: --mail-from, --mail-rcpt, --mail-auth.
-- Features: .curlrc-style config file parser, protocol restriction, max filesize enforcement (exit 63), libcurl C code generation, retry logic (408/429/5xx), netrc credential lookup, Content-Disposition filename extraction, URL query parameter appending.
-- Misc: --globoff (no-op, no URL globbing).
+- Features: .curlrc config parser, protocol restriction, max filesize (exit 63), libcurl codegen, retry (408/429/5xx), netrc, Content-Disposition filename, URL query append.
 
-**Testing — 2,090 tests (0 failures):**
-- Unit + integration tests across all crates
-- Integration: 1,048 (hyper-based test servers)
-- Property-based: 60 (proptest — URL, cookie, FTP, HTTP, HSTS, multipart, protocols, WebSocket)
+**Testing — 1,933 tests (0 failures):**
+- Unit: 774 (liburlx 562, FFI 212)
+- Integration: 1,156 (hyper-based test servers, differential curl tests, error code mapping)
 - Doc tests: 3
+- Property-based: included in unit/integration counts (proptest — URL, cookie, FTP, HTTP, HSTS, multipart, protocols, WebSocket)
 - Fuzz harnesses: 4 (URL, HTTP, cookie, HSTS parsers)
 - Benchmarks: 3 (throughput, latency, concurrency via criterion)
 
 **Guardrails:** Zero TODO/FIXME/HACK. Zero `unwrap()` in production code. `#![deny(unsafe_code)]` in liburlx and urlx-cli. GitHub Actions CI (fmt, clippy, test on 3 OS, doc, cargo-deny, MSRV 1.85, commit lint). Pre-commit hooks (fmt, clippy, test, deny, doc, conventional commit).
 
-**Known gaps (as of Phase 36):** HTTP/3 missing connection pooling and server push. HTTP/2 missing stream priority/dependency. SSH known_hosts verification not implemented. Socket/timer callbacks stored but not actively invoked (tokio manages I/O). Missing FFI: CURLOPT_HTTPPOST (deprecated). URL globbing not yet implemented. No async DNS resolver (hickory-dns). No cookie public suffix list. NTLM auth is skeleton only. No PAC proxy auto-config. `--rate` stored but not enforced. `--path-as-is` stored but URL crate still normalizes paths.
+**Known gaps (as of Phase 40 review):** HTTP/3 missing connection pooling and server push. HTTP/2 missing stream priority/dependency. SSH known_hosts verification not implemented. Socket/timer callbacks stored but not actively invoked (tokio manages I/O). URL globbing not yet implemented. No async DNS resolver (hickory-dns). No cookie public suffix list. NTLM auth is skeleton only. No PAC proxy auto-config. `--rate` stored but not enforced. `--path-as-is` stored but URL crate still normalizes paths.
 
 ---
 
-### Phase 30: Completeness Review (2026-03-09)
+### Phase 40: Completeness Review IV (2026-03-09)
 
-Third mandatory review phase. Audited the codebase against curl/libcurl. Compacted phases 21-29 into Phase 0.
+Fourth mandatory review phase. Compacted phases 30-39 into Phase 0.
 
-**Audit results:**
-- 43 FFI functions, 86 CURLOPT, 22 CURLINFO, 25 CURLcode
-- 79 Easy API methods, 14 Multi methods
-- ~89 CLI long flags + short aliases
-- 18 protocol modules (10 top-level + 8 HTTP submodules)
-- 1,954 tests (0 failures)
-- Hot-path string allocation optimizations applied
+**Audit results (measured):**
+- 49 FFI functions, 102 CURLOPT, 30 CURLINFO, 25 CURLcode
+- 91 Easy API methods, 14 Multi methods
+- ~120 CLI long flags + short aliases
+- ~54K lines of Rust (26K liburlx, 6K FFI, 4K CLI, 18K tests)
+- 1,933 tests (0 failures)
 
 **Completeness assessment:**
 - ~92% for basic HTTP/HTTPS use cases
-- ~60% overall curl feature parity
-- FFI at ~46% (43 of ~90+ libcurl functions)
-- CLI at ~36% (~89 of ~250 flags)
+- ~62% overall curl feature parity
+- FFI at ~55% (49 of ~90+ libcurl functions, 102 of ~300 CURLOPT)
+- CLI at ~48% (~120 of ~250 flags)
 
 **Key gaps for 1.0:**
-1. Async DNS resolver (hickory-dns) for non-blocking resolution
-2. HTTP/3 Alt-Svc upgrade and 0-RTT
-3. HTTP/2 stream priority/dependency
-4. HTTPS proxy tunneling
-5. Trace file output (--trace writes to file)
-6. URL globbing (--glob)
-7. Additional FFI functions (curl_formadd, curl_getdate, curl_escape/unescape)
-8. Additional CLI flags (50+ remaining common flags)
-9. Cookie public suffix list
-10. NTLM full implementation (MD4+DES crypto)
+1. URL globbing (`--glob`, `{a,b,c}`, `[1-10]`)
+2. HTTP/2 stream priority/dependency
+3. HTTP/3 connection pooling
+4. Async DNS resolver (hickory-dns)
+5. Cookie public suffix list
+6. SSH known_hosts verification
+7. NTLM full crypto (MD4+DES)
+8. `--rate` enforcement in parallel mode
+9. `--path-as-is` URL normalization bypass
+10. ~130 remaining CLI flags for full curl parity
 
 ---
 
-### Phase 31: Cookie Domain Indexing (2026-03-09)
+### Phase 41: URL Globbing & Request Chaining
 
-Domain-indexed cookie jar for O(1) lookup. HashMap<String, Vec<usize>> maps domains to cookie indices. cookie_header() walks exact + parent domains via index. Index rebuilt on mutation. 4 new tests. Remaining items (hickory-dns async resolver, cookie public suffix list, DoH implementation) deferred to Phase 36+.
+**Goal:** Implement URL globbing and `--next` request chaining.
 
----
-
-### Phase 32: HTTPS Proxy & Trace Output (2026-03-09)
-
-HTTPS proxy tunnel (TLS-in-TLS via `connect_generic<S>`), trace file writing (`--trace` hex dump, `--trace-ascii` plain text, `--trace-time` timestamps), `--stderr` flag for error redirection. Generic `establish_connect_tunnel<S>` and `send_connect_request<S>` accepting any `AsyncRead+AsyncWrite+Unpin` stream. `TlsConnector::new_no_alpn()` for proxy TLS. Fixed flaky `ws_key_unique` test (atomic counter for nanosecond-collision uniqueness). 14 new tests.
-
----
-
-### Phase 33: CLI Expansion III (2026-03-09)
-
-Added 10 CLI flags: `--json` (JSON POST shorthand — sets Content-Type/Accept + POST), `--url-query` (append query params to URL with encoding), `-J`/`--remote-header-name` (use Content-Disposition filename for -O), `--raw` (disable HTTP content decoding), `--path-as-is` (no dot normalization in URL path), `--globoff` (no-op), `--rate` (parallel request rate — stored), `--styled-output`/`--no-styled-output` (no-op). Added Easy API `path_as_is()` and `raw()` methods. `raw` disables accept_encoding in perform_transfer. `content_disposition_filename()` extracts filename from quoted/unquoted Content-Disposition headers. `append_url_queries()` handles encoding. 20 new tests.
+- `{a,b,c}` set expansion in URLs
+- `[1-10]` numeric range expansion (with optional step `[1-10:2]`)
+- `[a-z]` alpha range expansion
+- `#[num]` output filename counter
+- `--next` flag separates independent requests with different options
+- Nested glob combinations
 
 ---
 
-### Phase 34: FFI Expansion II (2026-03-09)
+### Phase 42: CLI Expansion V
 
-Added 16 CURLOPT options, 10 CURLINFO codes, and 7 utility functions. HTTP date parser (RFC 2822, RFC 850, asctime) with inline Unix timestamp computation. URL percent-encoding/decoding (RFC 3986). curl_formadd/curl_formfree stubs (deprecated API returns DISABLED). 65 new tests (212 FFI tests total). Totals: 102 CURLOPT, 32 CURLINFO, 50 functions, 2,049 tests.
+**Goal:** Continue toward full curl CLI parity.
 
----
-
-### Phase 35: WebSocket Enhancements (2026-03-09)
-
-Added `CloseCode` enum (11 RFC 6455 Section 7.4.1 status codes), `close_with_code()` constructor, `close_code()`/`close_reason()` extractors. `Message` enum (Text/Binary/Close/Ping/Pong) for high-level API. `WebSocketStream<S>` wrapping any `AsyncRead+AsyncWrite` with automatic pong response to pings, close handshake (auto-reply), fragmented message reassembly (continuation frames), and client/server mode (masked/unmasked). RSV1 bit in `Frame` for future permessage-deflate. `write_frame_masked()` for configurable masking. 15 new tests.
-
----
-
-### Phase 36: HTTP/3 Maturity (2026-03-09)
-
-Alt-Svc-based automatic HTTP/3 upgrade: wired Alt-Svc cache into `do_single_request` so cached h3 entries trigger QUIC dispatch when `HttpVersion` is `None` or `Http2`. Alt-Svc port override (h3 on different port than origin). 0-RTT QUIC connection via quinn's `into_0rtt()` with fallback to full handshake when no session data available. Verbose output distinguishes `--http3` from "Alt-Svc upgrade". 5 new tests.
+- `--proxy-tlsv1.2`/`--proxy-tlsv1.3`/`--proxy-cacert`/`--proxy-cert`/`--proxy-key` (proxy TLS config)
+- `--abstract-unix-socket` (Linux abstract sockets)
+- `--alt-svc` (Alt-Svc cache file)
+- `--compressed-ssh` (SSH compression)
+- `--connect-to` (host:port mapping)
+- `--doh-insecure`/`--doh-cert-status` (DoH TLS options)
+- `--etag-save`/`--etag-compare` (ETag conditional requests)
+- `--haproxy-protocol` (HAProxy PROXY protocol)
 
 ---
 
-### Phase 37: Platform & Build (2026-03-09)
+### Phase 43: HTTP/2 Stream Priority & Advanced Features
 
-cbindgen `build.rs` auto-regenerates `include/urlx.h` (829 lines) when source changes. Full C header with all 50 functions, 102 CURLOPT, 32 CURLINFO, 25 CURLcode, CURLSHcode, CURLUcode, CURLMcode enums. pkg-config template (`liburlx.pc.in`) for library discovery. MPL-2.0 license allowed in deny.toml for cbindgen dependency. Static + dynamic library output (`crate-type = ["cdylib", "staticlib"]`). Native-tls backend deferred — rustls covers all current use cases.
+**Goal:** HTTP/2 stream priority/dependency and window management.
 
----
-
-### Phase 38: CLI Expansion IV (2026-03-09)
-
-Added 12 CLI flags: `--ciphers` (TLS cipher selection via `ssl_cipher_list()`), `--ntlm` (HTTP NTLM auth with `-u`), `--negotiate` (no-op, Kerberos/SPNEGO placeholder), `--delegation` (no-op, GSS-API placeholder), `--sasl-authzid`/`--sasl-ir` (SASL options stored on Easy), `--mail-from`/`--mail-rcpt`/`--mail-auth` (SMTP envelope settings), `--ftp-create-dirs` (create missing FTP dirs), `--ftp-method` (multicwd/singlecwd/nocwd). Added `FtpMethod` enum, `ntlm_auth()` Easy method, SMTP/FTP/SASL Easy API fields. 21 new tests.
-
----
-
-### Phase 39: Differential Testing (2026-03-09)
-
-Systematic testing against curl behavior. 30 differential tests covering: error codes (DNS, connection refused, timeout), redirect behavior (307/308 preserve POST, 301 with/without post301, max-redirs, relative URL), header handling (case insensitive, last value wins, custom headers), HTTP methods (PUT, PATCH, DELETE, OPTIONS), transfer info (`effective_url`, timing, `size_download`), URL parsing (ports, userinfo, empty path), cookies (jar sends cookies), content-type/body (empty POST body, GET no content-length), `fail_on_error` (4xx, 5xx, 200 success), auth (Basic header verification with inline base64, Bearer token). 11 error code mapping tests covering URL parse errors, valid patterns, query/fragment, percent encoding, error display, variant distinctness, timeout/http/transfer formatting. MSRV bumped to 1.85.0 (getrandom 0.4 requires edition2024). 46 clippy lint fixes from MSRV upgrade (is_none_or, const fn, &raw mut).
+- Stream priority weights
+- Stream dependencies (exclusive/non-exclusive)
+- Flow control window tuning
+- Server push handling improvements
+- PING frame keep-alive
 
 ---
 
-### Phase 40: Completeness Review IV (mandatory review)
+### Phase 44: Async DNS Resolver
 
-**Goal:** Fourth mandatory review. Compact phases 31-39 into Phase 0. Audit codebase, update completeness table, plan phases 41-50.
+**Goal:** Non-blocking DNS resolution via hickory-dns.
 
-- Compact Phase 0: merge phases 31-39 summaries into cumulative summary
-- Remove individual phase 31-39 entries
-- Count current tests, Easy methods, FFI functions/options/info codes
-- Update completeness table with accurate parity percentages
-- Update known gaps list
-- Assess 1.0 readiness
-- Plan phases 41-50
+- Feature-gated `hickory-dns` integration
+- Async resolution in transfer engine
+- DNS-over-HTTPS (DoH) actual implementation
+- DNS-over-TLS (DoT) support
+- Configurable resolver selection
+
+---
+
+### Phase 45: Cookie Public Suffix List
+
+**Goal:** Proper domain validation using the public suffix list.
+
+- PSL database (embedded or downloadable)
+- Domain validation on cookie set
+- Prevent super-domain cookie attacks
+- eTLD+1 computation
+
+---
+
+### Phase 46: FFI Expansion III
+
+**Goal:** Expand FFI toward 120+ CURLOPT and 40+ CURLINFO.
+
+- CURLOPT_HTTPPOST (deprecated but still used)
+- CURLOPT_CONNECT_TO
+- CURLOPT_HAPROXYPROTOCOL
+- Additional CURLINFO timing fields
+- Additional CURLcode error codes
+- Target 60+ FFI functions
+
+---
+
+### Phase 47: CLI Expansion VI
+
+**Goal:** Additional CLI flags toward 150+.
+
+- `--form-string` (literal form data, no @ interpretation)
+- `--proto-default` (default protocol for schemeless URLs)
+- `--request-target` (custom request target)
+- `--socks4`/`--socks4a`/`--socks5` (SOCKS proxy variants)
+- `--proxy-1.0` (HTTP/1.0 proxy)
+- `--tftp-blksize`/`--tftp-no-options` (TFTP options)
+- Remaining output formatting flags
+
+---
+
+### Phase 48: SSH Known Hosts & Security Hardening
+
+**Goal:** SSH host verification and security improvements.
+
+- `--hostpubsha256` (SSH host key fingerprint verification)
+- Known hosts file parsing and validation
+- Strict host key checking modes
+- Key exchange algorithm selection
+
+---
+
+### Phase 49: Performance & Optimization II
+
+**Goal:** Profiling and optimization pass.
+
+- Throughput benchmarks vs curl
+- Connection setup latency profiling
+- Memory allocation analysis
+- Zero-copy improvements
+- Connection pool warming strategies
+- Parallel transfer optimization
+
+---
+
+### Phase 50: Completeness Review V (mandatory review)
+
+**Goal:** Fifth mandatory review. Assess progress toward 1.0.
+
+- Compact phases 41-49 into Phase 0
+- Comprehensive differential testing against curl
+- FFI/CLI coverage audit
+- API stability assessment
+- Plan phases 51-60 or 1.0 release
 
 ---
 
