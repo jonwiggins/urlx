@@ -141,8 +141,8 @@ where
                         || final_status == 204
                         || final_status == 304
                         || (100..200).contains(&final_status);
-                    let (response_body, body_read_to_eof) = if no_body {
-                        (Vec::new(), false)
+                    let (response_body, body_read_to_eof, trailers) = if no_body {
+                        (Vec::new(), false, HashMap::new())
                     } else {
                         read_body_from_headers(
                             stream,
@@ -158,10 +158,12 @@ where
                         .is_some_and(|v| v.eq_ignore_ascii_case("close"));
                     let can_reuse =
                         keep_alive && !use_http10 && !server_wants_close && !body_read_to_eof;
-                    return Ok((
-                        Response::new(final_status, final_headers, response_body, url.to_string()),
-                        can_reuse,
-                    ));
+                    let mut resp =
+                        Response::new(final_status, final_headers, response_body, url.to_string());
+                    if !trailers.is_empty() {
+                        resp.set_trailers(trailers);
+                    }
+                    return Ok((resp, can_reuse));
                 }
             }
             Err(_) => {
@@ -208,8 +210,8 @@ where
     let no_body = is_head || status == 204 || status == 304;
 
     // Read body
-    let (response_body, body_read_to_eof) = if no_body {
-        (Vec::new(), false)
+    let (response_body, body_read_to_eof, trailers) = if no_body {
+        (Vec::new(), false, HashMap::new())
     } else {
         read_body_from_headers(
             stream,
@@ -226,7 +228,11 @@ where
         headers.get("connection").is_some_and(|v| v.eq_ignore_ascii_case("close"));
     let can_reuse = keep_alive && !use_http10 && !server_wants_close && !body_read_to_eof;
 
-    Ok((Response::new(status, headers, response_body, url.to_string()), can_reuse))
+    let mut resp = Response::new(status, headers, response_body, url.to_string());
+    if !trailers.is_empty() {
+        resp.set_trailers(trailers);
+    }
+    Ok((resp, can_reuse))
 }
 
 /// Read response headers incrementally from a stream.
@@ -394,14 +400,14 @@ where
 
 /// Read the response body based on headers (Content-Length, chunked, or EOF).
 ///
-/// Returns the body bytes and whether the body was read to EOF.
+/// Returns the body bytes, whether the body was read to EOF, and any trailer headers.
 async fn read_body_from_headers<S>(
     stream: &mut S,
     headers: &HashMap<String, String>,
     body_prefix: Vec<u8>,
     keep_alive: bool,
     ignore_content_length: bool,
-) -> Result<(Vec<u8>, bool), Error>
+) -> Result<(Vec<u8>, bool, HashMap<String, String>), Error>
 where
     S: AsyncRead + Unpin,
 {
@@ -409,17 +415,17 @@ where
         headers.get("transfer-encoding").is_some_and(|te| te.eq_ignore_ascii_case("chunked"));
 
     if is_chunked {
-        let body = read_chunked_body_streaming(stream, body_prefix).await?;
-        Ok((body, false))
+        let (body, trailers) = read_chunked_body_streaming(stream, body_prefix).await?;
+        Ok((body, false, trailers))
     } else if !ignore_content_length && headers.contains_key("content-length") {
         let cl = &headers["content-length"];
         let content_length: usize =
             cl.parse().map_err(|e| Error::Http(format!("invalid Content-Length: {e}")))?;
         let body = read_exact_body(stream, content_length, body_prefix).await?;
-        Ok((body, false))
+        Ok((body, false, HashMap::new()))
     } else if keep_alive && !ignore_content_length {
         // No Content-Length, no chunked, but keep-alive → assume empty body
-        Ok((body_prefix, false))
+        Ok((body_prefix, false, HashMap::new()))
     } else {
         // No Content-Length (or ignoring it), connection close → read until EOF
         let mut body = body_prefix;
@@ -428,12 +434,17 @@ where
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof && !body.is_empty() => {}
             Err(e) => return Err(Error::Http(format!("read failed: {e}"))),
         }
-        Ok((body, true))
+        Ok((body, true, HashMap::new()))
     }
 }
 
 /// Read a chunked transfer-encoded body incrementally from a stream.
-async fn read_chunked_body_streaming<S>(stream: &mut S, prefix: Vec<u8>) -> Result<Vec<u8>, Error>
+///
+/// Returns the decoded body and any trailer headers.
+async fn read_chunked_body_streaming<S>(
+    stream: &mut S,
+    prefix: Vec<u8>,
+) -> Result<(Vec<u8>, HashMap<String, String>), Error>
 where
     S: AsyncRead + Unpin,
 {
@@ -450,7 +461,7 @@ where
                 .await
                 .map_err(|e| Error::Http(format!("chunked read failed: {e}")))?;
             if n == 0 {
-                return Ok(decoded);
+                return Ok((decoded, HashMap::new()));
             }
             buf.extend_from_slice(&tmp[..n]);
         }
@@ -467,19 +478,37 @@ where
         pos = line_end + 2;
 
         if chunk_size == 0 {
-            // Read trailing CRLF after last chunk
-            while buf.len() < pos + 2 {
-                let mut tmp = [0u8; 256];
-                let n = stream
-                    .read(&mut tmp)
-                    .await
-                    .map_err(|e| Error::Http(format!("chunked trailer read failed: {e}")))?;
-                if n == 0 {
+            // Read trailers + final CRLF after last chunk
+            // Trailers end with an empty line (\r\n\r\n) or just \r\n if none
+            let mut trailers = HashMap::new();
+            loop {
+                // Ensure we have at least one line
+                while find_crlf(&buf, pos).is_none() {
+                    let mut tmp = [0u8; 256];
+                    let n = stream
+                        .read(&mut tmp)
+                        .await
+                        .map_err(|e| Error::Http(format!("chunked trailer read failed: {e}")))?;
+                    if n == 0 {
+                        return Ok((decoded, trailers));
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                }
+                let Some(line_end) = find_crlf(&buf, pos) else { break };
+                if line_end == pos {
+                    // Empty line — end of trailers
                     break;
                 }
-                buf.extend_from_slice(&tmp[..n]);
+                // Parse trailer header
+                if let Ok(line) = std::str::from_utf8(&buf[pos..line_end]) {
+                    if let Some((name, value)) = line.split_once(':') {
+                        let _ =
+                            trailers.insert(name.trim().to_lowercase(), value.trim().to_string());
+                    }
+                }
+                pos = line_end + 2;
             }
-            break;
+            return Ok((decoded, trailers));
         }
 
         // Ensure we have the full chunk data + trailing \r\n
@@ -494,7 +523,7 @@ where
                 // Partial chunk — take what we have
                 let available = buf.len().saturating_sub(pos).min(chunk_size);
                 decoded.extend_from_slice(&buf[pos..pos + available]);
-                return Ok(decoded);
+                return Ok((decoded, HashMap::new()));
             }
             buf.extend_from_slice(&tmp[..n]);
         }
@@ -502,8 +531,6 @@ where
         decoded.extend_from_slice(&buf[pos..pos + chunk_size]);
         pos += chunk_size + 2;
     }
-
-    Ok(decoded)
 }
 
 /// Decode a chunked transfer-encoded body from a complete buffer.
@@ -1261,6 +1288,91 @@ mod tests {
         .unwrap();
         // Should read all 11 bytes because Content-Length is ignored
         assert_eq!(resp.body_str().unwrap(), "hello world");
+
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn request_chunked_with_trailers() {
+        use tokio::io::duplex;
+
+        let (mut client, mut server) = duplex(4096);
+
+        let server_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            let _n = server.read(&mut buf).await.unwrap();
+            // Chunked response with trailers
+            let response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n\
+                             5\r\nhello\r\n\
+                             6\r\n world\r\n\
+                             0\r\n\
+                             X-Checksum: abc123\r\n\
+                             X-Timestamp: 1234567890\r\n\
+                             \r\n";
+            server.write_all(response).await.unwrap();
+            server.shutdown().await.unwrap();
+        });
+
+        let (resp, _) = request(
+            &mut client,
+            "GET",
+            "example.com",
+            "/test",
+            &[],
+            None,
+            "http://example.com/test",
+            false,
+            false,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(resp.body_str().unwrap(), "hello world");
+        assert_eq!(resp.trailer("X-Checksum"), Some("abc123"));
+        assert_eq!(resp.trailer("X-Timestamp"), Some("1234567890"));
+        assert!(resp.trailers().len() >= 2);
+
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn request_chunked_no_trailers() {
+        use tokio::io::duplex;
+
+        let (mut client, mut server) = duplex(4096);
+
+        let server_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            let _n = server.read(&mut buf).await.unwrap();
+            // Chunked response without trailers
+            let response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n\
+                             5\r\nhello\r\n\
+                             0\r\n\
+                             \r\n";
+            server.write_all(response).await.unwrap();
+            server.shutdown().await.unwrap();
+        });
+
+        let (resp, _) = request(
+            &mut client,
+            "GET",
+            "example.com",
+            "/test",
+            &[],
+            None,
+            "http://example.com/test",
+            false,
+            false,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(resp.body_str().unwrap(), "hello");
+        assert!(resp.trailers().is_empty());
 
         server_task.await.unwrap();
     }

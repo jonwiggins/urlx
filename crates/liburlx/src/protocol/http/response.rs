@@ -43,6 +43,8 @@ pub struct Response {
     status: u16,
     /// Response headers.
     headers: HashMap<String, String>,
+    /// Trailer headers from chunked transfer encoding.
+    trailers: HashMap<String, String>,
     /// Response body bytes.
     body: Vec<u8>,
     /// The effective URL after any redirects.
@@ -60,19 +62,31 @@ impl Response {
         body: Vec<u8>,
         effective_url: String,
     ) -> Self {
-        Self { status, headers, body, effective_url, info: TransferInfo::default() }
+        Self {
+            status,
+            headers,
+            trailers: HashMap::new(),
+            body,
+            effective_url,
+            info: TransferInfo::default(),
+        }
     }
 
     /// Create a new response with transfer info.
     #[must_use]
-    pub const fn with_info(
+    pub fn with_info(
         status: u16,
         headers: HashMap<String, String>,
         body: Vec<u8>,
         effective_url: String,
         info: TransferInfo,
     ) -> Self {
-        Self { status, headers, body, effective_url, info }
+        Self { status, headers, trailers: HashMap::new(), body, effective_url, info }
+    }
+
+    /// Set trailer headers on this response.
+    pub fn set_trailers(&mut self, trailers: HashMap<String, String>) {
+        self.trailers = trailers;
     }
 
     /// Returns the HTTP status code.
@@ -128,6 +142,19 @@ impl Response {
         self.header("content-type")
     }
 
+    /// Returns the trailer headers from chunked transfer encoding.
+    #[must_use]
+    pub const fn trailers(&self) -> &HashMap<String, String> {
+        &self.trailers
+    }
+
+    /// Returns a specific trailer header value (case-insensitive lookup).
+    #[must_use]
+    pub fn trailer(&self, name: &str) -> Option<&str> {
+        let lower = name.to_lowercase();
+        self.trailers.get(&lower).map(String::as_str)
+    }
+
     /// Returns the size of the response body in bytes.
     #[must_use]
     pub fn size_download(&self) -> usize {
@@ -177,5 +204,37 @@ mod tests {
         let body = vec![0xFF, 0xFE];
         let resp = Response::new(200, HashMap::new(), body, String::new());
         assert!(resp.body_str().is_err());
+    }
+
+    #[test]
+    fn response_trailers_empty_by_default() {
+        let resp = Response::new(200, HashMap::new(), Vec::new(), String::new());
+        assert!(resp.trailers().is_empty());
+        assert!(resp.trailer("X-Foo").is_none());
+    }
+
+    #[test]
+    fn response_trailers_set_and_get() {
+        let mut resp = Response::new(200, HashMap::new(), Vec::new(), String::new());
+        let mut trailers = HashMap::new();
+        trailers.insert("x-checksum".to_string(), "abc123".to_string());
+        trailers.insert("x-timestamp".to_string(), "1234567890".to_string());
+        resp.set_trailers(trailers);
+
+        assert_eq!(resp.trailer("X-Checksum"), Some("abc123"));
+        assert_eq!(resp.trailer("X-Timestamp"), Some("1234567890"));
+        assert_eq!(resp.trailers().len(), 2);
+    }
+
+    #[test]
+    fn response_trailer_case_insensitive() {
+        let mut resp = Response::new(200, HashMap::new(), Vec::new(), String::new());
+        let mut trailers = HashMap::new();
+        trailers.insert("x-custom".to_string(), "value".to_string());
+        resp.set_trailers(trailers);
+
+        assert_eq!(resp.trailer("X-Custom"), Some("value"));
+        assert_eq!(resp.trailer("x-custom"), Some("value"));
+        assert_eq!(resp.trailer("X-CUSTOM"), Some("value"));
     }
 }
