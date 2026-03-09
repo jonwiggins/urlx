@@ -41,6 +41,9 @@ struct CliOptions {
     speed_time: Option<u64>,
     remote_name: bool,
     create_dirs: bool,
+    proxy_digest: bool,
+    proxy_ntlm: bool,
+    proxy_user: Option<(String, String)>,
 }
 
 /// Print usage information to stderr.
@@ -82,6 +85,8 @@ fn print_usage() {
     eprintln!("      --key <file>          Client private key (PEM format)");
     eprintln!("      --digest              Use HTTP Digest authentication");
     eprintln!("      --proxy-user <u:p>    Proxy authentication (user:password)");
+    eprintln!("      --proxy-digest        Use Digest auth with proxy");
+    eprintln!("      --proxy-ntlm          Use NTLM auth with proxy");
     eprintln!("      --unix-socket <path>  Connect via Unix domain socket");
     eprintln!("      --interface <name>    Use network interface/address for outgoing connections");
     eprintln!("      --local-port <port>   Bind to local port for outgoing connections");
@@ -145,6 +150,9 @@ fn parse_args(args: &[String]) -> Option<CliOptions> {
         speed_time: None,
         remote_name: false,
         create_dirs: false,
+        proxy_digest: false,
+        proxy_ntlm: false,
+        proxy_user: None,
     };
 
     let mut i = 1;
@@ -366,7 +374,13 @@ fn parse_args(args: &[String]) -> Option<CliOptions> {
                 let val = require_arg(args, i, "--proxy-user")?;
                 let (user, pass) =
                     if let Some((u, p)) = val.split_once(':') { (u, p) } else { (val, "") };
-                opts.easy.proxy_auth(user, pass);
+                opts.proxy_user = Some((user.to_string(), pass.to_string()));
+            }
+            "--proxy-digest" => {
+                opts.proxy_digest = true;
+            }
+            "--proxy-ntlm" => {
+                opts.proxy_ntlm = true;
             }
             "--tlsv1.2" => {
                 opts.easy.ssl_min_version(liburlx::TlsVersion::Tls12);
@@ -646,6 +660,17 @@ fn parse_args(args: &[String]) -> Option<CliOptions> {
             opts.easy.digest_auth(user, pass);
         } else {
             opts.easy.basic_auth(user, pass);
+        }
+    }
+
+    // Apply proxy auth credentials
+    if let Some((ref user, ref pass)) = opts.proxy_user {
+        if opts.proxy_ntlm {
+            opts.easy.proxy_ntlm_auth(user, pass);
+        } else if opts.proxy_digest {
+            opts.easy.proxy_digest_auth(user, pass);
+        } else {
+            opts.easy.proxy_auth(user, pass);
         }
     }
 

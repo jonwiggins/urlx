@@ -26,7 +26,7 @@ pub mod share;
 pub mod tls;
 pub mod url;
 
-pub use auth::{AuthCredentials, AuthMethod};
+pub use auth::{AuthCredentials, AuthMethod, ProxyAuthCredentials, ProxyAuthMethod};
 pub use cookie::CookieJar;
 pub use dns::DnsCache;
 pub use easy::{Easy, HttpVersion};

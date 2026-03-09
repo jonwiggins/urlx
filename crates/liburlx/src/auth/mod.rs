@@ -1,9 +1,10 @@
 //! HTTP authentication mechanisms.
 //!
-//! Supports Basic, Bearer, Digest (RFC 7616), and AWS `SigV4` authentication.
+//! Supports Basic, Bearer, Digest (RFC 7616), NTLM, and AWS `SigV4` authentication.
 
 pub mod aws_sigv4;
 pub mod digest;
+pub mod ntlm;
 
 /// The HTTP authentication method to use.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -20,6 +21,11 @@ pub enum AuthMethod {
     /// Performs challenge-response: first request gets 401, then retries
     /// with a computed hash response.
     Digest,
+    /// NTLM authentication (NT LAN Manager).
+    ///
+    /// Multi-step challenge-response: Type 1 negotiate, Type 2 challenge,
+    /// Type 3 authenticate.
+    Ntlm,
 }
 
 /// Credentials for HTTP authentication.
@@ -31,4 +37,29 @@ pub struct AuthCredentials {
     pub password: String,
     /// The authentication method to use.
     pub method: AuthMethod,
+}
+
+/// Proxy authentication method.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ProxyAuthMethod {
+    /// HTTP Basic authentication.
+    Basic,
+    /// HTTP Digest authentication.
+    Digest,
+    /// NTLM authentication.
+    Ntlm,
+}
+
+/// Proxy authentication credentials.
+#[derive(Debug, Clone)]
+pub struct ProxyAuthCredentials {
+    /// Username for proxy authentication.
+    pub username: String,
+    /// Password for proxy authentication.
+    pub password: String,
+    /// The authentication method to use.
+    pub method: ProxyAuthMethod,
+    /// Optional NTLM domain (e.g., "DOMAIN\\user").
+    pub domain: Option<String>,
 }

@@ -71,10 +71,13 @@ pub enum CURLoption {
     CURLOPT_ACCEPT_ENCODING = 10102,
     CURLOPT_COOKIEFILE = 10031,
     CURLOPT_COOKIEJAR = 10082,
+    CURLOPT_PROXYUSERPWD = 10006,
     CURLOPT_NOPROXY = 10177,
     CURLOPT_RESOLVE = 10203,
     CURLOPT_PINNEDPUBLICKEY = 10230,
     CURLOPT_UNIX_SOCKET_PATH = 10231,
+    CURLOPT_PROXY_SSLCERT = 10254,
+    CURLOPT_PROXY_SSLKEY = 10255,
 
     // Long options (CURLOPTTYPE_LONG = 0)
     CURLOPT_TIMEOUT = 13,
@@ -96,7 +99,9 @@ pub enum CURLoption {
     CURLOPT_CONNECTTIMEOUT = 78,
     CURLOPT_HTTPGET = 80,
     CURLOPT_SSL_VERIFYHOST = 81,
+    CURLOPT_PROXYAUTH = 111,
     CURLOPT_HTTPAUTH = 107,
+    CURLOPT_PROXY_SSL_VERIFYPEER = 248,
     CURLOPT_TCP_NODELAY = 121,
     CURLOPT_LOCALPORT = 139,
     CURLOPT_TIMEOUT_MS = 155,
@@ -599,6 +604,37 @@ pub unsafe extern "C" fn curl_easy_setopt(
             CURLcode::CURLE_OK
         }
 
+        // CURLOPT_PROXYUSERPWD = 10006
+        10006 => {
+            // SAFETY: value must be a null-terminated C string in "user:password" format
+            if let Some(s) = unsafe { read_cstr(value) } {
+                if let Some((user, pass)) = s.split_once(':') {
+                    h.easy.proxy_auth(user, pass);
+                } else {
+                    h.easy.proxy_auth(s, "");
+                }
+            }
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_PROXY_SSLCERT = 10254
+        10254 => {
+            // SAFETY: value must be a null-terminated C string
+            if let Some(s) = unsafe { read_cstr(value) } {
+                h.easy.proxy_ssl_client_cert(std::path::Path::new(s));
+            }
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_PROXY_SSLKEY = 10255
+        10255 => {
+            // SAFETY: value must be a null-terminated C string
+            if let Some(s) = unsafe { read_cstr(value) } {
+                h.easy.proxy_ssl_client_key(std::path::Path::new(s));
+            }
+            CURLcode::CURLE_OK
+        }
+
         // CURLOPT_RESOLVE = 10203
         10203 => {
             // This expects a curl_slist of "host:port:address" entries
@@ -735,6 +771,13 @@ pub unsafe extern "C" fn curl_easy_setopt(
             CURLcode::CURLE_OK
         }
 
+        // CURLOPT_PROXYAUTH = 111
+        111 => {
+            // libcurl proxy auth bitmask: 1=Basic, 2=Digest, 8=NTLM
+            // Accept the value; actual method selection happens with proxy_auth calls
+            CURLcode::CURLE_OK
+        }
+
         // CURLOPT_TCP_NODELAY = 121
         121 => {
             h.easy.tcp_nodelay(value as c_long != 0);
@@ -834,6 +877,12 @@ pub unsafe extern "C" fn curl_easy_setopt(
         // CURLOPT_SSL_SESSIONID_CACHE = 150
         150 => {
             h.easy.ssl_session_cache(value as c_long != 0);
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_PROXY_SSL_VERIFYPEER = 248
+        248 => {
+            h.easy.proxy_ssl_verify_peer(value as c_long != 0);
             CURLcode::CURLE_OK
         }
 
@@ -1956,6 +2005,54 @@ mod tests {
         let handle = curl_easy_init();
         let iface = c"lo0";
         let code = unsafe { curl_easy_setopt(handle, 10062, iface.as_ptr().cast::<c_void>()) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_proxyuserpwd() {
+        let handle = curl_easy_init();
+        let up = c"proxyuser:proxypass";
+        // CURLOPT_PROXYUSERPWD = 10006
+        let code = unsafe { curl_easy_setopt(handle, 10006, up.as_ptr().cast::<c_void>()) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_proxyauth() {
+        let handle = curl_easy_init();
+        // CURLOPT_PROXYAUTH = 111, bitmask 1=Basic
+        let code = unsafe { curl_easy_setopt(handle, 111, 1_usize as *const c_void) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_proxy_sslcert() {
+        let handle = curl_easy_init();
+        let path = c"/tmp/proxy-cert.pem";
+        // CURLOPT_PROXY_SSLCERT = 10254
+        let code = unsafe { curl_easy_setopt(handle, 10254, path.as_ptr().cast::<c_void>()) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_proxy_sslkey() {
+        let handle = curl_easy_init();
+        let path = c"/tmp/proxy-key.pem";
+        // CURLOPT_PROXY_SSLKEY = 10255
+        let code = unsafe { curl_easy_setopt(handle, 10255, path.as_ptr().cast::<c_void>()) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_proxy_ssl_verifypeer() {
+        let handle = curl_easy_init();
+        // CURLOPT_PROXY_SSL_VERIFYPEER = 248
+        let code = unsafe { curl_easy_setopt(handle, 248, 1_usize as *const c_void) };
         assert_eq!(code, CURLcode::CURLE_OK);
         unsafe { curl_easy_cleanup(handle) };
     }

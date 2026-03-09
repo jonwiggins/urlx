@@ -6,7 +6,7 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use crate::auth::{AuthCredentials, AuthMethod};
+use crate::auth::{AuthCredentials, AuthMethod, ProxyAuthCredentials, ProxyAuthMethod};
 use crate::cookie::CookieJar;
 use crate::dns::DnsCache;
 use crate::error::Error;
@@ -83,6 +83,8 @@ pub struct Easy {
     low_speed_time: Option<Duration>,
     fresh_connect: bool,
     forbid_reuse: bool,
+    proxy_credentials: Option<ProxyAuthCredentials>,
+    proxy_tls_config: Option<TlsConfig>,
 }
 
 impl std::fmt::Debug for Easy {
@@ -129,6 +131,11 @@ impl std::fmt::Debug for Easy {
             .field("low_speed_time", &self.low_speed_time)
             .field("fresh_connect", &self.fresh_connect)
             .field("forbid_reuse", &self.forbid_reuse)
+            .field(
+                "proxy_credentials",
+                &self.proxy_credentials.as_ref().map(|_| "<proxy_credentials>"),
+            )
+            .field("proxy_tls_config", &self.proxy_tls_config)
             .finish()
     }
 }
@@ -177,6 +184,8 @@ impl Clone for Easy {
             low_speed_time: self.low_speed_time,
             fresh_connect: self.fresh_connect,
             forbid_reuse: self.forbid_reuse,
+            proxy_credentials: self.proxy_credentials.clone(),
+            proxy_tls_config: self.proxy_tls_config.clone(),
         }
     }
 }
@@ -227,6 +236,8 @@ impl Easy {
             low_speed_time: None,
             fresh_connect: false,
             forbid_reuse: false,
+            proxy_credentials: None,
+            proxy_tls_config: None,
         }
     }
 
@@ -467,12 +478,93 @@ impl Easy {
     /// Set proxy authentication credentials (Basic).
     ///
     /// Adds a `Proxy-Authorization: Basic <base64>` header for proxy requests.
+    /// For Basic auth, the header is added immediately. For Digest or NTLM,
+    /// use [`proxy_digest_auth`](Self::proxy_digest_auth) or
+    /// [`proxy_ntlm_auth`](Self::proxy_ntlm_auth) instead.
+    ///
     /// Equivalent to curl's `--proxy-user user:pass`.
     pub fn proxy_auth(&mut self, user: &str, password: &str) {
         use base64::Engine;
         let credentials = format!("{user}:{password}");
         let encoded = base64::engine::general_purpose::STANDARD.encode(credentials.as_bytes());
         self.header("Proxy-Authorization", &format!("Basic {encoded}"));
+        // Also store credentials for potential Digest/NTLM fallback
+        self.proxy_credentials = Some(ProxyAuthCredentials {
+            username: user.to_string(),
+            password: password.to_string(),
+            method: ProxyAuthMethod::Basic,
+            domain: None,
+        });
+    }
+
+    /// Set proxy Digest authentication credentials.
+    ///
+    /// When the proxy returns `407 Proxy Authentication Required` with a
+    /// `Proxy-Authenticate: Digest` challenge, the request is retried
+    /// with the computed Digest response.
+    ///
+    /// Equivalent to curl's `--proxy-digest --proxy-user user:pass`.
+    pub fn proxy_digest_auth(&mut self, user: &str, password: &str) {
+        self.proxy_credentials = Some(ProxyAuthCredentials {
+            username: user.to_string(),
+            password: password.to_string(),
+            method: ProxyAuthMethod::Digest,
+            domain: None,
+        });
+    }
+
+    /// Set proxy NTLM authentication credentials.
+    ///
+    /// Performs the NTLM Type 1/2/3 handshake with the proxy.
+    ///
+    /// Equivalent to curl's `--proxy-ntlm --proxy-user user:pass`.
+    pub fn proxy_ntlm_auth(&mut self, user: &str, password: &str) {
+        // Extract domain from "DOMAIN\user" format if present
+        let (domain, username) = if let Some((d, u)) = user.split_once('\\') {
+            (Some(d.to_string()), u.to_string())
+        } else {
+            (None, user.to_string())
+        };
+
+        self.proxy_credentials = Some(ProxyAuthCredentials {
+            username,
+            password: password.to_string(),
+            method: ProxyAuthMethod::Ntlm,
+            domain,
+        });
+    }
+
+    /// Set proxy TLS configuration for HTTPS proxies.
+    ///
+    /// When connecting to an HTTPS proxy (proxy URL starts with `https://`),
+    /// this TLS configuration is used for the proxy connection. The regular
+    /// TLS configuration is used for the target server.
+    pub fn proxy_tls_config(&mut self, config: TlsConfig) {
+        self.proxy_tls_config = Some(config);
+    }
+
+    /// Set proxy client certificate for HTTPS proxy authentication.
+    ///
+    /// Equivalent to `CURLOPT_PROXY_SSLCERT`.
+    pub fn proxy_ssl_client_cert(&mut self, path: &Path) {
+        let config = self.proxy_tls_config.get_or_insert_with(TlsConfig::default);
+        config.client_cert = Some(path.to_path_buf());
+    }
+
+    /// Set proxy client private key for HTTPS proxy authentication.
+    ///
+    /// Equivalent to `CURLOPT_PROXY_SSLKEY`.
+    pub fn proxy_ssl_client_key(&mut self, path: &Path) {
+        let config = self.proxy_tls_config.get_or_insert_with(TlsConfig::default);
+        config.client_key = Some(path.to_path_buf());
+    }
+
+    /// Enable or disable TLS certificate verification for HTTPS proxies.
+    ///
+    /// Equivalent to `CURLOPT_PROXY_SSL_VERIFYPEER`.
+    pub fn proxy_ssl_verify_peer(&mut self, verify: bool) {
+        let config = self.proxy_tls_config.get_or_insert_with(TlsConfig::default);
+        config.verify_peer = verify;
     }
 
     /// Set Digest authentication credentials.
@@ -884,6 +976,7 @@ impl Easy {
             &mut self.hsts_cache,
             &self.resolve_overrides,
             self.auth_credentials.as_ref(),
+            self.proxy_credentials.as_ref(),
             &self.tls_config,
             self.tcp_nodelay,
             self.tcp_keepalive,
@@ -972,6 +1065,7 @@ async fn perform_transfer(
     hsts_cache: &mut Option<HstsCache>,
     resolve_overrides: &[(String, String)],
     auth_credentials: Option<&AuthCredentials>,
+    proxy_credentials: Option<&ProxyAuthCredentials>,
     tls_config: &TlsConfig,
     tcp_nodelay: bool,
     tcp_keepalive: Option<Duration>,
@@ -1017,6 +1111,7 @@ async fn perform_transfer(
             accept_encoding,
             connect_timeout,
             effective_proxy,
+            proxy_credentials,
             resolve_overrides,
             tls_config,
             tcp_nodelay,
@@ -1072,6 +1167,7 @@ async fn perform_transfer(
                                 accept_encoding,
                                 connect_timeout,
                                 effective_proxy,
+                                proxy_credentials,
                                 resolve_overrides,
                                 tls_config,
                                 tcp_nodelay,
@@ -1181,6 +1277,7 @@ async fn do_single_request(
     accept_encoding: bool,
     connect_timeout: Option<Duration>,
     proxy: Option<&Url>,
+    proxy_credentials: Option<&ProxyAuthCredentials>,
     resolve_overrides: &[(String, String)],
     tls_config: &TlsConfig,
     tcp_nodelay: bool,
@@ -1448,7 +1545,15 @@ async fn do_single_request(
                             eprintln!("* Establishing tunnel to {host}:{port} via proxy");
                         }
                     }
-                    establish_connect_tunnel(tcp_stream, &host, port, &effective_headers).await?
+                    establish_connect_tunnel(
+                        tcp_stream,
+                        &host,
+                        port,
+                        &effective_headers,
+                        proxy_credentials,
+                        verbose,
+                    )
+                    .await?
                 } else {
                     tcp_stream
                 };
@@ -1598,14 +1703,160 @@ fn maybe_decompress(response: Response, accept_encoding: bool) -> Result<Respons
 ///
 /// Sends a CONNECT request to the proxy and validates the 200 response
 /// before returning the raw TCP stream for TLS negotiation.
-/// If the request headers include `Proxy-Authorization`, it is forwarded
-/// to the proxy.
+/// Handles 407 Proxy Authentication Required for Digest and NTLM auth.
+#[allow(clippy::too_many_lines)]
 async fn establish_connect_tunnel(
     mut stream: tokio::net::TcpStream,
     target_host: &str,
     target_port: u16,
     headers: &[(String, String)],
+    proxy_credentials: Option<&ProxyAuthCredentials>,
+    verbose: bool,
 ) -> Result<tokio::net::TcpStream, Error> {
+    // Send initial CONNECT request
+    let (status, response_headers) =
+        send_connect_request(&mut stream, target_host, target_port, headers, None).await?;
+
+    if status == 200 {
+        return Ok(stream);
+    }
+
+    // Handle 407 Proxy Authentication Required
+    if status == 407 {
+        if let Some(creds) = proxy_credentials {
+            let proxy_auth_header = find_header(&response_headers, "proxy-authenticate");
+
+            match creds.method {
+                ProxyAuthMethod::Digest => {
+                    if let Some(ref auth_header) = proxy_auth_header {
+                        if let Ok(challenge) =
+                            crate::auth::digest::DigestChallenge::parse(auth_header)
+                        {
+                            if verbose {
+                                #[allow(clippy::print_stderr)]
+                                {
+                                    eprintln!(
+                                        "* Proxy auth using Digest with realm '{}'",
+                                        challenge.realm
+                                    );
+                                }
+                            }
+
+                            let uri = format!("{target_host}:{target_port}");
+                            let cnonce = crate::auth::digest::generate_cnonce();
+                            let auth_value = challenge.respond(
+                                &creds.username,
+                                &creds.password,
+                                "CONNECT",
+                                &uri,
+                                1,
+                                &cnonce,
+                            );
+
+                            let (retry_status, _) = send_connect_request(
+                                &mut stream,
+                                target_host,
+                                target_port,
+                                headers,
+                                Some(&format!("Proxy-Authorization: {auth_value}")),
+                            )
+                            .await?;
+
+                            if retry_status == 200 {
+                                return Ok(stream);
+                            }
+
+                            return Err(Error::Http(format!(
+                                "proxy CONNECT Digest auth failed with status {retry_status}"
+                            )));
+                        }
+                    }
+                }
+                ProxyAuthMethod::Ntlm => {
+                    // NTLM Type 1 → Type 2 → Type 3 handshake
+                    let type1 = crate::auth::ntlm::create_type1_message();
+
+                    if verbose {
+                        #[allow(clippy::print_stderr)]
+                        {
+                            eprintln!("* Proxy auth using NTLM");
+                        }
+                    }
+
+                    // Send CONNECT with Type 1
+                    let (status2, headers2) = send_connect_request(
+                        &mut stream,
+                        target_host,
+                        target_port,
+                        headers,
+                        Some(&format!("Proxy-Authorization: NTLM {type1}")),
+                    )
+                    .await?;
+
+                    if status2 == 407 {
+                        // Look for Type 2 challenge in response
+                        if let Some(auth2) = find_header(&headers2, "proxy-authenticate") {
+                            if let Some(type2_data) = auth2.strip_prefix("NTLM ") {
+                                let challenge = crate::auth::ntlm::parse_type2_message(type2_data)?;
+                                let domain = creds.domain.as_deref().unwrap_or("");
+                                let type3 = crate::auth::ntlm::create_type3_message(
+                                    &challenge,
+                                    &creds.username,
+                                    &creds.password,
+                                    domain,
+                                );
+
+                                // Send CONNECT with Type 3
+                                let (status3, _) = send_connect_request(
+                                    &mut stream,
+                                    target_host,
+                                    target_port,
+                                    headers,
+                                    Some(&format!("Proxy-Authorization: NTLM {type3}")),
+                                )
+                                .await?;
+
+                                if status3 == 200 {
+                                    return Ok(stream);
+                                }
+
+                                return Err(Error::Http(format!(
+                                    "proxy CONNECT NTLM auth failed with status {status3}"
+                                )));
+                            }
+                        }
+                    } else if status2 == 200 {
+                        return Ok(stream);
+                    }
+
+                    return Err(Error::Http(format!(
+                        "proxy CONNECT NTLM handshake failed with status {status2}"
+                    )));
+                }
+                ProxyAuthMethod::Basic => {
+                    // Basic auth should have been in the initial headers already.
+                    // If we still got 407, the credentials are wrong.
+                    return Err(Error::Http(format!(
+                        "proxy CONNECT failed with status {status} (Basic auth rejected)"
+                    )));
+                }
+            }
+        }
+    }
+
+    Err(Error::Http(format!("proxy CONNECT failed with status {status}")))
+}
+
+/// Send a CONNECT request and read the response status + headers.
+///
+/// Returns `(status_code, response_headers)`.
+async fn send_connect_request(
+    stream: &mut tokio::net::TcpStream,
+    target_host: &str,
+    target_port: u16,
+    headers: &[(String, String)],
+    extra_header: Option<&str>,
+) -> Result<(u16, Vec<(String, String)>), Error> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let mut connect_req = format!(
@@ -1613,12 +1864,18 @@ async fn establish_connect_tunnel(
          Host: {target_host}:{target_port}\r\n"
     );
 
-    // Forward Proxy-Authorization header if present
+    // Forward Proxy-Authorization header if present in original headers
     for (name, value) in headers {
         if name.eq_ignore_ascii_case("proxy-authorization") {
             use std::fmt::Write as _;
             let _ = write!(connect_req, "{name}: {value}\r\n");
         }
+    }
+
+    // Add extra auth header (overrides forwarded one)
+    if let Some(extra) = extra_header {
+        use std::fmt::Write as _;
+        let _ = write!(connect_req, "{extra}\r\n");
     }
 
     connect_req.push_str("\r\n");
@@ -1630,7 +1887,7 @@ async fn establish_connect_tunnel(
 
     stream.flush().await.map_err(|e| Error::Http(format!("proxy CONNECT flush failed: {e}")))?;
 
-    // Read the proxy's response. We only need the status line + headers.
+    // Read the proxy's response
     let mut buf = vec![0u8; 4096];
     let mut total = 0;
 
@@ -1646,18 +1903,14 @@ async fn establish_connect_tunnel(
 
         total += n;
 
-        // Check if we have received the full headers (ends with \r\n\r\n)
         if let Some(end) = find_header_end(&buf[..total]) {
-            // Parse the status line
             let header_str = std::str::from_utf8(&buf[..end])
                 .map_err(|_| Error::Http("invalid proxy CONNECT response encoding".into()))?;
 
-            let status_line = header_str
-                .lines()
-                .next()
-                .ok_or_else(|| Error::Http("empty proxy CONNECT response".into()))?;
+            let mut lines = header_str.lines();
+            let status_line =
+                lines.next().ok_or_else(|| Error::Http("empty proxy CONNECT response".into()))?;
 
-            // Parse "HTTP/1.x 200 ..."
             let parts: Vec<&str> = status_line.splitn(3, ' ').collect();
             if parts.len() < 2 {
                 return Err(Error::Http(format!(
@@ -1669,20 +1922,26 @@ async fn establish_connect_tunnel(
                 Error::Http(format!("invalid proxy CONNECT status code: {}", parts[1]))
             })?;
 
-            if status != 200 {
-                return Err(Error::Http(format!(
-                    "proxy CONNECT failed with status {status}: {status_line}"
-                )));
+            // Parse response headers
+            let mut response_headers = Vec::new();
+            for line in lines {
+                if let Some((name, value)) = line.split_once(':') {
+                    response_headers.push((name.trim().to_string(), value.trim().to_string()));
+                }
             }
 
-            // Tunnel established — return the stream for TLS
-            return Ok(stream);
+            return Ok((status, response_headers));
         }
 
         if total >= buf.len() {
             return Err(Error::Http("proxy CONNECT response too large".to_string()));
         }
     }
+}
+
+/// Find a header value by name (case-insensitive).
+fn find_header(headers: &[(String, String)], name: &str) -> Option<String> {
+    headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.clone())
 }
 
 /// Find the end of HTTP headers (\r\n\r\n) in a buffer.
@@ -2525,5 +2784,81 @@ mod tests {
         let cloned = easy.clone();
         assert!(cloned.fresh_connect);
         assert!(cloned.forbid_reuse);
+    }
+
+    #[test]
+    fn easy_proxy_digest_auth() {
+        let mut easy = Easy::new();
+        easy.proxy_digest_auth("user", "pass");
+        assert!(easy.proxy_credentials.is_some());
+        let creds = easy.proxy_credentials.as_ref().unwrap();
+        assert_eq!(creds.username, "user");
+        assert_eq!(creds.password, "pass");
+        assert_eq!(creds.method, ProxyAuthMethod::Digest);
+        assert!(creds.domain.is_none());
+    }
+
+    #[test]
+    fn easy_proxy_ntlm_auth() {
+        let mut easy = Easy::new();
+        easy.proxy_ntlm_auth("DOMAIN\\user", "pass");
+        assert!(easy.proxy_credentials.is_some());
+        let creds = easy.proxy_credentials.as_ref().unwrap();
+        assert_eq!(creds.username, "user");
+        assert_eq!(creds.password, "pass");
+        assert_eq!(creds.method, ProxyAuthMethod::Ntlm);
+        assert_eq!(creds.domain.as_deref(), Some("DOMAIN"));
+    }
+
+    #[test]
+    fn easy_proxy_ntlm_auth_no_domain() {
+        let mut easy = Easy::new();
+        easy.proxy_ntlm_auth("user", "pass");
+        let creds = easy.proxy_credentials.as_ref().unwrap();
+        assert_eq!(creds.username, "user");
+        assert!(creds.domain.is_none());
+    }
+
+    #[test]
+    fn easy_proxy_tls_config() {
+        let mut easy = Easy::new();
+        assert!(easy.proxy_tls_config.is_none());
+        easy.proxy_ssl_verify_peer(false);
+        assert!(easy.proxy_tls_config.is_some());
+        assert!(!easy.proxy_tls_config.as_ref().unwrap().verify_peer);
+    }
+
+    #[test]
+    fn easy_proxy_ssl_client_cert() {
+        let mut easy = Easy::new();
+        easy.proxy_ssl_client_cert(std::path::Path::new("/tmp/cert.pem"));
+        let config = easy.proxy_tls_config.as_ref().unwrap();
+        assert_eq!(config.client_cert.as_ref().unwrap().to_str().unwrap(), "/tmp/cert.pem");
+    }
+
+    #[test]
+    fn easy_proxy_ssl_client_key() {
+        let mut easy = Easy::new();
+        easy.proxy_ssl_client_key(std::path::Path::new("/tmp/key.pem"));
+        let config = easy.proxy_tls_config.as_ref().unwrap();
+        assert_eq!(config.client_key.as_ref().unwrap().to_str().unwrap(), "/tmp/key.pem");
+    }
+
+    #[test]
+    fn easy_proxy_credentials_clone() {
+        let mut easy = Easy::new();
+        easy.proxy_digest_auth("user", "pass");
+        let cloned = easy.clone();
+        assert!(cloned.proxy_credentials.is_some());
+        assert_eq!(cloned.proxy_credentials.as_ref().unwrap().username, "user");
+    }
+
+    #[test]
+    fn easy_proxy_auth_stores_credentials() {
+        let mut easy = Easy::new();
+        easy.proxy_auth("user", "pass");
+        // proxy_auth also stores credentials
+        assert!(easy.proxy_credentials.is_some());
+        assert_eq!(easy.proxy_credentials.as_ref().unwrap().method, ProxyAuthMethod::Basic);
     }
 }
