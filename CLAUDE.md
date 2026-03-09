@@ -14,12 +14,12 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 9 — Advanced Transfer Features + Cookie Persistence
-**Last completed:** Phase 8 (HTTP Completeness) — 2026-03-08
-**Total tests:** 1580+
-**In progress:** Planning Phase 9
+**Phase:** 10 — Completeness Review + Curl Test Suite Porting
+**Last completed:** Phase 9 (Advanced Transfer Features + Cookie Persistence) — 2026-03-08
+**Total tests:** 1610+
+**In progress:** Planning Phase 10
 **Blockers:** None
-**Next up:** Rate limiting, cookie persistence, retry logic in library
+**Next up:** Comprehensive review, gap analysis, differential testing
 
 ### Completeness Summary
 
@@ -30,16 +30,17 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 | HTTP/3 | 0% | Not implemented |
 | TLS | 80% | rustls with insecure mode, custom CA, client certs, pinning, version selection |
 | Authentication | 50% | Basic, Bearer, Digest (MD5/SHA-256), AWS SigV4 |
-| Cookie engine | 75% | In-memory only, no persistence |
+| Cookie engine | 90% | Netscape file format read/write, in-memory jar; no public suffix list |
 | Proxy | 80% | HTTP + SOCKS + proxy auth; no HTTPS proxy or PAC |
 | DNS | 60% | Cache with TTL, Happy Eyeballs (RFC 6555), DNS shuffle; no async resolver or DoH |
 | FTP | 70% | Session API, upload, resume, dir ops, FEAT; no FTPS or active mode |
 | SSH/SFTP/SCP | 0% | Not implemented |
 | Multi API | 55% | Connection limiting, message queue, share interface, pipelining config; no poll/socket/timer callbacks |
 | FFI (libcurl C ABI) | ~18% | 37 options, 12 info codes, 25 error codes, multi API, slist, duphandle |
-| CLI | ~20% | ~62 of ~250 flags |
+| CLI | ~22% | ~68 of ~250 flags |
 | Connection | 80% | Pool, TCP_NODELAY, keepalive, Unix sockets, interface/port binding |
-| Overall | ~50% | ~90% for basic HTTP/HTTPS use cases |
+| Transfer control | 40% | Rate limiting, speed enforcement API; not wired into transfer engine yet |
+| Overall | ~52% | ~90% for basic HTTP/HTTPS use cases |
 
 ---
 
@@ -72,6 +73,8 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 - **2026-03-08:** HTTP/3 via quinn deferred from Phase 8. Adding QUIC transport is a major effort requiring: new dependency, QUIC connection management, Alt-Svc-based discovery, 0-RTT, connection migration. Better as a dedicated phase after the Phase 10 review.
 - **2026-03-08:** `HttpVersion` enum uses `None` (auto) as default rather than `Http11` to preserve existing ALPN-based HTTP/2 negotiation behavior. `Http2` variant is equivalent to `None` for HTTPS since ALPN already prefers H2.
 - **2026-03-08:** Expect: 100-continue timeout defaults to sending body on timeout (matching curl behavior). Body is NOT sent only when server actively responds with an error status before the timeout.
+- **2026-03-08:** Netscape cookie file format uses leading dot prefix for all domains (matching curl behavior). `#HttpOnly_` prefix handled before general `#` comment check to avoid false skipping. Session cookies written with `expiration=0`.
+- **2026-03-08:** Rate limiting (max_recv_speed, max_send_speed) and minimum speed enforcement (low_speed_limit, low_speed_time) added as Easy API setters. Not yet wired into the transfer engine — the options are stored and can be used by future transfer-level throttling logic. CLI `--limit-rate` supports K/M/G suffixes using 1024-based multipliers (matching curl behavior).
 
 ---
 
@@ -323,33 +326,9 @@ Implemented HTTP version selection, Expect: 100-continue, and response header pa
 
 ---
 
-### Phase 9: Advanced Transfer Features + Cookie Persistence
+### Phase 9: Advanced Transfer Features + Cookie Persistence — COMPLETED (2026-03-08)
 
-**Goal:** Production-grade transfer reliability and cookie management.
-
-**Transfer reliability:**
-- Automatic retry with configurable count and delay
-- Rate limiting (upload and download) — `CURLOPT_MAX_SEND_SPEED_LARGE`, `CURLOPT_MAX_RECV_SPEED_LARGE`
-- Minimum speed enforcement — `CURLOPT_LOW_SPEED_LIMIT`, `CURLOPT_LOW_SPEED_TIME`
-- Transfer abort on stall
-
-**Cookie persistence:**
-- Netscape cookie file format (read/write)
-- Mozilla cookie file format
-- Cookie file export (`-c/--cookie-jar`)
-- Cookie file import (`-b/--cookie`)
-- Public suffix list for domain validation
-- Session vs persistent cookies
-
-**TLS session management:**
-- SSL session caching and reuse
-- OCSP stapling — `CURLOPT_SSL_VERIFYSTATUS`
-- Certificate transparency
-
-**Other:**
-- MIME API for structured multipart (replacing simple MultipartForm)
-- URL API (curl_url_*) for programmatic URL building/parsing
-- `--libcurl` CLI flag — output equivalent C code for a transfer
+Cookie persistence (Netscape format read/write, `-b <file>` import, `-c/--cookie-jar` export), rate limiting API (`max_recv_speed`, `max_send_speed`, `low_speed_limit`, `low_speed_time`), CLI flags (`--limit-rate` with K/M/G suffixes, `--speed-limit`, `--speed-time`), `Error::Io` variant. 25+ new tests. Rate limiting options stored but not yet wired into transfer engine. Deferred: Mozilla cookie format, public suffix list, TLS session caching, OCSP, MIME API, URL API, `--libcurl` flag.
 
 ---
 
