@@ -21,6 +21,11 @@ pub fn read_file(url: &crate::url::Url) -> Result<Response, Error> {
     // Decode percent-encoded characters in the path
     let decoded_path = percent_decode(path);
 
+    // On Windows, file:// URLs produce paths like "/C:/..." which need
+    // the leading slash stripped to form a valid Windows path.
+    #[cfg(windows)]
+    let decoded_path = strip_windows_leading_slash(&decoded_path);
+
     let data = std::fs::read(&decoded_path)
         .map_err(|e| Error::Http(format!("file read failed: {decoded_path}: {e}")))?;
 
@@ -28,6 +33,21 @@ pub fn read_file(url: &crate::url::Url) -> Result<Response, Error> {
     let _old = headers.insert("content-length".to_string(), data.len().to_string());
 
     Ok(Response::new(200, headers, data, url.as_str().to_string()))
+}
+
+/// Strip the leading slash from Windows drive-letter paths.
+///
+/// `file://` URLs produce paths like `/C:/Users/...` which need the leading
+/// slash removed to form valid Windows filesystem paths.
+#[cfg(windows)]
+fn strip_windows_leading_slash(path: &str) -> String {
+    let bytes = path.as_bytes();
+    // Match "/X:" or "/X|" where X is a drive letter
+    if bytes.len() >= 3 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() && bytes[2] == b':' {
+        path[1..].to_string()
+    } else {
+        path.to_string()
+    }
 }
 
 /// Decode percent-encoded characters in a URL path.
