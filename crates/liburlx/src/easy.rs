@@ -85,6 +85,7 @@ pub struct Easy {
     forbid_reuse: bool,
     proxy_credentials: Option<ProxyAuthCredentials>,
     proxy_tls_config: Option<TlsConfig>,
+    infilesize: Option<u64>,
 }
 
 impl std::fmt::Debug for Easy {
@@ -136,6 +137,7 @@ impl std::fmt::Debug for Easy {
                 &self.proxy_credentials.as_ref().map(|_| "<proxy_credentials>"),
             )
             .field("proxy_tls_config", &self.proxy_tls_config)
+            .field("infilesize", &self.infilesize)
             .finish()
     }
 }
@@ -186,6 +188,7 @@ impl Clone for Easy {
             forbid_reuse: self.forbid_reuse,
             proxy_credentials: self.proxy_credentials.clone(),
             proxy_tls_config: self.proxy_tls_config.clone(),
+            infilesize: self.infilesize,
         }
     }
 }
@@ -238,6 +241,7 @@ impl Easy {
             forbid_reuse: false,
             proxy_credentials: None,
             proxy_tls_config: None,
+            infilesize: None,
         }
     }
 
@@ -270,6 +274,32 @@ impl Easy {
     /// Set the request body.
     pub fn body(&mut self, data: &[u8]) {
         self.body = Some(data.to_vec());
+    }
+
+    /// Set the expected upload size in bytes.
+    ///
+    /// This is used as a hint for progress reporting and for setting
+    /// `Content-Length` when streaming uploads. Equivalent to
+    /// `CURLOPT_INFILESIZE_LARGE`.
+    pub fn infilesize(&mut self, size: u64) {
+        self.infilesize = Some(size);
+    }
+
+    /// Upload a file by path. Reads the file and sets it as the request body.
+    ///
+    /// Also sets the method to PUT if no method has been explicitly set.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Io`] if the file cannot be read.
+    pub fn upload_file(&mut self, path: &Path) -> Result<(), Error> {
+        let data = std::fs::read(path).map_err(Error::Io)?;
+        self.infilesize = Some(data.len() as u64);
+        self.body = Some(data);
+        if self.method.is_none() {
+            self.method = Some("PUT".to_string());
+        }
+        Ok(())
     }
 
     /// Enable or disable redirect following.
@@ -2860,5 +2890,77 @@ mod tests {
         // proxy_auth also stores credentials
         assert!(easy.proxy_credentials.is_some());
         assert_eq!(easy.proxy_credentials.as_ref().unwrap().method, ProxyAuthMethod::Basic);
+    }
+
+    #[test]
+    fn easy_infilesize() {
+        let mut easy = Easy::new();
+        assert!(easy.infilesize.is_none());
+        easy.infilesize(4096);
+        assert_eq!(easy.infilesize, Some(4096));
+    }
+
+    #[test]
+    fn easy_infilesize_zero() {
+        let mut easy = Easy::new();
+        easy.infilesize(0);
+        assert_eq!(easy.infilesize, Some(0));
+    }
+
+    #[test]
+    fn easy_upload_file_sets_body_and_method() {
+        use std::io::Write;
+
+        let dir = std::env::temp_dir();
+        let path = dir.join("urlx_test_upload.txt");
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            f.write_all(b"hello upload").unwrap();
+        }
+
+        let mut easy = Easy::new();
+        easy.upload_file(&path).unwrap();
+
+        assert_eq!(easy.body.as_deref(), Some(b"hello upload".as_slice()));
+        assert_eq!(easy.infilesize, Some(12));
+        assert_eq!(easy.method.as_deref(), Some("PUT"));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn easy_upload_file_preserves_explicit_method() {
+        use std::io::Write;
+
+        let dir = std::env::temp_dir();
+        let path = dir.join("urlx_test_upload2.txt");
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            f.write_all(b"data").unwrap();
+        }
+
+        let mut easy = Easy::new();
+        easy.method("POST");
+        easy.upload_file(&path).unwrap();
+
+        // Should keep explicit POST, not override to PUT
+        assert_eq!(easy.method.as_deref(), Some("POST"));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn easy_upload_file_nonexistent() {
+        let mut easy = Easy::new();
+        let result = easy.upload_file(Path::new("/nonexistent/path/to/file.txt"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn easy_infilesize_cloned() {
+        let mut easy = Easy::new();
+        easy.infilesize(8192);
+        let cloned = easy.clone();
+        assert_eq!(cloned.infilesize, Some(8192));
     }
 }

@@ -78,6 +78,8 @@ pub enum CURLoption {
     CURLOPT_UNIX_SOCKET_PATH = 10231,
     CURLOPT_PROXY_SSLCERT = 10254,
     CURLOPT_PROXY_SSLKEY = 10255,
+    CURLOPT_READDATA = 10009,
+    CURLOPT_DEBUGDATA = 10095,
 
     // Long options (CURLOPTTYPE_LONG = 0)
     CURLOPT_TIMEOUT = 13,
@@ -110,12 +112,15 @@ pub enum CURLoption {
     CURLOPT_SSL_SESSIONID_CACHE = 150,
 
     // Off_t options (CURLOPTTYPE_OFF_T = 30000)
+    CURLOPT_INFILESIZE_LARGE = 30115,
     CURLOPT_MAX_SEND_SPEED_LARGE = 30145,
     CURLOPT_MAX_RECV_SPEED_LARGE = 30146,
 
     // Function options (CURLOPTTYPE_FUNCTIONPOINT = 20000)
     CURLOPT_WRITEFUNCTION = 20011,
+    CURLOPT_READFUNCTION = 20012,
     CURLOPT_HEADERFUNCTION = 20079,
+    CURLOPT_DEBUGFUNCTION = 20094,
 }
 
 // ───────────────────────── CURLINFO ─────────────────────────
@@ -165,6 +170,19 @@ type WriteCallback = unsafe extern "C" fn(*mut c_char, usize, usize, *mut c_void
 
 /// Header callback type matching libcurl's `CURLOPT_HEADERFUNCTION`.
 type HeaderCallback = unsafe extern "C" fn(*mut c_char, usize, usize, *mut c_void) -> usize;
+
+/// Read callback type matching libcurl's `CURLOPT_READFUNCTION`.
+///
+/// Called to supply upload data. Returns number of bytes written to buffer.
+/// Return 0 to signal end of data, `CURL_READFUNC_ABORT` (0x10000000) to abort.
+type ReadCallback = unsafe extern "C" fn(*mut c_char, usize, usize, *mut c_void) -> usize;
+
+/// Debug callback type matching libcurl's `CURLOPT_DEBUGFUNCTION`.
+///
+/// Called with debug information during transfer. The `info_type` parameter
+/// indicates the type of data (text, header in/out, data in/out).
+type DebugCallback =
+    unsafe extern "C" fn(*mut c_void, c_long, *mut c_char, usize, *mut c_void) -> c_long;
 
 // ───────────────────────── curl_slist ─────────────────────────
 
@@ -258,7 +276,12 @@ struct EasyHandle {
     write_data: *mut c_void,
     header_callback: Option<HeaderCallback>,
     header_data: *mut c_void,
+    read_callback: Option<ReadCallback>,
+    read_data: *mut c_void,
+    debug_callback: Option<DebugCallback>,
+    debug_data: *mut c_void,
     postfields: Option<Vec<u8>>,
+    infilesize: Option<u64>,
     error_buf: [u8; 256],
 }
 
@@ -282,7 +305,12 @@ pub extern "C" fn curl_easy_init() -> *mut c_void {
         write_data: ptr::null_mut(),
         header_callback: None,
         header_data: ptr::null_mut(),
+        read_callback: None,
+        read_data: ptr::null_mut(),
+        debug_callback: None,
+        debug_data: ptr::null_mut(),
         postfields: None,
+        infilesize: None,
         error_buf: [0u8; 256],
     });
     Box::into_raw(handle).cast::<c_void>()
@@ -323,7 +351,12 @@ pub unsafe extern "C" fn curl_easy_duphandle(handle: *mut c_void) -> *mut c_void
         write_data: h.write_data,
         header_callback: h.header_callback,
         header_data: h.header_data,
+        read_callback: h.read_callback,
+        read_data: h.read_data,
+        debug_callback: h.debug_callback,
+        debug_data: h.debug_data,
         postfields: h.postfields.clone(),
+        infilesize: h.infilesize,
         error_buf: [0u8; 256],
     });
     Box::into_raw(dup).cast::<c_void>()
@@ -348,7 +381,12 @@ pub unsafe extern "C" fn curl_easy_reset(handle: *mut c_void) {
     h.write_data = ptr::null_mut();
     h.header_callback = None;
     h.header_data = ptr::null_mut();
+    h.read_callback = None;
+    h.read_data = ptr::null_mut();
+    h.debug_callback = None;
+    h.debug_data = ptr::null_mut();
     h.postfields = None;
+    h.infilesize = None;
     h.error_buf = [0u8; 256];
 }
 
@@ -426,6 +464,34 @@ pub unsafe extern "C" fn curl_easy_setopt(
         // CURLOPT_HEADERDATA = 10029
         10029 => {
             h.header_data = value.cast_mut();
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_READFUNCTION = 20012
+        20012 => {
+            // SAFETY: Caller guarantees value is a valid function pointer
+            h.read_callback =
+                Some(unsafe { std::mem::transmute::<*const c_void, ReadCallback>(value) });
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_READDATA = 10009
+        10009 => {
+            h.read_data = value.cast_mut();
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_DEBUGFUNCTION = 20094
+        20094 => {
+            // SAFETY: Caller guarantees value is a valid function pointer
+            h.debug_callback =
+                Some(unsafe { std::mem::transmute::<*const c_void, DebugCallback>(value) });
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_DEBUGDATA = 10095
+        10095 => {
+            h.debug_data = value.cast_mut();
             CURLcode::CURLE_OK
         }
 
@@ -886,6 +952,15 @@ pub unsafe extern "C" fn curl_easy_setopt(
             CURLcode::CURLE_OK
         }
 
+        // CURLOPT_INFILESIZE_LARGE = 30115
+        30115 => {
+            #[allow(clippy::cast_sign_loss)]
+            let size = value as u64;
+            h.infilesize = Some(size);
+            h.easy.infilesize(size);
+            CURLcode::CURLE_OK
+        }
+
         // CURLOPT_MAX_SEND_SPEED_LARGE = 30145
         30145 => {
             #[allow(clippy::cast_sign_loss)]
@@ -927,6 +1002,30 @@ pub unsafe extern "C" fn curl_easy_perform(handle: *mut c_void) -> CURLcode {
     // Set POST body if configured
     if let Some(ref body) = h.postfields {
         h.easy.body(body);
+    } else if let Some(read_cb) = h.read_callback {
+        // Read callback: collect upload data by calling the callback in a loop
+        let mut upload_data = Vec::new();
+        let mut buf = [0u8; 16384]; // 16 KiB read buffer
+        loop {
+            // SAFETY: Caller set up the read callback and data pointer correctly.
+            // The callback writes into buf and returns bytes written (0 = EOF).
+            let n =
+                unsafe { read_cb(buf.as_mut_ptr().cast::<c_char>(), 1, buf.len(), h.read_data) };
+            // CURL_READFUNC_ABORT = 0x10000000
+            if n == 0x1000_0000 {
+                return CURLcode::CURLE_ABORTED_BY_CALLBACK;
+            }
+            if n == 0 {
+                break;
+            }
+            if n > buf.len() {
+                return CURLcode::CURLE_READ_ERROR;
+            }
+            upload_data.extend_from_slice(&buf[..n]);
+        }
+        if !upload_data.is_empty() {
+            h.easy.body(&upload_data);
+        }
     }
 
     // Perform the transfer, catching any panics
@@ -934,6 +1033,40 @@ pub unsafe extern "C" fn curl_easy_perform(handle: *mut c_void) -> CURLcode {
 
     match result {
         Ok(Ok(response)) => {
+            // Call debug callback if set — inform about headers and data
+            if let Some(debug_cb) = h.debug_callback {
+                // CURLINFO_HEADER_IN = 1 — response headers
+                for (name, value) in response.headers() {
+                    let line = format!("{name}: {value}\r\n");
+                    let bytes = line.into_bytes();
+                    // SAFETY: Caller set up the debug callback and data pointer correctly
+                    let _ = unsafe {
+                        debug_cb(
+                            handle,
+                            1, // CURLINFO_HEADER_IN
+                            bytes.as_ptr().cast_mut().cast::<c_char>(),
+                            bytes.len(),
+                            h.debug_data,
+                        )
+                    };
+                }
+
+                // CURLINFO_DATA_IN = 2 — response body
+                let body = response.body();
+                if !body.is_empty() {
+                    // SAFETY: Caller set up the debug callback and data pointer correctly
+                    let _ = unsafe {
+                        debug_cb(
+                            handle,
+                            2, // CURLINFO_DATA_IN
+                            body.as_ptr().cast_mut().cast::<c_char>(),
+                            body.len(),
+                            h.debug_data,
+                        )
+                    };
+                }
+            }
+
             // Call write callback if set
             if let Some(cb) = h.write_callback {
                 let body = response.body();
@@ -2054,6 +2187,112 @@ mod tests {
         // CURLOPT_PROXY_SSL_VERIFYPEER = 248
         let code = unsafe { curl_easy_setopt(handle, 248, 1_usize as *const c_void) };
         assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    unsafe extern "C" fn test_read_cb(
+        _buf: *mut c_char,
+        _size: usize,
+        _nmemb: usize,
+        _data: *mut c_void,
+    ) -> usize {
+        0 // EOF
+    }
+
+    unsafe extern "C" fn test_debug_cb(
+        _handle: *mut c_void,
+        _info_type: c_long,
+        _data: *mut c_char,
+        _size: usize,
+        _userdata: *mut c_void,
+    ) -> c_long {
+        0
+    }
+
+    #[test]
+    fn easy_setopt_readfunction() {
+        let handle = curl_easy_init();
+        // CURLOPT_READFUNCTION = 20012
+        let code = unsafe { curl_easy_setopt(handle, 20012, test_read_cb as *const c_void) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_readdata() {
+        let handle = curl_easy_init();
+        // CURLOPT_READDATA = 10009
+        let mut data: usize = 42;
+        let code =
+            unsafe { curl_easy_setopt(handle, 10009, ptr::from_mut(&mut data).cast::<c_void>()) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_debugfunction() {
+        let handle = curl_easy_init();
+        // CURLOPT_DEBUGFUNCTION = 20094
+        let code = unsafe { curl_easy_setopt(handle, 20094, test_debug_cb as *const c_void) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_debugdata() {
+        let handle = curl_easy_init();
+        // CURLOPT_DEBUGDATA = 10095
+        let mut data: usize = 99;
+        let code =
+            unsafe { curl_easy_setopt(handle, 10095, ptr::from_mut(&mut data).cast::<c_void>()) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_infilesize_large() {
+        let handle = curl_easy_init();
+        // CURLOPT_INFILESIZE_LARGE = 30115
+        let code = unsafe { curl_easy_setopt(handle, 30115, 4096_usize as *const c_void) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_duphandle_preserves_callbacks() {
+        let handle = curl_easy_init();
+        let _ = unsafe { curl_easy_setopt(handle, 20012, test_read_cb as *const c_void) };
+        let _ = unsafe { curl_easy_setopt(handle, 20094, test_debug_cb as *const c_void) };
+        let _ = unsafe { curl_easy_setopt(handle, 30115, 1024_usize as *const c_void) };
+
+        let dup = unsafe { curl_easy_duphandle(handle) };
+        assert!(!dup.is_null());
+
+        // Verify callbacks were preserved
+        let dup_h = unsafe { &*dup.cast::<EasyHandle>() };
+        assert!(dup_h.read_callback.is_some());
+        assert!(dup_h.debug_callback.is_some());
+        assert_eq!(dup_h.infilesize, Some(1024));
+
+        unsafe {
+            curl_easy_cleanup(dup);
+            curl_easy_cleanup(handle);
+        }
+    }
+
+    #[test]
+    fn easy_reset_clears_callbacks() {
+        let handle = curl_easy_init();
+        let _ = unsafe { curl_easy_setopt(handle, 20012, test_read_cb as *const c_void) };
+        let _ = unsafe { curl_easy_setopt(handle, 30115, 2048_usize as *const c_void) };
+
+        unsafe { curl_easy_reset(handle) };
+
+        let h = unsafe { &*handle.cast::<EasyHandle>() };
+        assert!(h.read_callback.is_none());
+        assert!(h.debug_callback.is_none());
+        assert!(h.infilesize.is_none());
+
         unsafe { curl_easy_cleanup(handle) };
     }
 }
