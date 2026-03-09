@@ -14,12 +14,12 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 7 — CLI Completeness
-**Last completed:** Phase 6 (FFI Expansion) — 2026-03-08
-**Total tests:** 1520+
-**In progress:** Planning Phase 7
+**Phase:** 8 — HTTP Completeness + HTTP/3
+**Last completed:** Phase 7 (CLI Completeness) — 2026-03-08
+**Total tests:** 1550+
+**In progress:** Planning Phase 8
 **Blockers:** None
-**Next up:** Cookie flags, TLS flags, auth flags, transfer flags, debug flags
+**Next up:** Expect: 100-continue, HTTP/2 server push, HTTP/3 via quinn
 
 ### Completeness Summary
 
@@ -37,9 +37,9 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 | SSH/SFTP/SCP | 0% | Not implemented |
 | Multi API | 55% | Connection limiting, message queue, share interface, pipelining config; no poll/socket/timer callbacks |
 | FFI (libcurl C ABI) | ~18% | 37 options, 12 info codes, 25 error codes, multi API, slist, duphandle |
-| CLI | ~14% | ~43 of ~250 flags |
+| CLI | ~19% | ~58 of ~250 flags |
 | Connection | 80% | Pool, TCP_NODELAY, keepalive, Unix sockets, interface/port binding |
-| Overall | ~46% | ~88% for basic HTTP/HTTPS use cases |
+| Overall | ~48% | ~89% for basic HTTP/HTTPS use cases |
 
 ---
 
@@ -295,45 +295,11 @@ Expanded liburlx-ffi from ~8% to ~18% libcurl coverage:
 
 ---
 
-### Phase 7: CLI Completeness
+### Phase 7: CLI Completeness — COMPLETED (2026-03-08)
 
-**Goal:** Support all commonly-used curl command-line flags.
+Added 15 new CLI flags: `-b/--cookie`, `--data-binary`, `--data-urlencode`, `--resolve`, `--http2`, `--retry`/`--retry-delay`/`--retry-max-time`, `-Z/--parallel`/`--parallel-max`, `--socks5-hostname`, `--tcp-nodelay`, `--tcp-keepalive`, `--hsts`, `--bearer`. Implemented retry logic with retryable status detection (408/429/5xx), URL percent-encoding for `--data-urlencode`, parallel transfer control via Multi API. ~58 total flags now supported. 30 new unit tests (80 total in CLI).
 
-**Cookie flags:**
-- `-b/--cookie` — read cookies from file or string
-- `-c/--cookie-jar` — write cookies to file after transfer
-
-**TLS flags:** (from Phase 2 implementation)
-- `--cert`, `--key`, `--cacert`, `--capath`, `-k/--insecure`, `--pinnedpubkey`
-- `--tls-max`, `--tlsv1.2`, `--tlsv1.3`, `--ciphers`
-
-**Auth flags:**
-- `--digest`, `--ntlm`, `--negotiate`, `--aws-sigv4`, `--proxy-user`
-
-**Transfer flags:**
-- `--retry`, `--retry-delay`, `--retry-max-time`
-- `--limit-rate` — bandwidth throttling
-- `--speed-limit`, `--speed-time` — minimum speed enforcement
-- `-T/--upload-file` — PUT upload from file
-- `--data-binary`, `--data-urlencode` — POST data variants
-
-**Debug/output flags:**
-- `--trace`, `--trace-ascii`, `--trace-time` — wire-level logging
-- `--stderr` — redirect stderr
-- `-K/--config` — read flags from config file
-- `--libcurl` — output equivalent C code
-
-**Protocol flags:**
-- `--http2`, `--http2-prior-knowledge`, `--http3`
-- `--ftp-pasv`, `--ftp-port`, `--ftp-ssl`
-- `--socks5-hostname`, `--proxy-header`
-
-**Miscellaneous:**
-- `--dns-servers`, `--doh-url`
-- `--unix-socket`, `--abstract-unix-socket`
-- `--interface`, `--local-port`
-- `-Z/--parallel`, `--parallel-max`, `--parallel-immediate` — parallel transfer control
-- `--styled-output`, `--no-styled-output`
+**Deferred to later phases:** `--cookie-jar` (needs cookie persistence, Phase 9), `--capath`/`--ciphers` (TLS), `--ntlm`/`--negotiate` (auth), `--limit-rate`/`--speed-limit`/`--speed-time` (rate limiting, Phase 9), `--trace`/`--trace-ascii`/`--trace-time` (debug), `--config` (config file), `--libcurl` (C code output, Phase 9), `--http3` (Phase 8), `--ftp-*` (FTP flags), `--proxy-header`, `--dns-servers`/`--doh-url`, `--abstract-unix-socket`, `--parallel-immediate`, `--styled-output`.
 
 ---
 
