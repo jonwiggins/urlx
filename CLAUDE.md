@@ -14,12 +14,12 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 34 — FFI Expansion II
-**Last completed:** Phase 33 (CLI Expansion III) — 2026-03-09
-**Total tests:** 1,981
-**In progress:** Phase 34 — FFI Expansion II
+**Phase:** 35 — Planning
+**Last completed:** Phase 34 (FFI Expansion II) — 2026-03-09
+**Total tests:** 2,049
+**In progress:** Planning Phase 35
 **Blockers:** None
-**Next up:** Phase 34 — FFI Expansion II
+**Next up:** Phase 35 — WebSocket Enhancements
 
 ### Completeness Summary (updated Phase 30 review)
 
@@ -36,7 +36,7 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 | FTP | 85% | Session API, upload, resume, dir ops, FEAT, explicit/implicit FTPS, active mode (PORT/EPRT) |
 | SSH/SFTP/SCP | 60% | SFTP download/upload/list, SCP download/upload, password + pubkey auth; no known_hosts |
 | Multi API | 75% | Connection limiting, message queue, share, pipelining, wait/poll/wakeup/fdset/socket_action/timeout/info_read |
-| FFI (libcurl C ABI) | ~48% | 86 options, 22 info codes, 25 error codes, 43 functions |
+| FFI (libcurl C ABI) | ~55% | 102 options, 32 info codes, 25 error codes, 50 functions |
 | CLI | ~40% | ~100 of ~250 flags |
 | Connection | 80% | Pool, TCP_NODELAY, keepalive, Unix sockets, interface/port binding |
 | Transfer control | 80% | Rate limiting enforced in transfer engine (max recv/send speed, low speed timeout) |
@@ -106,6 +106,9 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 - **2026-03-09:** HTTP/3 dispatch in easy.rs bypasses TCP connection and TLS — it uses the resolved DNS address directly for QUIC (UDP). The QUIC endpoint binds to 0.0.0.0:0 (OS-assigned port). Connection errors map to `Error::Connect` to match the existing error taxonomy.
 - **2026-03-09:** HTTPS proxy tunnel uses TLS-in-TLS: first TLS-wrap TCP to the proxy (via `new_no_alpn`), then HTTP CONNECT through the TLS stream, then TLS-wrap the tunnel to the target. The result is `TlsStream<TlsStream<TcpStream>>` which doesn't fit `PooledStream::Tls(TlsStream<TcpStream>)`, so the HTTPS proxy path uses a separate early-return block with `h1::request` directly on the generic stream.
 - **2026-03-09:** WebSocket key generation uses `AtomicU64` counter mixed with nanosecond timestamp to ensure uniqueness even when called within the same nanosecond. Previous approach used only timestamp, causing identical keys on fast CI machines.
+- **2026-03-09:** `curl_getdate` FFI function implements inline HTTP date parsing supporting three formats: RFC 2822 ("Sun, 06 Nov 1994 08:49:37 GMT"), RFC 850 ("Sunday, 06-Nov-94 08:49:37 GMT"), and asctime ("Sun Nov  6 08:49:37 1994"). Inline Unix timestamp computation avoids adding a `chrono` dependency for a single use case. Two-digit years ≥70 map to 1900s, <70 to 2000s (matching curl).
+- **2026-03-09:** `curl_escape`/`curl_unescape` use RFC 3986 unreserved characters (A-Z, a-z, 0-9, `-._~`) for percent-encoding. `curl_unescape` decodes `+` as space (matching curl's behavior for form-encoded data). `curl_easy_escape`/`curl_easy_unescape` delegate to the same implementation.
+- **2026-03-09:** `curl_formadd` returns `CURL_FORMADD_DISABLED` (7) as a stub — the deprecated multipart API is replaced by the MIME API (`curl_mime_*`). `curl_formfree` is a no-op. This matches libcurl's behavior when built without form API support.
 
 ---
 
@@ -278,13 +281,15 @@ Built from scratch over 29 phases. All features below are implemented and tested
 - **Performance:** Hot-path string allocation elimination — cookie domain matching, DNS cache keys, response header lookup, decompression encoding dispatch, multipart content type guessing all use `eq_ignore_ascii_case` instead of `to_lowercase()`. Criterion benchmarks for URL parsing, cookie jar, HSTS cache, DNS cache, response headers, and cookie domain matching.
 - **Response:** Status, headers, body, trailers, effective_url, TransferInfo (6 timing fields + speed/size metrics).
 
-**FFI Layer (liburlx-ffi) — 86 CURLOPT, 22 CURLINFO, 25 CURLcode, 43 functions:**
-- Functions: curl_easy_init/cleanup/duphandle/reset/setopt/perform/getinfo/strerror, curl_slist_append/free_all, curl_multi_init/cleanup/add_handle/remove_handle/perform/info_read/setopt/timeout/wait/poll/wakeup/fdset/socket_action/strerror, curl_version, curl_mime_init/addpart/name/data/filename/type/free, curl_share_init/cleanup/setopt/strerror, curl_url/url_cleanup/url_dup/url_set/url_get, curl_free.
+**FFI Layer (liburlx-ffi) — 102 CURLOPT, 32 CURLINFO, 25 CURLcode, 50 functions:**
+- Functions: curl_easy_init/cleanup/duphandle/reset/setopt/perform/getinfo/strerror/escape/unescape, curl_slist_append/free_all, curl_multi_init/cleanup/add_handle/remove_handle/perform/info_read/setopt/timeout/wait/poll/wakeup/fdset/socket_action/strerror, curl_version, curl_mime_init/addpart/name/data/filename/type/free, curl_share_init/cleanup/setopt/strerror, curl_url/url_cleanup/url_dup/url_set/url_get, curl_free, curl_escape/unescape, curl_getdate, curl_formadd/formfree.
 - Callbacks: WRITEFUNCTION, READFUNCTION (with CURL_READFUNC_ABORT), HEADERFUNCTION, DEBUGFUNCTION, PROGRESSFUNCTION, XFERINFOFUNCTION, SEEKFUNCTION.
-- Options: CURLOPT_PRIVATE, CURLOPT_SHARE, CURLOPT_MIMEPOST, CURLOPT_NOPROGRESS, CURLOPT_REFERER, CURLOPT_HTTP_VERSION, CURLOPT_XOAUTH2_BEARER, CURLOPT_RESUME_FROM_LARGE, CURLOPT_NOSIGNAL, CURLOPT_AUTOREFERER, CURLOPT_LOCALPORTRANGE, CURLOPT_AWS_SIGV4.
+- Options: 102 CURLOPT including PRIVATE, SHARE, MIMEPOST, NOPROGRESS, REFERER, HTTP_VERSION, XOAUTH2_BEARER, RESUME_FROM_LARGE, NOSIGNAL, AUTOREFERER, LOCALPORTRANGE, AWS_SIGV4, ERRORBUFFER, STDERR, COOKIELIST, PROXY_CAINFO, HSTS, PROTOCOLS_STR, REDIR_PROTOCOLS_STR, HTTPPROXYTUNNEL, MAXFILESIZE, MAXFILESIZE_LARGE, POSTREDIR, TRANSFER_ENCODING, EXPECT_100_TIMEOUT_MS, PATH_AS_IS, DNS_SHUFFLE_ADDRESSES, PROXY_SSL_VERIFYHOST.
+- CURLINFO: 32 codes including FILETIME, CONTENT_LENGTH_DOWNLOAD/UPLOAD, OS_ERRNO, PRIMARY_IP, NUM_CONNECTS, LOCAL_IP/PORT, REDIRECT_URL, CONDITION_UNMET.
 - Multi options: CURLMoption (SOCKETFUNCTION, SOCKETDATA, PIPELINING, TIMERFUNCTION, TIMERDATA, MAXCONNECTS, MAX_HOST_CONNECTIONS, MAX_TOTAL_CONNECTIONS).
 - Enums: CURLSHcode (6), CURLSHoption (4), CURLUcode (10), CURLUPart (11), CURLMcode (6), CURLMSG (1), CURLMoption (8).
 - URL API: Mutable UrlHandle with component-level get/set (scheme, user, password, host, port, path, query, fragment).
+- Utility: URL percent-encoding/decoding (RFC 3986), HTTP date parsing (RFC 2822/850/asctime), curl_formadd stub (returns DISABLED).
 - Memory: Box<[u8]>-based slist string allocation (exact-size, no capacity mismatch). catch_unwind on all FFI boundaries.
 
 **CLI (urlx) — ~100 long flags + short aliases:**
@@ -302,7 +307,7 @@ Built from scratch over 29 phases. All features below are implemented and tested
 - Features: .curlrc-style config file parser, protocol restriction, max filesize enforcement (exit 63), libcurl C code generation, retry logic (408/429/5xx), netrc credential lookup, Content-Disposition filename extraction, URL query parameter appending.
 - Misc: --globoff (no-op, no URL globbing).
 
-**Testing — 1,981 tests (0 failures):**
+**Testing — 2,049 tests (0 failures):**
 - Unit + integration tests across all crates
 - Integration: 1,048 (hyper-based test servers)
 - Property-based: 60 (proptest — URL, cookie, FTP, HTTP, HSTS, multipart, protocols, WebSocket)
@@ -312,7 +317,7 @@ Built from scratch over 29 phases. All features below are implemented and tested
 
 **Guardrails:** Zero TODO/FIXME/HACK. Zero `unwrap()` in production code. `#![deny(unsafe_code)]` in liburlx and urlx-cli. GitHub Actions CI (fmt, clippy, test on 3 OS, doc, cargo-deny, MSRV 1.83, commit lint). Pre-commit hooks (fmt, clippy, test, deny, doc, conventional commit).
 
-**Known gaps (as of Phase 33):** HTTP/3 missing 0-RTT and Alt-Svc-based upgrade from HTTP/2. HTTP/2 missing stream priority/dependency. SSH known_hosts verification not implemented. Socket/timer callbacks stored but not actively invoked (tokio manages I/O). Missing FFI: CURLOPT_HTTPPOST (deprecated). URL globbing not yet implemented. No async DNS resolver (hickory-dns). No cookie public suffix list. NTLM auth is skeleton only. No PAC proxy auto-config. `--rate` stored but not enforced. `--path-as-is` stored but URL crate still normalizes paths.
+**Known gaps (as of Phase 34):** HTTP/3 missing 0-RTT and Alt-Svc-based upgrade from HTTP/2. HTTP/2 missing stream priority/dependency. SSH known_hosts verification not implemented. Socket/timer callbacks stored but not actively invoked (tokio manages I/O). Missing FFI: CURLOPT_HTTPPOST (deprecated). URL globbing not yet implemented. No async DNS resolver (hickory-dns). No cookie public suffix list. NTLM auth is skeleton only. No PAC proxy auto-config. `--rate` stored but not enforced. `--path-as-is` stored but URL crate still normalizes paths.
 
 ---
 
@@ -366,16 +371,9 @@ Added 10 CLI flags: `--json` (JSON POST shorthand — sets Content-Type/Accept +
 
 ---
 
-### Phase 34: FFI Expansion II
+### Phase 34: FFI Expansion II (2026-03-09)
 
-**Goal:** Expand FFI toward 100+ options and 50+ functions.
-
-- curl_formadd / curl_formfree (deprecated but used)
-- curl_getdate (RFC 2822 date parsing)
-- curl_escape / curl_unescape (URL encoding)
-- CURLOPT_HTTPPOST (deprecated multipart API)
-- Additional CURLINFO codes (local IP/port, redirect URL, condition unmet)
-- Target: 100+ CURLOPT, 30+ CURLINFO, 50+ functions
+Added 16 CURLOPT options, 10 CURLINFO codes, and 7 utility functions. HTTP date parser (RFC 2822, RFC 850, asctime) with inline Unix timestamp computation. URL percent-encoding/decoding (RFC 3986). curl_formadd/curl_formfree stubs (deprecated API returns DISABLED). 65 new tests (212 FFI tests total). Totals: 102 CURLOPT, 32 CURLINFO, 50 functions, 2,049 tests.
 
 ---
 
