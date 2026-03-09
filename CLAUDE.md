@@ -14,12 +14,12 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 12 — TLS Session Management & Cipher Control
-**Last completed:** Phase 11 (FFI Expansion) — 2026-03-08
-**Total tests:** 1,620+
-**In progress:** Planning Phase 12
+**Phase:** 13 — Proxy Enhancements — HTTPS Proxy & Auth
+**Last completed:** Phase 12 (TLS Session Management & Cipher Control) — 2026-03-08
+**Total tests:** 1,656+
+**In progress:** Planning Phase 13
 **Blockers:** None
-**Next up:** TLS session caching, cipher suite control
+**Next up:** HTTPS proxy, proxy auth, NTLM skeleton
 
 ### Completeness Summary (updated Phase 10 review)
 
@@ -28,7 +28,7 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 | HTTP/1.1 | 95% | Expect: 100-continue, HTTP/1.0 mode; no trailer headers |
 | HTTP/2 | 60% | Works; no server push |
 | HTTP/3 | 0% | Not implemented |
-| TLS | 80% | rustls with insecure mode, custom CA, client certs, pinning, version selection |
+| TLS | 85% | rustls with insecure mode, custom CA, client certs, pinning, version selection, cipher list, session cache |
 | Authentication | 50% | Basic, Bearer, Digest (MD5/SHA-256), AWS SigV4 |
 | Cookie engine | 90% | Netscape file format read/write, in-memory jar; no public suffix list |
 | Proxy | 80% | HTTP + SOCKS + proxy auth; no HTTPS proxy or PAC |
@@ -36,7 +36,7 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 | FTP | 70% | Session API, upload, resume, dir ops, FEAT; no FTPS or active mode |
 | SSH/SFTP/SCP | 0% | Not implemented |
 | Multi API | 55% | Connection limiting, message queue, share interface, pipelining config; no poll/socket/timer callbacks |
-| FFI (libcurl C ABI) | ~22% | 48 options, 15 info codes, 25 error codes, multi API, slist, duphandle |
+| FFI (libcurl C ABI) | ~23% | 53 options, 16 info codes, 25 error codes, multi API, slist, duphandle |
 | CLI | ~24% | ~72 of ~250 flags |
 | Connection | 80% | Pool, TCP_NODELAY, keepalive, Unix sockets, interface/port binding |
 | Transfer control | 40% | Rate limiting, speed enforcement API; not wired into transfer engine yet |
@@ -352,15 +352,9 @@ Added 11 new CURLOPT options (TIMEOUT_MS, CONNECTTIMEOUT_MS, FRESH_CONNECT, FORB
 
 ---
 
-### Phase 12: TLS Session Management & Cipher Control
+### Phase 12: TLS Session Management & Cipher Control — COMPLETED (2026-03-08)
 
-**Goal:** Production-grade TLS configuration.
-
-- CURLOPT_SSL_CIPHER_LIST (cipher suite selection)
-- CURLOPT_SSL_SESSIONID_CACHE (session resumption)
-- CURLINFO_SSL_VERIFYRESULT, CURLINFO_CERTINFO
-- CURLOPT_CRLFILE (CRL checking)
-- TLS session ID reuse in ConnectionPool
+Added `ssl_cipher_list()` and `ssl_session_cache()` Easy API methods. Added `cipher_list` and `session_cache` fields to TlsConfig. Added FFI support for CURLOPT_SSL_CIPHER_LIST, CURLOPT_COOKIEFILE, CURLOPT_COOKIEJAR, CURLOPT_SSL_SESSIONID_CACHE, CURLOPT_INTERFACE, and CURLINFO_SSL_VERIFYRESULT. 11 new tests. Deferred: CURLINFO_CERTINFO (requires certificate chain introspection API), CURLOPT_CRLFILE (CRL checking not supported by rustls), TLS session ID reuse in pool (rustls handles session tickets internally).
 
 ---
 
