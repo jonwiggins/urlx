@@ -44,6 +44,8 @@ pub struct Easy {
     fail_on_error: bool,
     auth_credentials: Option<AuthCredentials>,
     tls_config: TlsConfig,
+    aws_sigv4: Option<crate::auth::aws_sigv4::AwsSigV4Config>,
+    aws_credentials: Option<(String, String)>,
     pool: ConnectionPool,
 }
 
@@ -71,6 +73,8 @@ impl std::fmt::Debug for Easy {
             .field("fail_on_error", &self.fail_on_error)
             .field("auth_credentials", &self.auth_credentials.as_ref().map(|_| "<credentials>"))
             .field("tls_config", &self.tls_config)
+            .field("aws_sigv4", &self.aws_sigv4)
+            .field("aws_credentials", &self.aws_credentials.as_ref().map(|_| "<credentials>"))
             .field("pool", &"<ConnectionPool>")
             .finish()
     }
@@ -100,6 +104,8 @@ impl Clone for Easy {
             fail_on_error: self.fail_on_error,
             auth_credentials: self.auth_credentials.clone(),
             tls_config: self.tls_config.clone(),
+            aws_sigv4: self.aws_sigv4.clone(),
+            aws_credentials: self.aws_credentials.clone(),
             pool: ConnectionPool::new(),
         }
     }
@@ -131,6 +137,8 @@ impl Easy {
             fail_on_error: false,
             auth_credentials: None,
             tls_config: TlsConfig::default(),
+            aws_sigv4: None,
+            aws_credentials: None,
             pool: ConnectionPool::new(),
         }
     }
@@ -351,6 +359,24 @@ impl Easy {
         });
     }
 
+    /// Configure AWS Signature Version 4 signing.
+    ///
+    /// The `spec` format is `provider:region:service` (e.g., `aws:us-east-1:s3`).
+    /// Credentials are taken from the user/password set via [`basic_auth`](Self::basic_auth)
+    /// or [`digest_auth`](Self::digest_auth), or can be set separately.
+    /// Equivalent to curl's `--aws-sigv4`.
+    pub fn aws_sigv4(&mut self, spec: &str) {
+        self.aws_sigv4 = crate::auth::aws_sigv4::AwsSigV4Config::parse(spec);
+    }
+
+    /// Set AWS credentials for `SigV4` signing.
+    ///
+    /// Uses `access_key` and `secret_key` for request signing.
+    /// Must be used together with [`aws_sigv4`](Self::aws_sigv4).
+    pub fn aws_credentials(&mut self, access_key: &str, secret_key: &str) {
+        self.aws_credentials = Some((access_key.to_string(), secret_key.to_string()));
+    }
+
     /// Enable or disable fail-on-error mode.
     ///
     /// When enabled, HTTP responses with status >= 400 cause
@@ -455,6 +481,7 @@ impl Easy {
     ///
     /// Returns errors for connection failures, TLS errors, HTTP protocol
     /// errors, timeouts, and other transfer problems.
+    #[allow(clippy::too_many_lines)]
     pub async fn perform_async(&mut self) -> Result<Response, Error> {
         let url = self.url.as_ref().ok_or_else(|| Error::UrlParse("no URL set".to_string()))?;
 
@@ -495,6 +522,27 @@ impl Easy {
         if let Some(ref range) = self.range {
             if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("range")) {
                 headers.push(("Range".to_string(), format!("bytes={range}")));
+            }
+        }
+
+        // AWS SigV4 signing: add auth headers before sending
+        if let Some(ref sigv4_config) = self.aws_sigv4 {
+            if let Some((ref access_key, ref secret_key)) = self.aws_credentials {
+                if let Ok(parsed_url) = url::Url::parse(url.as_str()) {
+                    let timestamp = crate::auth::aws_sigv4::now_timestamp();
+                    let body_bytes = effective_body.as_deref().unwrap_or(&[]);
+                    let sigv4_headers = crate::auth::aws_sigv4::sign_request(
+                        &effective_method,
+                        &parsed_url,
+                        &headers,
+                        body_bytes,
+                        access_key,
+                        secret_key,
+                        sigv4_config,
+                        &timestamp,
+                    );
+                    headers.extend(sigv4_headers);
+                }
             }
         }
 

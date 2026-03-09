@@ -27,6 +27,7 @@ struct CliOptions {
     include_headers: bool,
     dump_header: Option<String>,
     use_digest: bool,
+    use_aws_sigv4: bool,
     user_credentials: Option<(String, String)>,
 }
 
@@ -87,6 +88,7 @@ fn parse_args(args: &[String]) -> Option<CliOptions> {
         include_headers: false,
         dump_header: None,
         use_digest: false,
+        use_aws_sigv4: false,
         user_credentials: None,
     };
 
@@ -320,6 +322,12 @@ fn parse_args(args: &[String]) -> Option<CliOptions> {
                 let val = require_arg(args, i, "--pinnedpubkey")?;
                 opts.easy.ssl_pinned_public_key(val);
             }
+            "--aws-sigv4" => {
+                i += 1;
+                let val = require_arg(args, i, "--aws-sigv4")?;
+                opts.easy.aws_sigv4(val);
+                opts.use_aws_sigv4 = true;
+            }
             arg if arg.starts_with('-') => {
                 eprintln!("urlx: unknown option: {arg}");
                 return None;
@@ -333,7 +341,9 @@ fn parse_args(args: &[String]) -> Option<CliOptions> {
 
     // Apply auth credentials after all flags are parsed
     if let Some((ref user, ref pass)) = opts.user_credentials {
-        if opts.use_digest {
+        if opts.use_aws_sigv4 {
+            opts.easy.aws_credentials(user, pass);
+        } else if opts.use_digest {
             opts.easy.digest_auth(user, pass);
         } else {
             opts.easy.basic_auth(user, pass);
