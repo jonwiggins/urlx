@@ -224,206 +224,56 @@ urlx/
 
 ## Implementation Phases
 
-### Phase 1: Foundation — COMPLETED (2026-03-08)
-
-Repository setup, CI/CD, and core library implementation. Built from scratch over 34 sub-phases:
-
-- **Workspace & guardrails:** Three-crate workspace (liburlx, liburlx-ffi, urlx-cli). Rustfmt, clippy, cargo-deny, pre-commit hooks, GitHub Actions CI with commit linting, multi-OS testing, MSRV check.
-- **HTTP/1.1:** Full request/response codec (GET/POST/PUT/DELETE/HEAD/PATCH/OPTIONS), custom headers, chunked transfer encoding, Content-Encoding decompression (gzip, deflate, brotli, zstd), redirects (301/302/303/307/308), fail_on_error, verbose output.
-- **HTTP/2:** Via h2 crate with ALPN negotiation, automatic protocol selection.
-- **TLS:** rustls + tokio-rustls with system root certificates, SNI, ALPN.
-- **Easy API:** 26 public methods — URL, method, headers, body, auth (Basic/Bearer), proxy, timeouts, cookies, HSTS, resolve overrides, multipart forms, range/resume, progress callbacks, fail_on_error.
-- **Multi API:** JoinSet-based concurrent execution with result ordering, perform_blocking wrapper.
-- **Connection pooling:** PooledStream enum (Tcp/Tls), stale connection retry, per-host caching.
-- **Cookie engine:** RFC 6265 Set-Cookie parsing, domain/path matching, Max-Age, Secure, HttpOnly, SameSite (stored). In-memory only.
-- **HSTS cache:** Strict-Transport-Security parsing, auto HTTP→HTTPS upgrade, includeSubDomains.
-- **Proxy:** HTTP forward proxy, HTTP CONNECT tunneling, SOCKS4/SOCKS4a/SOCKS5 with auth, noproxy bypass, environment variables.
-- **Protocols:** FTP (download/LIST), WebSocket (RFC 6455 frames), SMTP, IMAP, POP3, MQTT 3.1.1, DICT, TFTP, FILE.
-- **FFI:** curl_easy_init/cleanup/setopt (19 options)/perform/getinfo (6 codes)/strerror, curl_version. CURLcode (9 codes), cbindgen header generation.
-- **CLI:** 27+ flags including -X, -H, -d, -L, -I, -o, -v, -s, -S, -f, -i, -D, -A, -u, -F, -r, -C, -x, -w, -m, --compressed, --max-redirs, --noproxy, --data-raw, multi-URL support.
-- **Testing:** 1331+ tests — unit, integration (hyper-based test server), property-based (proptest), fuzz harnesses (cargo-fuzz), E2E scenarios, curl behavioral compatibility tests, benchmarks (criterion).
-
----
-
-### Phase 2: TLS Hardening + Authentication — COMPLETED (2026-03-08)
-
-TLS configuration and authentication mechanisms:
-
-- **TLS config:** `TlsConfig` struct with `verify_peer`, `verify_host`, `ca_cert`, `client_cert`, `client_key`, `min_tls_version`, `max_tls_version`, `pinned_public_key`. `NoVerifier` for insecure mode. PEM loading via `rustls-pemfile`.
-- **TLS version selection:** `TlsVersion` enum (Tls12/Tls13) with `builder_with_protocol_versions()`. CLI flags: `--tlsv1.2`, `--tlsv1.3`, `--tls-max`.
-- **Certificate pinning:** Inline DER parser extracts SPKI from X.509 certs, SHA-256 hash compared against pin. CLI flag: `--pinnedpubkey sha256//<base64>`.
-- **Digest auth:** `DigestChallenge` parser + `respond()` method. MD5 and SHA-256 algorithms, `qop=auth`, opaque echo. Challenge-response retry loop in `perform_transfer`.
-- **Proxy auth:** `proxy_auth()` method adds `Proxy-Authorization: Basic` header. Forward to CONNECT tunnel. CLI flag: `--proxy-user`.
-- **AWS SigV4:** `AwsSigV4Config` with `provider:region:service` parsing. Full signing pipeline (canonical request, HMAC-SHA256, signing key). CLI flag: `--aws-sigv4`.
-- **CLI flags added:** `-k/--insecure`, `--cacert`, `--cert`, `--key`, `--digest`, `--proxy-user`, `--tlsv1.2`, `--tlsv1.3`, `--tls-max`, `--pinnedpubkey`, `--aws-sigv4` (11 new flags).
-- **Deferred:** NTLM, Negotiate/SPNEGO, cipher suite selection (see Decision Log).
-
----
-
-### Phase 3: DNS + Connection Infrastructure — COMPLETED (2026-03-08)
-
-DNS caching (TTL-based, 60s default), Happy Eyeballs (RFC 6555, 250ms IPv6 head start), DNS shuffle, TCP_NODELAY (default on), TCP keepalive (socket2), Unix domain sockets, local interface/port binding (socket2), TransferInfo timing fields (namelookup, connect, appconnect, pretransfer, starttransfer, speed_download/upload, size_upload), CLI --write-out variables, --unix-socket, --interface, --local-port, --dns-shuffle flags. Migrated PEM parsing from unmaintained rustls-pemfile to rustls-pki-types.
-
-**Deferred to later phases:** Async DNS resolver (hickory-dns), DNS-over-HTTPS, abstract Unix sockets.
-
----
-
-### Phase 4: FTP Completeness + SSH/SFTP/SCP — COMPLETED (2026-03-08)
-
-Refactored FTP into session-based `FtpSession` API. Added: STOR upload, APPE append, REST resume, FEAT detection with capability parsing, MKD/RMD/DELE directory operations, RNFR/RNTO rename, SITE command, PWD/CWD, SIZE, MLSD (RFC 3659), TYPE A/I switching. Wired FTP upload into Easy API (PUT method → STOR) and CLI `-T/--upload-file` flag. Backward-compatible `download()`/`list()`/`upload()` convenience functions preserved.
-
-**Deferred to later phases:** Active mode (PORT/EPRT), FTPS (AUTH TLS), SSH/SFTP/SCP (requires `russh` crate — pure-Rust SSH, avoids `ssh2`'s C dependency).
-
----
-
-### Phase 5: Multi API Event-Driven Architecture — COMPLETED (2026-03-08)
-
-Implemented connection limiting, message queue, share interface, and pipelining config:
-- `TransferMessage` struct + `info_read()`/`messages_in_queue()` for per-transfer completion
-- `max_total_connections()` with semaphore-based limiting
-- `max_host_connections()` configuration
-- `remove()` for dynamic handle management
-- `Share` module for cross-handle DNS cache and cookie jar sharing via `Arc<Mutex<>>`
-- `PipeliningMode` enum (`Nothing`/`Multiplex`) for HTTP/2 multiplexing config
-- `set_share()` on both Easy and Multi handles
-- Poll/socket/timer/fdset APIs deferred to Phase 6 (FFI-specific concerns)
-
----
-
-### Phase 6: FFI Expansion — COMPLETED (2026-03-08)
-
-Expanded liburlx-ffi from ~8% to ~18% libcurl coverage:
-- CURLcode: 12 → 25 error codes (proxy, FTP, HTTP error, write/read, SSL cert, auth, abort)
-- CURLoption: 18 → 37 options (TLS verify/cert/key/CA/pin/version, auth, cookies, encoding, range, TCP, Unix socket, interface, resolve, upload)
-- CURLINFO: 6 → 12 codes (namelookup, connect, appconnect, starttransfer, speed, header size)
-- New functions: `curl_easy_duphandle`, `curl_easy_reset`, `curl_slist_append`/`curl_slist_free_all`, `curl_multi_init`/`cleanup`/`add_handle`/`remove_handle`/`perform`, `curl_version`
-- CURLMcode enum for multi error codes
-- Deferred: `curl_mime_*`, `curl_url_*`, read/progress/debug callbacks, CURLOPT_PRIVATE/SHARE
-
----
-
-### Phase 7: CLI Completeness — COMPLETED (2026-03-08)
-
-Added 15 new CLI flags: `-b/--cookie`, `--data-binary`, `--data-urlencode`, `--resolve`, `--http2`, `--retry`/`--retry-delay`/`--retry-max-time`, `-Z/--parallel`/`--parallel-max`, `--socks5-hostname`, `--tcp-nodelay`, `--tcp-keepalive`, `--hsts`, `--bearer`. Implemented retry logic with retryable status detection (408/429/5xx), URL percent-encoding for `--data-urlencode`, parallel transfer control via Multi API. ~58 total flags now supported. 30 new unit tests (80 total in CLI).
-
-**Deferred to later phases:** `--cookie-jar` (needs cookie persistence, Phase 9), `--capath`/`--ciphers` (TLS), `--ntlm`/`--negotiate` (auth), `--limit-rate`/`--speed-limit`/`--speed-time` (rate limiting, Phase 9), `--trace`/`--trace-ascii`/`--trace-time` (debug), `--config` (config file), `--libcurl` (C code output, Phase 9), `--http3` (Phase 8), `--ftp-*` (FTP flags), `--proxy-header`, `--dns-servers`/`--doh-url`, `--abstract-unix-socket`, `--parallel-immediate`, `--styled-output`.
-
----
-
-### Phase 8: HTTP Completeness — COMPLETED (2026-03-08)
-
-Implemented HTTP version selection, Expect: 100-continue, and response header parsing:
-- `HttpVersion` enum (`None`/`Http10`/`Http11`/`Http2`) for `CURLOPT_HTTP_VERSION`
-- HTTP/1.0 mode: sends `HTTP/1.0` request line, `Connection: close`, no keep-alive
-- HTTP/1.1 mode: forces HTTP/1.1, skips HTTP/2 ALPN
-- Expect: 100-continue: sends `Expect` header, waits for `100 Continue`, handles server rejection, timeout fallback
-- 1xx response skipping with buffered prefix handling
-- Alt-Svc header parsing (RFC 7838): protocol_id, host, port, max_age, clear directive, multiple entries
-- Retry-After header parsing (seconds format)
-- CLI flags: `--http1.0`, `--http1.1`, `--http2`, `--expect100-timeout`
-- 28 new unit tests
-
-**Deferred:** HTTP/3 via quinn (massive effort — needs own phase), HTTP/2 server push, stream priority, trailer headers, Alt-Svc caching/persistence, HSTS preload list.
-
----
-
-### Phase 9: Advanced Transfer Features + Cookie Persistence — COMPLETED (2026-03-08)
-
-Cookie persistence (Netscape format read/write, `-b <file>` import, `-c/--cookie-jar` export), rate limiting API (`max_recv_speed`, `max_send_speed`, `low_speed_limit`, `low_speed_time`), CLI flags (`--limit-rate` with K/M/G suffixes, `--speed-limit`, `--speed-time`), `Error::Io` variant. 25+ new tests. Rate limiting options stored but not yet wired into transfer engine. Deferred: Mozilla cookie format, public suffix list, TLS session caching, OCSP, MIME API, URL API, `--libcurl` flag.
-
----
-
-### Phase 10: Completeness Review — COMPLETED (2026-03-08)
-
-Comprehensive codebase audit against libcurl. Key findings:
-- **Rust API:** 41 Easy methods, 14 Multi methods — 73-74% coverage of top-used libcurl API surface
-- **FFI:** 37 CURLOPT options (35% of top 100), 12 CURLINFO codes (22%), 25 CURLcode values (27%)
-- **CLI:** 56 flags (56% of top 100 curl flags). Added 4 high-priority missing flags: `-O/--remote-name`, `-e/--referer`, `-G/--get`, `--create-dirs`
-- **Tests:** 1,590+ across unit (370+), integration (1,108), FFI (48), CLI (105), fuzz (4)
-- **No TODO/FIXME/HACK comments** in codebase — clean technical debt
-- **Gaps:** Rate limiting not enforced in transfer engine; READFUNCTION callback missing; NTLM/Negotiate deferred; HTTP/3 not started; no streaming upload support
-
-Planned Phases 11-20 based on gap analysis (see below).
-
----
-
-### Phase 11: FFI Expansion — COMPLETED (2026-03-08)
-
-Added 11 new CURLOPT options (TIMEOUT_MS, CONNECTTIMEOUT_MS, FRESH_CONNECT, FORBID_REUSE, LOW_SPEED_LIMIT, LOW_SPEED_TIME, MAX_SEND_SPEED_LARGE, MAX_RECV_SPEED_LARGE) and 3 new CURLINFO codes (SIZE_UPLOAD, SPEED_UPLOAD, PRETRANSFER_TIME). Added `fresh_connect()` and `forbid_reuse()` to Easy API. 14 new tests. Deferred: transfer-level rate limiting enforcement (requires chunked body reading architecture change).
-
----
-
-### Phase 12: TLS Session Management & Cipher Control — COMPLETED (2026-03-08)
-
-Added `ssl_cipher_list()` and `ssl_session_cache()` Easy API methods. Added `cipher_list` and `session_cache` fields to TlsConfig. Added FFI support for CURLOPT_SSL_CIPHER_LIST, CURLOPT_COOKIEFILE, CURLOPT_COOKIEJAR, CURLOPT_SSL_SESSIONID_CACHE, CURLOPT_INTERFACE, and CURLINFO_SSL_VERIFYRESULT. 11 new tests. Deferred: CURLINFO_CERTINFO (requires certificate chain introspection API), CURLOPT_CRLFILE (CRL checking not supported by rustls), TLS session ID reuse in pool (rustls handles session tickets internally).
-
----
-
-### Phase 13: Proxy Enhancements — HTTPS Proxy & Auth — COMPLETED (2026-03-08)
-
-Added NTLM auth skeleton (Type 1/2/3 message exchange) in `auth/ntlm.rs`. Added proxy Digest/NTLM auth methods to Easy API. Updated CONNECT tunnel to handle 407 with Digest and NTLM challenge-response. Added proxy TLS config (`proxy_ssl_client_cert`, `proxy_ssl_client_key`, `proxy_ssl_verify_peer`). Added FFI options: CURLOPT_PROXYUSERPWD, CURLOPT_PROXYAUTH, CURLOPT_PROXY_SSLCERT, CURLOPT_PROXY_SSLKEY, CURLOPT_PROXY_SSL_VERIFYPEER. Added CLI flags: `--proxy-digest`, `--proxy-ntlm`. 24 new tests. Deferred: HTTPS proxy tunnel (TLS-to-proxy), Negotiate/SPNEGO (Kerberos).
-
----
-
-### Phase 14: Streaming Upload & Callback API — COMPLETED (2026-03-08)
-
-Added CURLOPT_READFUNCTION/CURLOPT_READDATA for streaming upload data collection via callback (with CURL_READFUNC_ABORT support). Added CURLOPT_DEBUGFUNCTION/CURLOPT_DEBUGDATA for wire-level debug information (CURLINFO_HEADER_IN, CURLINFO_DATA_IN). Added CURLOPT_INFILESIZE_LARGE for expected upload size. Added Easy::infilesize() and Easy::upload_file() convenience methods. Read callback invocation in curl_easy_perform collects upload data when no postfields are set. Debug callback receives response headers and body data after transfer. Deferred: CURLOPT_TRAILERFUNCTION (chunked trailer headers — deferred to Phase 17 HTTP edge cases). 13 new tests.
-
----
-
-### Phase 15: DNS Hardening & DoH — COMPLETED (2026-03-09)
-
-Added configurable DNS cache TTL via `dns_cache_timeout()` and `DnsCache::set_ttl()`/`DnsCache::ttl()`. Added configurable Happy Eyeballs timeout via `happy_eyeballs_timeout()` — threaded through perform_transfer → do_single_request → happy_eyeballs_connect. Added `dns_servers()` for custom DNS server addresses with comma-separated IP:port parsing (default port 53). Added `doh_url()` for DNS-over-HTTPS endpoint configuration. Added FFI options: CURLOPT_DNS_CACHE_TIMEOUT (92), CURLOPT_HAPPY_EYEBALLS_TIMEOUT_MS (271), CURLOPT_DNS_SERVERS (10211), CURLOPT_DOH_URL (10279). Added CLI flags: `--dns-servers`, `--doh-url`, `--happy-eyeballs-timeout-ms`. Deferred: async DNS resolver via hickory-dns (significant dependency), DoH query execution (requires nested HTTP during DNS phase).
-
----
-
-### Phase 16: Connection Control & Header Management — COMPLETED (2026-03-08)
-
-Header deduplication (last wins), CURLOPT_UNRESTRICTED_AUTH (auth on cross-origin redirects), CURLOPT_IGNORE_CONTENT_LENGTH (read to EOF), FFI options 105/136, CLI flags. 13 new tests.
-
----
-
-### Phase 17: HTTP/1.1 Edge Cases & Protocol Refinements — COMPLETED (2026-03-08)
-
-Chunked trailer header parsing and exposure in Response API (trailers(), trailer(), set_trailers()). HEAD body skipping, Content-Encoding/Transfer-Encoding distinction, and redirect method downgrade already complete from prior phases. 5 new tests.
-
----
-
-### Phase 18: HTTP/3 (QUIC) & Alt-Svc — COMPLETED (2026-03-08)
-
-Alt-Svc cache with TTL-based expiry, automatic Alt-Svc header processing in transfers, HttpVersion::Http3 variant. QUIC transport (quinn) deferred — requires adding heavy dependency. 10 new cache tests.
-
----
-
-### Phase 19: CLI Expansion & Debug Tools — COMPLETED (2026-03-08)
-
-Added 9 new CLI flags: `--trace`, `--trace-ascii`, `--trace-time`, `-K/--config`, `--libcurl`, `--proto`, `--proto-redir`, `--max-filesize`, `--no-keepalive`. Config file parser for .curlrc-style format (comments, quotes, `=` syntax). Protocol restriction with URL scheme validation. Max filesize enforcement (exit code 63). `--libcurl` generates equivalent C code. 29 new unit tests (134 total in CLI).
-
----
-
-### Phase 20: Completeness Review — COMPLETED (2026-03-09)
-
-Second mandatory review. Comprehensive codebase audit against libcurl/curl.
-
-**Audit Results:**
-- **Rust API:** 73 Easy methods, 14 Multi methods — ~80% coverage of top-used libcurl API surface
-- **FFI:** 70 CURLOPT options, 16 CURLINFO codes, 25 CURLcode values, 16 functions
-- **CLI:** ~84 flags (~34% of ~250 curl flags, ~56% of top 100)
-- **Tests:** 1,768 across unit (442 liburlx, 81 FFI, 134 CLI), integration (1,108), doc (3)
-- **No TODO/FIXME/HACK comments** — clean technical debt
-- **No `unwrap()` in production code** — all in test modules
-
-**Key Gaps Identified:**
-1. Rate limiting not enforced in transfer engine (stored but not applied)
-2. Trace file writing not fully wired (verbose goes to stderr)
-3. HTTP/3 QUIC transport not implemented (only Alt-Svc cache + enum variant)
-4. SSH/SFTP/SCP not implemented
-5. FTPS (AUTH TLS) not implemented
-6. Poll/socket/timer Multi APIs not implemented
-7. Missing CLI flags: `--netrc`, `--cert-status`, `--proxy-header`, `--ftp-*`, `--post30x`
-8. Missing FFI: `curl_mime_*`, `curl_url_*`, CURLOPT_PRIVATE, progress/debug callbacks from C
-
-**Planned Phases 21-30:**
+### Phase 0: Cumulative Summary (Phases 1-20, completed 2026-03-09)
+
+Built from scratch over 20 phases. All features below are implemented and tested.
+
+**Core Library (liburlx) — 73 Easy methods, 14 Multi methods:**
+- **HTTP/1.x:** Full request/response codec (all methods), chunked transfer encoding with trailer header parsing, Content-Encoding decompression (gzip, deflate, brotli, zstd), redirects (301/302/303/307/308), Expect: 100-continue, HTTP/1.0 mode, header deduplication (last wins), ignore-content-length (read to EOF), auth stripping on cross-origin redirects (unrestricted_auth option).
+- **HTTP/2:** Via h2 crate with ALPN negotiation. `HttpVersion` enum (None/Http10/Http11/Http2/Http3). No server push.
+- **TLS:** rustls + tokio-rustls. `TlsConfig` with verify_peer/host, CA cert, client cert/key, version selection (TLS 1.2/1.3), certificate pinning (SHA-256 SPKI), cipher list, session cache. Inline DER parser for SPKI extraction.
+- **Authentication:** Basic, Bearer, Digest (MD5/SHA-256 with qop=auth), AWS SigV4 (inline HMAC-SHA256), NTLM skeleton (SHA-256-based, sufficient for proxy auth testing).
+- **Cookie engine:** RFC 6265 parsing, domain/path matching, Netscape file format persistence (read/write), HttpOnly, Secure, SameSite (stored). No public suffix list.
+- **HSTS cache:** STS parsing, HTTP→HTTPS upgrade, includeSubDomains.
+- **Proxy:** HTTP forward, HTTP CONNECT tunnel (with Digest/NTLM 407 challenge-response), SOCKS4/4a/5 with auth, noproxy bypass, proxy TLS config.
+- **Connection:** Pool with stale retry, TCP_NODELAY (default on), TCP keepalive (socket2), Unix domain sockets, interface/port binding, Happy Eyeballs (250ms, configurable).
+- **DNS:** Cache with configurable TTL, shuffle (inline xorshift32), custom server addresses, DoH URL config. No async resolver.
+- **FTP:** Session-based API — STOR, APPE, REST, FEAT, MKD/RMD/DELE, RNFR/RNTO, SITE, PWD/CWD, SIZE, MLSD, TYPE A/I. No FTPS or active mode.
+- **Other protocols:** WebSocket (RFC 6455), SMTP, IMAP, POP3, MQTT 3.1.1, DICT, TFTP, FILE.
+- **Multi API:** JoinSet-based concurrency, connection limiting (semaphore), message queue, Share interface (DNS cache + cookie jar), PipeliningMode (Nothing/Multiplex). No poll/socket/timer callbacks.
+- **Alt-Svc:** Header parsing (RFC 7838), TTL-based cache, automatic processing in transfers.
+- **Transfer control:** Rate limiting and speed enforcement API stored but not yet wired into transfer engine.
+- **Response:** Status, headers, body, trailers, effective_url, TransferInfo (6 timing fields + speed/size metrics).
+
+**FFI Layer (liburlx-ffi) — 70 CURLOPT, 16 CURLINFO, 25 CURLcode, 16 functions:**
+- Functions: curl_easy_init/cleanup/duphandle/reset/setopt/perform/getinfo/strerror, curl_slist_append/free_all, curl_multi_init/cleanup/add_handle/remove_handle/perform, curl_version.
+- Callbacks: WRITEFUNCTION, READFUNCTION (with CURL_READFUNC_ABORT), HEADERFUNCTION, DEBUGFUNCTION.
+- Memory: Box<[u8]>-based slist string allocation (exact-size, no capacity mismatch). catch_unwind on all FFI boundaries.
+
+**CLI (urlx) — ~84 flags:**
+- HTTP: -X, -H, -d, --data-raw, --data-binary, --data-urlencode, -L, --max-redirs, -I, -A, -e, -G, -F, -r, -C, --compressed, --http1.0, --http1.1, --http2, --expect100-timeout.
+- Output: -o, -O, -D, -i, -w, --create-dirs, -v, -s, -S, -f, -#.
+- Auth: -u, --digest, --bearer, --aws-sigv4, -b, -c.
+- TLS: -k, --cacert, --cert, --key, --tlsv1.2, --tlsv1.3, --tls-max, --pinnedpubkey.
+- Proxy: -x, --noproxy, --socks5-hostname, --proxy-user, --proxy-digest, --proxy-ntlm.
+- Transfer: -m, --connect-timeout, --retry/--retry-delay/--retry-max-time, --limit-rate, --speed-limit, --speed-time, -T, --unrestricted-auth, --ignore-content-length.
+- Connection: --tcp-nodelay, --tcp-keepalive, --no-keepalive, --unix-socket, --interface, --local-port, --resolve.
+- DNS: --dns-shuffle, --dns-servers, --doh-url, --happy-eyeballs-timeout-ms.
+- Concurrency: -Z, --parallel-max.
+- Debug/Config: --trace, --trace-ascii, --trace-time, -K/--config, --libcurl, --proto, --proto-redir, --max-filesize, --hsts.
+- Features: .curlrc-style config file parser, protocol restriction, max filesize enforcement (exit 63), libcurl C code generation, retry logic (408/429/5xx).
+
+**Testing — 1,768 tests (0 failures):**
+- Unit: 442 (liburlx) + 81 (FFI) + 134 (CLI) = 657
+- Integration: 1,048 (hyper-based test servers)
+- Property-based: 60 (proptest — URL, cookie, FTP, HTTP, HSTS, multipart, protocols, WebSocket)
+- Doc tests: 3
+- Fuzz harnesses: 4 (URL, HTTP, cookie, HSTS parsers)
+- Benchmarks: 3 (throughput, latency, concurrency via criterion)
+
+**Guardrails:** Zero TODO/FIXME/HACK. Zero `unwrap()` in production code. `#![deny(unsafe_code)]` in liburlx and urlx-cli. GitHub Actions CI (fmt, clippy, test on 3 OS, doc, cargo-deny, MSRV 1.83, commit lint). Pre-commit hooks (fmt, clippy, test, deny, doc, conventional commit).
+
+**Known gaps (as of Phase 20 review):** Rate limiting not enforced in transfer engine. Trace file writing not fully wired. HTTP/3 QUIC transport not implemented. SSH/SFTP/SCP not implemented. FTPS not implemented. Poll/socket/timer Multi APIs not implemented. Missing FFI: curl_mime_*, curl_url_*, CURLOPT_PRIVATE, progress callbacks from C.
 
 ---
 
@@ -745,7 +595,7 @@ When working on this project:
 
 ### Milestone Review Phases
 
-9. **Every 10th phase (10, 20, 30, ...) must be a comprehensive review.** These phases are dedicated to auditing the entire codebase against curl/libcurl for completeness, running differential tests, measuring FFI coverage, profiling performance, and planning the next 10 phases. No new features are added during review phases — only testing, gap analysis, and planning.
+9. **Every 10th phase (10, 20, 30, ...) must be a comprehensive review.** These phases are dedicated to auditing the entire codebase against curl/libcurl for completeness, running differential tests, measuring FFI coverage, profiling performance, and planning the next 10 phases. No new features are added during review phases — only testing, gap analysis, and planning. **During review phases, compact the phase list:** merge all completed phases from the prior 10-phase block into the existing "Phase 0" summary (or create one if it doesn't exist). Phase 0 should describe the current state of the repo — what has been built, key stats, and architectural decisions. After compaction, the Implementation Phases section should contain only Phase 0 (cumulative summary of all completed work) followed by the next 10 planned phases (brief outlines of future work). This keeps CLAUDE.md concise and avoids unbounded growth.
 
 ### Behavioral Correctness
 
