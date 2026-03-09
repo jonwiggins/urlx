@@ -14,12 +14,12 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 16 — Connection Control & Header Management
-**Last completed:** Phase 15 (DNS Hardening & DoH) — 2026-03-09
-**Total tests:** 1,717+
-**In progress:** Planning Phase 16
+**Phase:** 17 — Planning
+**Last completed:** Phase 16 (Connection Control & Header Management) — 2026-03-08
+**Total tests:** 1,730+
+**In progress:** Planning Phase 17
 **Blockers:** None
-**Next up:** Header deduplication, CURLOPT_UNRESTRICTED_AUTH, CURLOPT_IGNORE_CONTENT_LENGTH
+**Next up:** Phase 17 — Cookie Persistence Hardening & HSTS Preload
 
 ### Completeness Summary (updated Phase 10 review)
 
@@ -377,14 +377,9 @@ Added configurable DNS cache TTL via `dns_cache_timeout()` and `DnsCache::set_tt
 
 ---
 
-### Phase 16: Connection Control & Header Management
+### Phase 16: Connection Control & Header Management — COMPLETED (2026-03-08)
 
-**Goal:** Fine-grained connection management.
-
-- CURLOPT_FRESH_CONNECT, CURLOPT_FORBID_REUSE
-- Header deduplication (prevent User-Agent/Content-Type duplicates)
-- CURLOPT_UNRESTRICTED_AUTH (auth on redirect)
-- CURLOPT_IGNORE_CONTENT_LENGTH
+Header deduplication (last wins), CURLOPT_UNRESTRICTED_AUTH (auth on cross-origin redirects), CURLOPT_IGNORE_CONTENT_LENGTH (read to EOF), FFI options 105/136, CLI flags. 13 new tests.
 
 ---
 
