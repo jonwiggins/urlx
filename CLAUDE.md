@@ -14,12 +14,12 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 21 — Planning
-**Last completed:** Phase 20 (Completeness Review) — 2026-03-09
-**Total tests:** 1,768
-**In progress:** Planning Phase 21
+**Phase:** 22 — Planning
+**Last completed:** Phase 21 (Transfer Engine Rate Limiting) — 2026-03-09
+**Total tests:** 1,788
+**In progress:** Planning Phase 22
 **Blockers:** None
-**Next up:** Phase 21 — Transfer Engine Rate Limiting
+**Next up:** Phase 22 — FFI Callbacks & MIME API
 
 ### Completeness Summary (updated Phase 20 review)
 
@@ -39,7 +39,7 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 | FFI (libcurl C ABI) | ~32% | 70 options, 16 info codes, 25 error codes, 16 functions |
 | CLI | ~34% | ~84 of ~250 flags |
 | Connection | 80% | Pool, TCP_NODELAY, keepalive, Unix sockets, interface/port binding |
-| Transfer control | 40% | Rate limiting, speed enforcement API; not wired into transfer engine yet |
+| Transfer control | 80% | Rate limiting enforced in transfer engine (max recv/send speed, low speed timeout) |
 | Overall | ~56% | ~92% for basic HTTP/HTTPS use cases |
 
 ---
@@ -75,7 +75,8 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 - **2026-03-08:** `HttpVersion` enum uses `None` (auto) as default rather than `Http11` to preserve existing ALPN-based HTTP/2 negotiation behavior. `Http2` variant is equivalent to `None` for HTTPS since ALPN already prefers H2.
 - **2026-03-08:** Expect: 100-continue timeout defaults to sending body on timeout (matching curl behavior). Body is NOT sent only when server actively responds with an error status before the timeout.
 - **2026-03-08:** Netscape cookie file format uses leading dot prefix for all domains (matching curl behavior). `#HttpOnly_` prefix handled before general `#` comment check to avoid false skipping. Session cookies written with `expiration=0`.
-- **2026-03-08:** Rate limiting (max_recv_speed, max_send_speed) and minimum speed enforcement (low_speed_limit, low_speed_time) added as Easy API setters. Not yet wired into the transfer engine — the options are stored and can be used by future transfer-level throttling logic. CLI `--limit-rate` supports K/M/G suffixes using 1024-based multipliers (matching curl behavior).
+- **2026-03-08:** Rate limiting (max_recv_speed, max_send_speed) and minimum speed enforcement (low_speed_limit, low_speed_time) added as Easy API setters. CLI `--limit-rate` supports K/M/G suffixes using 1024-based multipliers (matching curl behavior).
+- **2026-03-09:** Rate limiting wired into transfer engine via `SpeedLimits` struct and `RateLimiter`. Token-bucket approach: tracks bytes transferred vs elapsed time, sleeps to enforce max speed. Low speed enforcement checks average throughput and aborts with `Error::SpeedLimit` after exceeding `low_speed_time`. Throttled reads/writes use 16KB chunks (`THROTTLE_CHUNK_SIZE`). Large futures from added parameters addressed with `Box::pin` on `perform_transfer` and `#[allow(clippy::large_futures)]` on `do_single_request`.
 
 ---
 
@@ -242,7 +243,7 @@ Built from scratch over 20 phases. All features below are implemented and tested
 - **Other protocols:** WebSocket (RFC 6455), SMTP, IMAP, POP3, MQTT 3.1.1, DICT, TFTP, FILE.
 - **Multi API:** JoinSet-based concurrency, connection limiting (semaphore), message queue, Share interface (DNS cache + cookie jar), PipeliningMode (Nothing/Multiplex). No poll/socket/timer callbacks.
 - **Alt-Svc:** Header parsing (RFC 7838), TTL-based cache, automatic processing in transfers.
-- **Transfer control:** Rate limiting and speed enforcement API stored but not yet wired into transfer engine.
+- **Transfer control:** Rate limiting enforced in transfer engine via `SpeedLimits` and `RateLimiter`. Max recv/send speed throttling (token bucket, 16KB chunks). Low speed enforcement aborts with `Error::SpeedLimit` after timeout.
 - **Response:** Status, headers, body, trailers, effective_url, TransferInfo (6 timing fields + speed/size metrics).
 
 **FFI Layer (liburlx-ffi) — 70 CURLOPT, 16 CURLINFO, 25 CURLcode, 16 functions:**
@@ -263,7 +264,7 @@ Built from scratch over 20 phases. All features below are implemented and tested
 - Debug/Config: --trace, --trace-ascii, --trace-time, -K/--config, --libcurl, --proto, --proto-redir, --max-filesize, --hsts.
 - Features: .curlrc-style config file parser, protocol restriction, max filesize enforcement (exit 63), libcurl C code generation, retry logic (408/429/5xx).
 
-**Testing — 1,768 tests (0 failures):**
+**Testing — 1,788 tests (0 failures):**
 - Unit: 442 (liburlx) + 81 (FFI) + 134 (CLI) = 657
 - Integration: 1,048 (hyper-based test servers)
 - Property-based: 60 (proptest — URL, cookie, FTP, HTTP, HSTS, multipart, protocols, WebSocket)
@@ -273,18 +274,13 @@ Built from scratch over 20 phases. All features below are implemented and tested
 
 **Guardrails:** Zero TODO/FIXME/HACK. Zero `unwrap()` in production code. `#![deny(unsafe_code)]` in liburlx and urlx-cli. GitHub Actions CI (fmt, clippy, test on 3 OS, doc, cargo-deny, MSRV 1.83, commit lint). Pre-commit hooks (fmt, clippy, test, deny, doc, conventional commit).
 
-**Known gaps (as of Phase 20 review):** Rate limiting not enforced in transfer engine. Trace file writing not fully wired. HTTP/3 QUIC transport not implemented. SSH/SFTP/SCP not implemented. FTPS not implemented. Poll/socket/timer Multi APIs not implemented. Missing FFI: curl_mime_*, curl_url_*, CURLOPT_PRIVATE, progress callbacks from C.
+**Known gaps (as of Phase 21):** Trace file writing not fully wired. HTTP/3 QUIC transport not implemented. SSH/SFTP/SCP not implemented. FTPS not implemented. Poll/socket/timer Multi APIs not implemented. Missing FFI: curl_mime_*, curl_url_*, CURLOPT_PRIVATE, progress callbacks from C.
 
 ---
 
-### Phase 21: Transfer Engine Rate Limiting
+### Phase 21: Transfer Engine Rate Limiting (completed 2026-03-09)
 
-**Goal:** Wire rate limiting into the actual transfer engine.
-
-- Enforce `max_recv_speed` / `max_send_speed` during body read/write
-- Enforce `low_speed_limit` / `low_speed_time` timeout
-- Chunked body reading with throttling
-- Integration tests with measurable throughput verification
+Wired rate limiting into the transfer engine. Added `SpeedLimits` struct, `RateLimiter` with token-bucket throttling, `Error::SpeedLimit` variant. Throttled HTTP/1.x and HTTP/2 body reads/writes in 16KB chunks. 7 integration tests + 12 unit tests. Total tests: 1,788.
 
 ---
 
