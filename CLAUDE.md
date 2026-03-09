@@ -14,12 +14,12 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 33 — Cookie Wire Integration + File Protocol + Progress Callback
-**Last completed:** Phase 32 (header wire format, Multi concurrency, URL conformance) — 2026-03-08
-**Total tests:** 1311
-**In progress:** Planning Phase 33
+**Phase:** 34 — Comprehensive API Surface Audit
+**Last completed:** Phase 33 (cookie wire flow, file protocol edges, progress integration) — 2026-03-08
+**Total tests:** 1331
+**In progress:** Planning Phase 34
 **Blockers:** None
-**Next up:** Cookie wire integration, file protocol edge cases, progress callback behavior
+**Next up:** Public API audit — cover remaining untested methods and edge cases
 
 ---
 
@@ -633,29 +633,37 @@ body sizes, multi-server, empty, len tracking). 40 URL conformance tests (scheme
 IPv4/IPv6, paths, queries, fragments, credentials, roundtrip, methods, real-world URLs).
 1311 total tests.
 
-### Phase 33: Cookie Wire Integration + File Protocol + Progress Callback
+### Phase 33: Cookie Wire Flow + File Protocol Edge + Progress Integration — COMPLETED (2026-03-08)
 
-**Scope:** End-to-end cookie flow through the wire, file protocol edge
-cases, and progress callback integration.
+5 cookie wire flow tests (Set-Cookie/Cookie round-trip, multiple cookies, disabled jar,
+replacement, accumulation). 8 file protocol edge case tests (spaces, large, unicode,
+effective URL, size_download, nested dirs). 7 progress integration tests (invocation,
+download reporting, abort, small/empty body). 1331 total tests.
 
-**Step 33.1: Cookie wire integration** (`cookie_wire_integration.rs`)
-- Server sends Set-Cookie, client returns Cookie on next request
-- Cookie not sent to wrong domain
-- Cookie path scoping through wire
-- Multiple Set-Cookie headers accumulated
+### Phase 34: Comprehensive API Surface Audit
 
-**Step 33.2: File protocol edge cases** (`file_protocol_edge.rs`)
-- Read existing file
-- Non-existent file returns error
-- Directory returns error
-- Empty file
+**Scope:** Final audit pass to cover any remaining untested public API
+methods and edge cases across the entire library surface.
 
-**Step 33.3: Progress callback integration** (`progress_integration.rs`)
-- Callback invoked during transfer
-- Download size reported
-- Abort via callback
+**Step 34.1: Response API completeness** (`response_api_completeness.rs`)
+- Response::with_info construction
+- headers() method returns all headers
+- set_transfer_info mutation
+- Clone independence verified with mutations
 
-**Exit criteria:** 1360+ tests.
+**Step 34.2: Easy handle edge cases** (`easy_edge_cases.rs`)
+- form_file with real file
+- Proxy URL setting and clearing
+- Accept-encoding toggle
+- Cookie jar enable/disable/re-enable
+- Multiple header adds accumulate
+
+**Step 34.3: Multi perform_blocking** (`multi_blocking.rs`)
+- perform_blocking basic usage
+- perform_blocking with multiple URLs
+- perform_blocking error handling
+
+**Exit criteria:** 1380+ tests.
 
 ---
 
