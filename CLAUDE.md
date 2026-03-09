@@ -14,12 +14,12 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 4 — FTP Completeness + SSH/SFTP/SCP
-**Last completed:** Phase 3 (DNS + connection infrastructure) — 2026-03-08
-**Total tests:** 1460+
-**In progress:** Planning Phase 4
+**Phase:** 5 — Multi API Event-Driven Architecture
+**Last completed:** Phase 4 (FTP completeness) — 2026-03-08
+**Total tests:** 1470+
+**In progress:** Planning Phase 5
 **Blockers:** None
-**Next up:** FTP upload, FTPS, directory operations, SSH/SFTP
+**Next up:** Poll-based event loop, socket/timer callbacks, message queue
 
 ### Completeness Summary
 
@@ -33,13 +33,13 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 | Cookie engine | 75% | In-memory only, no persistence |
 | Proxy | 80% | HTTP + SOCKS + proxy auth; no HTTPS proxy or PAC |
 | DNS | 60% | Cache with TTL, Happy Eyeballs (RFC 6555), DNS shuffle; no async resolver or DoH |
-| FTP | 30% | Download only; no upload or FTPS |
+| FTP | 70% | Session API, upload, resume, dir ops, FEAT; no FTPS or active mode |
 | SSH/SFTP/SCP | 0% | Not implemented |
 | Multi API | 30% | Simple concurrency; no event-driven model |
 | FFI (libcurl C ABI) | ~8% | 19/300+ options, 6/50+ info codes |
-| CLI | ~13% | ~41 of ~250 flags |
+| CLI | ~14% | ~43 of ~250 flags |
 | Connection | 80% | Pool, TCP_NODELAY, keepalive, Unix sockets, interface/port binding |
-| Overall | ~40% | ~88% for basic HTTP/HTTPS use cases |
+| Overall | ~42% | ~88% for basic HTTP/HTTPS use cases |
 
 ---
 
@@ -62,6 +62,8 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 - **2026-03-08:** Happy Eyeballs uses 250ms delay (RFC 6555 recommendation) before starting IPv4 after IPv6. Uses `tokio::select!` for racing. Falls back to sequential if only one address family available.
 - **2026-03-08:** DNS shuffle uses inline xorshift32 PRNG seeded from nanosecond timestamp. Avoids adding a `rand` dependency for a simple shuffle operation.
 - **2026-03-08:** Local interface/port binding uses `socket2::Socket` for pre-bind + non-blocking connect, with platform-specific `EINPROGRESS` handling (code 36 on macOS, 115 on Linux, 10036 on Windows).
+- **2026-03-08:** FTP refactored from standalone functions to `FtpSession` struct to eliminate code duplication (login, PASV, data connection). Original `download()`/`list()` functions preserved as convenience wrappers.
+- **2026-03-08:** SSH/SFTP deferred — `russh` (pure-Rust) preferred over `ssh2` (C bindings via libssh2) to maintain zero-unsafe-outside-FFI principle. Significant effort to implement properly.
 
 ---
 
@@ -254,26 +256,11 @@ DNS caching (TTL-based, 60s default), Happy Eyeballs (RFC 6555, 250ms IPv6 head 
 
 ---
 
-### Phase 4: FTP Completeness + SSH/SFTP/SCP
+### Phase 4: FTP Completeness + SSH/SFTP/SCP — COMPLETED (2026-03-08)
 
-**Goal:** Full FTP parity with curl and SSH-based file transfers.
+Refactored FTP into session-based `FtpSession` API. Added: STOR upload, APPE append, REST resume, FEAT detection with capability parsing, MKD/RMD/DELE directory operations, RNFR/RNTO rename, SITE command, PWD/CWD, SIZE, MLSD (RFC 3659), TYPE A/I switching. Wired FTP upload into Easy API (PUT method → STOR) and CLI `-T/--upload-file` flag. Backward-compatible `download()`/`list()`/`upload()` convenience functions preserved.
 
-**FTP:**
-- STOR upload, APPE append
-- Active mode (PORT/EPRT)
-- FTPS (FTP over TLS) — explicit (AUTH TLS) and implicit
-- Directory operations: MKD, RMD, DELE, RNFR/RNTO, SITE
-- MLST/MLSD (RFC 3659 modern listing)
-- TYPE A/I (ASCII/binary mode switching)
-- Resume (REST command)
-- FEAT detection and capability negotiation
-
-**SSH/SFTP/SCP:**
-- SFTP file download/upload via ssh2 crate (feature-gated)
-- SCP file download/upload
-- SSH key authentication (public key, agent)
-- Known hosts verification
-- CLI flags: `--key`, `--pubkey`, `--known-hosts`
+**Deferred to later phases:** Active mode (PORT/EPRT), FTPS (AUTH TLS), SSH/SFTP/SCP (requires `russh` crate — pure-Rust SSH, avoids `ssh2`'s C dependency).
 
 ---
 
