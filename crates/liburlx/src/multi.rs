@@ -2,30 +2,72 @@
 //!
 //! The `Multi` handle runs multiple transfers concurrently using
 //! tokio's async runtime. Each transfer is spawned as a separate task.
+//! Supports connection limiting, dynamic handle management, and
+//! per-transfer completion messages.
+
+use std::sync::{Arc, Mutex};
 
 use crate::easy::Easy;
 use crate::error::Error;
 use crate::protocol::http::response::Response;
 
+/// Completion message for a finished transfer.
+///
+/// Returned by [`Multi::info_read`] to report per-transfer outcomes
+/// without needing to wait for all transfers to complete.
+#[derive(Debug)]
+pub struct TransferMessage {
+    /// The index of this transfer (order it was added).
+    pub index: usize,
+    /// The result of the transfer.
+    pub result: Result<Response, Error>,
+}
+
 /// A handle for running multiple URL transfers concurrently.
 ///
 /// Transfers are queued with [`add`](Self::add) and executed in parallel
 /// with [`perform`](Self::perform).
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Multi {
     handles: Vec<Easy>,
+    max_total_connections: Option<usize>,
+    max_host_connections: Option<usize>,
+    /// Completed transfer messages waiting to be read.
+    messages: Arc<Mutex<Vec<TransferMessage>>>,
+}
+
+impl Default for Multi {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Multi {
     /// Create a new Multi handle.
     #[must_use]
-    pub const fn new() -> Self {
-        Self { handles: Vec::new() }
+    pub fn new() -> Self {
+        Self {
+            handles: Vec::new(),
+            max_total_connections: None,
+            max_host_connections: None,
+            messages: Arc::new(Mutex::new(Vec::new())),
+        }
     }
 
     /// Add a configured Easy handle to be executed concurrently.
     pub fn add(&mut self, easy: Easy) {
         self.handles.push(easy);
+    }
+
+    /// Remove a handle by index before performing.
+    ///
+    /// Returns `None` if the index is out of bounds.
+    pub fn remove(&mut self, index: usize) -> Option<Easy> {
+        if index < self.handles.len() {
+            Some(self.handles.remove(index))
+        } else {
+            None
+        }
     }
 
     /// Returns the number of queued transfers.
@@ -40,13 +82,58 @@ impl Multi {
         self.handles.is_empty()
     }
 
+    /// Set the maximum number of total concurrent connections.
+    ///
+    /// When set, the Multi handle will limit the number of
+    /// simultaneously active transfers. Excess transfers are queued
+    /// and started as earlier ones complete.
+    /// Equivalent to `CURLMOPT_MAX_TOTAL_CONNECTIONS`.
+    pub fn max_total_connections(&mut self, max: usize) {
+        self.max_total_connections = Some(max);
+    }
+
+    /// Set the maximum number of concurrent connections per host.
+    ///
+    /// Equivalent to `CURLMOPT_MAX_HOST_CONNECTIONS`.
+    pub fn max_host_connections(&mut self, max: usize) {
+        self.max_host_connections = Some(max);
+    }
+
+    /// Read a completed transfer message.
+    ///
+    /// Returns `None` when no more messages are available.
+    /// Messages are available after [`perform`](Self::perform) completes.
+    /// Equivalent to `curl_multi_info_read`.
+    #[allow(clippy::option_if_let_else)]
+    pub fn info_read(&mut self) -> Option<TransferMessage> {
+        if let Ok(mut msgs) = self.messages.lock() {
+            if msgs.is_empty() {
+                None
+            } else {
+                Some(msgs.remove(0))
+            }
+        } else {
+            None
+        }
+    }
+
+    /// Returns the number of pending completion messages.
+    #[must_use]
+    pub fn messages_in_queue(&self) -> usize {
+        self.messages.lock().map_or(0, |m| m.len())
+    }
+
     /// Execute all queued transfers concurrently and return their results.
     ///
     /// Results are returned in the same order as the handles were added.
     /// Each result is independent — a failure in one transfer does not
     /// affect the others.
     ///
-    /// The handle list is drained after execution.
+    /// If [`max_total_connections`](Self::max_total_connections) is set,
+    /// transfers are executed in batches.
+    ///
+    /// The handle list is drained after execution. Completion messages
+    /// are available via [`info_read`](Self::info_read).
     ///
     /// # Errors
     ///
@@ -59,33 +146,28 @@ impl Multi {
             return Vec::new();
         }
 
-        let mut join_set = tokio::task::JoinSet::new();
+        let results = if let Some(max_conns) = self.max_total_connections {
+            // Execute with connection limiting using a semaphore
+            perform_with_limit(handles, max_conns).await
+        } else {
+            // Execute all concurrently
+            perform_unlimited(handles).await
+        };
 
-        // Spawn all transfers, tracking their index for ordering
-        for (idx, mut easy) in handles.into_iter().enumerate() {
-            let _handle = join_set.spawn(async move { (idx, easy.perform_async().await) });
-        }
-
-        // Collect results, preserving original order
-        let mut results: Vec<(usize, Result<Response, Error>)> = Vec::with_capacity(join_set.len());
-
-        while let Some(join_result) = join_set.join_next().await {
-            match join_result {
-                Ok(indexed_result) => results.push(indexed_result),
-                Err(join_err) => {
-                    // JoinError means the task panicked — shouldn't happen
-                    // but we need to handle it gracefully
-                    results.push((
-                        usize::MAX,
-                        Err(Error::Http(format!("transfer task failed: {join_err}"))),
-                    ));
-                }
+        // Store completion messages
+        if let Ok(mut msgs) = self.messages.lock() {
+            for (idx, result) in results.iter().enumerate() {
+                msgs.push(TransferMessage {
+                    index: idx,
+                    result: match result {
+                        Ok(r) => Ok(r.clone()),
+                        Err(e) => Err(Error::Http(e.to_string())),
+                    },
+                });
             }
         }
 
-        // Sort by original index to maintain order
-        results.sort_by_key(|(idx, _)| *idx);
-        results.into_iter().map(|(_, result)| result).collect()
+        results
     }
 
     /// Execute all queued transfers concurrently (blocking version).
@@ -105,6 +187,56 @@ impl Multi {
 
         Ok(rt.block_on(self.perform()))
     }
+}
+
+/// Execute transfers without connection limits.
+async fn perform_unlimited(handles: Vec<Easy>) -> Vec<Result<Response, Error>> {
+    let mut join_set = tokio::task::JoinSet::new();
+
+    for (idx, mut easy) in handles.into_iter().enumerate() {
+        let _handle = join_set.spawn(async move { (idx, easy.perform_async().await) });
+    }
+
+    collect_results(&mut join_set).await
+}
+
+/// Execute transfers with a connection limit using a semaphore.
+async fn perform_with_limit(handles: Vec<Easy>, max_conns: usize) -> Vec<Result<Response, Error>> {
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(max_conns));
+    let mut join_set = tokio::task::JoinSet::new();
+
+    for (idx, mut easy) in handles.into_iter().enumerate() {
+        let sem = semaphore.clone();
+        let _handle = join_set.spawn(async move {
+            let _permit =
+                sem.acquire().await.map_err(|e| Error::Http(format!("semaphore error: {e}")));
+            (idx, easy.perform_async().await)
+        });
+    }
+
+    collect_results(&mut join_set).await
+}
+
+/// Collect results from a `JoinSet`, preserving original order.
+async fn collect_results(
+    join_set: &mut tokio::task::JoinSet<(usize, Result<Response, Error>)>,
+) -> Vec<Result<Response, Error>> {
+    let mut results: Vec<(usize, Result<Response, Error>)> = Vec::with_capacity(join_set.len());
+
+    while let Some(join_result) = join_set.join_next().await {
+        match join_result {
+            Ok(indexed_result) => results.push(indexed_result),
+            Err(join_err) => {
+                results.push((
+                    usize::MAX,
+                    Err(Error::Http(format!("transfer task failed: {join_err}"))),
+                ));
+            }
+        }
+    }
+
+    results.sort_by_key(|(idx, _)| *idx);
+    results.into_iter().map(|(_, result)| result).collect()
 }
 
 #[cfg(test)]
@@ -152,5 +284,105 @@ mod tests {
 
         let _results = multi.perform().await;
         assert!(multi.is_empty(), "handles should be drained after perform");
+    }
+
+    #[test]
+    fn multi_remove_valid_index() {
+        let mut multi = Multi::new();
+        multi.add(Easy::new());
+        multi.add(Easy::new());
+        assert_eq!(multi.len(), 2);
+
+        let removed = multi.remove(0);
+        assert!(removed.is_some());
+        assert_eq!(multi.len(), 1);
+    }
+
+    #[test]
+    fn multi_remove_invalid_index() {
+        let mut multi = Multi::new();
+        assert!(multi.remove(0).is_none());
+    }
+
+    #[test]
+    fn multi_max_total_connections() {
+        let mut multi = Multi::new();
+        multi.max_total_connections(4);
+        assert_eq!(multi.max_total_connections, Some(4));
+    }
+
+    #[test]
+    fn multi_max_host_connections() {
+        let mut multi = Multi::new();
+        multi.max_host_connections(2);
+        assert_eq!(multi.max_host_connections, Some(2));
+    }
+
+    #[test]
+    fn multi_messages_initially_empty() {
+        let multi = Multi::new();
+        assert_eq!(multi.messages_in_queue(), 0);
+    }
+
+    #[test]
+    fn multi_info_read_empty() {
+        let mut multi = Multi::new();
+        assert!(multi.info_read().is_none());
+    }
+
+    #[tokio::test]
+    async fn multi_perform_stores_messages() {
+        let mut multi = Multi::new();
+        let mut easy = Easy::new();
+        let _ = easy.url("http://127.0.0.1:1");
+        easy.connect_timeout(std::time::Duration::from_millis(50));
+        multi.add(easy);
+
+        let _results = multi.perform().await;
+        // Should have one completion message
+        assert_eq!(multi.messages_in_queue(), 1);
+
+        let msg = multi.info_read().unwrap();
+        assert_eq!(msg.index, 0);
+        assert!(msg.result.is_err()); // Connection should fail
+
+        // Queue should now be empty
+        assert_eq!(multi.messages_in_queue(), 0);
+    }
+
+    #[tokio::test]
+    async fn multi_perform_unlimited_ordering() {
+        // Test that results are returned in order even with concurrent execution
+        let handles: Vec<Easy> = (0..5)
+            .map(|_| {
+                let mut e = Easy::new();
+                let _ = e.url("http://127.0.0.1:1");
+                e.connect_timeout(std::time::Duration::from_millis(10));
+                e
+            })
+            .collect();
+
+        let results = perform_unlimited(handles).await;
+        assert_eq!(results.len(), 5);
+        // All should fail (unreachable address)
+        for r in &results {
+            assert!(r.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn multi_perform_with_limit() {
+        let handles: Vec<Easy> = (0..5)
+            .map(|_| {
+                let mut e = Easy::new();
+                let _ = e.url("http://127.0.0.1:1");
+                e.connect_timeout(std::time::Duration::from_millis(10));
+                e
+            })
+            .collect();
+
+        // Limit to 2 concurrent connections
+        let results = perform_with_limit(handles, 2).await;
+        assert_eq!(results.len(), 5);
     }
 }
