@@ -46,5 +46,8 @@ pub use throttle::SpeedLimits;
 pub use tls::{TlsConfig, TlsVersion};
 pub use url::Url;
 
+#[cfg(feature = "ssh")]
+pub use protocol::ssh::{SshAuthMethod, SshHostKeyPolicy};
+
 /// Convenience result type for liburlx operations.
 pub type Result<T> = std::result::Result<T, Error>;

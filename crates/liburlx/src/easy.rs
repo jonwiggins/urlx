@@ -111,6 +111,10 @@ pub struct Easy {
     ftp_active_port: Option<String>,
     /// Path to SSH private key for SFTP/SCP authentication.
     ssh_key_path: Option<String>,
+    /// SSH host key SHA-256 fingerprint for verification (base64, no prefix).
+    ssh_host_key_sha256: Option<String>,
+    /// Path to SSH `known_hosts` file for host key verification.
+    ssh_known_hosts_path: Option<String>,
     /// Don't normalize `..` and `.` in URL paths (curl --path-as-is).
     path_as_is: bool,
     /// Disable all HTTP content decoding (curl --raw).
@@ -223,6 +227,8 @@ impl std::fmt::Debug for Easy {
             .field("ftp_ssl_mode", &self.ftp_ssl_mode)
             .field("ftp_active_port", &self.ftp_active_port)
             .field("ssh_key_path", &self.ssh_key_path)
+            .field("ssh_host_key_sha256", &self.ssh_host_key_sha256)
+            .field("ssh_known_hosts_path", &self.ssh_known_hosts_path)
             .field("path_as_is", &self.path_as_is)
             .field("raw", &self.raw)
             .field("mail_from", &self.mail_from)
@@ -311,6 +317,8 @@ impl Clone for Easy {
             ftp_ssl_mode: self.ftp_ssl_mode,
             ftp_active_port: self.ftp_active_port.clone(),
             ssh_key_path: self.ssh_key_path.clone(),
+            ssh_host_key_sha256: self.ssh_host_key_sha256.clone(),
+            ssh_known_hosts_path: self.ssh_known_hosts_path.clone(),
             path_as_is: self.path_as_is,
             raw: self.raw,
             mail_from: self.mail_from.clone(),
@@ -401,6 +409,8 @@ impl Easy {
             ftp_ssl_mode: crate::protocol::ftp::FtpSslMode::None,
             ftp_active_port: None,
             ssh_key_path: None,
+            ssh_host_key_sha256: None,
+            ssh_known_hosts_path: None,
             path_as_is: false,
             raw: false,
             mail_from: None,
@@ -1212,6 +1222,26 @@ impl Easy {
         self.ssh_key_path = Some(path.to_string());
     }
 
+    /// Set the expected SSH host key SHA-256 fingerprint for verification.
+    ///
+    /// The fingerprint should be base64-encoded without the `SHA256:` prefix.
+    /// If the server's host key does not match, the connection is rejected.
+    ///
+    /// Equivalent to curl's `--hostpubsha256`.
+    pub fn ssh_host_key_sha256(&mut self, fingerprint: &str) {
+        self.ssh_host_key_sha256 = Some(fingerprint.to_string());
+    }
+
+    /// Set the path to an SSH `known_hosts` file for host key verification.
+    ///
+    /// When set, the server's host key is verified against entries in the file.
+    /// Supports both plain and hashed hostname formats.
+    ///
+    /// Equivalent to curl's `--known-hosts`.
+    pub fn ssh_known_hosts_path(&mut self, path: &str) {
+        self.ssh_known_hosts_path = Some(path.to_string());
+    }
+
     /// Don't normalize `..` and `.` path segments in the URL.
     ///
     /// Equivalent to curl's `--path-as-is` / `CURLOPT_PATH_AS_IS`.
@@ -1572,6 +1602,14 @@ impl Easy {
 
         let dns_resolver = self.build_dns_resolver();
 
+        #[cfg(feature = "ssh")]
+        let ssh_host_key_policy = build_ssh_host_key_policy(
+            self.ssh_host_key_sha256.as_deref(),
+            self.ssh_known_hosts_path.as_deref(),
+        )?;
+        #[cfg(not(feature = "ssh"))]
+        let ssh_host_key_policy = ();
+
         let fut = perform_transfer(
             &url,
             Some(effective_method.as_str()),
@@ -1617,6 +1655,7 @@ impl Easy {
             self.custom_request_target.as_deref(),
             self.tftp_blksize,
             self.tftp_no_options,
+            &ssh_host_key_policy,
         );
 
         // Apply total transfer timeout if set.
@@ -1724,6 +1763,8 @@ async fn perform_transfer(
     custom_request_target: Option<&str>,
     tftp_blksize: Option<u16>,
     tftp_no_options: bool,
+    #[cfg(feature = "ssh")] ssh_host_key_policy: &crate::protocol::ssh::SshHostKeyPolicy,
+    #[cfg(not(feature = "ssh"))] _ssh_host_key_policy: &(),
 ) -> Result<Response, Error> {
     let transfer_start = Instant::now();
     let original_url = url.clone();
@@ -1792,6 +1833,8 @@ async fn perform_transfer(
             custom_request_target,
             tftp_blksize,
             tftp_no_options,
+            #[cfg(feature = "ssh")]
+            ssh_host_key_policy,
         ))
         .await?;
 
@@ -1861,6 +1904,8 @@ async fn perform_transfer(
                                 custom_request_target,
                                 tftp_blksize,
                                 tftp_no_options,
+                                #[cfg(feature = "ssh")]
+                                ssh_host_key_policy,
                             ))
                             .await?;
                         }
@@ -2006,6 +2051,7 @@ async fn do_single_request(
     custom_request_target: Option<&str>,
     tftp_blksize: Option<u16>,
     tftp_no_options: bool,
+    #[cfg(feature = "ssh")] ssh_host_key_policy: &crate::protocol::ssh::SshHostKeyPolicy,
 ) -> Result<Response, Error> {
     // Handle non-HTTP schemes directly
     match url.scheme() {
@@ -2017,9 +2063,10 @@ async fn do_single_request(
         "sftp" | "scp" => {
             return if method == "PUT" {
                 let upload_data = body.unwrap_or(&[]);
-                crate::protocol::ssh::upload(url, upload_data, ssh_key_path).await
+                crate::protocol::ssh::upload(url, upload_data, ssh_key_path, ssh_host_key_policy)
+                    .await
             } else {
-                crate::protocol::ssh::download(url, ssh_key_path).await
+                crate::protocol::ssh::download(url, ssh_key_path, ssh_host_key_policy).await
             };
         }
         "ftp" | "ftps" => {
@@ -2880,6 +2927,27 @@ fn noproxy_from_env() -> Option<String> {
 /// Get the request target, using the custom target if set, otherwise from the URL.
 fn resolve_request_target(custom: Option<&str>, url: &Url) -> String {
     custom.map_or_else(|| url.request_target(), str::to_string)
+}
+
+/// Build an SSH host key verification policy from Easy options.
+#[cfg(feature = "ssh")]
+fn build_ssh_host_key_policy(
+    sha256_fingerprint: Option<&str>,
+    known_hosts_path: Option<&str>,
+) -> Result<crate::protocol::ssh::SshHostKeyPolicy, Error> {
+    use crate::protocol::ssh::SshHostKeyPolicy;
+
+    // SHA-256 fingerprint takes priority (most specific)
+    if let Some(fp) = sha256_fingerprint {
+        return Ok(SshHostKeyPolicy::Sha256Fingerprint(fp.to_string()));
+    }
+    // Then known_hosts file
+    if let Some(path) = known_hosts_path {
+        let entries = crate::protocol::ssh::parse_known_hosts_file(path)?;
+        return Ok(SshHostKeyPolicy::KnownHosts(entries));
+    }
+    // Default: accept all (matches curl default behavior)
+    Ok(SshHostKeyPolicy::AcceptAll)
 }
 
 fn should_bypass_proxy(url: &Url, noproxy: Option<&str>) -> bool {
@@ -4093,6 +4161,48 @@ mod tests {
         easy.ssh_key_path("/home/user/.ssh/id_rsa");
         let cloned = easy.clone();
         assert_eq!(cloned.ssh_key_path.as_deref(), Some("/home/user/.ssh/id_rsa"));
+    }
+
+    #[test]
+    fn easy_ssh_host_key_sha256_default() {
+        let easy = Easy::new();
+        assert!(easy.ssh_host_key_sha256.is_none());
+    }
+
+    #[test]
+    fn easy_ssh_host_key_sha256_set() {
+        let mut easy = Easy::new();
+        easy.ssh_host_key_sha256("abcdef1234567890");
+        assert_eq!(easy.ssh_host_key_sha256.as_deref(), Some("abcdef1234567890"));
+    }
+
+    #[test]
+    fn easy_ssh_host_key_sha256_cloned() {
+        let mut easy = Easy::new();
+        easy.ssh_host_key_sha256("test_fp");
+        let cloned = easy.clone();
+        assert_eq!(cloned.ssh_host_key_sha256.as_deref(), Some("test_fp"));
+    }
+
+    #[test]
+    fn easy_ssh_known_hosts_path_default() {
+        let easy = Easy::new();
+        assert!(easy.ssh_known_hosts_path.is_none());
+    }
+
+    #[test]
+    fn easy_ssh_known_hosts_path_set() {
+        let mut easy = Easy::new();
+        easy.ssh_known_hosts_path("/home/user/.ssh/known_hosts");
+        assert_eq!(easy.ssh_known_hosts_path.as_deref(), Some("/home/user/.ssh/known_hosts"));
+    }
+
+    #[test]
+    fn easy_ssh_known_hosts_path_cloned() {
+        let mut easy = Easy::new();
+        easy.ssh_known_hosts_path("/etc/ssh/known_hosts");
+        let cloned = easy.clone();
+        assert_eq!(cloned.ssh_known_hosts_path.as_deref(), Some("/etc/ssh/known_hosts"));
     }
 
     #[test]

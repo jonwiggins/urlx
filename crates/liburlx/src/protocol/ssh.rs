@@ -3,7 +3,8 @@
 //! Provides SFTP file transfer and SCP file copy over SSH connections
 //! using the `russh` and `russh-sftp` crates (pure-Rust, async).
 //!
-//! Supports password and public key authentication.
+//! Supports password and public key authentication, known_hosts verification,
+//! and SHA-256 host key fingerprint pinning.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -20,23 +21,339 @@ pub enum SshAuthMethod {
     PublicKey,
 }
 
-/// Minimal SSH client handler.
+/// SSH host key verification policy.
+#[derive(Debug, Clone, Default)]
+pub enum SshHostKeyPolicy {
+    /// Accept all host keys (default, matches curl without `--known-hosts`).
+    #[default]
+    AcceptAll,
+    /// Verify against a known_hosts file.
+    KnownHosts(Vec<KnownHostEntry>),
+    /// Verify against a specific SHA-256 fingerprint (base64-encoded, no prefix).
+    Sha256Fingerprint(String),
+}
+
+/// A parsed known_hosts entry for host key verification.
+#[derive(Debug, Clone)]
+pub struct KnownHostEntry {
+    /// Host patterns (plain hostnames or hashed).
+    pub host_patterns: KnownHostPatterns,
+    /// Whether this entry is revoked.
+    pub revoked: bool,
+    /// The public key bytes (SSH wire format).
+    pub public_key_bytes: Vec<u8>,
+}
+
+/// Host pattern types from known_hosts file.
+#[derive(Debug, Clone)]
+pub enum KnownHostPatterns {
+    /// Comma-separated hostname patterns.
+    Patterns(Vec<String>),
+    /// Hashed hostname (HMAC-SHA1).
+    Hashed {
+        /// The salt for HMAC-SHA1.
+        salt: Vec<u8>,
+        /// The HMAC-SHA1 hash of the hostname.
+        hash: [u8; 20],
+    },
+}
+
+/// Parse a known_hosts file into entries.
 ///
-/// Accepts all server host keys by default (matching curl's default behavior
-/// without `--known-hosts`). A future phase can add `known_hosts` checking.
-struct SshHandler;
+/// Supports both plain and hashed hostname formats (RFC 4251 known_hosts).
+///
+/// # Errors
+///
+/// Returns [`Error::Ssh`] if the file cannot be read or parsed.
+pub fn parse_known_hosts_file(path: &str) -> Result<Vec<KnownHostEntry>, Error> {
+    let contents = std::fs::read_to_string(path)
+        .map_err(|e| Error::Ssh(format!("failed to read known_hosts '{path}': {e}")))?;
+    parse_known_hosts(&contents)
+}
+
+/// Parse known_hosts content string into entries.
+pub fn parse_known_hosts(contents: &str) -> Result<Vec<KnownHostEntry>, Error> {
+    use russh::keys::ssh_key::known_hosts::KnownHosts;
+
+    let mut entries = Vec::new();
+    for result in KnownHosts::new(contents) {
+        let entry = result.map_err(|e| Error::Ssh(format!("known_hosts parse error: {e}")))?;
+
+        let revoked = entry
+            .marker()
+            .is_some_and(|m| matches!(m, russh::keys::ssh_key::known_hosts::Marker::Revoked));
+
+        let host_patterns = match entry.host_patterns() {
+            russh::keys::ssh_key::known_hosts::HostPatterns::Patterns(patterns) => {
+                KnownHostPatterns::Patterns(patterns.clone())
+            }
+            russh::keys::ssh_key::known_hosts::HostPatterns::HashedName { salt, hash } => {
+                KnownHostPatterns::Hashed { salt: salt.clone(), hash: *hash }
+            }
+        };
+
+        let public_key_bytes = entry
+            .public_key()
+            .to_bytes()
+            .map_err(|e| Error::Ssh(format!("known_hosts key encode error: {e}")))?;
+
+        entries.push(KnownHostEntry { host_patterns, revoked, public_key_bytes });
+    }
+    Ok(entries)
+}
+
+/// Check if a hostname matches a known_hosts entry.
+fn host_matches_entry(hostname: &str, entry: &KnownHostEntry) -> bool {
+    match &entry.host_patterns {
+        KnownHostPatterns::Patterns(patterns) => {
+            patterns.iter().any(|p| host_matches_pattern(hostname, p))
+        }
+        KnownHostPatterns::Hashed { salt, hash } => {
+            // Compute HMAC-SHA1(salt, hostname) and compare
+            let computed = hmac_sha1(salt, hostname.as_bytes());
+            computed == *hash
+        }
+    }
+}
+
+/// Simple glob-style pattern matching for known_hosts hostnames.
+///
+/// Supports `*` and `?` wildcards and `!` negation prefix.
+fn host_matches_pattern(hostname: &str, pattern: &str) -> bool {
+    if let Some(negated) = pattern.strip_prefix('!') {
+        return !simple_glob_match(hostname, negated);
+    }
+    // Strip port brackets: [hostname]:port
+    let pattern = if pattern.starts_with('[') {
+        if let Some(bracket_end) = pattern.find(']') {
+            &pattern[1..bracket_end]
+        } else {
+            pattern
+        }
+    } else {
+        pattern
+    };
+    simple_glob_match(hostname, pattern)
+}
+
+/// Simple glob matching supporting `*` and `?`.
+fn simple_glob_match(text: &str, pattern: &str) -> bool {
+    if !pattern.contains('*') && !pattern.contains('?') {
+        return text.eq_ignore_ascii_case(pattern);
+    }
+    // Basic recursive glob match
+    glob_match_recursive(text.as_bytes(), pattern.as_bytes())
+}
+
+fn glob_match_recursive(text: &[u8], pattern: &[u8]) -> bool {
+    if pattern.is_empty() {
+        return text.is_empty();
+    }
+    if pattern[0] == b'*' {
+        // Try matching * with 0 or more characters
+        for i in 0..=text.len() {
+            if glob_match_recursive(&text[i..], &pattern[1..]) {
+                return true;
+            }
+        }
+        return false;
+    }
+    if text.is_empty() {
+        return false;
+    }
+    if pattern[0] == b'?' || pattern[0].eq_ignore_ascii_case(&text[0]) {
+        return glob_match_recursive(&text[1..], &pattern[1..]);
+    }
+    false
+}
+
+/// Compute HMAC-SHA1(key, message).
+///
+/// Used for hashed known_hosts hostname verification.
+fn hmac_sha1(key: &[u8], message: &[u8]) -> [u8; 20] {
+    const BLOCK_SIZE: usize = 64;
+    const OPAD: u8 = 0x5C;
+    const IPAD: u8 = 0x36;
+
+    // If key is longer than block size, hash it first
+    let key = if key.len() > BLOCK_SIZE {
+        let digest = sha1_hash(key);
+        digest.to_vec()
+    } else {
+        key.to_vec()
+    };
+
+    // Pad key to block size
+    let mut padded_key = vec![0u8; BLOCK_SIZE];
+    padded_key[..key.len()].copy_from_slice(&key);
+
+    // Inner hash: SHA1(key XOR ipad || message)
+    let mut inner = Vec::with_capacity(BLOCK_SIZE + message.len());
+    for &b in &padded_key {
+        inner.push(b ^ IPAD);
+    }
+    inner.extend_from_slice(message);
+    let inner_hash = sha1_hash(&inner);
+
+    // Outer hash: SHA1(key XOR opad || inner_hash)
+    let mut outer = Vec::with_capacity(BLOCK_SIZE + 20);
+    for &b in &padded_key {
+        outer.push(b ^ OPAD);
+    }
+    outer.extend_from_slice(&inner_hash);
+    sha1_hash(&outer)
+}
+
+/// Minimal SHA-1 implementation for HMAC-SHA1 known_hosts verification.
+///
+/// Not used for security purposes — only for hostname hash verification
+/// in `known_hosts` files (`OpenSSH` format).
+fn sha1_hash(data: &[u8]) -> [u8; 20] {
+    let mut h0: u32 = 0x6745_2301;
+    let mut h1: u32 = 0xEFCD_AB89;
+    let mut h2: u32 = 0x98BA_DCFE;
+    let mut h3: u32 = 0x1032_5476;
+    let mut h4: u32 = 0xC3D2_E1F0;
+
+    let bit_len = (data.len() as u64) * 8;
+    let mut padded = data.to_vec();
+    padded.push(0x80);
+    while padded.len() % 64 != 56 {
+        padded.push(0);
+    }
+    padded.extend_from_slice(&bit_len.to_be_bytes());
+
+    for chunk in padded.chunks_exact(64) {
+        let mut w = [0u32; 80];
+        for i in 0..16 {
+            w[i] = u32::from_be_bytes([
+                chunk[4 * i],
+                chunk[4 * i + 1],
+                chunk[4 * i + 2],
+                chunk[4 * i + 3],
+            ]);
+        }
+        for i in 16..80 {
+            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
+        }
+
+        let (mut a, mut b, mut c, mut d, mut e) = (h0, h1, h2, h3, h4);
+
+        #[allow(clippy::needless_range_loop)] // SHA-1 round loop uses index for w[] lookup
+        for i in 0..80 {
+            let (f, k) = match i {
+                0..=19 => ((b & c) | ((!b) & d), 0x5A82_7999_u32),
+                20..=39 => (b ^ c ^ d, 0x6ED9_EBA1),
+                40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1B_BCDC),
+                _ => (b ^ c ^ d, 0xCA62_C1D6),
+            };
+
+            let temp =
+                a.rotate_left(5).wrapping_add(f).wrapping_add(e).wrapping_add(k).wrapping_add(w[i]);
+            e = d;
+            d = c;
+            c = b.rotate_left(30);
+            b = a;
+            a = temp;
+        }
+
+        h0 = h0.wrapping_add(a);
+        h1 = h1.wrapping_add(b);
+        h2 = h2.wrapping_add(c);
+        h3 = h3.wrapping_add(d);
+        h4 = h4.wrapping_add(e);
+    }
+
+    let mut result = [0u8; 20];
+    result[0..4].copy_from_slice(&h0.to_be_bytes());
+    result[4..8].copy_from_slice(&h1.to_be_bytes());
+    result[8..12].copy_from_slice(&h2.to_be_bytes());
+    result[12..16].copy_from_slice(&h3.to_be_bytes());
+    result[16..20].copy_from_slice(&h4.to_be_bytes());
+    result
+}
+
+/// SSH client handler with configurable host key verification.
+struct SshHandler {
+    policy: SshHostKeyPolicy,
+    hostname: String,
+}
 
 impl russh::client::Handler for SshHandler {
     type Error = crate::error::Error;
 
     async fn check_server_key(
         &mut self,
-        _server_public_key: &russh::keys::ssh_key::PublicKey,
+        server_public_key: &russh::keys::ssh_key::PublicKey,
     ) -> Result<bool, Self::Error> {
-        // Accept all server keys (matches curl default without known_hosts).
-        // TODO: Add known_hosts verification in a future phase.
-        Ok(true)
+        match &self.policy {
+            SshHostKeyPolicy::AcceptAll => Ok(true),
+            SshHostKeyPolicy::Sha256Fingerprint(expected) => {
+                let fingerprint =
+                    server_public_key.fingerprint(russh::keys::ssh_key::HashAlg::Sha256);
+                let actual = base64_encode(fingerprint.as_bytes());
+                if actual == *expected {
+                    Ok(true)
+                } else {
+                    Err(Error::Ssh(format!(
+                        "SSH host key fingerprint mismatch: expected SHA256:{expected}, got SHA256:{actual}"
+                    )))
+                }
+            }
+            SshHostKeyPolicy::KnownHosts(entries) => {
+                let server_key_bytes = server_public_key
+                    .to_bytes()
+                    .map_err(|e| Error::Ssh(format!("failed to encode server key: {e}")))?;
+
+                for entry in entries {
+                    if host_matches_entry(&self.hostname, entry) {
+                        if entry.revoked {
+                            return Err(Error::Ssh(format!(
+                                "SSH host key for '{}' is revoked in known_hosts",
+                                self.hostname
+                            )));
+                        }
+                        if entry.public_key_bytes == server_key_bytes {
+                            return Ok(true);
+                        }
+                        // Key mismatch — potential MITM
+                        return Err(Error::Ssh(format!(
+                            "SSH host key for '{}' does not match known_hosts (possible MITM attack)",
+                            self.hostname
+                        )));
+                    }
+                }
+                // Host not found in known_hosts — reject
+                Err(Error::Ssh(format!(
+                    "SSH host '{}' not found in known_hosts file",
+                    self.hostname
+                )))
+            }
+        }
     }
+}
+
+/// Base64-encode bytes (standard alphabet, no padding).
+fn base64_encode(data: &[u8]) -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut result = String::new();
+    let mut i = 0;
+    while i < data.len() {
+        let b0 = data[i];
+        let b1 = if i + 1 < data.len() { data[i + 1] } else { 0 };
+        let b2 = if i + 2 < data.len() { data[i + 2] } else { 0 };
+
+        result.push(ALPHABET[(b0 >> 2) as usize] as char);
+        result.push(ALPHABET[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
+        if i + 1 < data.len() {
+            result.push(ALPHABET[(((b1 & 0x0F) << 2) | (b2 >> 6)) as usize] as char);
+        }
+        if i + 2 < data.len() {
+            result.push(ALPHABET[(b2 & 0x3F) as usize] as char);
+        }
+        i += 3;
+    }
+    result
 }
 
 // Our Error type needs From<russh::Error> for the Handler trait.
@@ -57,9 +374,15 @@ impl SshSession {
     /// # Errors
     ///
     /// Returns [`Error::Ssh`] if the connection or authentication fails.
-    pub async fn connect(host: &str, port: u16, user: &str, pass: &str) -> Result<Self, Error> {
+    pub async fn connect(
+        host: &str,
+        port: u16,
+        user: &str,
+        pass: &str,
+        policy: SshHostKeyPolicy,
+    ) -> Result<Self, Error> {
         let config = Arc::new(russh::client::Config::default());
-        let handler = SshHandler;
+        let handler = SshHandler { policy, hostname: host.to_string() };
         let mut handle = russh::client::connect(config, (host, port), handler).await?;
 
         let auth_result = handle
@@ -84,9 +407,10 @@ impl SshSession {
         port: u16,
         user: &str,
         key_path: &str,
+        policy: SshHostKeyPolicy,
     ) -> Result<Self, Error> {
         let config = Arc::new(russh::client::Config::default());
-        let handler = SshHandler;
+        let handler = SshHandler { policy, hostname: host.to_string() };
         let mut handle = russh::client::connect(config, (host, port), handler).await?;
 
         let key_pair = russh::keys::load_secret_key(key_path, None)
@@ -403,12 +727,13 @@ async fn wait_for_scp_ack(channel: &mut russh::Channel<russh::client::Msg>) -> R
 pub async fn download(
     url: &crate::url::Url,
     ssh_key_path: Option<&str>,
+    policy: &SshHostKeyPolicy,
 ) -> Result<Response, Error> {
     let (host, port) = url.host_and_port()?;
     let (user, pass) = url.credentials().unwrap_or(("", ""));
     let path = url.path();
 
-    let session = connect_session(&host, port, user, pass, ssh_key_path).await?;
+    let session = connect_session(&host, port, user, pass, ssh_key_path, policy).await?;
 
     let data = if url.scheme() == "scp" {
         session.scp_download(path).await?
@@ -432,12 +757,13 @@ pub async fn upload(
     url: &crate::url::Url,
     data: &[u8],
     ssh_key_path: Option<&str>,
+    policy: &SshHostKeyPolicy,
 ) -> Result<Response, Error> {
     let (host, port) = url.host_and_port()?;
     let (user, pass) = url.credentials().unwrap_or(("", ""));
     let path = url.path();
 
-    let session = connect_session(&host, port, user, pass, ssh_key_path).await?;
+    let session = connect_session(&host, port, user, pass, ssh_key_path, policy).await?;
 
     if url.scheme() == "scp" {
         session.scp_upload(path, data).await?;
@@ -457,13 +783,14 @@ async fn connect_session(
     user: &str,
     pass: &str,
     ssh_key_path: Option<&str>,
+    policy: &SshHostKeyPolicy,
 ) -> Result<SshSession, Error> {
     let effective_user = if user.is_empty() { "root" } else { user };
 
     if let Some(key_path) = ssh_key_path {
-        SshSession::connect_with_key(host, port, effective_user, key_path).await
+        SshSession::connect_with_key(host, port, effective_user, key_path, policy.clone()).await
     } else if !pass.is_empty() {
-        SshSession::connect(host, port, effective_user, pass).await
+        SshSession::connect(host, port, effective_user, pass, policy.clone()).await
     } else {
         // Try default SSH key locations
         let home = std::env::var("HOME").unwrap_or_default();
@@ -474,8 +801,14 @@ async fn connect_session(
         ];
         for key_path in &default_keys {
             if std::path::Path::new(key_path).exists() {
-                if let Ok(session) =
-                    SshSession::connect_with_key(host, port, effective_user, key_path).await
+                if let Ok(session) = SshSession::connect_with_key(
+                    host,
+                    port,
+                    effective_user,
+                    key_path,
+                    policy.clone(),
+                )
+                .await
                 {
                     return Ok(session);
                 }
@@ -563,5 +896,166 @@ mod tests {
         let russh_err = russh::Error::Disconnect;
         let err: Error = Error::from(russh_err);
         assert!(err.to_string().contains("SSH error"));
+    }
+
+    #[test]
+    fn ssh_host_key_policy_default_is_accept_all() {
+        let policy = SshHostKeyPolicy::default();
+        assert!(matches!(policy, SshHostKeyPolicy::AcceptAll));
+    }
+
+    #[test]
+    fn ssh_host_key_policy_sha256() {
+        let policy = SshHostKeyPolicy::Sha256Fingerprint("abc123".to_string());
+        assert!(matches!(policy, SshHostKeyPolicy::Sha256Fingerprint(_)));
+    }
+
+    #[test]
+    fn ssh_host_key_policy_clone() {
+        let policy = SshHostKeyPolicy::Sha256Fingerprint("test".to_string());
+        let cloned = policy.clone();
+        assert!(matches!(cloned, SshHostKeyPolicy::Sha256Fingerprint(s) if s == "test"));
+    }
+
+    #[test]
+    fn host_matches_pattern_exact() {
+        assert!(host_matches_pattern("example.com", "example.com"));
+        assert!(!host_matches_pattern("example.com", "other.com"));
+    }
+
+    #[test]
+    fn host_matches_pattern_case_insensitive() {
+        assert!(host_matches_pattern("Example.Com", "example.com"));
+        assert!(host_matches_pattern("example.com", "EXAMPLE.COM"));
+    }
+
+    #[test]
+    fn host_matches_pattern_wildcard() {
+        assert!(host_matches_pattern("foo.example.com", "*.example.com"));
+        assert!(!host_matches_pattern("example.com", "*.example.com"));
+    }
+
+    #[test]
+    fn host_matches_pattern_question_mark() {
+        assert!(host_matches_pattern("host1", "host?"));
+        assert!(!host_matches_pattern("host12", "host?"));
+    }
+
+    #[test]
+    fn host_matches_pattern_negation() {
+        assert!(!host_matches_pattern("bad.com", "!bad.com"));
+        assert!(host_matches_pattern("good.com", "!bad.com"));
+    }
+
+    #[test]
+    fn host_matches_pattern_bracketed_port() {
+        assert!(host_matches_pattern("example.com", "[example.com]:22"));
+    }
+
+    #[test]
+    fn simple_glob_match_no_wildcards() {
+        assert!(simple_glob_match("hello", "hello"));
+        assert!(!simple_glob_match("hello", "world"));
+    }
+
+    #[test]
+    fn simple_glob_match_star() {
+        assert!(simple_glob_match("anything", "*"));
+        assert!(simple_glob_match("foobar", "foo*"));
+        assert!(simple_glob_match("foobar", "*bar"));
+        assert!(simple_glob_match("foobar", "f*r"));
+    }
+
+    #[test]
+    fn simple_glob_match_question() {
+        assert!(simple_glob_match("ab", "a?"));
+        assert!(!simple_glob_match("abc", "a?"));
+    }
+
+    #[test]
+    fn sha1_hash_empty() {
+        // SHA-1("") = da39a3ee5e6b4b0d3255bfef95601890afd80709
+        let hash = sha1_hash(b"");
+        let hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex, "da39a3ee5e6b4b0d3255bfef95601890afd80709");
+    }
+
+    #[test]
+    fn sha1_hash_abc() {
+        // SHA-1("abc") = a9993e364706816aba3e25717850c26c9cd0d89d
+        let hash = sha1_hash(b"abc");
+        let hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex, "a9993e364706816aba3e25717850c26c9cd0d89d");
+    }
+
+    #[test]
+    fn hmac_sha1_rfc2202_test1() {
+        // HMAC-SHA1 test vector from RFC 2202:
+        // key = 0x0b repeated 20 times, data = "Hi There"
+        let key = [0x0bu8; 20];
+        let data = b"Hi There";
+        let result = hmac_sha1(&key, data);
+        let hex: String = result.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex, "b617318655057264e28bc0b6fb378c8ef146be00");
+    }
+
+    #[test]
+    fn base64_encode_basic() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg");
+        assert_eq!(base64_encode(b"fo"), "Zm8");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg");
+    }
+
+    #[test]
+    fn host_matches_entry_plain_patterns() {
+        let entry = KnownHostEntry {
+            host_patterns: KnownHostPatterns::Patterns(vec![
+                "example.com".to_string(),
+                "alias.example.com".to_string(),
+            ]),
+            revoked: false,
+            public_key_bytes: vec![1, 2, 3],
+        };
+        assert!(host_matches_entry("example.com", &entry));
+        assert!(host_matches_entry("alias.example.com", &entry));
+        assert!(!host_matches_entry("other.com", &entry));
+    }
+
+    #[test]
+    fn host_matches_entry_hashed() {
+        // Pre-compute HMAC-SHA1 for "example.com" with a known salt
+        let salt = b"testsalt".to_vec();
+        let hash = hmac_sha1(&salt, b"example.com");
+        let entry = KnownHostEntry {
+            host_patterns: KnownHostPatterns::Hashed { salt, hash },
+            revoked: false,
+            public_key_bytes: vec![1, 2, 3],
+        };
+        assert!(host_matches_entry("example.com", &entry));
+        assert!(!host_matches_entry("other.com", &entry));
+    }
+
+    #[test]
+    fn parse_known_hosts_empty() {
+        let entries = parse_known_hosts("").unwrap();
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn parse_known_hosts_comments_only() {
+        let entries = parse_known_hosts("# this is a comment\n# another comment\n").unwrap();
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn known_host_entry_revoked_flag() {
+        let entry = KnownHostEntry {
+            host_patterns: KnownHostPatterns::Patterns(vec!["revoked.com".to_string()]),
+            revoked: true,
+            public_key_bytes: vec![],
+        };
+        assert!(entry.revoked);
     }
 }
