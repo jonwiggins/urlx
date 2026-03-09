@@ -362,3 +362,162 @@ async fn proxy_connect_tunnel() {
 
     origin_handle.await.unwrap();
 }
+
+// =============================================================================
+// Proxy authentication tests
+// =============================================================================
+
+/// A proxy that requires Basic authentication.
+struct TestAuthProxy {
+    addr: SocketAddr,
+    shutdown: Option<oneshot::Sender<()>>,
+}
+
+impl TestAuthProxy {
+    /// Start a proxy that checks for Proxy-Authorization header.
+    /// Expected credentials: user:pass (base64: dXNlcjpwYXNz).
+    async fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, mut rx) = oneshot::channel();
+
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    accept_result = listener.accept() => {
+                        if let Ok((mut client_stream, _)) = accept_result {
+                            tokio::spawn(async move {
+                                let mut buf = Vec::with_capacity(8192);
+                                let mut tmp = vec![0u8; 4096];
+                                loop {
+                                    let n = client_stream.read(&mut tmp).await.unwrap();
+                                    if n == 0 { break; }
+                                    buf.extend_from_slice(&tmp[..n]);
+                                    if buf.windows(4).position(|w| w == b"\r\n\r\n").is_some() {
+                                        break;
+                                    }
+                                }
+                                let request = String::from_utf8_lossy(&buf).to_string();
+
+                                // Check for valid Proxy-Authorization
+                                let has_auth = request.lines().any(|line| {
+                                    line.starts_with("Proxy-Authorization: Basic dXNlcjpwYXNz")
+                                });
+
+                                if !has_auth {
+                                    // 407 Proxy Authentication Required
+                                    let resp = "HTTP/1.1 407 Proxy Authentication Required\r\n\
+                                                Proxy-Authenticate: Basic realm=\"proxy\"\r\n\
+                                                Content-Length: 0\r\n\
+                                                Connection: close\r\n\r\n";
+                                    let _ = client_stream.write_all(resp.as_bytes()).await;
+                                    return;
+                                }
+
+                                // Parse method
+                                let first_line = request.lines().next().unwrap_or("");
+                                let parts: Vec<&str> = first_line.splitn(3, ' ').collect();
+                                if parts.len() < 3 { return; }
+                                let method = parts[0];
+                                let url_str = parts[1];
+
+                                if method == "CONNECT" {
+                                    let target = parts[1];
+                                    let Some((host, port)) = target.split_once(':') else { return; };
+                                    let target_addr = format!("{host}:{port}");
+                                    if let Ok(mut target_stream) =
+                                        tokio::net::TcpStream::connect(&target_addr).await
+                                    {
+                                        let resp = "HTTP/1.1 200 Connection Established\r\n\r\n";
+                                        client_stream.write_all(resp.as_bytes()).await.unwrap();
+                                        let _ = tokio::io::copy_bidirectional(
+                                            &mut client_stream,
+                                            &mut target_stream,
+                                        ).await;
+                                    }
+                                } else if let Ok(url) = url::Url::parse(url_str) {
+                                    let host = url.host_str().unwrap_or("127.0.0.1");
+                                    let port = url.port_or_known_default().unwrap_or(80);
+                                    let target_addr = format!("{host}:{port}");
+                                    if let Ok(mut target_stream) =
+                                        tokio::net::TcpStream::connect(&target_addr).await
+                                    {
+                                        let path = url.path();
+                                        let query = url.query().map_or(String::new(), |q| format!("?{q}"));
+                                        let new_first_line = format!("{method} {path}{query} HTTP/1.1");
+                                        let rest = request.split_once("\r\n").map_or("", |x| x.1);
+                                        let new_request = format!("{new_first_line}\r\n{rest}");
+                                        target_stream.write_all(new_request.as_bytes()).await.unwrap();
+                                        let mut resp_buf = Vec::new();
+                                        let _ = target_stream.read_to_end(&mut resp_buf).await;
+                                        let _ = client_stream.write_all(&resp_buf).await;
+                                    }
+                                }
+                            });
+                        }
+                    }
+                    _ = &mut rx => {
+                        break;
+                    }
+                }
+            }
+        });
+
+        Self { addr, shutdown: Some(tx) }
+    }
+
+    fn url(&self) -> String {
+        format!("http://127.0.0.1:{}", self.addr.port())
+    }
+}
+
+impl Drop for TestAuthProxy {
+    fn drop(&mut self) {
+        if let Some(tx) = self.shutdown.take() {
+            let _ = tx.send(());
+        }
+    }
+}
+
+#[tokio::test]
+async fn proxy_auth_succeeds() {
+    let origin = TestOrigin::start("authed proxy response").await;
+    let proxy = TestAuthProxy::start().await;
+
+    let mut easy = liburlx::Easy::new();
+    easy.url(&format!("http://127.0.0.1:{}/test", origin.port())).unwrap();
+    easy.proxy(&proxy.url()).unwrap();
+    easy.proxy_auth("user", "pass");
+    let resp = easy.perform_async().await.unwrap();
+
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.body_str().unwrap(), "authed proxy response");
+}
+
+#[tokio::test]
+async fn proxy_auth_wrong_credentials_gets_407() {
+    let origin = TestOrigin::start("should not reach").await;
+    let proxy = TestAuthProxy::start().await;
+
+    let mut easy = liburlx::Easy::new();
+    easy.url(&format!("http://127.0.0.1:{}/test", origin.port())).unwrap();
+    easy.proxy(&proxy.url()).unwrap();
+    easy.proxy_auth("wrong", "creds");
+    let resp = easy.perform_async().await.unwrap();
+
+    assert_eq!(resp.status(), 407);
+}
+
+#[tokio::test]
+async fn proxy_no_auth_gets_407() {
+    let origin = TestOrigin::start("should not reach").await;
+    let proxy = TestAuthProxy::start().await;
+
+    let mut easy = liburlx::Easy::new();
+    easy.url(&format!("http://127.0.0.1:{}/test", origin.port())).unwrap();
+    easy.proxy(&proxy.url()).unwrap();
+    // No proxy_auth set
+    let resp = easy.perform_async().await.unwrap();
+
+    assert_eq!(resp.status(), 407);
+}
