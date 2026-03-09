@@ -8,8 +8,8 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.85.0"
 license = "MIT"
-repository = "https://github.com/jonatan/urlx"
-homepage = "https://github.com/jonatan/urlx"
+repository = "https://github.com/jonwiggins/urlx"
+homepage = "https://github.com/jonwiggins/urlx"
 documentation = "https://docs.rs/liburlx"
 
 [workspace.lints.rust]
