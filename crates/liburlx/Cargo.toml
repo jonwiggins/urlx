@@ -5,6 +5,11 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords = ["http", "curl", "transfer", "tls", "async"]
+categories = ["network-programming", "web-programming::http-client"]
 
 [lints]
 workspace = true

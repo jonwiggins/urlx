@@ -5,6 +5,10 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords = ["ffi", "libcurl", "curl", "http"]
+categories = ["network-programming", "api-bindings"]
 
 [lib]
 crate-type = ["cdylib", "staticlib"]

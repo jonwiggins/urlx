@@ -14,115 +14,68 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 48 — Planning
-**Last completed:** Phase 47 (CLI Expansion VI) — 2026-03-09
-**Total tests:** 2,243
-**In progress:** Planning Phase 48
+**Phase:** 51 — Documentation & Release Prep (COMPLETE)
+**Last completed:** Phase 51 (Documentation & Release Prep) — 2026-03-09
+**Total tests:** 2,282
+**In progress:** Ready for v0.1.0 publish
 **Blockers:** None
-**Next up:** Phase 48 — SSH Known Hosts & Security Hardening
+**Target:** v0.1.0 release — publish to crates.io
 
-### Completeness Summary (updated Phase 40 review)
+### Completeness Summary (updated Phase 47 review)
 
 | Feature Area | Parity | Notes |
 |---|---|---|
 | HTTP/1.1 | 97% | Expect, HTTP/1.0, trailer headers; no chunked upload |
-| HTTP/2 | 80% | Server push, Builder config, flow control tuning, PING keep-alive; no stream priority enforcement |
-| HTTP/3 | 55% | QUIC via quinn, Alt-Svc upgrade, 0-RTT; no connection pooling or server push |
+| HTTP/2 | 80% | Server push, flow control, PING; no stream priority |
+| HTTP/3 | 55% | QUIC via quinn, Alt-Svc, 0-RTT; no pooling/push; untested |
 | TLS | 85% | rustls, insecure mode, CA/client certs, pinning, version selection, cipher list, session cache |
-| Authentication | 60% | Basic, Bearer, Digest, AWS SigV4, NTLM skeleton, SASL options |
-| Cookie engine | 95% | Netscape file format, domain-indexed jar, public suffix list validation |
+| Authentication | 65% | Basic, Bearer, Digest (CSPRNG cnonce), AWS SigV4, NTLM skeleton, SASL |
+| Cookie engine | 95% | Netscape file format, domain-indexed jar, PSL validation |
 | Proxy | 90% | HTTP + SOCKS + HTTPS tunnel (TLS-in-TLS), proxy auth; no PAC |
-| DNS | 85% | Cache, Happy Eyeballs, shuffle, custom servers, DoH, DoT, async hickory-dns resolver |
-| FTP | 87% | Full session API, FTPS (explicit/implicit), active mode, FtpMethod; no MLST |
-| SSH/SFTP/SCP | 60% | SFTP/SCP download/upload, password + pubkey auth; no known_hosts |
-| WebSocket | 85% | RFC 6455, CloseCode, Message, WebSocketStream, fragmentation; no permessage-deflate |
+| DNS | 85% | Cache, Happy Eyeballs, shuffle, custom servers, DoH, DoT, hickory-dns |
+| FTP | 87% | Full session API, FTPS, active mode, FtpMethod; no MLST |
+| SSH/SFTP/SCP | 65% | Download/upload, password + pubkey auth, known_hosts, SHA-256 fingerprint |
+| WebSocket | 85% | RFC 6455, CloseCode, fragmentation; no permessage-deflate |
 | Multi API | 75% | Connection limiting, share, pipelining, FFI event loop stubs |
-| FFI (libcurl C ABI) | ~60% | 116 CURLOPT, 43 CURLINFO, 32 CURLcode, 56 functions, cbindgen header |
-| CLI | ~55% | ~150 of ~250 flags |
+| FFI (libcurl C ABI) | ~60% | 177 CURLOPT, 47 CURLINFO, 32 CURLcode, 56 functions; comprehensive SAFETY docs |
+| CLI | ~60% | ~154 flags; stdin data support; curl-compatible exit codes; expanded write-out |
 | Connection | 80% | Pool, TCP_NODELAY, keepalive, Unix sockets, interface/port binding |
 | Transfer control | 80% | Rate limiting enforced (max recv/send speed, low speed timeout) |
 | Overall | ~64% | ~92% for basic HTTP/HTTPS use cases |
 
 ---
 
-## Decision Log
+## v0.1.0 Launch Plan
 
-- **2026-03-09:** `custom_request_target` is passed through `perform_transfer` → `do_single_request` as `Option<&str>` parameter (not a method) since these are free functions, not methods. A helper `resolve_request_target()` free function handles the fallback to `url.request_target()`.
-- **2026-03-09:** TFTP block size negotiation uses RFC 2348 OACK mechanism. The `build_rrq()` function appends `blksize\0{value}\0` option when requested. OACK response (opcode 6) is parsed to update effective block size, then ACK'd with block 0. When `tftp_no_options` is set, no OACK options are sent (vanilla RFC 1350).
-- **2026-03-09:** `--proxy-1.0` sets both the proxy URL and forces HTTP/1.0 version. This matches curl behavior where `--proxy-1.0` means "use HTTP/1.0 for proxy communication."
-- **2026-03-08:** Workspace lint inheritance is all-or-nothing in Cargo. `unsafe_code = "deny"` is enforced via `#![deny(unsafe_code)]` in source files (liburlx, urlx-cli) rather than workspace lints, since liburlx-ffi needs to allow it and can't partially override workspace lints.
-- **2026-03-08:** `rustfmt.toml` uses only stable options (`edition`, `max_width`, `use_small_heuristics`). `imports_granularity` and `group_imports` are nightly-only and omitted.
-- **2026-03-08:** cargo-deny v0.19 uses a simplified config format — `vulnerability`/`unmaintained`/`unlicensed`/`copyleft` keys were removed.
-- **2026-03-08:** Connection pool uses `PooledStream` enum (Tcp/Tls variants) with AsyncRead/AsyncWrite delegation, avoiding trait objects. Pool only stores non-proxied H1 connections; H2 multiplexing handles its own reuse.
-- **2026-03-08:** For keep-alive, responses with no Content-Length and no chunked encoding (e.g., 204 No Content) are treated as empty body to avoid hanging on `read_to_end`. Stale pooled connections trigger automatic retry with fresh connection.
-- **2026-03-08:** WebSocket SHA-1 implemented inline (minimal, ~50 lines) to avoid adding a dependency for a single use case. Not used for security purposes — only for RFC 6455 accept key computation.
-- **2026-03-08:** Found and fixed WebSocket accept key GUID typo (`5AB5DC85B11B` → `C5AB0DC85B11`). The existing unit test was written against the buggy implementation. Discovered via RFC 6455 example test in integration tests.
-- **2026-03-08:** Certificate pinning uses a minimal inline DER parser (~50 lines) to extract SPKI from X.509 certs, avoiding adding an ASN.1 parsing dependency. Only the SPKI portion is needed for SHA-256 hashing.
-- **2026-03-08:** AWS SigV4 uses inline HMAC-SHA256 implementation (~20 lines) rather than adding the `hmac` crate, since it's the only HMAC user. Same approach as WebSocket SHA-1.
-- **2026-03-08:** NTLM and Negotiate/SPNEGO auth deferred from Phase 2 — they are complex, platform-specific, and rarely needed. Can be added later if demanded.
-- **2026-03-08:** Cipher suite selection deferred from Phase 2 — rustls defaults are secure and appropriate. The `CryptoProvider` API exists for future use if needed.
-- **2026-03-08:** Migrated from `rustls-pemfile` (RUSTSEC-2025-0134, unmaintained) to `rustls-pki-types` `PemObject` trait for PEM parsing. The `rustls-pki-types` API is the maintained replacement.
-- **2026-03-08:** TCP_NODELAY defaults to `true` (matching curl behavior). TCP keepalive uses `socket2` crate (already in dependency tree via tokio) for cross-platform `SO_KEEPALIVE` + `TCP_KEEPIDLE`.
-- **2026-03-08:** TransferInfo timing now separates `time_namelookup` from `time_connect` — DNS resolution via `tokio::net::lookup_host` is explicit, with caching. Previous approach had them equal since `TcpStream::connect` does both.
-- **2026-03-08:** Happy Eyeballs uses 250ms delay (RFC 6555 recommendation) before starting IPv4 after IPv6. Uses `tokio::select!` for racing. Falls back to sequential if only one address family available.
-- **2026-03-08:** DNS shuffle uses inline xorshift32 PRNG seeded from nanosecond timestamp. Avoids adding a `rand` dependency for a simple shuffle operation.
-- **2026-03-08:** Local interface/port binding uses `socket2::Socket` for pre-bind + non-blocking connect, with platform-specific `EINPROGRESS` handling (code 36 on macOS, 115 on Linux, 10036 on Windows).
-- **2026-03-08:** FTP refactored from standalone functions to `FtpSession` struct to eliminate code duplication (login, PASV, data connection). Original `download()`/`list()` functions preserved as convenience wrappers.
-- **2026-03-08:** SSH/SFTP deferred — `russh` (pure-Rust) preferred over `ssh2` (C bindings via libssh2) to maintain zero-unsafe-outside-FFI principle. Significant effort to implement properly.
-- **2026-03-08:** Share interface uses swap-based approach: shared state is swapped into local Easy fields before transfer, then swapped back after. No lock held across async await points — only brief locks for the swap. This naturally serializes access per-transfer.
-- **2026-03-08:** Poll/socket/timer/fdset Multi APIs deferred to FFI phase — these are C event-loop integration points that don't map naturally to tokio's async model. The Rust Multi API already provides native async via `perform()`.
-- **2026-03-08:** `PipeliningMode` enum has `Nothing` and `Multiplex` variants. HTTP/1.1 pipelining was deprecated in libcurl and is not supported — only HTTP/2 multiplexing is offered.
-- **2026-03-08:** `curl_slist` is implemented as a C-compatible linked list with manual memory management (Vec + mem::forget for string data, Box for nodes). This matches libcurl's API exactly.
-- **2026-03-08:** `curl_multi_perform` uses `perform_blocking` internally, creating a tokio runtime per call. This matches the blocking C API model. For async-native C consumers, poll/socket callbacks would be needed (deferred).
-- **2026-03-08:** NTLM authentication uses a skeleton implementation with SHA-256-based NT response instead of real MD4+DES. Avoids adding `md4` and DES dependencies for a rarely-used auth mechanism. Sufficient for basic proxy auth testing; real NTLM interop would need full crypto.
-- **2026-03-08:** HTTP/3 via quinn deferred from Phase 8. Adding QUIC transport is a major effort requiring: new dependency, QUIC connection management, Alt-Svc-based discovery, 0-RTT, connection migration. Better as a dedicated phase after the Phase 10 review.
-- **2026-03-08:** `HttpVersion` enum uses `None` (auto) as default rather than `Http11` to preserve existing ALPN-based HTTP/2 negotiation behavior. `Http2` variant is equivalent to `None` for HTTPS since ALPN already prefers H2.
-- **2026-03-08:** Expect: 100-continue timeout defaults to sending body on timeout (matching curl behavior). Body is NOT sent only when server actively responds with an error status before the timeout.
-- **2026-03-08:** Netscape cookie file format uses leading dot prefix for all domains (matching curl behavior). `#HttpOnly_` prefix handled before general `#` comment check to avoid false skipping. Session cookies written with `expiration=0`.
-- **2026-03-08:** Rate limiting (max_recv_speed, max_send_speed) and minimum speed enforcement (low_speed_limit, low_speed_time) added as Easy API setters. CLI `--limit-rate` supports K/M/G suffixes using 1024-based multipliers (matching curl behavior).
-- **2026-03-09:** Rate limiting wired into transfer engine via `SpeedLimits` struct and `RateLimiter`. Token-bucket approach: tracks bytes transferred vs elapsed time, sleeps to enforce max speed. Low speed enforcement checks average throughput and aborts with `Error::SpeedLimit` after exceeding `low_speed_time`. Throttled reads/writes use 16KB chunks (`THROTTLE_CHUNK_SIZE`). Large futures from added parameters addressed with `Box::pin` on `perform_transfer` and `#[allow(clippy::large_futures)]` on `do_single_request`.
-- **2026-03-09:** FFI MIME API uses standalone `MimePartHandle` structs that are finalized into the parent `MimeHandle`'s `MultipartForm` via `finalize_mime_part()`. This matches libcurl's workflow: `curl_mime_addpart` → set name/data/filename → `CURLOPT_MIMEPOST`. Parts own their data until finalized.
-- **2026-03-09:** `CURLOPT_PROGRESSFUNCTION` and `CURLOPT_XFERINFOFUNCTION` share the same data pointer (`CURLOPT_PROGRESSDATA` = 10057). The xferinfo callback takes precedence over the progress callback (matching libcurl behavior). Both are only invoked when `CURLOPT_NOPROGRESS` is set to 0.
-- **2026-03-09:** `CURLINFO_PRIVATE` is handled before the response check in `curl_easy_getinfo` since it doesn't require a completed transfer — it's stored directly on the `EasyHandle` struct, not on the response.
-- **2026-03-09:** `curl_share_setopt` lock/unlock function callbacks (options 3/4) are accepted but ignored. The Rust `Share` type uses `Arc<Mutex>` internally, making external locking unnecessary.
-- **2026-03-09:** `curl_url_*` API uses an FFI-specific `UrlHandle` struct with mutable component storage, since the core `Url` type is immutable. Components are stored individually and reassembled on `curl_url_get(CURLUPART_URL)`. Strings returned by `curl_url_get` are allocated via `CString::into_raw` and must be freed with `curl_free`.
-- **2026-03-09:** `CURLOPT_NOSIGNAL`, `CURLOPT_AUTOREFERER`, `CURLOPT_LOCALPORTRANGE`, and `CURLOPT_AWS_SIGV4` are accepted as no-ops. NOSIGNAL is irrelevant (tokio doesn't use signals), AUTOREFERER is not yet implemented, LOCALPORTRANGE supplements LOCALPORT (which is implemented), and AWS_SIGV4 auth is configured through separate credential setters.
-- **2026-03-09:** `.netrc` credential loading is deferred from argument parsing to the `run()` function, where the URL is known. This allows extracting the hostname for lookup. `--netrc-optional` silently ignores missing files; `--netrc` fails if the file doesn't exist.
-- **2026-03-09:** `--remote-time` uses the `filetime` crate for cross-platform file mtime setting. HTTP date parsing is inline (RFC 7231 format only) to avoid adding a date-parsing dependency for a single use case.
-- **2026-03-09:** `--post301/--post302/--post303` flags map to `post301`/`post302`/`post303` bool fields on Easy. The redirect logic in `perform_transfer` checks these before converting POST→GET on 301/302/303 redirects. This matches curl's `CURLOPT_POSTREDIR` bitmask approach.
-- **2026-03-09:** `FtpStream` enum follows the same pattern as `PooledStream` (Plain/Tls variants with `#[cfg(feature = "rustls")]` on the Tls variant, `#[allow(clippy::large_enum_variant)]`). `AsyncRead`/`AsyncWrite` delegation via `Pin::new(s).poll_*`.
-- **2026-03-09:** `TlsConnector::new_no_alpn()` added via internal `build(tls_config, use_http_alpn)` refactor. FTP/SMTP/IMAP don't use HTTP ALPN protocols; sending them could cause some servers to reject the connection. No public API change to existing `new()`.
-- **2026-03-09:** Explicit FTPS uses AUTH TLS → PBSZ 0 → PROT P sequence before login (RFC 4217). `auth_tls()` consumes self because it needs to reassemble the split reader/writer, extract TcpStream, TLS-wrap it, and re-split. PBSZ/PROT happen on the (now TLS) control connection after upgrade.
-- **2026-03-09:** Active mode FTP uses `tokio::net::TcpListener::bind(local_ip, 0)` for OS-assigned ports. PORT command formats IPv4 octets; EPRT supports both IPv4/IPv6. `--ftp-port "-"` uses the control connection's local address (stored during connect).
-- **2026-03-09:** `ftps://` URL scheme defaults to port 990 (implicit FTPS). The `url` crate doesn't know about `ftps`, so `port_or_default()` has a fallback match. In `do_single_request`, `ftps://` always maps to `FtpSslMode::Implicit`.
-- **2026-03-09:** SSH/SFTP/SCP uses russh 0.57 + russh-sftp 2.1 (pure-Rust). russh 0.48 does not have a `ring` feature; `ring` support was added in v0.53.0. Using `default-features = false, features = ["ring"]` to match our existing ring 0.17 dependency (from rustls).
-- **2026-03-09:** `SshHandler` accepts all server host keys by default (matching curl's behavior without `--known-hosts`). Known hosts verification deferred to a future phase.
-- **2026-03-09:** `best_supported_rsa_hash()` in russh 0.57 returns `Result<Option<Option<HashAlg>>>` — triple-nested. Flattened with `.ok().flatten().flatten()` to get `Option<HashAlg>` for `PrivateKeyWithHashAlg::new()`.
-- **2026-03-09:** SCP protocol implemented via exec channel (`scp -f` for download, `scp -t` for upload) rather than SFTP subsystem. SCP header parsing extracts file size from "C<mode> <size> <filename>" format. Acknowledgement is single null byte; error codes 1/2 include message text.
-- **2026-03-09:** `--key` flag (CURLOPT_SSH_PRIVATE_KEYFILE in libcurl) sets both TLS client key and SSH identity in the CLI, matching curl's dual-purpose behavior. At transfer time, the appropriate one is used based on URL scheme.
-- **2026-03-09:** SSH auth fallback order: explicit `--key` → URL password → default keys (`~/.ssh/id_ed25519`, `~/.ssh/id_rsa`, `~/.ssh/id_ecdsa`). If no credentials available, returns `Error::Ssh` with guidance message.
-- **2026-03-09:** Multi API event loop FFI functions use pragmatic stubs: tokio owns socket polling, so `curl_multi_fdset` returns max_fd=-1, `curl_multi_wait/poll` provide simple `thread::sleep`, `curl_multi_socket_action` delegates to `curl_multi_perform` on `CURL_SOCKET_TIMEOUT` (-1). Socket/timer callbacks are accepted and stored but not actively invoked. `curl_multi_info_read` returns `CURLMsg` pointers from a Vec-based message queue populated during `curl_multi_perform`.
-- **2026-03-09:** `CURLMsg` returned by `curl_multi_info_read` uses a rotate-to-back strategy: the consumed message is removed from the front and pushed to the back, with a pointer to the last element returned. This keeps the pointer valid until the next call (matching libcurl's lifetime guarantee).
-- **2026-03-09:** `CURLMOPT_MAXCONNECTS` (6) and `CURLMOPT_MAX_TOTAL_CONNECTIONS` (13) both map to `Multi::max_total_connections()`. In libcurl they have subtly different semantics (cache size vs active limit), but for our implementation the distinction is irrelevant since tokio manages connection lifecycle.
-- **2026-03-09:** HTTP/2 configuration uses `h2::client::Builder` instead of the free `h2::client::handshake()` function. This enables flow control window tuning (`initial_window_size`, `initial_connection_window_size`), max frame size, max header list size, and server push toggle via SETTINGS frame. Required adding `bytes` as a direct dependency for the `http2` feature (was already transitive via h2).
-- **2026-03-09:** HTTP/2 stream priority weight (`stream_weight`) is stored on Easy for API compatibility with `CURLOPT_STREAM_WEIGHT` but not enforced at the h2 level. HTTP/2 priority was deprecated in RFC 9113 and the h2 crate doesn't expose priority APIs. Most servers ignore it.
-- **2026-03-09:** HTTP/2 PING keep-alive spawns a separate tokio task that calls `PingPong::ping()` at the configured interval. The task is aborted when the response is fully received. `Connection::ping_pong()` takes the PingPong handle before the connection is moved into its driver task.
-- **2026-03-09:** HTTP/2 server push uses `response_fut.push_promises()` which clones h2 internal state, allowing independent collection in a background task without blocking the main response await. Spawned as a `tokio::spawn` task that runs concurrently with response body reading.
-- **2026-03-09:** HTTP/3 via quinn/h3/h3-quinn uses `bytes` crate as a direct dependency (feature-gated behind `http3`) because h3's `recv_data()` returns `impl Buf` which requires the `Buf` trait in scope. The `bytes` crate is already a transitive dependency via h3/quinn.
-- **2026-03-09:** HTTP/3 dispatch in easy.rs bypasses TCP connection and TLS — it uses the resolved DNS address directly for QUIC (UDP). The QUIC endpoint binds to 0.0.0.0:0 (OS-assigned port). Connection errors map to `Error::Connect` to match the existing error taxonomy.
-- **2026-03-09:** HTTPS proxy tunnel uses TLS-in-TLS: first TLS-wrap TCP to the proxy (via `new_no_alpn`), then HTTP CONNECT through the TLS stream, then TLS-wrap the tunnel to the target. The result is `TlsStream<TlsStream<TcpStream>>` which doesn't fit `PooledStream::Tls(TlsStream<TcpStream>)`, so the HTTPS proxy path uses a separate early-return block with `h1::request` directly on the generic stream.
-- **2026-03-09:** WebSocket key generation uses `AtomicU64` counter mixed with nanosecond timestamp to ensure uniqueness even when called within the same nanosecond. Previous approach used only timestamp, causing identical keys on fast CI machines.
-- **2026-03-09:** Alt-Svc HTTP/3 upgrade triggers only for `HttpVersion::None` (auto) or `HttpVersion::Http2` — explicit `Http10`/`Http11` requests are never upgraded. The origin key uses `format!("https://{}:{}", host, port)` matching how Alt-Svc entries are stored during response processing.
-- **2026-03-09:** 0-RTT via quinn's `Connecting::into_0rtt()` — currently falls back to full handshake every time since no session cache exists between requests. Adding a QUIC session cache is deferred; when implemented, 0-RTT will activate automatically on resumed connections. Only idempotent requests are safe for 0-RTT replay, but since `into_0rtt` handles this at the TLS level, no additional filtering is needed.
-- **2026-03-09:** `curl_getdate` FFI function implements inline HTTP date parsing supporting three formats: RFC 2822 ("Sun, 06 Nov 1994 08:49:37 GMT"), RFC 850 ("Sunday, 06-Nov-94 08:49:37 GMT"), and asctime ("Sun Nov  6 08:49:37 1994"). Inline Unix timestamp computation avoids adding a `chrono` dependency for a single use case. Two-digit years ≥70 map to 1900s, <70 to 2000s (matching curl).
-- **2026-03-09:** `curl_escape`/`curl_unescape` use RFC 3986 unreserved characters (A-Z, a-z, 0-9, `-._~`) for percent-encoding. `curl_unescape` decodes `+` as space (matching curl's behavior for form-encoded data). `curl_easy_escape`/`curl_easy_unescape` delegate to the same implementation.
-- **2026-03-09:** `DnsResolver::Hickory` variant uses `Box<HickoryResolver>` to avoid large enum variant clippy error — `HickoryResolver` contains `TokioResolver` which is ~1272 bytes, while `System` carries no data. Boxing eliminates the size disparity.
-- **2026-03-09:** Cookie PSL validation uses the `psl` crate (v2) which embeds the full Mozilla Public Suffix List at compile time. The embedded approach avoids runtime downloads and filesystem dependencies. Only cookies with an explicit `Domain` attribute are checked — host-only cookies are always allowed (matching curl's behavior with `--with-libpsl`). The `psl::List.suffix()` API returns the public suffix portion; if it equals the entire domain, the domain is a public suffix.
-- **2026-03-09:** `CurlVersionInfo` struct uses `Box::leak` + `OnceLock` to create a 'static pointer, avoiding raw pointer `Sync` issues with static variables. The protocols array is also leaked. `unsafe impl Sync for CurlVersionInfo` is required because the struct contains `*const c_char` pointers (all to static CStr literals).
-- **2026-03-09:** `curl_global_init`/`curl_global_cleanup` are no-ops in urlx — tokio and rustls handle their own initialization. Defined for API compatibility. `CURL_GLOBAL_ALL`/`CURL_GLOBAL_DEFAULT` constants provided.
-- **2026-03-09:** `curl_easy_pause` returns `CURLE_OK` as a stub — tokio async doesn't support pause/resume in the same way libcurl does. Would require cancellation tokens or similar mechanism.
-- **2026-03-09:** hickory-resolver 0.25 API uses `TokioResolver::builder_tokio()?.build()` for system config and `TokioResolver::builder_with_config(config, provider).build()` for custom config. The `system-config` feature is required for `builder_tokio()`. `TokioConnectionProvider` lives in `hickory_resolver::name_server`, and `Protocol` in `hickory_resolver::proto::xfer`.
-- **2026-03-09:** `curl_formadd` returns `CURL_FORMADD_DISABLED` (7) as a stub — the deprecated multipart API is replaced by the MIME API (`curl_mime_*`). `curl_formfree` is a no-op. This matches libcurl's behavior when built without form API support.
+### Phase 48 — Security & Correctness Hardening (COMPLETE — 2026-03-09)
+
+- Audited all `unwrap()` calls: confirmed zero violations in non-test library code (enforced by `unwrap_used = "deny"`)
+- Replaced Digest auth cnonce with CSPRNG (`rand` crate, 16 random bytes)
+- Added CRLF injection prevention in `easy.header()` and `easy.proxy_header()`
+- Added comprehensive FFI safety documentation (module-level invariants + targeted SAFETY comments)
+- Verified total transfer timeout wraps all protocol handlers via `tokio::time::timeout`
+
+### Phase 49 — CLI Polish (COMPLETE — 2026-03-09)
+
+- Implemented `-d @-` and `--data-binary @-` for stdin data
+- Mapped liburlx errors to curl-compatible exit codes (3, 6, 7, 22, 28, 35, 47, 60, 67)
+- Expanded `--write-out` with 9 new variables (http_version, scheme, size_header, etc.)
+- CLI refactor deferred to post-0.1.0
+
+### Phase 50 — Test Gap Closure (COMPLETE — 2026-03-09)
+
+- Added 6 AWS SigV4 integration tests (authorization format, amz-date, content hash, POST body)
+- Added 8 Bearer/Basic auth integration tests (token format, redirects, HTTP methods)
+- Added 11 HTTP version selection integration tests
+- Total tests: 2,282 (up from 2,243 pre-launch track)
+
+### Phase 51 — Documentation & Release Prep (COMPLETE — 2026-03-09)
+
+- Updated README (MSRV badge, test count)
+- Added crates.io metadata (repository, homepage, documentation, keywords, categories)
+- Added .gitignore entries for proptest regressions and .DS_Store
+- Verified `cargo publish --dry-run` succeeds for liburlx
+- Publish order: `liburlx` → `liburlx-ffi` → `urlx-cli`
 
 ---
 
@@ -147,299 +100,25 @@ urlx/
 ├── deny.toml                  # cargo-deny configuration
 ├── clippy.toml                # Clippy configuration
 ├── rustfmt.toml               # Formatting configuration
-├── .github/
-│   └── workflows/
-│       ├── ci.yml             # Main CI pipeline
-│       └── release.yml        # Release pipeline
+├── .github/workflows/         # CI (ci.yml) and release (release.yml) pipelines
 ├── .pre-commit-config.yaml    # Pre-commit hooks
-│
 ├── crates/
 │   ├── liburlx/               # Core library (pure Rust, idiomatic API)
-│   │   ├── Cargo.toml
-│   │   └── src/
-│   │       ├── lib.rs
-│   │       ├── easy.rs        # Single-transfer blocking API
-│   │       ├── multi.rs       # Concurrent transfer API (async-native)
-│   │       ├── error.rs       # Error types (maps to CURLcode)
-│   │       ├── options.rs     # Typed transfer options
-│   │       ├── info.rs        # Transfer info/stats queries
-│   │       ├── url.rs         # URL parsing (wraps `url` crate with curl quirks)
-│   │       ├── transfer.rs    # Transfer state machine
-│   │       ├── pool.rs        # Connection pooling and reuse
-│   │       ├── filter.rs      # Connection filter chain framework
-│   │       ├── cookie.rs      # Cookie jar engine
-│   │       ├── protocol/
-│   │       │   ├── mod.rs     # Protocol trait definition
-│   │       │   ├── http/
-│   │       │   │   ├── mod.rs
-│   │       │   │   ├── h1.rs  # HTTP/1.0 and HTTP/1.1
-│   │       │   │   ├── h2.rs  # HTTP/2
-│   │       │   │   ├── h3.rs  # HTTP/3 (feature-gated)
-│   │       │   │   ├── headers.rs
-│   │       │   │   ├── chunked.rs
-│   │       │   │   └── body.rs
-│   │       │   ├── ftp.rs
-│   │       │   ├── ws.rs      # WebSocket
-│   │       │   ├── mqtt.rs
-│   │       │   ├── smtp.rs
-│   │       │   ├── imap.rs
-│   │       │   ├── pop3.rs
-│   │       │   ├── file.rs    # file:// protocol
-│   │       │   └── ...
-│   │       ├── tls/
-│   │       │   ├── mod.rs     # TlsConnector trait
-│   │       │   ├── rustls.rs  # Default backend
-│   │       │   └── native.rs  # Platform-native (Schannel/SecureTransport)
-│   │       ├── dns/
-│   │       │   ├── mod.rs     # Resolver trait
-│   │       │   ├── system.rs  # System resolver
-│   │       │   └── hickory.rs # Async resolver (hickory-dns)
-│   │       ├── proxy/
-│   │       │   ├── mod.rs
-│   │       │   ├── http.rs    # HTTP CONNECT
-│   │       │   └── socks.rs   # SOCKS4/SOCKS5
-│   │       └── auth/
-│   │           ├── mod.rs
-│   │           ├── basic.rs
-│   │           ├── digest.rs
-│   │           ├── bearer.rs
-│   │           └── negotiate.rs
-│   │
+│   │   └── src/               # lib.rs, easy.rs, multi.rs, error.rs, options.rs, info.rs,
+│   │                          # url.rs, transfer.rs, pool.rs, filter.rs, cookie.rs,
+│   │                          # protocol/{http,ftp,ws,mqtt,smtp,imap,pop3,file,...},
+│   │                          # tls/{rustls,native}, dns/{system,hickory},
+│   │                          # proxy/{http,socks}, auth/{basic,digest,bearer,negotiate}
 │   ├── liburlx-ffi/           # C ABI compatibility layer
-│   │   ├── Cargo.toml
 │   │   ├── cbindgen.toml      # C header generation config
-│   │   ├── include/
-│   │   │   └── urlx.h         # Generated C header (libcurl-compatible)
-│   │   └── src/
-│   │       ├── lib.rs         # #[no_mangle] extern "C" exports
-│   │       ├── easy.rs        # curl_easy_* function implementations
-│   │       ├── multi.rs       # curl_multi_* function implementations
-│   │       ├── options.rs     # CURLOPT_* integer → typed option mapping
-│   │       ├── info.rs        # CURLINFO_* mapping
-│   │       └── error.rs       # CURLcode enum and conversion
-│   │
+│   │   ├── include/urlx.h     # Generated C header (libcurl-compatible)
+│   │   └── src/               # lib.rs, easy.rs, multi.rs, options.rs, info.rs, error.rs
 │   └── urlx-cli/              # Command-line tool
-│       ├── Cargo.toml
-│       └── src/
-│           ├── main.rs
-│           ├── args.rs        # Argument parsing (clap, mirrors curl's CLI)
-│           ├── config.rs      # .curlrc / config file parsing
-│           ├── output.rs      # --write-out formatting
-│           └── progress.rs    # Progress bar/meter display
-│
-├── tests/                     # Integration test suite
-│   ├── fixtures/              # Static test fixtures (certs, data files)
-│   │   ├── certs/            # TLS test certificates (generated by setup)
-│   │   └── data/             # Test response bodies
-│   ├── servers/               # Test server implementations
-│   │   ├── mod.rs
-│   │   ├── http.rs           # HTTP/1.1 + HTTP/2 test server
-│   │   ├── https.rs          # HTTPS test server
-│   │   ├── proxy.rs          # HTTP/SOCKS proxy test server
-│   │   ├── ftp.rs            # FTP test server
-│   │   └── echo.rs           # Generic echo/mirror server
-│   ├── common/                # Shared test utilities
-│   │   ├── mod.rs
-│   │   └── assertions.rs     # Custom assertion helpers
-│   ├── http_basic.rs          # HTTP GET/POST/PUT/DELETE/HEAD
-│   ├── http_headers.rs        # Header handling, encoding
-│   ├── http_redirect.rs       # Redirect following (3xx)
-│   ├── http_auth.rs           # Authentication mechanisms
-│   ├── http_proxy.rs          # Proxy tunneling
-│   ├── http_cookies.rs        # Cookie engine
-│   ├── http_tls.rs            # TLS/HTTPS behavior
-│   ├── http_upload.rs         # POST bodies, multipart, PUT
-│   ├── http_download.rs       # Large transfers, resume, range
-│   ├── http_h2.rs             # HTTP/2 specific
-│   ├── http_encoding.rs       # Content-Encoding (gzip, br, zstd)
-│   ├── connection_pool.rs     # Connection reuse
-│   ├── dns.rs                 # DNS resolution behavior
-│   ├── url_parsing.rs         # URL handling edge cases
-│   ├── error_handling.rs      # Error code correctness
-│   ├── ffi_compat.rs          # libcurl C ABI compatibility
-│   └── curl_test_compat/      # Ported curl test cases
-│       ├── mod.rs
-│       └── ...                # Translated from curl's test data
-│
-└── benches/                   # Benchmarks
-    ├── throughput.rs           # Transfer throughput
-    ├── latency.rs             # Connection setup latency
-    └── concurrency.rs         # Multi-transfer performance
+│       └── src/               # main.rs, args.rs, config.rs, output.rs, progress.rs
+├── tests/                     # Integration tests, fixtures, test servers
+├── benches/                   # Criterion benchmarks (throughput, latency, concurrency)
+└── fuzz/                      # 4 cargo-fuzz harnesses (URL, HTTP, cookie, HSTS)
 ```
-
----
-
-## Implementation Phases
-
-### Phase 0: Cumulative Summary (Phases 1-39, completed 2026-03-09)
-
-Built from scratch over 39 phases. All features below are implemented and tested. ~54K lines of Rust across all crates and tests.
-
-**Core Library (liburlx) — 91 Easy methods, 14 Multi methods:**
-- **HTTP/1.x:** Full request/response codec (all methods), chunked transfer encoding with trailer header parsing, Content-Encoding decompression (gzip, deflate, brotli, zstd), redirects (301/302/303/307/308 with post301/302/303 method preservation), Expect: 100-continue, HTTP/1.0 mode, header deduplication (last wins), ignore-content-length (read to EOF), auth stripping on cross-origin redirects (unrestricted_auth option), raw mode (disable content decoding), path_as_is.
-- **HTTP/2:** Via h2 crate with ALPN negotiation. `HttpVersion` enum (None/Http10/Http11/Http2/Http3). Server push collection via `push_promises()` stream — `PushedResponse` struct with URL, status, headers, body.
-- **TLS:** rustls + tokio-rustls. `TlsConfig` with verify_peer/host, CA cert, client cert/key, version selection (TLS 1.2/1.3), certificate pinning (SHA-256 SPKI), cipher list, session cache. Inline DER parser for SPKI extraction. `TlsConnector::new_no_alpn()` for non-HTTP TLS (FTP, SMTP).
-- **Authentication:** Basic, Bearer, Digest (MD5/SHA-256 with qop=auth), AWS SigV4 (inline HMAC-SHA256), NTLM skeleton (SHA-256-based, sufficient for proxy auth testing). SASL authzid/ir options.
-- **Cookie engine:** RFC 6265 parsing, domain/path matching, Netscape file format persistence (read/write), HttpOnly, Secure, SameSite (stored). Domain-indexed jar (HashMap by domain for O(1) lookup). No public suffix list.
-- **HSTS cache:** STS parsing, HTTP→HTTPS upgrade, includeSubDomains.
-- **Proxy:** HTTP forward, HTTP CONNECT tunnel (with Digest/NTLM 407 challenge-response), HTTPS proxy tunnel (TLS-in-TLS via `connect_generic<S>`), SOCKS4/4a/5 with auth, noproxy bypass, proxy TLS config.
-- **Connection:** Pool with stale retry, TCP_NODELAY (default on), TCP keepalive (socket2), Unix domain sockets, interface/port binding, Happy Eyeballs (250ms, configurable).
-- **DNS:** Cache with configurable TTL, shuffle (inline xorshift32), custom server addresses, DoH URL config. No async resolver.
-- **FTP:** Session-based API — STOR, APPE, REST, FEAT, MKD/RMD/DELE, RNFR/RNTO, SITE, PWD/CWD, SIZE, MLSD, TYPE A/I. Explicit FTPS (AUTH TLS + PBSZ 0 + PROT P, RFC 4217), implicit FTPS (port 990). Active mode (PORT/EPRT). `FtpMethod` enum (MultiCwd/SingleCwd/NoCwd). `ftp_create_dirs` option.
-- **SSH/SFTP/SCP:** Via russh + russh-sftp (pure-Rust, async). `SshSession` with password and public key auth. SFTP download/upload/list. SCP download/upload via exec channel. Auto-discovery of `~/.ssh/id_{ed25519,rsa,ecdsa}` keys. Feature-gated behind `ssh`.
-- **HTTP/3:** Via quinn 0.11 + h3 0.0.8 + h3-quinn 0.0.10 (feature-gated `http3`). QUIC with ALPN "h3", insecure cert verifier for -k mode. Rate-limited body send/recv. Alt-Svc-based automatic HTTP/3 upgrade with port override. 0-RTT via `into_0rtt()` with fallback. No connection pooling or server push.
-- **WebSocket:** RFC 6455 with `CloseCode` enum (11 status codes), `Message` enum (Text/Binary/Close/Ping/Pong), `WebSocketStream<S>` with auto pong, close handshake, fragmented message reassembly, client/server masking modes. RSV1 bit for future permessage-deflate.
-- **Other protocols:** SMTP (with mail_from/mail_rcpt/mail_auth), IMAP, POP3, MQTT 3.1.1, DICT, TFTP, FILE.
-- **Multi API:** JoinSet-based concurrency, connection limiting (semaphore), message queue, Share interface (DNS cache + cookie jar), PipeliningMode (Nothing/Multiplex). FFI event loop: wait/poll/wakeup, fdset, socket_action, timeout, info_read, setopt, strerror.
-- **Alt-Svc:** Header parsing (RFC 7838), TTL-based cache, automatic processing in transfers.
-- **Transfer control:** Rate limiting enforced in transfer engine via `SpeedLimits` and `RateLimiter`. Max recv/send speed throttling (token bucket, 16KB chunks). Low speed enforcement aborts with `Error::SpeedLimit` after timeout.
-- **Performance:** Hot-path string allocation elimination, `eq_ignore_ascii_case` over `to_lowercase()`. Criterion benchmarks for URL parsing, cookie jar, HSTS cache, DNS cache, response headers, cookie domain matching.
-- **Response:** Status, headers, body, trailers, effective_url, TransferInfo (6 timing fields + speed/size metrics).
-
-**FFI Layer (liburlx-ffi) — 102 CURLOPT, 30 CURLINFO, 25 CURLcode, 49 functions:**
-- Functions: curl_easy_init/cleanup/duphandle/reset/setopt/perform/getinfo/strerror/escape/unescape, curl_slist_append/free_all, curl_multi_init/cleanup/add_handle/remove_handle/perform/info_read/setopt/timeout/wait/poll/wakeup/fdset/socket_action/strerror, curl_version, curl_mime_init/addpart/name/data/filename/type/free, curl_share_init/cleanup/setopt/strerror, curl_url/url_cleanup/url_dup/url_set/url_get, curl_free, curl_getdate, curl_formadd/formfree.
-- Callbacks: WRITEFUNCTION, READFUNCTION (with CURL_READFUNC_ABORT), HEADERFUNCTION, DEBUGFUNCTION, PROGRESSFUNCTION, XFERINFOFUNCTION, SEEKFUNCTION.
-- Enums: CURLSHcode (6), CURLSHoption (4), CURLUcode (10), CURLUPart (11), CURLMcode (6), CURLMSG (1), CURLMoption (8).
-- URL API: Mutable UrlHandle with component-level get/set.
-- Utility: URL percent-encoding/decoding (RFC 3986), HTTP date parsing (RFC 2822/850/asctime), curl_formadd stub (DISABLED).
-- Build: cbindgen auto-generates `include/urlx.h` (829 lines). pkg-config template. Static + dynamic library output.
-- Memory: Box<[u8]>-based slist string allocation (exact-size). catch_unwind on all FFI boundaries.
-
-**CLI (urlx) — ~120 long flags + short aliases:**
-- HTTP: -X, -H, -d, --data-raw, --data-binary, --data-urlencode, -L, --max-redirs, -I, -A, -e, -G, -F, -r, -C, --compressed, --http1.0, --http1.1, --http2, --http3, --expect100-timeout, --post301, --post302, --post303, --json, --raw, --path-as-is, --url-query.
-- Output: -o, -O, -J/--remote-header-name, -D, -i, -w, --create-dirs, -v, -s, -S, -f, -#, -R/--remote-time, --styled-output, --no-styled-output.
-- Auth: -u, --digest, --ntlm, --negotiate, --bearer, --aws-sigv4, -b, -c, --netrc, --netrc-file, --netrc-optional, --delegation, --sasl-authzid, --sasl-ir.
-- TLS/SSH: -k, --cacert, --cert, --key, --tlsv1.2, --tlsv1.3, --tls-max, --pinnedpubkey, --ciphers.
-- Proxy: -x, --noproxy, --socks5-hostname, --proxy-user, --proxy-digest, --proxy-ntlm, --proxy-header.
-- Transfer: -m, --connect-timeout, --retry/--retry-delay/--retry-max-time, --limit-rate, --speed-limit, --speed-time, -T, --unrestricted-auth, --ignore-content-length.
-- Connection: --tcp-nodelay, --tcp-keepalive, --no-keepalive, --unix-socket, --interface, --local-port, --resolve.
-- DNS: --dns-shuffle, --dns-servers, --doh-url, --happy-eyeballs-timeout-ms.
-- Concurrency: -Z, --parallel-max, --rate.
-- Debug/Config: --trace, --trace-ascii, --trace-time, --stderr, -K/--config, --libcurl, --proto, --proto-redir, --max-filesize, --hsts, --next.
-- FTP: --ftp-pasv, --ftp-ssl, --ssl, --ftp-ssl-reqd, --ssl-reqd, --ftp-port, --ftp-create-dirs, --ftp-method.
-- SMTP: --mail-from, --mail-rcpt, --mail-auth.
-- Features: .curlrc config parser, protocol restriction, max filesize (exit 63), libcurl codegen, retry (408/429/5xx), netrc, Content-Disposition filename, URL query append.
-
-**Testing — 1,933 tests (0 failures):**
-- Unit: 774 (liburlx 562, FFI 212)
-- Integration: 1,156 (hyper-based test servers, differential curl tests, error code mapping)
-- Doc tests: 3
-- Property-based: included in unit/integration counts (proptest — URL, cookie, FTP, HTTP, HSTS, multipart, protocols, WebSocket)
-- Fuzz harnesses: 4 (URL, HTTP, cookie, HSTS parsers)
-- Benchmarks: 3 (throughput, latency, concurrency via criterion)
-
-**Guardrails:** Zero TODO/FIXME/HACK. Zero `unwrap()` in production code. `#![deny(unsafe_code)]` in liburlx and urlx-cli. GitHub Actions CI (fmt, clippy, test on 3 OS, doc, cargo-deny, MSRV 1.85, commit lint). Pre-commit hooks (fmt, clippy, test, deny, doc, conventional commit).
-
-**Known gaps (as of Phase 40 review):** HTTP/3 missing connection pooling and server push. HTTP/2 missing stream priority/dependency. SSH known_hosts verification not implemented. Socket/timer callbacks stored but not actively invoked (tokio manages I/O). URL globbing not yet implemented. No async DNS resolver (hickory-dns). No cookie public suffix list. NTLM auth is skeleton only. No PAC proxy auto-config. `--rate` stored but not enforced. `--path-as-is` stored but URL crate still normalizes paths.
-
----
-
-### Phase 40: Completeness Review IV (2026-03-09)
-
-Fourth mandatory review phase. Compacted phases 30-39 into Phase 0.
-
-**Audit results (measured):**
-- 49 FFI functions, 102 CURLOPT, 30 CURLINFO, 25 CURLcode
-- 91 Easy API methods, 14 Multi methods
-- ~120 CLI long flags + short aliases
-- ~54K lines of Rust (26K liburlx, 6K FFI, 4K CLI, 18K tests)
-- 1,933 tests (0 failures)
-
-**Completeness assessment:**
-- ~92% for basic HTTP/HTTPS use cases
-- ~62% overall curl feature parity
-- FFI at ~55% (49 of ~90+ libcurl functions, 102 of ~300 CURLOPT)
-- CLI at ~48% (~120 of ~250 flags)
-
-**Key gaps for 1.0:**
-1. URL globbing (`--glob`, `{a,b,c}`, `[1-10]`)
-2. HTTP/2 stream priority/dependency
-3. HTTP/3 connection pooling
-4. Async DNS resolver (hickory-dns)
-5. Cookie public suffix list
-6. SSH known_hosts verification
-7. NTLM full crypto (MD4+DES)
-8. `--rate` enforcement in parallel mode
-9. `--path-as-is` URL normalization bypass
-10. ~130 remaining CLI flags for full curl parity
-
----
-
-### Phase 41: URL Globbing (2026-03-09)
-
-URL glob expansion module (`liburlx::glob`). `expand_glob()` parses curl-compatible patterns: `{a,b,c}` set expansion, `[1-10]` numeric range (with optional step `[1-10:2]`), `[a-z]` alpha range (with step), zero-padded numeric ranges (`[01-03]`), combined patterns (`{foo,bar}/[1-3]`). Safety cap at 100K URLs. `glob_pattern_count()` for introspection. `--globoff` flag wired in CLI to disable expansion. 26 new tests (23 unit + 3 CLI). `--next` remains a URL separator (option groups not yet implemented).
-
----
-
-### Phase 42: CLI Expansion V (2026-03-09)
-
-Added 14 CLI flags: `--connect-to` (host:port mapping stored on Easy), `--alt-svc` (Alt-Svc cache file path), `--etag-save`/`--etag-compare` (ETag conditional requests — saves/reads ETag from file, sends If-None-Match header), `--haproxy-protocol` (PROXY protocol v1 flag), `--abstract-unix-socket` (Linux abstract socket path), `--proxy-cacert`/`--proxy-cert`/`--proxy-key` (proxy TLS config), `--doh-insecure`/`--doh-cert-status` (DoH TLS options), `--proto-default` (default protocol for schemeless URLs), `--compressed-ssh` (no-op). Added 4 Easy API methods: `connect_to()`, `haproxy_protocol()`, `abstract_unix_socket()`, `doh_insecure()`. 14 new tests (4 Easy + 10 CLI).
-
----
-
-### Phase 43: HTTP/2 Config & PING Keep-Alive (completed 2026-03-09)
-
-Added `Http2Config` struct with 7 fields: `window_size`, `connection_window_size`, `max_frame_size`, `max_header_list_size`, `enable_push`, `stream_weight`, `ping_interval`. Replaced `h2::client::handshake()` with `h2::client::Builder` to apply flow control and SETTINGS configuration. Added PING keep-alive via `Connection::ping_pong()` with configurable interval. Added 7 Easy setter methods and 11 unit tests. Added `bytes` as direct dependency for `http2` feature.
-
----
-
-### Phase 44: Async DNS Resolver (completed 2026-03-09)
-
-Added `DnsResolver` enum (System/Hickory variants) and `HickoryResolver` struct with `from_system()`, `from_servers()`, `from_doh()` constructors. Wired resolver into Easy transfer engine via `build_dns_resolver()` which selects hickory-dns backend when `dns_servers` or `doh_url` is configured. Feature-gated behind `hickory-dns` feature flag. Added 7 unit tests. Boxing `HickoryResolver` in enum to avoid large variant size difference.
-
----
-
-### Phase 45: Cookie Public Suffix List (completed 2026-03-09)
-
-Added `psl` crate (v2, embedded Mozilla Public Suffix List) for cookie domain validation. `is_public_suffix()` function checks if a domain is a TLD or public suffix. Integrated into `parse_set_cookie()` — cookies with explicit `Domain` attribute set to a public suffix (e.g., "com", "co.uk", "github.io") are silently rejected. Host-only cookies (no Domain attr) unaffected. Added 11 unit tests covering TLDs, multi-level suffixes, wildcard rules, and eTLD+1 acceptance.
-
----
-
-### Phase 46: FFI Expansion III (completed 2026-03-09)
-
-Added 6 FFI functions (curl_global_init/cleanup, curl_version_info with CurlVersionInfo struct, curl_easy_pause, curl_easy_upkeep, curl_multi_assign) reaching 56 total. Added 14 CURLOPT options (CONNECT_TO, HAPROXYPROTOCOL, HTTPPOST stub, ABSTRACT_UNIX_SOCKET, DOH_SSL_VERIFY*, blob options, BUFFERSIZE, MAXLIFETIME_CONN, FILETIME). Added 13 CURLINFO codes (microsecond _T timing variants, REDIRECT_TIME, RETRY_AFTER, SIZE/SPEED _T). Added 7 CURLcode values (FILESIZE_EXCEEDED, TOO_MANY_REDIRECTS, HTTP3, PARTIAL_FILE, RANGE_ERROR, AGAIN, UNRECOVERABLE_POLL). Fixed proptest cookie domain to avoid PSL-rejected domains. 15 new tests.
-
----
-
-### Phase 47: CLI Expansion VI (completed 2026-03-09)
-
-Added 30+ CLI flags reaching ~150 total. New flags: `--form-string`, `--request-target`, `--socks4`/`--socks4a`/`--socks5`, `--proxy-1.0`, `--tftp-blksize`/`--tftp-no-options`, `--url`, `--output-dir`, `--remove-on-error`, `--proxy-insecure`, `--tlsv1`/`--tlsv1.0`/`--tlsv1.1`/`--sslv3`, `-N`/`--no-buffer`, `--no-sessionid`, `--no-alpn`, `--no-npn`, `--cert-status`, `--false-start`, `--disable-eprt`/`--disable-epsv`, `--create-file-mode`, plus 8 no-op argument-taking flags. Wired `custom_request_target` into all HTTP request paths. Added TFTP block size negotiation (RFC 2348) with OACK handling. Connected TFTP protocol to Easy transfer dispatch.
-
----
-
-### Phase 48: SSH Known Hosts & Security Hardening
-
-**Goal:** SSH host verification and security improvements.
-
-- `--hostpubsha256` (SSH host key fingerprint verification)
-- Known hosts file parsing and validation
-- Strict host key checking modes
-- Key exchange algorithm selection
-
----
-
-### Phase 49: Performance & Optimization II
-
-**Goal:** Profiling and optimization pass.
-
-- Throughput benchmarks vs curl
-- Connection setup latency profiling
-- Memory allocation analysis
-- Zero-copy improvements
-- Connection pool warming strategies
-- Parallel transfer optimization
-
----
-
-### Phase 50: Completeness Review V (mandatory review)
-
-**Goal:** Fifth mandatory review. Assess progress toward 1.0.
-
-- Compact phases 41-49 into Phase 0
-- Comprehensive differential testing against curl
-- FFI/CLI coverage audit
-- API stability assessment
-- Plan phases 51-60 or 1.0 release
 
 ---
 
@@ -452,31 +131,6 @@ Added 30+ CLI flags reaching ~150 total. New flags: `--form-string`, `--request-
 - Error types must be non-exhaustive (`#[non_exhaustive]`) to allow future additions.
 - Never panic. Never `unwrap()` in library code. The `unwrap_used` clippy lint is denied.
 - In test code, `unwrap()` and `expect()` are fine.
-
-```rust
-#[derive(Debug, thiserror::Error)]
-#[non_exhaustive]
-pub enum Error {
-    #[error("URL parse error: {0}")]
-    UrlParse(#[from] url::ParseError),
-
-    #[error("connection failed: {0}")]
-    Connect(#[source] std::io::Error),
-
-    #[error("TLS handshake failed: {0}")]
-    Tls(#[source] Box<dyn std::error::Error + Send + Sync>),
-
-    #[error("HTTP protocol error: {0}")]
-    Http(String),
-
-    #[error("timeout after {0:?}")]
-    Timeout(std::time::Duration),
-
-    // Maps to CURLcode for FFI
-    #[error("transfer error (code {code}): {message}")]
-    Transfer { code: u32, message: String },
-}
-```
 
 ### Naming Conventions
 
@@ -496,65 +150,11 @@ pub enum Error {
 
 ### Async Architecture
 
-The core is async (tokio). The Easy API provides a sync wrapper:
-
-```rust
-// Internal: async core
-pub(crate) async fn perform_transfer(opts: &TransferOptions) -> Result<Response> {
-    // ...async implementation...
-}
-
-// Public: blocking Easy API (wraps async)
-impl Easy {
-    pub fn perform(&mut self) -> Result<Response> {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
-        rt.block_on(perform_transfer(&self.options))
-    }
-}
-
-// Public: async Multi API (native)
-impl Multi {
-    pub async fn perform(&mut self) -> Result<Vec<Response>> {
-        // ...direct async...
-    }
-}
-```
+The core is async (tokio). The Easy API provides a sync wrapper via `tokio::runtime::Builder::new_current_thread()`. The Multi API is native async.
 
 ### Feature Flags
 
-In `crates/liburlx/Cargo.toml`:
-
-```toml
-[features]
-default = ["http", "rustls", "cookies", "decompression"]
-
-# Protocols
-http = []
-http2 = ["dep:h2"]
-http3 = ["dep:quinn"]
-ftp = []
-mqtt = []
-ws = []              # WebSocket
-smtp = []
-imap = []
-pop3 = []
-sftp = ["dep:ssh2"]
-file = []
-ldap = ["dep:ldap3"]
-
-# TLS
-rustls = ["dep:rustls", "dep:webpki-roots"]
-native-tls = ["dep:native-tls"]
-
-# Features
-cookies = []
-decompression = ["dep:flate2", "dep:brotli", "dep:zstd"]
-hsts = []
-dns-over-https = []
-socks = []
-```
+Default features: `http`, `rustls`, `cookies`, `decompression`. Optional: `http2`, `http3`, `ftp`, `mqtt`, `ws`, `smtp`, `imap`, `pop3`, `ssh`, `file`, `hsts`, `dns-over-https`, `socks`, `hickory-dns`, `native-tls`.
 
 ---
 
@@ -569,25 +169,11 @@ socks = []
 
 ### Test Categories
 
-#### Unit Tests (in-crate `#[cfg(test)]` modules)
-
-Every public function, every struct method, every non-trivial private function. Located alongside the code in each crate. Run with `cargo test --lib`.
-
-#### Integration Tests (`tests/` directory)
-
-Test the library through its public API against real servers. Each test file focuses on one behavioral area. Run with `cargo test --test '*'`. Test servers written in Rust (using `hyper`, `tokio`) run on random ports.
-
-#### Property-Based Tests
-
-Use `proptest` for parser correctness (URL, cookie, HSTS, WebSocket, FTP, multipart).
-
-#### Fuzz Harnesses
-
-4 cargo-fuzz harnesses (URL, HTTP, cookie, HSTS parsers) in `fuzz/`.
-
-#### FFI Tests
-
-C-language test programs linking against liburlx-ffi to verify ABI compatibility.
+- **Unit tests:** In-crate `#[cfg(test)]` modules. Run with `cargo test --lib`.
+- **Integration tests:** `tests/` directory, against real servers (hyper/tokio on random ports). Run with `cargo test --test '*'`.
+- **Property-based:** `proptest` for parser correctness (URL, cookie, HSTS, WebSocket, FTP, multipart).
+- **Fuzz harnesses:** 4 cargo-fuzz harnesses in `fuzz/`.
+- **FFI tests:** C-language test programs linking against liburlx-ffi.
 
 ### Coverage Requirements
 

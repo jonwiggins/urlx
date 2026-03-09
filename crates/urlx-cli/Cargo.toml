@@ -5,6 +5,10 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords = ["cli", "curl", "http", "transfer"]
+categories = ["command-line-utilities", "network-programming"]
 
 [[bin]]
 name = "urlx"

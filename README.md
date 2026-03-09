@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/jonwiggins/urlx/actions/workflows/ci.yml/badge.svg)](https://github.com/jonwiggins/urlx/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![MSRV](https://img.shields.io/badge/MSRV-1.83-orange.svg)](https://blog.rust-lang.org/2024/11/28/Rust-1.83.0.html)
+[![MSRV](https://img.shields.io/badge/MSRV-1.85-orange.svg)](https://blog.rust-lang.org/2025/02/20/Rust-1.85.0.html)
 
 A memory-safe Rust reimplementation of **curl** and **libcurl**.
 
@@ -147,7 +147,7 @@ int main(void) {
 # Build everything
 cargo build --workspace
 
-# Run the full test suite (1,768 tests)
+# Run the full test suite (2,282 tests)
 cargo test --workspace
 
 # Build the CLI in release mode
