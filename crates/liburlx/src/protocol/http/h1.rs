@@ -51,6 +51,7 @@ pub async fn request<S>(
     keep_alive: bool,
     use_http10: bool,
     expect_100_timeout: Option<Duration>,
+    ignore_content_length: bool,
 ) -> Result<(Response, bool), Error>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -70,15 +71,33 @@ where
         req.push_str("Accept: */*\r\n");
     }
 
-    // Add custom headers
-    for (name, value) in custom_headers {
-        let _ = write!(req, "{name}: {value}\r\n");
+    // Add custom headers (deduplicate: last header with same name wins)
+    {
+        let mut seen: Vec<String> = Vec::new();
+        let mut keep = vec![true; custom_headers.len()];
+        for i in (0..custom_headers.len()).rev() {
+            let name_lower = custom_headers[i].0.to_lowercase();
+            if seen.iter().any(|s| s.eq_ignore_ascii_case(&name_lower)) {
+                keep[i] = false;
+            } else {
+                seen.push(name_lower);
+            }
+        }
+        for (i, (name, value)) in custom_headers.iter().enumerate() {
+            if keep[i] {
+                let _ = write!(req, "{name}: {value}\r\n");
+            }
+        }
     }
 
-    // Add Content-Length for bodies
+    // Add Content-Length for bodies (only if not set by custom headers)
+    let has_content_length =
+        custom_headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("content-length"));
     let use_expect = expect_100_timeout.is_some() && body.is_some_and(|b| !b.is_empty());
     if let Some(body_data) = body {
-        let _ = write!(req, "Content-Length: {}\r\n", body_data.len());
+        if !has_content_length {
+            let _ = write!(req, "Content-Length: {}\r\n", body_data.len());
+        }
     }
     if use_expect {
         req.push_str("Expect: 100-continue\r\n");
@@ -125,8 +144,14 @@ where
                     let (response_body, body_read_to_eof) = if no_body {
                         (Vec::new(), false)
                     } else {
-                        read_body_from_headers(stream, &final_headers, body_prefix, keep_alive)
-                            .await?
+                        read_body_from_headers(
+                            stream,
+                            &final_headers,
+                            body_prefix,
+                            keep_alive,
+                            ignore_content_length,
+                        )
+                        .await?
                     };
                     let server_wants_close = final_headers
                         .get("connection")
@@ -186,7 +211,14 @@ where
     let (response_body, body_read_to_eof) = if no_body {
         (Vec::new(), false)
     } else {
-        read_body_from_headers(stream, &headers, body_prefix, keep_alive && !use_http10).await?
+        read_body_from_headers(
+            stream,
+            &headers,
+            body_prefix,
+            keep_alive && !use_http10,
+            ignore_content_length,
+        )
+        .await?
     };
 
     // Determine if connection can be reused
@@ -368,6 +400,7 @@ async fn read_body_from_headers<S>(
     headers: &HashMap<String, String>,
     body_prefix: Vec<u8>,
     keep_alive: bool,
+    ignore_content_length: bool,
 ) -> Result<(Vec<u8>, bool), Error>
 where
     S: AsyncRead + Unpin,
@@ -378,16 +411,17 @@ where
     if is_chunked {
         let body = read_chunked_body_streaming(stream, body_prefix).await?;
         Ok((body, false))
-    } else if let Some(cl) = headers.get("content-length") {
+    } else if !ignore_content_length && headers.contains_key("content-length") {
+        let cl = &headers["content-length"];
         let content_length: usize =
             cl.parse().map_err(|e| Error::Http(format!("invalid Content-Length: {e}")))?;
         let body = read_exact_body(stream, content_length, body_prefix).await?;
         Ok((body, false))
-    } else if keep_alive {
+    } else if keep_alive && !ignore_content_length {
         // No Content-Length, no chunked, but keep-alive → assume empty body
         Ok((body_prefix, false))
     } else {
-        // No Content-Length, no chunked, connection close → read until EOF
+        // No Content-Length (or ignoring it), connection close → read until EOF
         let mut body = body_prefix;
         match stream.read_to_end(&mut body).await {
             Ok(_) => {}
@@ -758,6 +792,7 @@ mod tests {
             false,
             false,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -797,6 +832,7 @@ mod tests {
             false,
             false,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -840,6 +876,7 @@ mod tests {
             false,
             false,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -878,6 +915,7 @@ mod tests {
             true,
             false,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -917,6 +955,7 @@ mod tests {
             true,
             false,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -957,6 +996,7 @@ mod tests {
             true, // keep_alive requested
             true, // use_http10
             None,
+            false,
         )
         .await
         .unwrap();
@@ -1008,6 +1048,7 @@ mod tests {
             false,
             false,
             Some(Duration::from_secs(5)),
+            false,
         )
         .await
         .unwrap();
@@ -1045,6 +1086,7 @@ mod tests {
             false,
             false,
             Some(Duration::from_secs(5)),
+            false,
         )
         .await
         .unwrap();
@@ -1087,12 +1129,138 @@ mod tests {
             false,
             false,
             None,
+            false,
         )
         .await
         .unwrap();
 
         assert_eq!(resp.status(), 200);
         assert_eq!(resp.body_str().unwrap(), "done");
+
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn request_header_deduplication_last_wins() {
+        use tokio::io::duplex;
+
+        let (mut client, mut server) = duplex(4096);
+
+        let server_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            let n = server.read(&mut buf).await.unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]);
+            // The last X-Custom header should win
+            assert!(req.contains("X-Custom: second"), "expected last value: {req}");
+            // First duplicate should be removed
+            assert!(!req.contains("X-Custom: first"), "first duplicate should be gone: {req}");
+            let response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+            server.write_all(response).await.unwrap();
+            server.shutdown().await.unwrap();
+        });
+
+        let headers = vec![
+            ("X-Custom".to_string(), "first".to_string()),
+            ("X-Custom".to_string(), "second".to_string()),
+        ];
+
+        let (resp, _) = request(
+            &mut client,
+            "GET",
+            "example.com",
+            "/test",
+            &headers,
+            None,
+            "http://example.com/test",
+            false,
+            false,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 200);
+
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn request_user_content_length_not_duplicated() {
+        use tokio::io::duplex;
+
+        let (mut client, mut server) = duplex(4096);
+
+        let server_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            let n = server.read(&mut buf).await.unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]);
+            // Count Content-Length occurrences
+            let count = req.matches("Content-Length").count();
+            assert_eq!(count, 1, "should only have one Content-Length: {req}");
+            assert!(
+                req.contains("Content-Length: 99"),
+                "user Content-Length should be used: {req}"
+            );
+            let response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+            server.write_all(response).await.unwrap();
+            server.shutdown().await.unwrap();
+        });
+
+        let headers = vec![("Content-Length".to_string(), "99".to_string())];
+
+        let (resp, _) = request(
+            &mut client,
+            "POST",
+            "example.com",
+            "/test",
+            &headers,
+            Some(b"hello"),
+            "http://example.com/test",
+            false,
+            false,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 200);
+
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn request_ignore_content_length_reads_to_eof() {
+        use tokio::io::duplex;
+
+        let (mut client, mut server) = duplex(4096);
+
+        let server_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            let _n = server.read(&mut buf).await.unwrap();
+            // Send Content-Length: 5 but actually send 11 bytes, then close
+            let response =
+                b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello world";
+            server.write_all(response).await.unwrap();
+            server.shutdown().await.unwrap();
+        });
+
+        let (resp, _) = request(
+            &mut client,
+            "GET",
+            "example.com",
+            "/test",
+            &[],
+            None,
+            "http://example.com/test",
+            false,
+            false,
+            None,
+            true, // ignore_content_length
+        )
+        .await
+        .unwrap();
+        // Should read all 11 bytes because Content-Length is ignored
+        assert_eq!(resp.body_str().unwrap(), "hello world");
 
         server_task.await.unwrap();
     }

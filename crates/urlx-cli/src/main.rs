@@ -91,6 +91,8 @@ fn print_usage() {
     eprintln!("      --interface <name>    Use network interface/address for outgoing connections");
     eprintln!("      --local-port <port>   Bind to local port for outgoing connections");
     eprintln!("      --dns-shuffle         Randomize DNS resolution order");
+    eprintln!("      --unrestricted-auth   Keep auth on cross-origin redirects");
+    eprintln!("      --ignore-content-length  Ignore Content-Length in responses");
     eprintln!("      --dns-servers <addrs> Use custom DNS servers (comma-separated IP:port)");
     eprintln!("      --doh-url <url>       DNS-over-HTTPS URL");
     eprintln!("      --happy-eyeballs-timeout-ms <ms>  Happy Eyeballs timeout (milliseconds)");
@@ -438,6 +440,12 @@ fn parse_args(args: &[String]) -> Option<CliOptions> {
             }
             "--dns-shuffle" => {
                 opts.easy.dns_shuffle(true);
+            }
+            "--unrestricted-auth" => {
+                opts.easy.unrestricted_auth(true);
+            }
+            "--ignore-content-length" => {
+                opts.easy.ignore_content_length(true);
             }
             "--dns-servers" => {
                 i += 1;
@@ -2267,5 +2275,20 @@ mod tests {
             "http://example.com".into(),
         ];
         assert!(parse_args(&args).is_none());
+    }
+
+    #[test]
+    fn parse_args_unrestricted_auth() {
+        let args = vec!["urlx".into(), "--unrestricted-auth".into(), "http://example.com".into()];
+        let opts = parse_args(&args).unwrap();
+        assert_eq!(opts.urls, vec!["http://example.com"]);
+    }
+
+    #[test]
+    fn parse_args_ignore_content_length() {
+        let args =
+            vec!["urlx".into(), "--ignore-content-length".into(), "http://example.com".into()];
+        let opts = parse_args(&args).unwrap();
+        assert_eq!(opts.urls, vec!["http://example.com"]);
     }
 }

@@ -112,6 +112,8 @@ pub enum CURLoption {
     CURLOPT_CONNECTTIMEOUT_MS = 156,
     CURLOPT_DNS_CACHE_TIMEOUT = 92,
     CURLOPT_HAPPY_EYEBALLS_TIMEOUT_MS = 271,
+    CURLOPT_UNRESTRICTED_AUTH = 105,
+    CURLOPT_IGNORE_CONTENT_LENGTH = 136,
     CURLOPT_TCP_KEEPALIVE = 213,
     CURLOPT_SSL_SESSIONID_CACHE = 150,
 
@@ -1000,6 +1002,18 @@ pub unsafe extern "C" fn curl_easy_setopt(
             if let Some(s) = unsafe { read_cstr(value) } {
                 h.easy.doh_url(s);
             }
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_UNRESTRICTED_AUTH = 105
+        105 => {
+            h.easy.unrestricted_auth(value as c_long != 0);
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_IGNORE_CONTENT_LENGTH = 136
+        136 => {
+            h.easy.ignore_content_length(value as c_long != 0);
             CURLcode::CURLE_OK
         }
 
@@ -2381,6 +2395,24 @@ mod tests {
         // CURLOPT_DOH_URL = 10279
         let url = c"https://dns.google/dns-query";
         let code = unsafe { curl_easy_setopt(handle, 10279, url.as_ptr().cast::<c_void>()) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_unrestricted_auth() {
+        let handle = curl_easy_init();
+        // CURLOPT_UNRESTRICTED_AUTH = 105
+        let code = unsafe { curl_easy_setopt(handle, 105, 1usize as *const c_void) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_ignore_content_length() {
+        let handle = curl_easy_init();
+        // CURLOPT_IGNORE_CONTENT_LENGTH = 136
+        let code = unsafe { curl_easy_setopt(handle, 136, 1usize as *const c_void) };
         assert_eq!(code, CURLcode::CURLE_OK);
         unsafe { curl_easy_cleanup(handle) };
     }

@@ -90,6 +90,8 @@ pub struct Easy {
     dns_cache_timeout: Option<Duration>,
     dns_servers: Option<Vec<std::net::SocketAddr>>,
     doh_url: Option<String>,
+    unrestricted_auth: bool,
+    ignore_content_length: bool,
 }
 
 impl std::fmt::Debug for Easy {
@@ -146,6 +148,8 @@ impl std::fmt::Debug for Easy {
             .field("dns_cache_timeout", &self.dns_cache_timeout)
             .field("dns_servers", &self.dns_servers)
             .field("doh_url", &self.doh_url)
+            .field("unrestricted_auth", &self.unrestricted_auth)
+            .field("ignore_content_length", &self.ignore_content_length)
             .finish()
     }
 }
@@ -201,6 +205,8 @@ impl Clone for Easy {
             dns_cache_timeout: self.dns_cache_timeout,
             dns_servers: self.dns_servers.clone(),
             doh_url: self.doh_url.clone(),
+            unrestricted_auth: self.unrestricted_auth,
+            ignore_content_length: self.ignore_content_length,
         }
     }
 }
@@ -258,6 +264,8 @@ impl Easy {
             dns_cache_timeout: None,
             dns_servers: None,
             doh_url: None,
+            unrestricted_auth: false,
+            ignore_content_length: false,
         }
     }
 
@@ -849,6 +857,24 @@ impl Easy {
         self.doh_url = Some(url.to_string());
     }
 
+    /// Allow auth credentials to be sent to all hosts during redirects.
+    ///
+    /// By default, auth credentials are stripped when a redirect crosses to
+    /// a different host. Setting this to `true` keeps them on all redirects.
+    /// Equivalent to `CURLOPT_UNRESTRICTED_AUTH`.
+    pub fn unrestricted_auth(&mut self, enable: bool) {
+        self.unrestricted_auth = enable;
+    }
+
+    /// Ignore the Content-Length header in responses.
+    ///
+    /// When enabled, the response body is read until EOF rather than
+    /// using the Content-Length header to determine body size.
+    /// Equivalent to `CURLOPT_IGNORE_CONTENT_LENGTH`.
+    pub fn ignore_content_length(&mut self, enable: bool) {
+        self.ignore_content_length = enable;
+    }
+
     /// Connect via a Unix domain socket instead of TCP.
     ///
     /// When set, all connections go through the specified Unix socket path.
@@ -1101,6 +1127,8 @@ impl Easy {
             self.http_version,
             self.expect_100_timeout,
             self.happy_eyeballs_timeout,
+            self.unrestricted_auth,
+            self.ignore_content_length,
         );
 
         // Apply total transfer timeout if set
@@ -1191,8 +1219,11 @@ async fn perform_transfer(
     http_version: HttpVersion,
     expect_100_timeout: Option<Duration>,
     happy_eyeballs_timeout: Option<Duration>,
+    unrestricted_auth: bool,
+    ignore_content_length: bool,
 ) -> Result<Response, Error> {
     let transfer_start = Instant::now();
+    let original_url = url.clone();
     let mut current_url = url.clone();
     let mut current_method = method.unwrap_or("GET").to_string();
     let mut current_body = body.map(<[u8]>::to_vec);
@@ -1202,8 +1233,15 @@ async fn perform_transfer(
         // Determine effective proxy for this URL
         let effective_proxy = proxy.filter(|_| !should_bypass_proxy(&current_url, noproxy));
 
-        // Build headers with cookies if cookie jar is enabled
+        // Build headers, stripping auth on cross-origin redirects unless unrestricted
         let mut request_headers = headers.to_vec();
+        if redirects_followed > 0 && !unrestricted_auth {
+            let orig_host = original_url.host_str().unwrap_or("");
+            let cur_host = current_url.host_str().unwrap_or("");
+            if !orig_host.eq_ignore_ascii_case(cur_host) {
+                request_headers.retain(|(k, _)| !k.eq_ignore_ascii_case("authorization"));
+            }
+        }
         if let Some(ref jar) = cookie_jar {
             let host = current_url.host_str().unwrap_or("");
             let path = current_url.path();
@@ -1239,6 +1277,7 @@ async fn perform_transfer(
             http_version,
             expect_100_timeout,
             happy_eyeballs_timeout,
+            ignore_content_length,
         )
         .await?;
 
@@ -1296,6 +1335,7 @@ async fn perform_transfer(
                                 http_version,
                                 expect_100_timeout,
                                 happy_eyeballs_timeout,
+                                ignore_content_length,
                             )
                             .await?;
                         }
@@ -1407,6 +1447,7 @@ async fn do_single_request(
     http_version: HttpVersion,
     expect_100_timeout: Option<Duration>,
     happy_eyeballs_timeout: Option<Duration>,
+    ignore_content_length: bool,
 ) -> Result<Response, Error> {
     // Handle non-HTTP schemes directly
     match url.scheme() {
@@ -1459,6 +1500,7 @@ async fn do_single_request(
                 true,
                 use_http10,
                 expect_100_timeout,
+                ignore_content_length,
             )
             .await;
 
@@ -1542,6 +1584,7 @@ async fn do_single_request(
             false, // Don't pool Unix socket connections
             use_http10,
             expect_100_timeout,
+            ignore_content_length,
         )
         .await?;
         let time_starttransfer = request_start.elapsed();
@@ -1735,6 +1778,7 @@ async fn do_single_request(
                     use_pool,
                     use_http10,
                     expect_100_timeout,
+                    ignore_content_length,
                 )
                 .await?;
                 let time_starttransfer = request_start.elapsed();
@@ -1780,6 +1824,7 @@ async fn do_single_request(
                 use_pool,
                 use_http10,
                 expect_100_timeout,
+                ignore_content_length,
             )
             .await?;
             let time_starttransfer = request_start.elapsed();
@@ -3146,5 +3191,47 @@ mod tests {
         easy.doh_url("https://dns.cloudflare.com/dns-query");
         let cloned = easy.clone();
         assert_eq!(cloned.doh_url.as_deref(), Some("https://dns.cloudflare.com/dns-query"));
+    }
+
+    #[test]
+    fn easy_unrestricted_auth_default_false() {
+        let easy = Easy::new();
+        assert!(!easy.unrestricted_auth);
+    }
+
+    #[test]
+    fn easy_unrestricted_auth_set() {
+        let mut easy = Easy::new();
+        easy.unrestricted_auth(true);
+        assert!(easy.unrestricted_auth);
+    }
+
+    #[test]
+    fn easy_unrestricted_auth_cloned() {
+        let mut easy = Easy::new();
+        easy.unrestricted_auth(true);
+        let cloned = easy.clone();
+        assert!(cloned.unrestricted_auth);
+    }
+
+    #[test]
+    fn easy_ignore_content_length_default_false() {
+        let easy = Easy::new();
+        assert!(!easy.ignore_content_length);
+    }
+
+    #[test]
+    fn easy_ignore_content_length_set() {
+        let mut easy = Easy::new();
+        easy.ignore_content_length(true);
+        assert!(easy.ignore_content_length);
+    }
+
+    #[test]
+    fn easy_ignore_content_length_cloned() {
+        let mut easy = Easy::new();
+        easy.ignore_content_length(true);
+        let cloned = easy.clone();
+        assert!(cloned.ignore_content_length);
     }
 }
