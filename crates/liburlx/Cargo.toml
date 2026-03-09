@@ -19,6 +19,9 @@ http2 = ["dep:h2"]
 # TLS backends
 rustls = ["dep:rustls", "dep:webpki-roots", "dep:tokio-rustls"]
 
+# SSH/SFTP/SCP protocols
+ssh = ["dep:russh", "dep:russh-sftp"]
+
 # Content-Encoding decompression
 decompression = ["dep:flate2", "dep:brotli", "dep:zstd"]
 
@@ -37,6 +40,8 @@ httparse = "1"
 rustls = { version = "0.23", optional = true, default-features = false, features = ["std", "tls12", "ring"] }
 webpki-roots = { version = "1", optional = true }
 tokio-rustls = { version = "0.26", optional = true, default-features = false, features = ["ring", "tls12"] }
+russh = { version = "0.57", optional = true, default-features = false, features = ["ring"] }
+russh-sftp = { version = "2.1", optional = true }
 flate2 = { version = "1", optional = true }
 brotli = { version = "7", optional = true }
 zstd = { version = "0.13", optional = true, default-features = false }

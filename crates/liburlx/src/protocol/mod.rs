@@ -11,5 +11,7 @@ pub mod imap;
 pub mod mqtt;
 pub mod pop3;
 pub mod smtp;
+#[cfg(feature = "ssh")]
+pub mod ssh;
 pub mod tftp;
 pub mod ws;

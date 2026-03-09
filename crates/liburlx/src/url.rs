@@ -55,6 +55,7 @@ impl Url {
     pub fn port_or_default(&self) -> Option<u16> {
         self.inner.port_or_known_default().or_else(|| match self.inner.scheme() {
             "ftps" => Some(990),
+            "sftp" | "scp" | "ssh" => Some(22),
             _ => None,
         })
     }
@@ -414,5 +415,34 @@ mod tests {
         // Port 0 is technically valid in a URL (means auto-assign)
         let url = Url::parse("http://example.com:0/").unwrap();
         assert_eq!(url.port(), Some(0));
+    }
+
+    #[test]
+    fn parse_sftp_scheme() {
+        let url = Url::parse("sftp://user@host.example.com/path/file.txt").unwrap();
+        assert_eq!(url.scheme(), "sftp");
+        assert_eq!(url.host_str(), Some("host.example.com"));
+        assert_eq!(url.path(), "/path/file.txt");
+        assert_eq!(url.port_or_default(), Some(22));
+        assert_eq!(url.username(), "user");
+    }
+
+    #[test]
+    fn parse_scp_scheme() {
+        let url = Url::parse("scp://user:pass@host.example.com/remote/file").unwrap();
+        assert_eq!(url.scheme(), "scp");
+        assert_eq!(url.host_str(), Some("host.example.com"));
+        assert_eq!(url.path(), "/remote/file");
+        assert_eq!(url.port_or_default(), Some(22));
+        let (user, pass) = url.credentials().unwrap();
+        assert_eq!(user, "user");
+        assert_eq!(pass, "pass");
+    }
+
+    #[test]
+    fn parse_sftp_custom_port() {
+        let url = Url::parse("sftp://user@host.example.com:2222/file.txt").unwrap();
+        assert_eq!(url.port(), Some(2222));
+        assert_eq!(url.port_or_default(), Some(2222));
     }
 }

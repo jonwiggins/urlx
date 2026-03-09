@@ -96,7 +96,7 @@ fn print_usage() {
     eprintln!("  -k, --insecure            Allow insecure TLS connections");
     eprintln!("      --cacert <file>       CA certificate bundle (PEM format)");
     eprintln!("      --cert <file>         Client certificate (PEM format)");
-    eprintln!("      --key <file>          Client private key (PEM format)");
+    eprintln!("      --key <file>          Client private key (PEM/SSH format)");
     eprintln!("      --digest              Use HTTP Digest authentication");
     eprintln!("      --proxy-user <u:p>    Proxy authentication (user:password)");
     eprintln!("      --proxy-digest        Use Digest auth with proxy");
@@ -420,6 +420,7 @@ fn parse_args(args: &[String]) -> Option<CliOptions> {
                 i += 1;
                 let val = require_arg(args, i, "--key")?;
                 opts.easy.ssl_client_key(std::path::Path::new(val));
+                opts.easy.ssh_key_path(val);
             }
             "--digest" => {
                 opts.use_digest = true;
@@ -3017,6 +3018,17 @@ mod tests {
     #[test]
     fn parse_args_ssl_reqd() {
         let args = vec!["urlx".into(), "--ssl-reqd".into(), "ftp://example.com".into()];
+        assert!(parse_args(&args).is_some());
+    }
+
+    #[test]
+    fn parse_args_key_sets_ssh_key_path() {
+        let args = vec![
+            "urlx".into(),
+            "--key".into(),
+            "/home/user/.ssh/id_ed25519".into(),
+            "sftp://example.com/file".into(),
+        ];
         assert!(parse_args(&args).is_some());
     }
 

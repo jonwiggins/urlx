@@ -108,6 +108,8 @@ pub struct Easy {
     ftp_ssl_mode: crate::protocol::ftp::FtpSslMode,
     /// FTP active mode address (None = passive mode).
     ftp_active_port: Option<String>,
+    /// Path to SSH private key for SFTP/SCP authentication.
+    ssh_key_path: Option<String>,
 }
 
 impl std::fmt::Debug for Easy {
@@ -173,6 +175,7 @@ impl std::fmt::Debug for Easy {
             .field("proxy_headers", &self.proxy_headers)
             .field("ftp_ssl_mode", &self.ftp_ssl_mode)
             .field("ftp_active_port", &self.ftp_active_port)
+            .field("ssh_key_path", &self.ssh_key_path)
             .finish()
     }
 }
@@ -237,6 +240,7 @@ impl Clone for Easy {
             proxy_headers: self.proxy_headers.clone(),
             ftp_ssl_mode: self.ftp_ssl_mode,
             ftp_active_port: self.ftp_active_port.clone(),
+            ssh_key_path: self.ssh_key_path.clone(),
         }
     }
 }
@@ -303,6 +307,7 @@ impl Easy {
             proxy_headers: Vec::new(),
             ftp_ssl_mode: crate::protocol::ftp::FtpSslMode::None,
             ftp_active_port: None,
+            ssh_key_path: None,
         }
     }
 
@@ -1069,6 +1074,16 @@ impl Easy {
         self.ftp_active_port = Some(addr.to_string());
     }
 
+    /// Set the path to an SSH private key for SFTP/SCP authentication.
+    ///
+    /// When set, public key authentication is used instead of password.
+    /// Supports OpenSSH key formats (ed25519, RSA, ECDSA).
+    ///
+    /// Equivalent to curl's `--key`.
+    pub fn ssh_key_path(&mut self, path: &str) {
+        self.ssh_key_path = Some(path.to_string());
+    }
+
     /// Perform the transfer and return the response (blocking).
     ///
     /// Creates a new tokio runtime internally. Do not call from within
@@ -1234,6 +1249,7 @@ impl Easy {
             self.post302,
             self.post303,
             self.ftp_ssl_mode,
+            self.ssh_key_path.as_deref(),
         );
 
         // Apply total transfer timeout if set.
@@ -1334,6 +1350,7 @@ async fn perform_transfer(
     post302: bool,
     post303: bool,
     ftp_ssl_mode: crate::protocol::ftp::FtpSslMode,
+    ssh_key_path: Option<&str>,
 ) -> Result<Response, Error> {
     let transfer_start = Instant::now();
     let original_url = url.clone();
@@ -1393,6 +1410,7 @@ async fn perform_transfer(
             ignore_content_length,
             speed_limits,
             ftp_ssl_mode,
+            ssh_key_path,
         ))
         .await?;
 
@@ -1453,6 +1471,7 @@ async fn perform_transfer(
                                 ignore_content_length,
                                 speed_limits,
                                 ftp_ssl_mode,
+                                ssh_key_path,
                             ))
                             .await?;
                         }
@@ -1589,10 +1608,20 @@ async fn do_single_request(
     ignore_content_length: bool,
     speed_limits: &SpeedLimits,
     ftp_ssl_mode: crate::protocol::ftp::FtpSslMode,
+    #[cfg_attr(not(feature = "ssh"), allow(unused_variables))] ssh_key_path: Option<&str>,
 ) -> Result<Response, Error> {
     // Handle non-HTTP schemes directly
     match url.scheme() {
         "file" => return crate::protocol::file::read_file(url),
+        #[cfg(feature = "ssh")]
+        "sftp" | "scp" => {
+            return if method == "PUT" {
+                let upload_data = body.unwrap_or(&[]);
+                crate::protocol::ssh::upload(url, upload_data, ssh_key_path).await
+            } else {
+                crate::protocol::ssh::download(url, ssh_key_path).await
+            };
+        }
         "ftp" | "ftps" => {
             // Determine effective SSL mode: ftps:// always uses implicit TLS
             let effective_ssl_mode = if url.scheme() == "ftps" {
@@ -3497,5 +3526,26 @@ mod tests {
         easy.ftp_active_port("10.0.0.1");
         let cloned = easy.clone();
         assert_eq!(cloned.ftp_active_port.as_deref(), Some("10.0.0.1"));
+    }
+
+    #[test]
+    fn easy_ssh_key_path_default() {
+        let easy = Easy::new();
+        assert!(easy.ssh_key_path.is_none());
+    }
+
+    #[test]
+    fn easy_ssh_key_path_set() {
+        let mut easy = Easy::new();
+        easy.ssh_key_path("/home/user/.ssh/id_ed25519");
+        assert_eq!(easy.ssh_key_path.as_deref(), Some("/home/user/.ssh/id_ed25519"));
+    }
+
+    #[test]
+    fn easy_ssh_key_path_cloned() {
+        let mut easy = Easy::new();
+        easy.ssh_key_path("/home/user/.ssh/id_rsa");
+        let cloned = easy.clone();
+        assert_eq!(cloned.ssh_key_path.as_deref(), Some("/home/user/.ssh/id_rsa"));
     }
 }

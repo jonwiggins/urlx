@@ -53,6 +53,10 @@ pub enum Error {
         /// How long the speed has been below the limit.
         duration: Duration,
     },
+
+    /// An SSH protocol error occurred.
+    #[error("SSH error: {0}")]
+    Ssh(String),
 }
 
 #[cfg(test)]
@@ -89,6 +93,12 @@ mod tests {
     fn error_display_speed_limit() {
         let err = Error::SpeedLimit { speed: 50, limit: 100, duration: Duration::from_secs(10) };
         assert_eq!(err.to_string(), "transfer speed 50 B/s below limit 100 B/s for 10s");
+    }
+
+    #[test]
+    fn error_display_ssh() {
+        let err = Error::Ssh("authentication failed".to_string());
+        assert_eq!(err.to_string(), "SSH error: authentication failed");
     }
 
     #[test]
