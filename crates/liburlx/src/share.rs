@@ -43,9 +43,9 @@ pub enum ShareType {
 /// ```
 #[derive(Debug, Clone)]
 pub struct Share {
-    /// Shared DNS cache (behind Arc<Mutex> for thread-safe access).
+    /// Shared DNS cache (behind `Arc<Mutex>` for thread-safe access).
     dns_cache: Option<Arc<Mutex<DnsCache>>>,
-    /// Shared cookie jar (behind Arc<Mutex> for thread-safe access).
+    /// Shared cookie jar (behind `Arc<Mutex>` for thread-safe access).
     cookie_jar: Option<Arc<Mutex<CookieJar>>>,
 }
 
