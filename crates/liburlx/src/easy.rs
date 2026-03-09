@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use crate::auth::{AuthCredentials, AuthMethod};
 use crate::cookie::CookieJar;
+use crate::dns::DnsCache;
 use crate::error::Error;
 use crate::hsts::HstsCache;
 use crate::pool::{ConnectionPool, PooledStream};
@@ -49,6 +50,7 @@ pub struct Easy {
     tcp_nodelay: bool,
     tcp_keepalive: Option<Duration>,
     unix_socket: Option<String>,
+    dns_cache: DnsCache,
     pool: ConnectionPool,
 }
 
@@ -81,6 +83,7 @@ impl std::fmt::Debug for Easy {
             .field("tcp_nodelay", &self.tcp_nodelay)
             .field("tcp_keepalive", &self.tcp_keepalive)
             .field("unix_socket", &self.unix_socket)
+            .field("dns_cache", &self.dns_cache)
             .field("pool", &"<ConnectionPool>")
             .finish()
     }
@@ -115,6 +118,7 @@ impl Clone for Easy {
             tcp_nodelay: self.tcp_nodelay,
             tcp_keepalive: self.tcp_keepalive,
             unix_socket: self.unix_socket.clone(),
+            dns_cache: DnsCache::new(),
             pool: ConnectionPool::new(),
         }
     }
@@ -151,6 +155,7 @@ impl Easy {
             tcp_nodelay: true,
             tcp_keepalive: None,
             unix_socket: None,
+            dns_cache: DnsCache::new(),
             pool: ConnectionPool::new(),
         }
     }
@@ -614,6 +619,7 @@ impl Easy {
             self.tcp_nodelay,
             self.tcp_keepalive,
             self.unix_socket.as_deref(),
+            &mut self.dns_cache,
             &mut self.pool,
         );
 
@@ -678,6 +684,7 @@ async fn perform_transfer(
     tcp_nodelay: bool,
     tcp_keepalive: Option<Duration>,
     unix_socket: Option<&str>,
+    dns_cache: &mut DnsCache,
     pool: &mut ConnectionPool,
 ) -> Result<Response, Error> {
     let transfer_start = Instant::now();
@@ -718,6 +725,7 @@ async fn perform_transfer(
             tcp_nodelay,
             tcp_keepalive,
             unix_socket,
+            dns_cache,
             pool,
         )
         .await?;
@@ -767,6 +775,7 @@ async fn perform_transfer(
                                 tcp_nodelay,
                                 tcp_keepalive,
                                 unix_socket,
+                                dns_cache,
                                 pool,
                             )
                             .await?;
@@ -870,6 +879,7 @@ async fn do_single_request(
     tcp_nodelay: bool,
     tcp_keepalive: Option<Duration>,
     unix_socket: Option<&str>,
+    dns_cache: &mut DnsCache,
     pool: &mut ConnectionPool,
 ) -> Result<Response, Error> {
     // Handle non-HTTP schemes directly
@@ -1012,20 +1022,41 @@ async fn do_single_request(
         return Err(Error::Http("Unix sockets are not supported on this platform".to_string()));
     }
 
-    let addr = format!("{resolved_host}:{connect_port}");
-    let connect_fut = tokio::net::TcpStream::connect(&addr);
-    let tcp_stream = if let Some(timeout_dur) = connect_timeout {
-        tokio::time::timeout(timeout_dur, connect_fut)
-            .await
-            .map_err(|_| Error::Timeout(timeout_dur))?
-            .map_err(Error::Connect)?
+    // DNS resolution: check cache first, then resolve
+    let addr_str = format!("{resolved_host}:{connect_port}");
+    let addrs = if let Some(cached) = dns_cache.get(&resolved_host, connect_port) {
+        if verbose {
+            #[allow(clippy::print_stderr)]
+            {
+                eprintln!("* Using cached DNS entry for {resolved_host}");
+            }
+        }
+        cached.to_vec()
     } else {
-        connect_fut.await.map_err(Error::Connect)?
+        let lookup_fut = tokio::net::lookup_host(&addr_str);
+        let resolved: Vec<std::net::SocketAddr> = if let Some(timeout_dur) = connect_timeout {
+            tokio::time::timeout(timeout_dur, lookup_fut)
+                .await
+                .map_err(|_| Error::Timeout(timeout_dur))?
+                .map_err(Error::Connect)?
+                .collect()
+        } else {
+            lookup_fut.await.map_err(Error::Connect)?.collect()
+        };
+        if resolved.is_empty() {
+            return Err(Error::Connect(std::io::Error::new(
+                std::io::ErrorKind::AddrNotAvailable,
+                format!("DNS resolution failed for {resolved_host}"),
+            )));
+        }
+        dns_cache.put(&resolved_host, connect_port, resolved.clone());
+        resolved
     };
-    // DNS + TCP connect time (TcpStream::connect does both)
+    let time_namelookup = request_start.elapsed();
+
+    // Happy Eyeballs (RFC 6555): prefer IPv6, fall back to IPv4 after 250ms
+    let tcp_stream = happy_eyeballs_connect(&addrs, connect_timeout, request_start).await?;
     let time_connect = request_start.elapsed();
-    // For TcpStream::connect, DNS and TCP happen together
-    let time_namelookup = time_connect;
 
     // Apply TCP socket options
     tcp_stream.set_nodelay(tcp_nodelay).map_err(Error::Connect)?;
@@ -1403,6 +1434,97 @@ fn resolve_relative(base: &str, relative: &str) -> String {
     }
 }
 
+/// Happy Eyeballs (RFC 6555) TCP connection.
+///
+/// Given a list of resolved addresses (may contain both IPv4 and IPv6),
+/// try IPv6 first. If IPv6 doesn't connect within 250ms, start an IPv4
+/// attempt in parallel. Returns the first successful connection.
+/// If only one address family is present, connects directly.
+async fn happy_eyeballs_connect(
+    addrs: &[std::net::SocketAddr],
+    connect_timeout: Option<Duration>,
+    start: Instant,
+) -> Result<tokio::net::TcpStream, Error> {
+    use std::net::SocketAddr;
+
+    // Happy Eyeballs delay before starting the other address family
+    const EYEBALLS_DELAY: Duration = Duration::from_millis(250);
+
+    // Separate into IPv6 and IPv4
+    let v6: Vec<SocketAddr> = addrs.iter().copied().filter(SocketAddr::is_ipv6).collect();
+    let v4: Vec<SocketAddr> = addrs.iter().copied().filter(SocketAddr::is_ipv4).collect();
+
+    // If only one family, just try them in order
+    if v6.is_empty() || v4.is_empty() {
+        return try_connect_addrs(addrs, connect_timeout, start).await;
+    }
+
+    // Both families present: race with 250ms head start for IPv6
+    let remaining_timeout = connect_timeout.map(|t| {
+        let elapsed = start.elapsed();
+        t.saturating_sub(elapsed)
+    });
+
+    let v6_fut = try_connect_addrs(&v6, remaining_timeout, start);
+    let v4_delayed = async {
+        tokio::time::sleep(EYEBALLS_DELAY).await;
+        try_connect_addrs(&v4, remaining_timeout.map(|t| t.saturating_sub(EYEBALLS_DELAY)), start)
+            .await
+    };
+
+    tokio::pin!(v6_fut);
+    tokio::pin!(v4_delayed);
+
+    // Race both: return first success
+    tokio::select! {
+        result = &mut v6_fut => {
+            match result {
+                Ok(stream) => Ok(stream),
+                Err(_v6_err) => {
+                    // IPv6 failed, wait for IPv4
+                    v4_delayed.await
+                }
+            }
+        }
+        result = &mut v4_delayed => {
+            match result {
+                Ok(stream) => Ok(stream),
+                Err(_v4_err) => {
+                    // IPv4 failed, wait for IPv6
+                    v6_fut.await
+                }
+            }
+        }
+    }
+}
+
+/// Try connecting to each address in order, returning the first success.
+async fn try_connect_addrs(
+    addrs: &[std::net::SocketAddr],
+    timeout: Option<Duration>,
+    _start: Instant,
+) -> Result<tokio::net::TcpStream, Error> {
+    let mut last_err = None;
+    for addr in addrs {
+        let connect_fut = tokio::net::TcpStream::connect(addr);
+        let result = if let Some(timeout_dur) = timeout {
+            match tokio::time::timeout(timeout_dur, connect_fut).await {
+                Ok(r) => r,
+                Err(_) => return Err(Error::Timeout(timeout_dur)),
+            }
+        } else {
+            connect_fut.await
+        };
+        match result {
+            Ok(stream) => return Ok(stream),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(Error::Connect(last_err.unwrap_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::AddrNotAvailable, "no addresses to connect to")
+    })))
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -1676,5 +1798,58 @@ mod tests {
         let mut easy = Easy::new();
         easy.unix_socket("/var/run/docker.sock");
         assert_eq!(easy.unix_socket, Some("/var/run/docker.sock".to_string()));
+    }
+
+    #[test]
+    fn easy_dns_cache_starts_empty() {
+        let easy = Easy::new();
+        assert!(easy.dns_cache.is_empty());
+    }
+
+    #[test]
+    fn easy_clone_has_fresh_dns_cache() {
+        let mut easy = Easy::new();
+        easy.url("http://example.com").unwrap();
+        let cloned = easy.clone();
+        assert!(cloned.dns_cache.is_empty());
+    }
+
+    #[tokio::test]
+    async fn happy_eyeballs_single_v4_addr() {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let result = happy_eyeballs_connect(&[addr], None, Instant::now()).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn happy_eyeballs_no_addrs() {
+        let result = happy_eyeballs_connect(&[], None, Instant::now()).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn try_connect_addrs_succeeds() {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let result = try_connect_addrs(&[addr], None, Instant::now()).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn try_connect_addrs_fails_unreachable() {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        // Use a non-routable address that should fail quickly
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 1);
+        let result =
+            try_connect_addrs(&[addr], Some(Duration::from_millis(100)), Instant::now()).await;
+        assert!(result.is_err());
     }
 }
