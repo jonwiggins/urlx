@@ -1880,6 +1880,41 @@ async fn do_single_request(
 
     let response = match url.scheme() {
         "https" => {
+            // HTTP/3 over QUIC — bypasses TCP/TLS, uses UDP transport
+            #[cfg(feature = "http3")]
+            if http_version == HttpVersion::Http3 {
+                if verbose {
+                    #[allow(clippy::print_stderr)]
+                    {
+                        eprintln!("* Using HTTP/3");
+                    }
+                }
+                let addr = addrs[0];
+                let request_target = url.request_target();
+                let time_pretransfer = request_start.elapsed();
+                let resp = crate::protocol::http::h3::request(
+                    addr,
+                    &host,
+                    method,
+                    &request_target,
+                    &effective_headers,
+                    body,
+                    url.as_str(),
+                    speed_limits,
+                    tls_config.verify_peer,
+                )
+                .await?;
+                let time_starttransfer = request_start.elapsed();
+                let mut resp = maybe_decompress(resp, accept_encoding)?;
+                let mut info = resp.transfer_info().clone();
+                info.time_namelookup = time_namelookup;
+                info.time_connect = time_connect;
+                info.time_pretransfer = time_pretransfer;
+                info.time_starttransfer = time_starttransfer;
+                resp.set_transfer_info(info);
+                return Ok(resp);
+            }
+
             #[cfg(feature = "rustls")]
             {
                 let tls_stream_inner = if proxy.is_some() && !is_socks_proxy {

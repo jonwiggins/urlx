@@ -15,6 +15,7 @@ default = ["http", "http2", "rustls", "decompression"]
 # Protocols
 http = []
 http2 = ["dep:h2"]
+http3 = ["dep:quinn", "dep:h3", "dep:h3-quinn", "dep:bytes"]
 
 # TLS backends
 rustls = ["dep:rustls", "dep:webpki-roots", "dep:tokio-rustls"]
@@ -35,11 +36,15 @@ sha2 = "0.10"
 hex = "0.4"
 socket2 = { version = "0.6", features = ["all"] }
 url = "2"
+bytes = { version = "1", optional = true }
 http = "1"
 httparse = "1"
 rustls = { version = "0.23", optional = true, default-features = false, features = ["std", "tls12", "ring"] }
 webpki-roots = { version = "1", optional = true }
 tokio-rustls = { version = "0.26", optional = true, default-features = false, features = ["ring", "tls12"] }
+quinn = { version = "0.11", optional = true, default-features = false, features = ["ring", "runtime-tokio", "rustls"] }
+h3 = { version = "0.0.8", optional = true }
+h3-quinn = { version = "0.0.10", optional = true }
 russh = { version = "0.57", optional = true, default-features = false, features = ["ring"] }
 russh-sftp = { version = "2.1", optional = true }
 flate2 = { version = "1", optional = true }

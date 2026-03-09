@@ -8,12 +8,14 @@ use std::collections::HashMap;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::error::Error;
-use crate::protocol::http::response::Response;
+use crate::protocol::http::response::{PushedResponse, Response};
 use crate::throttle::{RateLimiter, SpeedLimits, THROTTLE_CHUNK_SIZE};
 
 /// Send an HTTP/2 request and read the response.
 ///
 /// Takes ownership of the stream since h2 manages its own I/O.
+/// Collects any server-pushed responses (`PUSH_PROMISE` frames) during
+/// the transfer and attaches them to the returned Response.
 ///
 /// # Errors
 ///
@@ -77,9 +79,61 @@ where
         builder.body(()).map_err(|e| Error::Http(format!("failed to build h2 request: {e}")))?;
 
     // Send the request
-    let (response_fut, mut send_stream) = client
+    let (mut response_fut, mut send_stream) = client
         .send_request(req, !has_body)
         .map_err(|e| Error::Http(format!("h2 send failed: {e}")))?;
+
+    // Extract push promises stream BEFORE awaiting the response.
+    // push_promises() clones internal state, so it's independent of response_fut.
+    let mut push_stream = response_fut.push_promises();
+
+    // Spawn a background task to collect any server-pushed responses
+    let push_task = tokio::spawn(async move {
+        let mut pushed = Vec::new();
+        while let Some(result) = push_stream.push_promise().await {
+            match result {
+                Ok(push_promise) => {
+                    let (req, resp_future) = push_promise.into_parts();
+                    // Extract the URL from the push promise request
+                    let push_url = req.uri().to_string();
+
+                    // Await the pushed response (skip failures silently)
+                    if let Ok(h2_resp) = resp_future.await {
+                        let status = h2_resp.status().as_u16();
+                        let mut headers = HashMap::new();
+                        for (name, value) in h2_resp.headers() {
+                            let name = name.as_str().to_lowercase();
+                            let value = String::from_utf8_lossy(value.as_bytes()).to_string();
+                            let _old = headers.insert(name, value);
+                        }
+
+                        // Read pushed response body
+                        let mut body_stream = h2_resp.into_body();
+                        let mut body_bytes = Vec::new();
+                        while let Some(chunk) = body_stream.data().await {
+                            match chunk {
+                                Ok(data) => {
+                                    let chunk_len = data.len();
+                                    body_bytes.extend_from_slice(&data);
+                                    let _r = body_stream.flow_control().release_capacity(chunk_len);
+                                }
+                                Err(_) => break,
+                            }
+                        }
+
+                        pushed.push(PushedResponse {
+                            url: push_url,
+                            status,
+                            headers,
+                            body: body_bytes,
+                        });
+                    }
+                }
+                Err(_) => break, // Stop on push promise stream errors
+            }
+        }
+        pushed
+    });
 
     // Send body if present, with optional rate limiting
     if let Some(body_data) = body {
@@ -121,7 +175,13 @@ where
 
     // HEAD responses have no body
     if is_head {
-        return Ok(Response::new(status, headers, Vec::new(), url.to_string()));
+        // Collect any push promises that arrived
+        let pushed = push_task.await.unwrap_or_default();
+        let mut resp = Response::new(status, headers, Vec::new(), url.to_string());
+        if !pushed.is_empty() {
+            resp.set_pushed_responses(pushed);
+        }
+        return Ok(resp);
     }
 
     // Read body with optional rate limiting
@@ -140,11 +200,30 @@ where
         }
     }
 
-    Ok(Response::new(status, headers, body_bytes, url.to_string()))
+    // Collect any push promises that arrived during the transfer
+    let pushed = push_task.await.unwrap_or_default();
+
+    let mut resp = Response::new(status, headers, body_bytes, url.to_string());
+    if !pushed.is_empty() {
+        resp.set_pushed_responses(pushed);
+    }
+    Ok(resp)
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    // h2 tests require a full h2 server, tested via integration tests
+    use super::*;
+
+    #[test]
+    fn pushed_response_struct() {
+        let pr = PushedResponse {
+            url: "/style.css".to_string(),
+            status: 200,
+            headers: HashMap::new(),
+            body: Vec::new(),
+        };
+        assert_eq!(pr.url, "/style.css");
+        assert_eq!(pr.status, 200);
+    }
 }

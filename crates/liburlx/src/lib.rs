@@ -37,7 +37,7 @@ pub use hsts::HstsCache;
 pub use multi::{Multi, PipeliningMode};
 pub use progress::{make_progress_callback, ProgressCallback, ProgressInfo};
 pub use protocol::http::multipart::MultipartForm;
-pub use protocol::http::response::{Response, TransferInfo};
+pub use protocol::http::response::{PushedResponse, Response, TransferInfo};
 pub use share::{Share, ShareType};
 pub use throttle::SpeedLimits;
 pub use tls::{TlsConfig, TlsVersion};

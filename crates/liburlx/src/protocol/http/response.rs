@@ -51,6 +51,24 @@ pub struct Response {
     effective_url: String,
     /// Transfer timing and metadata.
     info: TransferInfo,
+    /// HTTP/2 server-pushed responses received during this transfer.
+    pushed_responses: Vec<PushedResponse>,
+}
+
+/// An HTTP/2 server-pushed response.
+///
+/// Represents a resource that the server proactively sent via HTTP/2 server push
+/// (`PUSH_PROMISE` frame). Contains the promised request URL and the pushed response.
+#[derive(Debug, Clone)]
+pub struct PushedResponse {
+    /// The URL of the pushed resource (from the `PUSH_PROMISE` request headers).
+    pub url: String,
+    /// HTTP status code of the pushed response.
+    pub status: u16,
+    /// Response headers.
+    pub headers: HashMap<String, String>,
+    /// Response body bytes.
+    pub body: Vec<u8>,
 }
 
 impl Response {
@@ -69,6 +87,7 @@ impl Response {
             body,
             effective_url,
             info: TransferInfo::default(),
+            pushed_responses: Vec::new(),
         }
     }
 
@@ -81,7 +100,15 @@ impl Response {
         effective_url: String,
         info: TransferInfo,
     ) -> Self {
-        Self { status, headers, trailers: HashMap::new(), body, effective_url, info }
+        Self {
+            status,
+            headers,
+            trailers: HashMap::new(),
+            body,
+            effective_url,
+            info,
+            pushed_responses: Vec::new(),
+        }
     }
 
     /// Set trailer headers on this response.
@@ -171,6 +198,17 @@ impl Response {
     pub fn set_transfer_info(&mut self, info: TransferInfo) {
         self.info = info;
     }
+
+    /// Returns HTTP/2 server-pushed responses received during this transfer.
+    #[must_use]
+    pub fn pushed_responses(&self) -> &[PushedResponse] {
+        &self.pushed_responses
+    }
+
+    /// Set pushed responses on this response.
+    pub fn set_pushed_responses(&mut self, pushed: Vec<PushedResponse>) {
+        self.pushed_responses = pushed;
+    }
 }
 
 #[cfg(test)]
@@ -224,6 +262,28 @@ mod tests {
         assert_eq!(resp.trailer("X-Checksum"), Some("abc123"));
         assert_eq!(resp.trailer("X-Timestamp"), Some("1234567890"));
         assert_eq!(resp.trailers().len(), 2);
+    }
+
+    #[test]
+    fn response_pushed_responses_empty_by_default() {
+        let resp = Response::new(200, HashMap::new(), Vec::new(), String::new());
+        assert!(resp.pushed_responses().is_empty());
+    }
+
+    #[test]
+    fn response_pushed_responses_set_and_get() {
+        let mut resp = Response::new(200, HashMap::new(), Vec::new(), String::new());
+        let pushed = vec![PushedResponse {
+            url: "https://example.com/style.css".to_string(),
+            status: 200,
+            headers: HashMap::new(),
+            body: b"body{color:red}".to_vec(),
+        }];
+        resp.set_pushed_responses(pushed);
+        assert_eq!(resp.pushed_responses().len(), 1);
+        assert_eq!(resp.pushed_responses()[0].url, "https://example.com/style.css");
+        assert_eq!(resp.pushed_responses()[0].status, 200);
+        assert_eq!(resp.pushed_responses()[0].body, b"body{color:red}");
     }
 
     #[test]

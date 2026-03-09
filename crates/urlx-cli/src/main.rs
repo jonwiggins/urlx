@@ -121,6 +121,7 @@ fn print_usage() {
     eprintln!("      --http1.0             Use HTTP/1.0");
     eprintln!("      --http1.1             Use HTTP/1.1");
     eprintln!("      --http2               Request HTTP/2");
+    eprintln!("      --http3               Request HTTP/3 (QUIC)");
     eprintln!("      --expect100-timeout <ms>  Expect: 100-continue timeout (milliseconds)");
     eprintln!("      --retry <num>         Retry on transient errors");
     eprintln!("      --retry-delay <s>     Wait between retries (seconds)");
@@ -601,6 +602,9 @@ fn parse_args(args: &[String]) -> Option<CliOptions> {
             }
             "--http2" => {
                 opts.easy.http_version(liburlx::HttpVersion::Http2);
+            }
+            "--http3" => {
+                opts.easy.http_version(liburlx::HttpVersion::Http3);
             }
             "--expect100-timeout" => {
                 i += 1;
@@ -2245,6 +2249,13 @@ mod tests {
     #[test]
     fn parse_args_http2() {
         let args = vec!["urlx".to_string(), "--http2".to_string(), "http://x.com".to_string()];
+        let opts = parse_args(&args);
+        assert!(opts.is_some());
+    }
+
+    #[test]
+    fn parse_args_http3() {
+        let args = vec!["urlx".to_string(), "--http3".to_string(), "https://x.com".to_string()];
         let opts = parse_args(&args);
         assert!(opts.is_some());
     }
