@@ -1,7 +1,8 @@
 //! HTTP authentication mechanisms.
 //!
-//! Supports Basic, Bearer, and Digest (RFC 7616) authentication.
+//! Supports Basic, Bearer, Digest (RFC 7616), and AWS `SigV4` authentication.
 
+pub mod aws_sigv4;
 pub mod digest;
 
 /// The HTTP authentication method to use.
