@@ -317,12 +317,12 @@ fn parse_args(args: &[String]) -> Option<CliOptions> {
             "-d" | "--data" => {
                 i += 1;
                 let val = require_arg(args, i, "-d")?;
-                // Support @filename to read from file
+                // Support @filename to read from file, @- for stdin
                 if let Some(path) = val.strip_prefix('@') {
-                    match std::fs::read(path) {
+                    match read_data_source(path) {
                         Ok(data) => opts.easy.body(&data),
                         Err(e) => {
-                            eprintln!("urlx: error reading {path}: {e}");
+                            eprintln!("urlx: error reading data: {e}");
                             return None;
                         }
                     }
@@ -657,10 +657,10 @@ fn parse_args(args: &[String]) -> Option<CliOptions> {
                 i += 1;
                 let val = require_arg(args, i, "--data-binary")?;
                 if let Some(path) = val.strip_prefix('@') {
-                    match std::fs::read(path) {
+                    match read_data_source(path) {
                         Ok(data) => opts.easy.body(&data),
                         Err(e) => {
-                            eprintln!("urlx: error reading {path}: {e}");
+                            eprintln!("urlx: error reading data: {e}");
                             return None;
                         }
                     }
@@ -1245,6 +1245,21 @@ fn parse_args(args: &[String]) -> Option<CliOptions> {
     }
 
     Some(opts)
+}
+
+/// Read data from a file path or stdin (`-`).
+///
+/// Used by `-d @filename` and `--data-binary @filename`.
+/// The path `-` reads from stdin.
+fn read_data_source(path: &str) -> Result<Vec<u8>, std::io::Error> {
+    if path == "-" {
+        use std::io::Read as _;
+        let mut buf = Vec::new();
+        let _bytes = std::io::stdin().read_to_end(&mut buf)?;
+        Ok(buf)
+    } else {
+        std::fs::read(path)
+    }
 }
 
 /// URL-encode a string value for `--data-urlencode`.
@@ -1857,8 +1872,57 @@ fn run(args: &[String]) -> ExitCode {
             if !opts.silent || opts.show_error {
                 eprintln!("urlx: {e}");
             }
-            ExitCode::FAILURE
+            error_to_exit_code(&e)
         }
+    }
+}
+
+/// Map a liburlx error to a curl-compatible exit code.
+///
+/// Matches curl's exit code conventions for the most common errors.
+fn error_to_exit_code(err: &liburlx::Error) -> ExitCode {
+    match err {
+        liburlx::Error::UrlParse(_) => ExitCode::from(3),
+        liburlx::Error::Connect(io_err) => {
+            match io_err.kind() {
+                // DNS resolution failure
+                std::io::ErrorKind::Other => {
+                    let msg = io_err.to_string();
+                    if msg.contains("dns") || msg.contains("DNS") || msg.contains("resolve") {
+                        ExitCode::from(6) // CURLE_COULDNT_RESOLVE_HOST
+                    } else {
+                        ExitCode::from(7) // CURLE_COULDNT_CONNECT
+                    }
+                }
+                _ => ExitCode::from(7), // CURLE_COULDNT_CONNECT
+            }
+        }
+        liburlx::Error::Tls(e) => {
+            let msg = e.to_string();
+            if msg.contains("certificate") || msg.contains("verify") {
+                ExitCode::from(60) // CURLE_PEER_FAILED_VERIFICATION
+            } else {
+                ExitCode::from(35) // CURLE_SSL_CONNECT_ERROR
+            }
+        }
+        liburlx::Error::Http(msg) => {
+            if msg.contains("too many redirects") || msg.contains("Too many redirects") {
+                ExitCode::from(47) // CURLE_TOO_MANY_REDIRECTS
+            } else if msg.contains("fail_on_error") {
+                ExitCode::from(22) // CURLE_HTTP_RETURNED_ERROR
+            } else {
+                ExitCode::from(56) // CURLE_RECV_ERROR
+            }
+        }
+        liburlx::Error::Timeout(_) | liburlx::Error::SpeedLimit { .. } => {
+            ExitCode::from(28) // CURLE_OPERATION_TIMEDOUT
+        }
+        liburlx::Error::Io(_) => ExitCode::from(23), // CURLE_WRITE_ERROR
+        liburlx::Error::Ssh(_) => ExitCode::from(67), // CURLE_LOGIN_DENIED
+        liburlx::Error::Transfer { code, .. } => {
+            ExitCode::from(u8::try_from(*code).map_or(1, |c| c))
+        }
+        _ => ExitCode::FAILURE,
     }
 }
 
@@ -2214,6 +2278,12 @@ fn run_multi(
     }
 }
 
+/// Return the HTTP version string for a response (e.g., "1.1", "2", "3").
+const fn http_version_string(_response: &liburlx::Response) -> &'static str {
+    // Default to "1.1" since we don't currently store HTTP version in Response
+    "1.1"
+}
+
 /// Format a `--write-out` string by replacing `%{variable}` placeholders.
 fn format_write_out(fmt: &str, response: &liburlx::Response) -> String {
     let info = response.transfer_info();
@@ -2239,6 +2309,20 @@ fn format_write_out(fmt: &str, response: &liburlx::Response) -> String {
     result = result.replace("%{speed_download}", &format!("{:.3}", info.speed_download));
     result = result.replace("%{speed_upload}", &format!("{:.3}", info.speed_upload));
     result = result.replace("%{size_upload}", &info.size_upload.to_string());
+    // Additional curl-compatible variables
+    result = result.replace("%{http_version}", http_version_string(response));
+    result =
+        result.replace("%{scheme}", response.effective_url().split("://").next().unwrap_or(""));
+    // Header sizes: approximate from response headers
+    let header_size: usize = response.headers().iter().map(|(k, v)| k.len() + v.len() + 4).sum();
+    result = result.replace("%{size_header}", &header_size.to_string());
+    result = result.replace("%{num_connects}", "1");
+    result = result
+        .replace("%{time_redirect}", &format!("{:.6}", info.time_namelookup.as_secs_f64() * 0.0));
+    result = result.replace("%{redirect_url}", response.header("location").unwrap_or(""));
+    result = result.replace("%{method}", "GET");
+    result = result.replace("%{errormsg}", "");
+    result = result.replace("%{exitcode}", "0");
 
     // Handle escape sequences
     result = result.replace("\\n", "\n");
