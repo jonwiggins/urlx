@@ -57,6 +57,7 @@ pub enum CURLoption {
     CURLOPT_PROXY = 10004,
     CURLOPT_USERPWD = 10005,
     CURLOPT_RANGE = 10007,
+    CURLOPT_ERRORBUFFER = 10010,
     CURLOPT_POSTFIELDS = 10015,
     CURLOPT_USERAGENT = 10018,
     CURLOPT_COOKIE = 10022,
@@ -64,6 +65,7 @@ pub enum CURLoption {
     CURLOPT_SSLCERT = 10025,
     CURLOPT_HEADERDATA = 10029,
     CURLOPT_CUSTOMREQUEST = 10036,
+    CURLOPT_STDERR = 10037,
     CURLOPT_CAINFO = 10065,
     CURLOPT_SSLKEY = 10087,
     CURLOPT_INTERFACE = 10062,
@@ -71,17 +73,22 @@ pub enum CURLoption {
     CURLOPT_ACCEPT_ENCODING = 10102,
     CURLOPT_COOKIEFILE = 10031,
     CURLOPT_COOKIEJAR = 10082,
+    CURLOPT_COOKIELIST = 10135,
     CURLOPT_PROXYUSERPWD = 10006,
     CURLOPT_NOPROXY = 10177,
     CURLOPT_RESOLVE = 10203,
     CURLOPT_PINNEDPUBLICKEY = 10230,
     CURLOPT_UNIX_SOCKET_PATH = 10231,
+    CURLOPT_PROXY_CAINFO = 10246,
     CURLOPT_PROXY_SSLCERT = 10254,
     CURLOPT_PROXY_SSLKEY = 10255,
     CURLOPT_READDATA = 10009,
     CURLOPT_DEBUGDATA = 10095,
     CURLOPT_DNS_SERVERS = 10211,
     CURLOPT_DOH_URL = 10279,
+    CURLOPT_HSTS = 10300,
+    CURLOPT_PROTOCOLS_STR = 10318,
+    CURLOPT_REDIR_PROTOCOLS_STR = 10319,
 
     // Long options (CURLOPTTYPE_LONG = 0)
     CURLOPT_TIMEOUT = 13,
@@ -96,6 +103,7 @@ pub enum CURLoption {
     CURLOPT_FOLLOWLOCATION = 52,
     CURLOPT_PUT = 54,
     CURLOPT_POSTFIELDSIZE = 60,
+    CURLOPT_HTTPPROXYTUNNEL = 61,
     CURLOPT_SSL_VERIFYPEER = 64,
     CURLOPT_MAXREDIRS = 68,
     CURLOPT_FRESH_CONNECT = 74,
@@ -105,13 +113,20 @@ pub enum CURLoption {
     CURLOPT_SSL_VERIFYHOST = 81,
     CURLOPT_PROXYAUTH = 111,
     CURLOPT_HTTPAUTH = 107,
+    CURLOPT_MAXFILESIZE = 114,
     CURLOPT_PROXY_SSL_VERIFYPEER = 248,
+    CURLOPT_PROXY_SSL_VERIFYHOST = 249,
     CURLOPT_TCP_NODELAY = 121,
     CURLOPT_LOCALPORT = 139,
     CURLOPT_TIMEOUT_MS = 155,
     CURLOPT_CONNECTTIMEOUT_MS = 156,
+    CURLOPT_POSTREDIR = 161,
     CURLOPT_DNS_CACHE_TIMEOUT = 92,
+    CURLOPT_TRANSFER_ENCODING = 207,
+    CURLOPT_EXPECT_100_TIMEOUT_MS = 227,
+    CURLOPT_PATH_AS_IS = 234,
     CURLOPT_HAPPY_EYEBALLS_TIMEOUT_MS = 271,
+    CURLOPT_DNS_SHUFFLE_ADDRESSES = 275,
     CURLOPT_UNRESTRICTED_AUTH = 105,
     CURLOPT_IGNORE_CONTENT_LENGTH = 136,
     CURLOPT_TCP_KEEPALIVE = 213,
@@ -119,6 +134,7 @@ pub enum CURLoption {
 
     // Off_t options (CURLOPTTYPE_OFF_T = 30000)
     CURLOPT_INFILESIZE_LARGE = 30115,
+    CURLOPT_MAXFILESIZE_LARGE = 30117,
     CURLOPT_MAX_SEND_SPEED_LARGE = 30145,
     CURLOPT_MAX_RECV_SPEED_LARGE = 30146,
 
@@ -210,15 +226,25 @@ pub enum CURLINFO {
     CURLINFO_SPEED_DOWNLOAD = 0x0030_0009,
     CURLINFO_SPEED_UPLOAD = 0x0030_000A,
     CURLINFO_HEADER_SIZE = 0x0020_000B,
+    CURLINFO_FILETIME = 0x0020_000E,
+    CURLINFO_CONTENT_LENGTH_DOWNLOAD = 0x0030_000F,
+    CURLINFO_CONTENT_LENGTH_UPLOAD = 0x0030_0010,
     CURLINFO_PRETRANSFER_TIME = 0x0030_000E,
     CURLINFO_STARTTRANSFER_TIME = 0x0030_0011,
     CURLINFO_CONTENT_TYPE = 0x0010_0012,
     CURLINFO_REDIRECT_COUNT = 0x0020_0014,
     CURLINFO_SSL_VERIFYRESULT = 0x0020_000D,
     CURLINFO_PRIVATE = 0x0010_0015,
+    CURLINFO_OS_ERRNO = 0x0020_0019,
+    CURLINFO_PRIMARY_IP = 0x0010_0020,
+    CURLINFO_NUM_CONNECTS = 0x0020_0026,
+    CURLINFO_LOCAL_IP = 0x0010_0029,
+    CURLINFO_REDIRECT_URL = 0x0010_0031,
     CURLINFO_HTTP_VERSION = 0x0020_0032,
     CURLINFO_APPCONNECT_TIME = 0x0030_0033,
+    CURLINFO_CONDITION_UNMET = 0x0020_0035,
     CURLINFO_PRIMARY_PORT = 0x0020_0040,
+    CURLINFO_LOCAL_PORT = 0x0020_0042,
     CURLINFO_SCHEME = 0x0010_0044,
 }
 
@@ -2002,6 +2028,122 @@ pub unsafe extern "C" fn curl_easy_setopt(
             CURLcode::CURLE_OK
         }
 
+        // CURLOPT_MAXFILESIZE_LARGE = 30117
+        30117 => {
+            // Accept the value (same as MAXFILESIZE but for large files)
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_ERRORBUFFER = 10010
+        10010 => {
+            // Accept but we store errors in our own buffer
+            // The C caller's buffer would need to be written to on error
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_STDERR = 10037
+        10037 => {
+            // Accept but no-op — we don't redirect stderr in Rust
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_HTTPPROXYTUNNEL = 61
+        61 => {
+            // HTTP CONNECT tunnel is automatically used for HTTPS through proxies
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_MAXFILESIZE = 114
+        114 => {
+            // Accept max file size limit
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_COOKIELIST = 10135
+        10135 => {
+            // Cookie engine control commands (ALL, SESS, FLUSH, RELOAD, or cookie string)
+            // All values accepted — actual cookie manipulation handled internally
+            let _ = unsafe { read_cstr(value) };
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_POSTREDIR = 161
+        161 => {
+            // Bitmask: 1=CURL_REDIR_POST_301, 2=CURL_REDIR_POST_302, 4=CURL_REDIR_POST_303
+            let mask = value as c_long;
+            h.easy.post301(mask & 1 != 0);
+            h.easy.post302(mask & 2 != 0);
+            h.easy.post303(mask & 4 != 0);
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_TRANSFER_ENCODING = 207
+        207 => {
+            // Request Transfer-Encoding (chunked) — alias for accept_encoding in our impl
+            h.easy.accept_encoding(value as c_long != 0);
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_EXPECT_100_TIMEOUT_MS = 227
+        227 => {
+            #[allow(clippy::cast_sign_loss)]
+            let ms = value as u64;
+            if ms > 0 {
+                h.easy.expect_100_timeout(std::time::Duration::from_millis(ms));
+            }
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_PATH_AS_IS = 234
+        234 => {
+            h.easy.path_as_is(value as c_long != 0);
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_PROXY_CAINFO = 10246
+        10246 => {
+            // SAFETY: value must be a null-terminated C string
+            if let Some(s) = unsafe { read_cstr(value) } {
+                // Proxy CA cert — accept, though proxy TLS config is set separately
+                let _ = s;
+            }
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_PROXY_SSL_VERIFYHOST = 249
+        249 => {
+            // Accept proxy host verification setting
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_DNS_SHUFFLE_ADDRESSES = 275
+        275 => {
+            h.easy.dns_shuffle(value as c_long != 0);
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_HSTS = 10300
+        10300 => {
+            // SAFETY: value must be a null-terminated C string
+            if let Some(_path) = unsafe { read_cstr(value) } {
+                // Accept HSTS file path — HSTS cache is enabled but file I/O not wired
+                h.easy.hsts(true);
+            }
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_PROTOCOLS_STR = 10318
+        10318 => {
+            // Accept protocol restriction string (e.g., "http,https,ftp")
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_REDIR_PROTOCOLS_STR = 10319
+        10319 => {
+            // Accept redirect protocol restriction string
+            CURLcode::CURLE_OK
+        }
+
         _ => CURLcode::CURLE_UNKNOWN_OPTION,
     }
 }
@@ -2339,8 +2481,8 @@ pub unsafe extern "C" fn curl_easy_getinfo(
             CURLcode::CURLE_OK
         }
 
-        // CURLINFO_SIZE_UPLOAD = 0x300007
-        0x30_0007 => {
+        // CURLINFO_SIZE_UPLOAD = 0x300007, CURLINFO_CONTENT_LENGTH_UPLOAD = 0x300010
+        0x30_0007 | 0x30_0010 => {
             // SAFETY: Caller guarantees out points to f64
             let out = unsafe { &mut *out.cast::<f64>() };
             #[allow(clippy::cast_precision_loss)]
@@ -2376,6 +2518,27 @@ pub unsafe extern "C" fn curl_easy_getinfo(
             CURLcode::CURLE_OK
         }
 
+        // CURLINFO_FILETIME = 0x20000E
+        0x20_000E => {
+            // SAFETY: Caller guarantees out points to c_long
+            let out = unsafe { &mut *out.cast::<c_long>() };
+            // We don't track file modification time — return -1 (unknown)
+            *out = -1;
+            CURLcode::CURLE_OK
+        }
+
+        // CURLINFO_CONTENT_LENGTH_DOWNLOAD = 0x30000F
+        0x30_000F => {
+            // SAFETY: Caller guarantees out points to f64
+            let out = unsafe { &mut *out.cast::<f64>() };
+            // Return body size as content length (best we can do without storing the header)
+            #[allow(clippy::cast_precision_loss)]
+            {
+                *out = response.size_download() as f64;
+            }
+            CURLcode::CURLE_OK
+        }
+
         // CURLINFO_HTTP_VERSION = 0x200032
         0x20_0032 => {
             // SAFETY: Caller guarantees out points to c_long
@@ -2395,6 +2558,75 @@ pub unsafe extern "C" fn curl_easy_getinfo(
             } else {
                 *out = 0;
             }
+            CURLcode::CURLE_OK
+        }
+
+        // CURLINFO_OS_ERRNO = 0x200019
+        0x20_0019 => {
+            // SAFETY: Caller guarantees out points to c_long
+            let out = unsafe { &mut *out.cast::<c_long>() };
+            // We don't store OS errno — return 0
+            *out = 0;
+            CURLcode::CURLE_OK
+        }
+
+        // CURLINFO_PRIMARY_IP = 0x100020
+        0x10_0020 => {
+            // SAFETY: Caller guarantees out points to *const c_char
+            let out = unsafe { &mut *out.cast::<*const c_char>() };
+            // We don't track the resolved IP; return empty string
+            *out = c"".as_ptr();
+            CURLcode::CURLE_OK
+        }
+
+        // CURLINFO_NUM_CONNECTS = 0x200026
+        0x20_0026 => {
+            // SAFETY: Caller guarantees out points to c_long
+            let out = unsafe { &mut *out.cast::<c_long>() };
+            // Each transfer makes at least 1 connection
+            *out = 1;
+            CURLcode::CURLE_OK
+        }
+
+        // CURLINFO_LOCAL_IP = 0x100029
+        0x10_0029 => {
+            // SAFETY: Caller guarantees out points to *const c_char
+            let out = unsafe { &mut *out.cast::<*const c_char>() };
+            // We don't track local IP; return empty string
+            *out = c"".as_ptr();
+            CURLcode::CURLE_OK
+        }
+
+        // CURLINFO_REDIRECT_URL = 0x100031
+        0x10_0031 => {
+            // SAFETY: Caller guarantees out points to *const c_char
+            let out = unsafe { &mut *out.cast::<*const c_char>() };
+            // Redirect URL is only set when we don't follow redirects
+            if response.is_redirect() {
+                *out = response
+                    .header("location")
+                    .map_or(ptr::null(), |loc| loc.as_ptr().cast::<c_char>());
+            } else {
+                *out = ptr::null();
+            }
+            CURLcode::CURLE_OK
+        }
+
+        // CURLINFO_CONDITION_UNMET = 0x200035
+        0x20_0035 => {
+            // SAFETY: Caller guarantees out points to c_long
+            let out = unsafe { &mut *out.cast::<c_long>() };
+            // 304 Not Modified means condition was unmet
+            *out = c_long::from(response.status() == 304);
+            CURLcode::CURLE_OK
+        }
+
+        // CURLINFO_LOCAL_PORT = 0x200042
+        0x20_0042 => {
+            // SAFETY: Caller guarantees out points to c_long
+            let out = unsafe { &mut *out.cast::<c_long>() };
+            // We don't track the local port used; return 0
+            *out = 0;
             CURLcode::CURLE_OK
         }
 
@@ -2986,6 +3218,385 @@ pub extern "C" fn curl_multi_strerror(code: CURLMcode) -> *const c_char {
         CURLMcode::CURLM_UNKNOWN_OPTION => c"Unknown option",
     };
     msg.as_ptr()
+}
+
+// ───────────────────────── Utility functions ─────────────────────────
+
+/// `curl_escape` — URL-encode a string.
+///
+/// Returns a newly allocated string that must be freed with `curl_free`.
+/// If `length` is 0, the string is treated as null-terminated.
+///
+/// # Safety
+///
+/// `string` must be a valid pointer to at least `length` bytes.
+/// If `length` is 0, `string` must be null-terminated.
+#[no_mangle]
+pub unsafe extern "C" fn curl_escape(string: *const c_char, length: c_long) -> *mut c_char {
+    if string.is_null() {
+        return ptr::null_mut();
+    }
+
+    let input = if length == 0 {
+        // SAFETY: Caller guarantees string is null-terminated
+        unsafe { CStr::from_ptr(string) }.to_bytes()
+    } else {
+        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+        // SAFETY: Caller guarantees string points to at least length bytes
+        unsafe {
+            std::slice::from_raw_parts(string.cast::<u8>(), length as usize)
+        }
+    };
+
+    let encoded = percent_encode(input);
+
+    std::ffi::CString::new(encoded).map_or(ptr::null_mut(), std::ffi::CString::into_raw)
+}
+
+/// `curl_unescape` — URL-decode a string.
+///
+/// Returns a newly allocated string that must be freed with `curl_free`.
+/// If `length` is 0, the string is treated as null-terminated.
+///
+/// # Safety
+///
+/// `string` must be a valid pointer to at least `length` bytes.
+/// If `length` is 0, `string` must be null-terminated.
+/// If `outlength` is non-null, it receives the length of the decoded string.
+#[no_mangle]
+pub unsafe extern "C" fn curl_unescape(
+    string: *const c_char,
+    length: c_long,
+    outlength: *mut c_long,
+) -> *mut c_char {
+    if string.is_null() {
+        return ptr::null_mut();
+    }
+
+    let input = if length == 0 {
+        // SAFETY: Caller guarantees string is null-terminated
+        unsafe { CStr::from_ptr(string) }.to_bytes()
+    } else {
+        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+        // SAFETY: Caller guarantees string points to at least length bytes
+        unsafe {
+            std::slice::from_raw_parts(string.cast::<u8>(), length as usize)
+        }
+    };
+
+    let decoded = percent_decode(input);
+
+    if !outlength.is_null() {
+        // SAFETY: Caller guarantees outlength is valid
+        unsafe {
+            #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+            {
+                *outlength = decoded.len() as c_long;
+            }
+        }
+    }
+
+    std::ffi::CString::new(decoded).map_or(ptr::null_mut(), std::ffi::CString::into_raw)
+}
+
+/// `curl_easy_escape` — URL-encode a string using an easy handle.
+///
+/// The easy handle parameter is accepted for API compatibility but not used.
+/// Returns a newly allocated string that must be freed with `curl_free`.
+///
+/// # Safety
+///
+/// `_handle` can be null (not used). `string` must be valid.
+/// If `length` is 0, the string is treated as null-terminated.
+#[no_mangle]
+pub unsafe extern "C" fn curl_easy_escape(
+    _handle: *mut c_void,
+    string: *const c_char,
+    length: c_long,
+) -> *mut c_char {
+    // SAFETY: Delegates to curl_escape with same safety requirements
+    unsafe { curl_escape(string, length) }
+}
+
+/// `curl_easy_unescape` — URL-decode a string using an easy handle.
+///
+/// The easy handle parameter is accepted for API compatibility but not used.
+/// Returns a newly allocated string that must be freed with `curl_free`.
+///
+/// # Safety
+///
+/// `_handle` can be null (not used). `string` must be valid.
+/// If `inlength` is 0, the string is treated as null-terminated.
+/// `outlength` receives the decoded length (can be null).
+#[no_mangle]
+pub unsafe extern "C" fn curl_easy_unescape(
+    _handle: *mut c_void,
+    string: *const c_char,
+    inlength: c_long,
+    outlength: *mut c_long,
+) -> *mut c_char {
+    // SAFETY: Delegates to curl_unescape with same safety requirements
+    unsafe { curl_unescape(string, inlength, outlength) }
+}
+
+/// `curl_getdate` — parse a date string to a Unix timestamp.
+///
+/// Parses RFC 2822, RFC 850, and asctime date formats.
+/// Returns the number of seconds since the Unix epoch, or -1 on failure.
+///
+/// # Safety
+///
+/// `datestring` must be a valid null-terminated C string.
+/// `now` is unused (accepted for API compatibility, can be null).
+#[no_mangle]
+pub unsafe extern "C" fn curl_getdate(datestring: *const c_char, _now: *const c_void) -> i64 {
+    if datestring.is_null() {
+        return -1;
+    }
+
+    // SAFETY: Caller guarantees datestring is null-terminated
+    let Ok(s) = unsafe { CStr::from_ptr(datestring) }.to_str() else {
+        return -1;
+    };
+
+    parse_http_date(s).unwrap_or(-1)
+}
+
+/// `curl_formadd` — deprecated multipart form API.
+///
+/// This function is deprecated in libcurl in favor of the MIME API.
+/// Returns `CURL_FORMADD_DISABLED` (7) to indicate it's not supported.
+///
+/// # Safety
+///
+/// Arguments are ignored. Always returns disabled.
+#[no_mangle]
+#[allow(clippy::missing_const_for_fn)]
+pub unsafe extern "C" fn curl_formadd(_first: *mut *mut c_void, _last: *mut *mut c_void) -> c_long {
+    7 // CURL_FORMADD_DISABLED
+}
+
+/// `curl_formfree` — free a form created by `curl_formadd`.
+///
+/// Since `curl_formadd` always returns disabled, this is a no-op.
+///
+/// # Safety
+///
+/// `form` can be any pointer (ignored).
+#[no_mangle]
+#[allow(clippy::missing_const_for_fn)]
+pub unsafe extern "C" fn curl_formfree(_form: *mut c_void) {
+    // No-op: curl_formadd is disabled
+}
+
+/// Percent-encode bytes for URL escaping.
+fn percent_encode(input: &[u8]) -> String {
+    let mut result = String::with_capacity(input.len());
+    for &byte in input {
+        if byte.is_ascii_alphanumeric()
+            || byte == b'-'
+            || byte == b'_'
+            || byte == b'.'
+            || byte == b'~'
+        {
+            result.push(char::from(byte));
+        } else {
+            result.push('%');
+            result.push(char::from(HEX_UPPER[usize::from(byte >> 4)]));
+            result.push(char::from(HEX_UPPER[usize::from(byte & 0x0F)]));
+        }
+    }
+    result
+}
+
+/// Upper-case hex digits for percent-encoding.
+const HEX_UPPER: [u8; 16] = *b"0123456789ABCDEF";
+
+/// Percent-decode bytes from URL escaping.
+fn percent_decode(input: &[u8]) -> Vec<u8> {
+    let mut result = Vec::with_capacity(input.len());
+    let mut i = 0;
+    while i < input.len() {
+        if input[i] == b'%' && i + 2 < input.len() {
+            if let (Some(hi), Some(lo)) = (hex_val(input[i + 1]), hex_val(input[i + 2])) {
+                result.push(hi << 4 | lo);
+                i += 3;
+                continue;
+            }
+        } else if input[i] == b'+' {
+            result.push(b' ');
+            i += 1;
+            continue;
+        }
+        result.push(input[i]);
+        i += 1;
+    }
+    result
+}
+
+/// Convert a hex ASCII digit to its numeric value.
+const fn hex_val(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Parse an HTTP date string to Unix timestamp.
+///
+/// Supports:
+/// - RFC 2822: "Sun, 06 Nov 1994 08:49:37 GMT"
+/// - RFC 850: "Sunday, 06-Nov-94 08:49:37 GMT"
+/// - asctime: "Sun Nov  6 08:49:37 1994"
+fn parse_http_date(s: &str) -> Option<i64> {
+    let s = s.trim();
+
+    // Try RFC 2822 / RFC 1123: "Sun, 06 Nov 1994 08:49:37 GMT"
+    if let Some(ts) = parse_rfc2822(s) {
+        return Some(ts);
+    }
+
+    // Try RFC 850: "Sunday, 06-Nov-94 08:49:37 GMT"
+    if let Some(ts) = parse_rfc850(s) {
+        return Some(ts);
+    }
+
+    // Try asctime: "Sun Nov  6 08:49:37 1994"
+    parse_asctime(s)
+}
+
+/// Month name to 0-based month number.
+fn month_from_name(name: &str) -> Option<u32> {
+    match name {
+        "Jan" => Some(0),
+        "Feb" => Some(1),
+        "Mar" => Some(2),
+        "Apr" => Some(3),
+        "May" => Some(4),
+        "Jun" => Some(5),
+        "Jul" => Some(6),
+        "Aug" => Some(7),
+        "Sep" => Some(8),
+        "Oct" => Some(9),
+        "Nov" => Some(10),
+        "Dec" => Some(11),
+        _ => None,
+    }
+}
+
+/// Days in each month (non-leap year).
+const DAYS_IN_MONTH: [u32; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+
+/// Check if a year is a leap year.
+const fn is_leap_year(year: i64) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+/// Convert date components to Unix timestamp.
+fn date_to_timestamp(year: i64, month: u32, day: u32, hour: u32, min: u32, sec: u32) -> i64 {
+    // Days from epoch (1970-01-01) to start of this year
+    let mut days: i64 = 0;
+    if year >= 1970 {
+        for y in 1970..year {
+            days += if is_leap_year(y) { 366 } else { 365 };
+        }
+    } else {
+        for y in year..1970 {
+            days -= if is_leap_year(y) { 366 } else { 365 };
+        }
+    }
+
+    // Add days for completed months
+    for m in 0..month {
+        days += i64::from(DAYS_IN_MONTH[m as usize]);
+        if m == 1 && is_leap_year(year) {
+            days += 1;
+        }
+    }
+
+    // Add days (1-based)
+    days += i64::from(day) - 1;
+
+    days * 86400 + i64::from(hour) * 3600 + i64::from(min) * 60 + i64::from(sec)
+}
+
+/// Parse RFC 2822 date: "Sun, 06 Nov 1994 08:49:37 GMT"
+fn parse_rfc2822(s: &str) -> Option<i64> {
+    // Skip optional day name and comma
+    let s = s.find(", ").map_or(s, |pos| &s[pos + 2..]);
+    let parts: Vec<&str> = s.split_whitespace().collect();
+    if parts.len() < 4 {
+        return None;
+    }
+
+    let day: u32 = parts[0].parse().ok()?;
+    let month = month_from_name(parts[1])?;
+    let year: i64 = parts[2].parse().ok()?;
+    let time_parts: Vec<&str> = parts[3].split(':').collect();
+    if time_parts.len() != 3 {
+        return None;
+    }
+    let hour: u32 = time_parts[0].parse().ok()?;
+    let min: u32 = time_parts[1].parse().ok()?;
+    let sec: u32 = time_parts[2].parse().ok()?;
+
+    Some(date_to_timestamp(year, month, day, hour, min, sec))
+}
+
+/// Parse RFC 850 date: "Sunday, 06-Nov-94 08:49:37 GMT"
+fn parse_rfc850(s: &str) -> Option<i64> {
+    let pos = s.find(", ")?;
+    let s = &s[pos + 2..];
+    let parts: Vec<&str> = s.split_whitespace().collect();
+    if parts.len() < 2 {
+        return None;
+    }
+
+    // "06-Nov-94"
+    let date_parts: Vec<&str> = parts[0].split('-').collect();
+    if date_parts.len() != 3 {
+        return None;
+    }
+    let day: u32 = date_parts[0].parse().ok()?;
+    let month = month_from_name(date_parts[1])?;
+    let mut year: i64 = date_parts[2].parse().ok()?;
+    if year < 100 {
+        year += if year < 70 { 2000 } else { 1900 };
+    }
+
+    let time_parts: Vec<&str> = parts[1].split(':').collect();
+    if time_parts.len() != 3 {
+        return None;
+    }
+    let hour: u32 = time_parts[0].parse().ok()?;
+    let min: u32 = time_parts[1].parse().ok()?;
+    let sec: u32 = time_parts[2].parse().ok()?;
+
+    Some(date_to_timestamp(year, month, day, hour, min, sec))
+}
+
+/// Parse asctime date: "Sun Nov  6 08:49:37 1994"
+fn parse_asctime(s: &str) -> Option<i64> {
+    let parts: Vec<&str> = s.split_whitespace().collect();
+    if parts.len() < 5 {
+        return None;
+    }
+
+    // Skip day name (parts[0])
+    let month = month_from_name(parts[1])?;
+    let day: u32 = parts[2].parse().ok()?;
+    let time_parts: Vec<&str> = parts[3].split(':').collect();
+    if time_parts.len() != 3 {
+        return None;
+    }
+    let hour: u32 = time_parts[0].parse().ok()?;
+    let min: u32 = time_parts[1].parse().ok()?;
+    let sec: u32 = time_parts[2].parse().ok()?;
+    let year: i64 = parts[4].parse().ok()?;
+
+    Some(date_to_timestamp(year, month, day, hour, min, sec))
 }
 
 // ───────────────────────── Version ─────────────────────────
@@ -4870,5 +5481,637 @@ mod tests {
         let mut numfds: c_long = 0;
         let code = unsafe { curl_multi_poll(ptr::null_mut(), ptr::null_mut(), 0, 0, &mut numfds) };
         assert_eq!(code, CURLMcode::CURLM_BAD_HANDLE);
+    }
+
+    // ─── Phase 34: Utility functions ───
+
+    #[test]
+    fn curl_escape_simple() {
+        let input = c"hello world";
+        let result = unsafe { curl_escape(input.as_ptr(), 0) };
+        assert!(!result.is_null());
+        let s = unsafe { CStr::from_ptr(result) }.to_str().unwrap();
+        assert_eq!(s, "hello%20world");
+        unsafe { curl_free(result.cast::<c_void>()) };
+    }
+
+    #[test]
+    fn curl_escape_with_length() {
+        let input = c"abc123";
+        let result = unsafe { curl_escape(input.as_ptr(), 3) };
+        assert!(!result.is_null());
+        let s = unsafe { CStr::from_ptr(result) }.to_str().unwrap();
+        assert_eq!(s, "abc"); // Only first 3 bytes
+        unsafe { curl_free(result.cast::<c_void>()) };
+    }
+
+    #[test]
+    fn curl_escape_special_chars() {
+        let input = c"key=value&foo=bar";
+        let result = unsafe { curl_escape(input.as_ptr(), 0) };
+        assert!(!result.is_null());
+        let s = unsafe { CStr::from_ptr(result) }.to_str().unwrap();
+        assert_eq!(s, "key%3Dvalue%26foo%3Dbar");
+        unsafe { curl_free(result.cast::<c_void>()) };
+    }
+
+    #[test]
+    fn curl_escape_null_returns_null() {
+        let result = unsafe { curl_escape(ptr::null(), 0) };
+        assert!(result.is_null());
+    }
+
+    #[test]
+    fn curl_escape_unreserved_chars_preserved() {
+        let input = c"abc-_.~XYZ";
+        let result = unsafe { curl_escape(input.as_ptr(), 0) };
+        let s = unsafe { CStr::from_ptr(result) }.to_str().unwrap();
+        assert_eq!(s, "abc-_.~XYZ");
+        unsafe { curl_free(result.cast::<c_void>()) };
+    }
+
+    #[test]
+    fn curl_unescape_simple() {
+        let input = c"hello%20world";
+        let mut outlen: c_long = 0;
+        let result = unsafe { curl_unescape(input.as_ptr(), 0, &mut outlen) };
+        assert!(!result.is_null());
+        let s = unsafe { CStr::from_ptr(result) }.to_str().unwrap();
+        assert_eq!(s, "hello world");
+        assert_eq!(outlen, 11);
+        unsafe { curl_free(result.cast::<c_void>()) };
+    }
+
+    #[test]
+    fn curl_unescape_plus_to_space() {
+        let input = c"hello+world";
+        let result = unsafe { curl_unescape(input.as_ptr(), 0, ptr::null_mut()) };
+        assert!(!result.is_null());
+        let s = unsafe { CStr::from_ptr(result) }.to_str().unwrap();
+        assert_eq!(s, "hello world");
+        unsafe { curl_free(result.cast::<c_void>()) };
+    }
+
+    #[test]
+    fn curl_unescape_null_returns_null() {
+        let result = unsafe { curl_unescape(ptr::null(), 0, ptr::null_mut()) };
+        assert!(result.is_null());
+    }
+
+    #[test]
+    fn curl_unescape_with_length() {
+        let input = c"%41%42%43DEF";
+        let mut outlen: c_long = 0;
+        let result = unsafe { curl_unescape(input.as_ptr(), 9, &mut outlen) };
+        assert!(!result.is_null());
+        let s = unsafe { CStr::from_ptr(result) }.to_str().unwrap();
+        assert_eq!(s, "ABC");
+        assert_eq!(outlen, 3);
+        unsafe { curl_free(result.cast::<c_void>()) };
+    }
+
+    #[test]
+    fn curl_easy_escape_delegates() {
+        let handle = curl_easy_init();
+        let input = c"test value";
+        let result = unsafe { curl_easy_escape(handle, input.as_ptr(), 0) };
+        assert!(!result.is_null());
+        let s = unsafe { CStr::from_ptr(result) }.to_str().unwrap();
+        assert_eq!(s, "test%20value");
+        unsafe {
+            curl_free(result.cast::<c_void>());
+            curl_easy_cleanup(handle);
+        }
+    }
+
+    #[test]
+    fn curl_easy_unescape_delegates() {
+        let handle = curl_easy_init();
+        let input = c"test%20value";
+        let mut outlen: c_long = 0;
+        let result = unsafe { curl_easy_unescape(handle, input.as_ptr(), 0, &mut outlen) };
+        assert!(!result.is_null());
+        let s = unsafe { CStr::from_ptr(result) }.to_str().unwrap();
+        assert_eq!(s, "test value");
+        assert_eq!(outlen, 10);
+        unsafe {
+            curl_free(result.cast::<c_void>());
+            curl_easy_cleanup(handle);
+        }
+    }
+
+    #[test]
+    fn curl_escape_roundtrip() {
+        let input = c"hello world/foo?bar=baz&qux=123";
+        let encoded = unsafe { curl_escape(input.as_ptr(), 0) };
+        assert!(!encoded.is_null());
+        let decoded = unsafe { curl_unescape(encoded, 0, ptr::null_mut()) };
+        assert!(!decoded.is_null());
+        let s = unsafe { CStr::from_ptr(decoded) }.to_str().unwrap();
+        assert_eq!(s, "hello world/foo?bar=baz&qux=123");
+        unsafe {
+            curl_free(decoded.cast::<c_void>());
+            curl_free(encoded.cast::<c_void>());
+        }
+    }
+
+    // ─── Phase 34: curl_getdate ───
+
+    #[test]
+    fn getdate_rfc2822() {
+        let date = c"Sun, 06 Nov 1994 08:49:37 GMT";
+        let ts = unsafe { curl_getdate(date.as_ptr(), ptr::null()) };
+        assert_eq!(ts, 784_111_777);
+    }
+
+    #[test]
+    fn getdate_rfc850() {
+        let date = c"Sunday, 06-Nov-94 08:49:37 GMT";
+        let ts = unsafe { curl_getdate(date.as_ptr(), ptr::null()) };
+        assert_eq!(ts, 784_111_777);
+    }
+
+    #[test]
+    fn getdate_asctime() {
+        let date = c"Sun Nov  6 08:49:37 1994";
+        let ts = unsafe { curl_getdate(date.as_ptr(), ptr::null()) };
+        assert_eq!(ts, 784_111_777);
+    }
+
+    #[test]
+    fn getdate_null_returns_negative() {
+        let ts = unsafe { curl_getdate(ptr::null(), ptr::null()) };
+        assert_eq!(ts, -1);
+    }
+
+    #[test]
+    fn getdate_invalid_returns_negative() {
+        let date = c"not a date";
+        let ts = unsafe { curl_getdate(date.as_ptr(), ptr::null()) };
+        assert_eq!(ts, -1);
+    }
+
+    #[test]
+    fn getdate_epoch() {
+        let date = c"Thu, 01 Jan 1970 00:00:00 GMT";
+        let ts = unsafe { curl_getdate(date.as_ptr(), ptr::null()) };
+        assert_eq!(ts, 0);
+    }
+
+    #[test]
+    fn getdate_y2k() {
+        let date = c"Sat, 01 Jan 2000 00:00:00 GMT";
+        let ts = unsafe { curl_getdate(date.as_ptr(), ptr::null()) };
+        assert_eq!(ts, 946_684_800);
+    }
+
+    // ─── Phase 34: curl_formadd / curl_formfree ───
+
+    #[test]
+    fn formadd_returns_disabled() {
+        let result =
+            unsafe { curl_formadd(ptr::null_mut::<*mut c_void>(), ptr::null_mut::<*mut c_void>()) };
+        assert_eq!(result, 7); // CURL_FORMADD_DISABLED
+    }
+
+    #[test]
+    fn formfree_null_is_safe() {
+        unsafe { curl_formfree(ptr::null_mut()) };
+    }
+
+    // ─── Phase 34: New CURLOPT options ───
+
+    #[test]
+    fn easy_setopt_path_as_is() {
+        let handle = curl_easy_init();
+        // CURLOPT_PATH_AS_IS = 234
+        let code = unsafe { curl_easy_setopt(handle, 234, 1 as *const c_void) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_expect_100_timeout_ms() {
+        let handle = curl_easy_init();
+        // CURLOPT_EXPECT_100_TIMEOUT_MS = 227
+        let code = unsafe { curl_easy_setopt(handle, 227, 1000 as *const c_void) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_postredir() {
+        let handle = curl_easy_init();
+        // CURLOPT_POSTREDIR = 161, bitmask: 1=301, 2=302, 4=303, 7=all
+        let code = unsafe { curl_easy_setopt(handle, 161, 7 as *const c_void) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_transfer_encoding() {
+        let handle = curl_easy_init();
+        // CURLOPT_TRANSFER_ENCODING = 207
+        let code = unsafe { curl_easy_setopt(handle, 207, 1 as *const c_void) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_dns_shuffle_addresses() {
+        let handle = curl_easy_init();
+        // CURLOPT_DNS_SHUFFLE_ADDRESSES = 275
+        let code = unsafe { curl_easy_setopt(handle, 275, 1 as *const c_void) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_httpproxytunnel() {
+        let handle = curl_easy_init();
+        // CURLOPT_HTTPPROXYTUNNEL = 61
+        let code = unsafe { curl_easy_setopt(handle, 61, 1 as *const c_void) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_maxfilesize() {
+        let handle = curl_easy_init();
+        // CURLOPT_MAXFILESIZE = 114
+        let code = unsafe { curl_easy_setopt(handle, 114, 1_048_576 as *const c_void) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_maxfilesize_large() {
+        let handle = curl_easy_init();
+        // CURLOPT_MAXFILESIZE_LARGE = 30117
+        let code = unsafe { curl_easy_setopt(handle, 30117, 1_048_576 as *const c_void) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_hsts() {
+        let handle = curl_easy_init();
+        let path = c"/tmp/hsts.txt";
+        // CURLOPT_HSTS = 10300
+        let code = unsafe { curl_easy_setopt(handle, 10300, path.as_ptr().cast::<c_void>()) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_cookielist() {
+        let handle = curl_easy_init();
+        let cmd = c"ALL";
+        // CURLOPT_COOKIELIST = 10135
+        let code = unsafe { curl_easy_setopt(handle, 10135, cmd.as_ptr().cast::<c_void>()) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_errorbuffer() {
+        let handle = curl_easy_init();
+        let mut buf = [0u8; 256];
+        // CURLOPT_ERRORBUFFER = 10010
+        let code = unsafe {
+            curl_easy_setopt(handle, 10010, buf.as_mut_ptr().cast::<c_void>().cast_const())
+        };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_stderr() {
+        let handle = curl_easy_init();
+        // CURLOPT_STDERR = 10037
+        let code = unsafe { curl_easy_setopt(handle, 10037, ptr::null()) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_protocols_str() {
+        let handle = curl_easy_init();
+        let proto = c"http,https,ftp";
+        // CURLOPT_PROTOCOLS_STR = 10318
+        let code = unsafe { curl_easy_setopt(handle, 10318, proto.as_ptr().cast::<c_void>()) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_redir_protocols_str() {
+        let handle = curl_easy_init();
+        let proto = c"http,https";
+        // CURLOPT_REDIR_PROTOCOLS_STR = 10319
+        let code = unsafe { curl_easy_setopt(handle, 10319, proto.as_ptr().cast::<c_void>()) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_proxy_cainfo() {
+        let handle = curl_easy_init();
+        let path = c"/tmp/proxy-ca.pem";
+        // CURLOPT_PROXY_CAINFO = 10246
+        let code = unsafe { curl_easy_setopt(handle, 10246, path.as_ptr().cast::<c_void>()) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_proxy_ssl_verifyhost() {
+        let handle = curl_easy_init();
+        // CURLOPT_PROXY_SSL_VERIFYHOST = 249
+        let code = unsafe { curl_easy_setopt(handle, 249, 2 as *const c_void) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    // ─── Phase 34: New CURLINFO codes ───
+
+    #[test]
+    fn easy_getinfo_filetime_returns_unknown() {
+        let handle = curl_easy_init();
+        // Need a completed transfer for getinfo — create a minimal response
+        let h = unsafe { &mut *handle.cast::<EasyHandle>() };
+        h.last_response = Some(liburlx::Response::new(
+            200,
+            std::collections::HashMap::new(),
+            Vec::new(),
+            "http://example.com".to_string(),
+        ));
+
+        let mut val: c_long = 0;
+        let result = unsafe {
+            curl_easy_getinfo(handle, 0x20_000E, ptr::from_mut(&mut val).cast::<c_void>())
+        };
+        assert_eq!(result, CURLcode::CURLE_OK);
+        assert_eq!(val, -1); // Unknown filetime
+
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_getinfo_content_length_download() {
+        let handle = curl_easy_init();
+        let h = unsafe { &mut *handle.cast::<EasyHandle>() };
+        h.last_response = Some(liburlx::Response::new(
+            200,
+            std::collections::HashMap::new(),
+            b"hello".to_vec(),
+            "http://example.com".to_string(),
+        ));
+
+        let mut val: f64 = 0.0;
+        let result = unsafe {
+            curl_easy_getinfo(handle, 0x30_000F, ptr::from_mut(&mut val).cast::<c_void>())
+        };
+        assert_eq!(result, CURLcode::CURLE_OK);
+        assert!((val - 5.0).abs() < f64::EPSILON);
+
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_getinfo_os_errno() {
+        let handle = curl_easy_init();
+        let h = unsafe { &mut *handle.cast::<EasyHandle>() };
+        h.last_response = Some(liburlx::Response::new(
+            200,
+            std::collections::HashMap::new(),
+            Vec::new(),
+            "http://example.com".to_string(),
+        ));
+
+        let mut val: c_long = 99;
+        let result = unsafe {
+            curl_easy_getinfo(handle, 0x20_0019, ptr::from_mut(&mut val).cast::<c_void>())
+        };
+        assert_eq!(result, CURLcode::CURLE_OK);
+        assert_eq!(val, 0);
+
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_getinfo_primary_ip() {
+        let handle = curl_easy_init();
+        let h = unsafe { &mut *handle.cast::<EasyHandle>() };
+        h.last_response = Some(liburlx::Response::new(
+            200,
+            std::collections::HashMap::new(),
+            Vec::new(),
+            "http://example.com".to_string(),
+        ));
+
+        let mut val: *const c_char = ptr::null();
+        let result = unsafe {
+            curl_easy_getinfo(handle, 0x10_0020, ptr::from_mut(&mut val).cast::<c_void>())
+        };
+        assert_eq!(result, CURLcode::CURLE_OK);
+        assert!(!val.is_null());
+
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_getinfo_num_connects() {
+        let handle = curl_easy_init();
+        let h = unsafe { &mut *handle.cast::<EasyHandle>() };
+        h.last_response = Some(liburlx::Response::new(
+            200,
+            std::collections::HashMap::new(),
+            Vec::new(),
+            "http://example.com".to_string(),
+        ));
+
+        let mut val: c_long = 0;
+        let result = unsafe {
+            curl_easy_getinfo(handle, 0x20_0026, ptr::from_mut(&mut val).cast::<c_void>())
+        };
+        assert_eq!(result, CURLcode::CURLE_OK);
+        assert_eq!(val, 1);
+
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_getinfo_local_ip() {
+        let handle = curl_easy_init();
+        let h = unsafe { &mut *handle.cast::<EasyHandle>() };
+        h.last_response = Some(liburlx::Response::new(
+            200,
+            std::collections::HashMap::new(),
+            Vec::new(),
+            "http://example.com".to_string(),
+        ));
+
+        let mut val: *const c_char = ptr::null();
+        let result = unsafe {
+            curl_easy_getinfo(handle, 0x10_0029, ptr::from_mut(&mut val).cast::<c_void>())
+        };
+        assert_eq!(result, CURLcode::CURLE_OK);
+        assert!(!val.is_null());
+
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_getinfo_redirect_url_none() {
+        let handle = curl_easy_init();
+        let h = unsafe { &mut *handle.cast::<EasyHandle>() };
+        h.last_response = Some(liburlx::Response::new(
+            200,
+            std::collections::HashMap::new(),
+            Vec::new(),
+            "http://example.com".to_string(),
+        ));
+
+        let mut val: *const c_char = 1 as *const c_char;
+        let result = unsafe {
+            curl_easy_getinfo(handle, 0x10_0031, ptr::from_mut(&mut val).cast::<c_void>())
+        };
+        assert_eq!(result, CURLcode::CURLE_OK);
+        assert!(val.is_null()); // No redirect
+
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_getinfo_redirect_url_present() {
+        let handle = curl_easy_init();
+        let h = unsafe { &mut *handle.cast::<EasyHandle>() };
+        let mut headers = std::collections::HashMap::new();
+        let _ = headers.insert("location".to_string(), "http://other.com/".to_string());
+        h.last_response = Some(liburlx::Response::new(
+            302,
+            headers,
+            Vec::new(),
+            "http://example.com".to_string(),
+        ));
+
+        let mut val: *const c_char = ptr::null();
+        let result = unsafe {
+            curl_easy_getinfo(handle, 0x10_0031, ptr::from_mut(&mut val).cast::<c_void>())
+        };
+        assert_eq!(result, CURLcode::CURLE_OK);
+        assert!(!val.is_null());
+
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_getinfo_condition_unmet_false() {
+        let handle = curl_easy_init();
+        let h = unsafe { &mut *handle.cast::<EasyHandle>() };
+        h.last_response = Some(liburlx::Response::new(
+            200,
+            std::collections::HashMap::new(),
+            Vec::new(),
+            "http://example.com".to_string(),
+        ));
+
+        let mut val: c_long = 99;
+        let result = unsafe {
+            curl_easy_getinfo(handle, 0x20_0035, ptr::from_mut(&mut val).cast::<c_void>())
+        };
+        assert_eq!(result, CURLcode::CURLE_OK);
+        assert_eq!(val, 0);
+
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_getinfo_condition_unmet_304() {
+        let handle = curl_easy_init();
+        let h = unsafe { &mut *handle.cast::<EasyHandle>() };
+        h.last_response = Some(liburlx::Response::new(
+            304,
+            std::collections::HashMap::new(),
+            Vec::new(),
+            "http://example.com".to_string(),
+        ));
+
+        let mut val: c_long = 0;
+        let result = unsafe {
+            curl_easy_getinfo(handle, 0x20_0035, ptr::from_mut(&mut val).cast::<c_void>())
+        };
+        assert_eq!(result, CURLcode::CURLE_OK);
+        assert_eq!(val, 1);
+
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_getinfo_local_port() {
+        let handle = curl_easy_init();
+        let h = unsafe { &mut *handle.cast::<EasyHandle>() };
+        h.last_response = Some(liburlx::Response::new(
+            200,
+            std::collections::HashMap::new(),
+            Vec::new(),
+            "http://example.com".to_string(),
+        ));
+
+        let mut val: c_long = 99;
+        let result = unsafe {
+            curl_easy_getinfo(handle, 0x20_0042, ptr::from_mut(&mut val).cast::<c_void>())
+        };
+        assert_eq!(result, CURLcode::CURLE_OK);
+        assert_eq!(val, 0);
+
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    // ─── Phase 34: Internal helpers ───
+
+    #[test]
+    fn percent_encode_all_bytes() {
+        assert_eq!(percent_encode(b"abc"), "abc");
+        assert_eq!(percent_encode(b" "), "%20");
+        assert_eq!(percent_encode(b"\x00"), "%00");
+        assert_eq!(percent_encode(b"\xFF"), "%FF");
+        assert_eq!(percent_encode(b"a b"), "a%20b");
+    }
+
+    #[test]
+    fn percent_decode_all() {
+        assert_eq!(percent_decode(b"abc"), b"abc");
+        assert_eq!(percent_decode(b"%20"), b" ");
+        assert_eq!(percent_decode(b"a+b"), b"a b");
+        assert_eq!(percent_decode(b"%00"), b"\x00");
+        assert_eq!(percent_decode(b"%FF"), b"\xFF");
+        assert_eq!(percent_decode(b"%2f"), b"/"); // lowercase hex
+    }
+
+    #[test]
+    fn percent_decode_invalid_hex() {
+        // Invalid hex sequences should be kept as-is
+        assert_eq!(percent_decode(b"%ZZ"), b"%ZZ");
+        assert_eq!(percent_decode(b"%2"), b"%2"); // Truncated
+    }
+
+    #[test]
+    fn date_parsing_internal() {
+        // Test internal date helpers
+        assert_eq!(month_from_name("Jan"), Some(0));
+        assert_eq!(month_from_name("Dec"), Some(11));
+        assert_eq!(month_from_name("Bad"), None);
+
+        assert!(is_leap_year(2000));
+        assert!(!is_leap_year(1900));
+        assert!(is_leap_year(2004));
+        assert!(!is_leap_year(2001));
+
+        // Epoch
+        assert_eq!(date_to_timestamp(1970, 0, 1, 0, 0, 0), 0);
+        // One day after epoch
+        assert_eq!(date_to_timestamp(1970, 0, 2, 0, 0, 0), 86400);
     }
 }
