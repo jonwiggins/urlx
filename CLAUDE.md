@@ -14,12 +14,12 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 35 — Planning
-**Last completed:** Phase 34 (FFI Expansion II) — 2026-03-09
-**Total tests:** 2,049
-**In progress:** Planning Phase 35
+**Phase:** 36 — Planning
+**Last completed:** Phase 35 (WebSocket Enhancements) — 2026-03-09
+**Total tests:** 2,064
+**In progress:** Planning Phase 36
 **Blockers:** None
-**Next up:** Phase 35 — WebSocket Enhancements
+**Next up:** Phase 36 — HTTP/3 Maturity
 
 ### Completeness Summary (updated Phase 30 review)
 
@@ -307,7 +307,7 @@ Built from scratch over 29 phases. All features below are implemented and tested
 - Features: .curlrc-style config file parser, protocol restriction, max filesize enforcement (exit 63), libcurl C code generation, retry logic (408/429/5xx), netrc credential lookup, Content-Disposition filename extraction, URL query parameter appending.
 - Misc: --globoff (no-op, no URL globbing).
 
-**Testing — 2,049 tests (0 failures):**
+**Testing — 2,064 tests (0 failures):**
 - Unit + integration tests across all crates
 - Integration: 1,048 (hyper-based test servers)
 - Property-based: 60 (proptest — URL, cookie, FTP, HTTP, HSTS, multipart, protocols, WebSocket)
@@ -377,15 +377,9 @@ Added 16 CURLOPT options, 10 CURLINFO codes, and 7 utility functions. HTTP date 
 
 ---
 
-### Phase 35: WebSocket Enhancements
+### Phase 35: WebSocket Enhancements (2026-03-09)
 
-**Goal:** Improve WebSocket support.
-
-- WebSocket compression (permessage-deflate)
-- Ping/pong handling
-- Close frame handling with status codes
-- Binary message support improvements
-- WSS (WebSocket over TLS)
+Added `CloseCode` enum (11 RFC 6455 Section 7.4.1 status codes), `close_with_code()` constructor, `close_code()`/`close_reason()` extractors. `Message` enum (Text/Binary/Close/Ping/Pong) for high-level API. `WebSocketStream<S>` wrapping any `AsyncRead+AsyncWrite` with automatic pong response to pings, close handshake (auto-reply), fragmented message reassembly (continuation frames), and client/server mode (masked/unmasked). RSV1 bit in `Frame` for future permessage-deflate. `write_frame_masked()` for configurable masking. 15 new tests.
 
 ---
 
