@@ -14,12 +14,12 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 15 — DNS Hardening & DoH
-**Last completed:** Phase 14 (Streaming Upload & Callback API) — 2026-03-08
-**Total tests:** 1,693+
-**In progress:** Planning Phase 15
+**Phase:** 16 — Connection Control & Header Management
+**Last completed:** Phase 15 (DNS Hardening & DoH) — 2026-03-09
+**Total tests:** 1,717+
+**In progress:** Planning Phase 16
 **Blockers:** None
-**Next up:** CURLOPT_DNS_SERVERS, CURLOPT_DOH_URL, async resolver
+**Next up:** Header deduplication, CURLOPT_UNRESTRICTED_AUTH, CURLOPT_IGNORE_CONTENT_LENGTH
 
 ### Completeness Summary (updated Phase 10 review)
 
@@ -32,12 +32,12 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 | Authentication | 60% | Basic, Bearer, Digest (MD5/SHA-256), AWS SigV4, NTLM skeleton |
 | Cookie engine | 90% | Netscape file format read/write, in-memory jar; no public suffix list |
 | Proxy | 85% | HTTP + SOCKS + proxy Basic/Digest/NTLM auth, proxy TLS config; no HTTPS proxy tunnel or PAC |
-| DNS | 60% | Cache with TTL, Happy Eyeballs (RFC 6555), DNS shuffle; no async resolver or DoH |
+| DNS | 75% | Cache with configurable TTL, Happy Eyeballs with configurable timeout, DNS shuffle, DNS server config, DoH URL config; no async resolver implementation |
 | FTP | 70% | Session API, upload, resume, dir ops, FEAT; no FTPS or active mode |
 | SSH/SFTP/SCP | 0% | Not implemented |
 | Multi API | 55% | Connection limiting, message queue, share interface, pipelining config; no poll/socket/timer callbacks |
-| FFI (libcurl C ABI) | ~26% | 63 options, 16 info codes, 25 error codes, multi API, slist, duphandle |
-| CLI | ~25% | ~74 of ~250 flags |
+| FFI (libcurl C ABI) | ~27% | 67 options, 16 info codes, 25 error codes, multi API, slist, duphandle |
+| CLI | ~26% | ~77 of ~250 flags |
 | Connection | 80% | Pool, TCP_NODELAY, keepalive, Unix sockets, interface/port binding |
 | Transfer control | 40% | Rate limiting, speed enforcement API; not wired into transfer engine yet |
 | Overall | ~53% | ~90% for basic HTTP/HTTPS use cases |
@@ -371,14 +371,9 @@ Added CURLOPT_READFUNCTION/CURLOPT_READDATA for streaming upload data collection
 
 ---
 
-### Phase 15: DNS Hardening & DoH
+### Phase 15: DNS Hardening & DoH — COMPLETED (2026-03-09)
 
-**Goal:** Modern DNS features.
-
-- CURLOPT_DNS_SERVERS, CURLOPT_DOH_URL
-- CURLOPT_DNS_CACHE_TIMEOUT
-- Async DNS resolver via hickory-dns (feature-gated)
-- CURLOPT_HAPPY_EYEBALLS_TIMEOUT_MS
+Added configurable DNS cache TTL via `dns_cache_timeout()` and `DnsCache::set_ttl()`/`DnsCache::ttl()`. Added configurable Happy Eyeballs timeout via `happy_eyeballs_timeout()` — threaded through perform_transfer → do_single_request → happy_eyeballs_connect. Added `dns_servers()` for custom DNS server addresses with comma-separated IP:port parsing (default port 53). Added `doh_url()` for DNS-over-HTTPS endpoint configuration. Added FFI options: CURLOPT_DNS_CACHE_TIMEOUT (92), CURLOPT_HAPPY_EYEBALLS_TIMEOUT_MS (271), CURLOPT_DNS_SERVERS (10211), CURLOPT_DOH_URL (10279). Added CLI flags: `--dns-servers`, `--doh-url`, `--happy-eyeballs-timeout-ms`. Deferred: async DNS resolver via hickory-dns (significant dependency), DoH query execution (requires nested HTTP during DNS phase).
 
 ---
 
