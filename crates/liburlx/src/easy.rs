@@ -1369,6 +1369,31 @@ impl Easy {
         self.http2_ping_interval = Some(interval);
     }
 
+    /// Build a DNS resolver from the current configuration.
+    ///
+    /// Uses hickory-dns when available and custom DNS servers or `DoH` URL
+    /// is configured. Falls back to the system resolver otherwise.
+    #[allow(clippy::unused_self, clippy::missing_const_for_fn)]
+    fn build_dns_resolver(&self) -> crate::dns::DnsResolver {
+        #[cfg(feature = "hickory-dns")]
+        {
+            // If DoH URL is configured, use DoH resolver
+            if let Some(ref doh_url) = self.doh_url {
+                return crate::dns::DnsResolver::Hickory(Box::new(
+                    crate::dns::HickoryResolver::from_doh(doh_url),
+                ));
+            }
+            // If custom DNS servers are configured, use hickory with those servers
+            if let Some(ref servers) = self.dns_servers {
+                return crate::dns::DnsResolver::Hickory(Box::new(
+                    crate::dns::HickoryResolver::from_servers(servers),
+                ));
+            }
+        }
+        // Default: system resolver
+        crate::dns::DnsResolver::System
+    }
+
     /// Perform the transfer and return the response (blocking).
     ///
     /// Creates a new tokio runtime internally. Do not call from within
@@ -1508,6 +1533,8 @@ impl Easy {
             ping_interval: self.http2_ping_interval,
         };
 
+        let dns_resolver = self.build_dns_resolver();
+
         let fut = perform_transfer(
             &url,
             Some(effective_method.as_str()),
@@ -1549,6 +1576,7 @@ impl Easy {
             self.proxy_tls_config.as_ref(),
             #[cfg(feature = "http2")]
             &h2_config,
+            &dns_resolver,
         );
 
         // Apply total transfer timeout if set.
@@ -1652,6 +1680,7 @@ async fn perform_transfer(
     ssh_key_path: Option<&str>,
     proxy_tls_config: Option<&TlsConfig>,
     #[cfg(feature = "http2")] h2_config: &crate::protocol::http::h2::Http2Config,
+    dns_resolver: &crate::dns::DnsResolver,
 ) -> Result<Response, Error> {
     let transfer_start = Instant::now();
     let original_url = url.clone();
@@ -1716,6 +1745,7 @@ async fn perform_transfer(
             alt_svc_cache,
             #[cfg(feature = "http2")]
             h2_config,
+            dns_resolver,
         ))
         .await?;
 
@@ -1781,6 +1811,7 @@ async fn perform_transfer(
                                 alt_svc_cache,
                                 #[cfg(feature = "http2")]
                                 h2_config,
+                                dns_resolver,
                             ))
                             .await?;
                         }
@@ -1922,6 +1953,7 @@ async fn do_single_request(
     #[cfg_attr(not(feature = "http3"), allow(unused_variables))]
     alt_svc_cache: &crate::protocol::http::altsvc::AltSvcCache,
     #[cfg(feature = "http2")] h2_config: &crate::protocol::http::h2::Http2Config,
+    dns_resolver: &crate::dns::DnsResolver,
 ) -> Result<Response, Error> {
     // Handle non-HTTP schemes directly
     match url.scheme() {
@@ -2095,8 +2127,7 @@ async fn do_single_request(
         return Err(Error::Http("Unix sockets are not supported on this platform".to_string()));
     }
 
-    // DNS resolution: check cache first, then resolve
-    let addr_str = format!("{resolved_host}:{connect_port}");
+    // DNS resolution: check cache first, then use resolver
     let addrs = if let Some(cached) = dns_cache.get(&resolved_host, connect_port) {
         if verbose {
             #[allow(clippy::print_stderr)]
@@ -2106,22 +2137,14 @@ async fn do_single_request(
         }
         cached.to_vec()
     } else {
-        let lookup_fut = tokio::net::lookup_host(&addr_str);
-        let resolved: Vec<std::net::SocketAddr> = if let Some(timeout_dur) = connect_timeout {
-            tokio::time::timeout(timeout_dur, lookup_fut)
+        let resolve_fut = dns_resolver.resolve(&resolved_host, connect_port);
+        let resolved = if let Some(timeout_dur) = connect_timeout {
+            tokio::time::timeout(timeout_dur, resolve_fut)
                 .await
-                .map_err(|_| Error::Timeout(timeout_dur))?
-                .map_err(Error::Connect)?
-                .collect()
+                .map_err(|_| Error::Timeout(timeout_dur))??
         } else {
-            lookup_fut.await.map_err(Error::Connect)?.collect()
+            resolve_fut.await?
         };
-        if resolved.is_empty() {
-            return Err(Error::Connect(std::io::Error::new(
-                std::io::ErrorKind::AddrNotAvailable,
-                format!("DNS resolution failed for {resolved_host}"),
-            )));
-        }
         dns_cache.put(&resolved_host, connect_port, resolved.clone());
         resolved
     };
@@ -2202,7 +2225,7 @@ async fn do_single_request(
                 } else if http_version == HttpVersion::None || http_version == HttpVersion::Http2 {
                     // Check Alt-Svc cache for h3 support
                     let alt_port = url.port_or_default().unwrap_or(443);
-                    let origin = format!("https://{}:{}", host, alt_port);
+                    let origin = format!("https://{host}:{alt_port}");
                     alt_svc_cache.get_protocol(&origin, "h3").is_some()
                 } else {
                     false
@@ -2211,7 +2234,7 @@ async fn do_single_request(
                 if use_h3 {
                     // Determine target address — Alt-Svc may specify a different port
                     let alt_port = url.port_or_default().unwrap_or(443);
-                    let origin = format!("https://{}:{}", host, alt_port);
+                    let origin = format!("https://{host}:{alt_port}");
                     let h3_port =
                         alt_svc_cache.get_protocol(&origin, "h3").map_or(alt_port, |svc| svc.port);
 

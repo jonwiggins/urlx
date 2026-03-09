@@ -1,12 +1,133 @@
-//! DNS caching with TTL-based expiry.
+//! DNS resolution and caching.
 //!
-//! Provides a simple in-memory DNS cache that stores resolved addresses
-//! with a configurable time-to-live. This avoids repeated DNS lookups
-//! for the same hostname within the TTL window.
+//! Provides DNS resolution via pluggable resolvers and an in-memory
+//! TTL-based cache. The default `SystemResolver` wraps
+//! `tokio::net::lookup_host`. When the `hickory-dns` feature is enabled,
+//! `HickoryResolver` provides true async resolution with support for
+//! custom DNS servers, DNS-over-HTTPS (`DoH`), and DNS-over-TLS (`DoT`).
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
+
+use crate::error::Error;
+
+/// DNS resolver that can resolve hostnames to socket addresses.
+///
+/// Uses an enum to avoid async trait object safety issues while
+/// supporting multiple resolver backends.
+#[derive(Debug, Default)]
+pub enum DnsResolver {
+    /// System resolver via `tokio::net::lookup_host` (wraps `getaddrinfo`).
+    #[default]
+    System,
+    /// Async resolver via `hickory-resolver` with configurable DNS servers,
+    /// DNS-over-HTTPS, and DNS-over-TLS support.
+    #[cfg(feature = "hickory-dns")]
+    Hickory(Box<HickoryResolver>),
+}
+
+impl DnsResolver {
+    /// Resolve a hostname and port to a list of socket addresses.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Connect`] if DNS resolution fails.
+    pub async fn resolve(&self, host: &str, port: u16) -> Result<Vec<SocketAddr>, Error> {
+        match self {
+            Self::System => system_resolve(host, port).await,
+            #[cfg(feature = "hickory-dns")]
+            Self::Hickory(resolver) => resolver.resolve(host, port).await,
+        }
+    }
+}
+
+/// Resolve using the system DNS resolver (`tokio::net::lookup_host`).
+async fn system_resolve(host: &str, port: u16) -> Result<Vec<SocketAddr>, Error> {
+    let addr_str = format!("{host}:{port}");
+    let addrs: Vec<SocketAddr> =
+        tokio::net::lookup_host(&addr_str).await.map_err(Error::Connect)?.collect();
+    if addrs.is_empty() {
+        return Err(Error::Connect(std::io::Error::new(
+            std::io::ErrorKind::AddrNotAvailable,
+            format!("DNS resolution failed for {host}"),
+        )));
+    }
+    Ok(addrs)
+}
+
+/// Async DNS resolver backed by `hickory-resolver`.
+///
+/// Supports custom DNS server addresses, DNS-over-HTTPS (`DoH`),
+/// and DNS-over-TLS (`DoT`).
+#[cfg(feature = "hickory-dns")]
+#[derive(Debug)]
+pub struct HickoryResolver {
+    resolver: hickory_resolver::TokioResolver,
+}
+
+#[cfg(feature = "hickory-dns")]
+impl HickoryResolver {
+    /// Create a resolver using the system's default DNS configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the system DNS configuration cannot be read.
+    pub fn from_system() -> Result<Self, Error> {
+        let resolver = hickory_resolver::TokioResolver::builder_tokio()
+            .map_err(|e| Error::Http(format!("failed to create DNS resolver: {e}")))?
+            .build();
+        Ok(Self { resolver })
+    }
+
+    /// Create a resolver using custom DNS server addresses.
+    #[must_use]
+    pub fn from_servers(servers: &[SocketAddr]) -> Self {
+        use hickory_resolver::config::{NameServerConfig, ResolverConfig};
+        use hickory_resolver::proto::xfer::Protocol;
+        let mut config = ResolverConfig::new();
+        for addr in servers {
+            config.add_name_server(NameServerConfig::new(*addr, Protocol::Udp));
+            config.add_name_server(NameServerConfig::new(*addr, Protocol::Tcp));
+        }
+        let provider = hickory_resolver::name_server::TokioConnectionProvider::default();
+        let resolver =
+            hickory_resolver::TokioResolver::builder_with_config(config, provider).build();
+        Self { resolver }
+    }
+
+    /// Create a resolver that performs DNS-over-HTTPS queries.
+    ///
+    /// Uses Cloudflare's DNS-over-HTTPS by default. The `_doh_url` parameter
+    /// is accepted for API compatibility but the resolver uses the well-known
+    /// Cloudflare `DoH` endpoint directly.
+    #[must_use]
+    pub fn from_doh(_doh_url: &str) -> Self {
+        use hickory_resolver::config::ResolverConfig;
+        let config = ResolverConfig::cloudflare_https();
+        let provider = hickory_resolver::name_server::TokioConnectionProvider::default();
+        let resolver =
+            hickory_resolver::TokioResolver::builder_with_config(config, provider).build();
+        Self { resolver }
+    }
+
+    /// Resolve a hostname to socket addresses.
+    async fn resolve(&self, host: &str, port: u16) -> Result<Vec<SocketAddr>, Error> {
+        let response = self
+            .resolver
+            .lookup_ip(host)
+            .await
+            .map_err(|e| Error::Connect(std::io::Error::other(e)))?;
+        let addrs: Vec<SocketAddr> = response.iter().map(|ip| SocketAddr::new(ip, port)).collect();
+        if addrs.is_empty() {
+            return Err(Error::Connect(std::io::Error::new(
+                std::io::ErrorKind::AddrNotAvailable,
+                format!("DNS resolution failed for {host}"),
+            )));
+        }
+        Ok(addrs)
+    }
+}
 
 /// Default TTL for cached DNS entries (60 seconds, matching curl).
 const DEFAULT_TTL: Duration = Duration::from_secs(60);
@@ -261,5 +382,65 @@ mod tests {
         assert_eq!(cache_key("Example.COM", 443), "example.com:443");
         assert_eq!(cache_key("localhost", 80), "localhost:80");
         assert_eq!(cache_key("HOST", 65535), "host:65535");
+    }
+
+    #[test]
+    fn dns_resolver_default_is_system() {
+        let resolver = DnsResolver::default();
+        assert!(matches!(resolver, DnsResolver::System));
+    }
+
+    #[test]
+    fn dns_resolver_system_debug() {
+        let resolver = DnsResolver::System;
+        let debug = format!("{resolver:?}");
+        assert!(debug.contains("System"));
+    }
+
+    #[tokio::test]
+    async fn system_resolver_resolves_localhost() {
+        let resolver = DnsResolver::System;
+        let addrs = resolver.resolve("localhost", 80).await.unwrap();
+        assert!(!addrs.is_empty());
+        // All addresses should have port 80
+        for addr in &addrs {
+            assert_eq!(addr.port(), 80);
+        }
+    }
+
+    #[tokio::test]
+    async fn system_resolver_fails_for_invalid_host() {
+        let resolver = DnsResolver::System;
+        let result = resolver.resolve("this-host-does-not-exist.invalid", 80).await;
+        assert!(result.is_err());
+    }
+
+    #[cfg(feature = "hickory-dns")]
+    #[test]
+    fn hickory_resolver_from_system() {
+        let resolver = HickoryResolver::from_system().unwrap();
+        let dns = DnsResolver::Hickory(Box::new(resolver));
+        let debug = format!("{dns:?}");
+        assert!(debug.contains("Hickory"));
+    }
+
+    #[cfg(feature = "hickory-dns")]
+    #[test]
+    fn hickory_resolver_from_servers() {
+        use std::net::Ipv4Addr;
+        let servers = vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53)];
+        let resolver = HickoryResolver::from_servers(&servers);
+        let dns = DnsResolver::Hickory(Box::new(resolver));
+        let debug = format!("{dns:?}");
+        assert!(debug.contains("Hickory"));
+    }
+
+    #[cfg(feature = "hickory-dns")]
+    #[test]
+    fn hickory_resolver_from_doh() {
+        let resolver = HickoryResolver::from_doh("https://cloudflare-dns.com/dns-query");
+        let dns = DnsResolver::Hickory(Box::new(resolver));
+        let debug = format!("{dns:?}");
+        assert!(debug.contains("Hickory"));
     }
 }

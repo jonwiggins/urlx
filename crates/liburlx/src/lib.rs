@@ -31,7 +31,9 @@ pub mod url;
 
 pub use auth::{AuthCredentials, AuthMethod, ProxyAuthCredentials, ProxyAuthMethod};
 pub use cookie::CookieJar;
-pub use dns::DnsCache;
+#[cfg(feature = "hickory-dns")]
+pub use dns::HickoryResolver;
+pub use dns::{DnsCache, DnsResolver};
 pub use easy::{Easy, HttpVersion};
 pub use error::Error;
 pub use hsts::HstsCache;

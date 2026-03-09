@@ -23,6 +23,9 @@ rustls = ["dep:rustls", "dep:webpki-roots", "dep:tokio-rustls"]
 # SSH/SFTP/SCP protocols
 ssh = ["dep:russh", "dep:russh-sftp"]
 
+# Async DNS resolver
+hickory-dns = ["dep:hickory-resolver"]
+
 # Content-Encoding decompression
 decompression = ["dep:flate2", "dep:brotli", "dep:zstd"]
 
@@ -50,6 +53,7 @@ russh-sftp = { version = "2.1", optional = true }
 flate2 = { version = "1", optional = true }
 brotli = { version = "7", optional = true }
 zstd = { version = "0.13", optional = true, default-features = false }
+hickory-resolver = { version = "0.25", optional = true, default-features = false, features = ["tokio", "system-config", "https-ring", "tls-ring"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
