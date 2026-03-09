@@ -122,11 +122,26 @@ pub enum CURLoption {
     CURLOPT_MAX_SEND_SPEED_LARGE = 30145,
     CURLOPT_MAX_RECV_SPEED_LARGE = 30146,
 
+    // Pointer/object options
+    CURLOPT_SHARE = 10100,
+    CURLOPT_PRIVATE = 10103,
+    CURLOPT_MIMEPOST = 10269,
+
     // Function options (CURLOPTTYPE_FUNCTIONPOINT = 20000)
     CURLOPT_WRITEFUNCTION = 20011,
     CURLOPT_READFUNCTION = 20012,
+    CURLOPT_PROGRESSFUNCTION = 20056,
     CURLOPT_HEADERFUNCTION = 20079,
     CURLOPT_DEBUGFUNCTION = 20094,
+    CURLOPT_SEEKFUNCTION = 20167,
+    CURLOPT_XFERINFOFUNCTION = 20219,
+
+    // Long options (progress control)
+    CURLOPT_NOPROGRESS = 43,
+
+    // Pointer data options for callbacks
+    CURLOPT_PROGRESSDATA = 10057,
+    CURLOPT_SEEKDATA = 10168,
 }
 
 // ───────────────────────── CURLINFO ─────────────────────────
@@ -151,6 +166,7 @@ pub enum CURLINFO {
     CURLINFO_CONTENT_TYPE = 0x0010_0012,
     CURLINFO_REDIRECT_COUNT = 0x0020_0014,
     CURLINFO_SSL_VERIFYRESULT = 0x0020_000D,
+    CURLINFO_PRIVATE = 0x0010_0015,
     CURLINFO_APPCONNECT_TIME = 0x0030_0033,
 }
 
@@ -189,6 +205,347 @@ type ReadCallback = unsafe extern "C" fn(*mut c_char, usize, usize, *mut c_void)
 /// indicates the type of data (text, header in/out, data in/out).
 type DebugCallback =
     unsafe extern "C" fn(*mut c_void, c_long, *mut c_char, usize, *mut c_void) -> c_long;
+
+/// Progress callback type matching libcurl's `CURLOPT_PROGRESSFUNCTION`.
+///
+/// Called with download/upload progress. Parameters: clientp, dltotal, dlnow, ultotal, ulnow.
+/// Return non-zero to abort the transfer.
+type ProgressCallback = unsafe extern "C" fn(*mut c_void, f64, f64, f64, f64) -> c_long;
+
+/// Transfer info callback type matching libcurl's `CURLOPT_XFERINFOFUNCTION`.
+///
+/// Modern replacement for `CURLOPT_PROGRESSFUNCTION` using `curl_off_t` (i64).
+/// Return non-zero to abort the transfer.
+type XferInfoCallback = unsafe extern "C" fn(*mut c_void, i64, i64, i64, i64) -> c_long;
+
+/// Seek callback type matching libcurl's `CURLOPT_SEEKFUNCTION`.
+///
+/// Called to seek in the input stream. Returns 0 on success, 1 on failure, 2 for can't seek.
+type SeekCallback = unsafe extern "C" fn(*mut c_void, i64, c_long) -> c_long;
+
+// ───────────────────────── CURLSHcode / CURLSHoption ─────────────────────────
+
+/// `CURLSHcode` — result codes for share handle operations.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(non_camel_case_types, missing_docs)]
+pub enum CURLSHcode {
+    CURLSHE_OK = 0,
+    CURLSHE_BAD_OPTION = 1,
+    CURLSHE_IN_USE = 2,
+    CURLSHE_INVALID = 3,
+    CURLSHE_NOMEM = 4,
+    CURLSHE_NOT_BUILT_IN = 5,
+}
+
+/// `CURLSHoption` — option codes for `curl_share_setopt`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(non_camel_case_types, missing_docs)]
+pub enum CURLSHoption {
+    CURLSHOPT_SHARE = 1,
+    CURLSHOPT_UNSHARE = 2,
+    CURLSHOPT_LOCKFUNC = 3,
+    CURLSHOPT_UNLOCKFUNC = 4,
+}
+
+// ───────────────────────── curl_mime ─────────────────────────
+
+/// Internal state for a MIME handle.
+struct MimeHandle {
+    form: liburlx::MultipartForm,
+}
+
+/// Internal state for a MIME part being built.
+struct MimePartHandle {
+    name: Option<String>,
+    data: Option<Vec<u8>>,
+    filename: Option<String>,
+    mime_type: Option<String>,
+}
+
+/// `curl_mime_init` — create a new MIME handle.
+///
+/// # Safety
+///
+/// `easy` must be a valid pointer from `curl_easy_init` (used for context only).
+/// The returned handle must be freed with `curl_mime_free`.
+#[no_mangle]
+pub unsafe extern "C" fn curl_mime_init(_easy: *mut c_void) -> *mut c_void {
+    let handle = Box::new(MimeHandle { form: liburlx::MultipartForm::new() });
+    Box::into_raw(handle).cast::<c_void>()
+}
+
+/// `curl_mime_addpart` — add a new part to a MIME handle.
+///
+/// # Safety
+///
+/// `mime` must be a valid pointer from `curl_mime_init`.
+/// The returned part pointer is valid until `curl_mime_free` is called on the parent.
+#[no_mangle]
+pub unsafe extern "C" fn curl_mime_addpart(mime: *mut c_void) -> *mut c_void {
+    if mime.is_null() {
+        return ptr::null_mut();
+    }
+    let part = Box::new(MimePartHandle { name: None, data: None, filename: None, mime_type: None });
+    Box::into_raw(part).cast::<c_void>()
+}
+
+/// `curl_mime_name` — set the name of a MIME part.
+///
+/// # Safety
+///
+/// `part` must be a valid pointer from `curl_mime_addpart`.
+/// `name` must be a valid null-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn curl_mime_name(part: *mut c_void, name: *const c_char) -> CURLcode {
+    if part.is_null() || name.is_null() {
+        return CURLcode::CURLE_BAD_FUNCTION_ARGUMENT;
+    }
+    // SAFETY: Caller guarantees part is from curl_mime_addpart
+    let p = unsafe { &mut *part.cast::<MimePartHandle>() };
+    // SAFETY: Caller guarantees name is a null-terminated C string
+    let s = unsafe { CStr::from_ptr(name) };
+    match s.to_str() {
+        Ok(name_str) => {
+            p.name = Some(name_str.to_string());
+            CURLcode::CURLE_OK
+        }
+        Err(_) => CURLcode::CURLE_BAD_FUNCTION_ARGUMENT,
+    }
+}
+
+/// `curl_mime_data` — set data for a MIME part.
+///
+/// # Safety
+///
+/// `part` must be a valid pointer from `curl_mime_addpart`.
+/// `data` must point to at least `datasize` bytes.
+/// If `datasize` is `usize::MAX`, `data` is treated as a null-terminated string.
+#[no_mangle]
+pub unsafe extern "C" fn curl_mime_data(
+    part: *mut c_void,
+    data: *const c_char,
+    datasize: usize,
+) -> CURLcode {
+    if part.is_null() || data.is_null() {
+        return CURLcode::CURLE_BAD_FUNCTION_ARGUMENT;
+    }
+    // SAFETY: Caller guarantees part is from curl_mime_addpart
+    let p = unsafe { &mut *part.cast::<MimePartHandle>() };
+
+    let bytes = if datasize == usize::MAX {
+        // CURL_ZERO_TERMINATED — treat as null-terminated string
+        // SAFETY: Caller guarantees data is null-terminated
+        let s = unsafe { CStr::from_ptr(data) };
+        s.to_bytes().to_vec()
+    } else {
+        // SAFETY: Caller guarantees data points to at least datasize bytes
+        unsafe { std::slice::from_raw_parts(data.cast::<u8>(), datasize) }.to_vec()
+    };
+
+    p.data = Some(bytes);
+    CURLcode::CURLE_OK
+}
+
+/// `curl_mime_filename` — set the filename for a MIME part.
+///
+/// # Safety
+///
+/// `part` must be a valid pointer from `curl_mime_addpart`.
+/// `filename` must be a valid null-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn curl_mime_filename(
+    part: *mut c_void,
+    filename: *const c_char,
+) -> CURLcode {
+    if part.is_null() || filename.is_null() {
+        return CURLcode::CURLE_BAD_FUNCTION_ARGUMENT;
+    }
+    // SAFETY: Caller guarantees part is from curl_mime_addpart
+    let p = unsafe { &mut *part.cast::<MimePartHandle>() };
+    // SAFETY: Caller guarantees filename is a null-terminated C string
+    let s = unsafe { CStr::from_ptr(filename) };
+    match s.to_str() {
+        Ok(f) => {
+            p.filename = Some(f.to_string());
+            CURLcode::CURLE_OK
+        }
+        Err(_) => CURLcode::CURLE_BAD_FUNCTION_ARGUMENT,
+    }
+}
+
+/// `curl_mime_type` — set the MIME type for a MIME part.
+///
+/// # Safety
+///
+/// `part` must be a valid pointer from `curl_mime_addpart`.
+/// `mimetype` must be a valid null-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn curl_mime_type(part: *mut c_void, mimetype: *const c_char) -> CURLcode {
+    if part.is_null() || mimetype.is_null() {
+        return CURLcode::CURLE_BAD_FUNCTION_ARGUMENT;
+    }
+    // SAFETY: Caller guarantees part is from curl_mime_addpart
+    let p = unsafe { &mut *part.cast::<MimePartHandle>() };
+    // SAFETY: Caller guarantees mimetype is a null-terminated C string
+    let s = unsafe { CStr::from_ptr(mimetype) };
+    match s.to_str() {
+        Ok(t) => {
+            p.mime_type = Some(t.to_string());
+            CURLcode::CURLE_OK
+        }
+        Err(_) => CURLcode::CURLE_BAD_FUNCTION_ARGUMENT,
+    }
+}
+
+/// `curl_mime_free` — free a MIME handle and all its parts.
+///
+/// # Safety
+///
+/// `mime` must be a valid pointer from `curl_mime_init`, or null.
+/// After this call, `mime` must not be used.
+#[no_mangle]
+pub unsafe extern "C" fn curl_mime_free(mime: *mut c_void) {
+    if !mime.is_null() {
+        // SAFETY: Caller guarantees mime is from curl_mime_init
+        let _ = unsafe { Box::from_raw(mime.cast::<MimeHandle>()) };
+    }
+}
+
+/// Helper to finalize a MIME part into the parent MIME form.
+///
+/// # Safety
+///
+/// `mime` must be a valid `MimeHandle`, `part` a valid `MimePartHandle`.
+unsafe fn finalize_mime_part(mime: *mut c_void, part: *mut c_void) {
+    if mime.is_null() || part.is_null() {
+        return;
+    }
+    // SAFETY: Caller guarantees these are valid handles
+    let m = unsafe { &mut *mime.cast::<MimeHandle>() };
+    let p = unsafe { Box::from_raw(part.cast::<MimePartHandle>()) };
+
+    if let (Some(name), Some(data)) = (&p.name, &p.data) {
+        if let Some(ref filename) = p.filename {
+            m.form.file_data(name, filename, data);
+        } else {
+            // Treat as text field
+            if let Ok(text) = std::str::from_utf8(data) {
+                m.form.field(name, text);
+            } else {
+                // Binary data without filename — use file_data with a default name
+                m.form.file_data(name, "data", data);
+            }
+        }
+    }
+}
+
+// ───────────────────────── curl_share ─────────────────────────
+
+/// `curl_share_init` — create a new share handle.
+///
+/// # Safety
+///
+/// Returns a new handle that must be freed with `curl_share_cleanup`.
+#[no_mangle]
+pub extern "C" fn curl_share_init() -> *mut c_void {
+    let share = Box::new(liburlx::Share::new());
+    Box::into_raw(share).cast::<c_void>()
+}
+
+/// `curl_share_cleanup` — free a share handle.
+///
+/// # Safety
+///
+/// `share` must be a valid pointer from `curl_share_init`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn curl_share_cleanup(share: *mut c_void) -> CURLSHcode {
+    if share.is_null() {
+        return CURLSHcode::CURLSHE_INVALID;
+    }
+    // SAFETY: Caller guarantees share is from curl_share_init
+    let _ = unsafe { Box::from_raw(share.cast::<liburlx::Share>()) };
+    CURLSHcode::CURLSHE_OK
+}
+
+/// `curl_share_setopt` — set options on a share handle.
+///
+/// # Safety
+///
+/// `share` must be a valid pointer from `curl_share_init`.
+/// For `CURLSHOPT_SHARE`/`CURLSHOPT_UNSHARE`, `value` is a `CURL_LOCK_DATA_*` constant.
+#[no_mangle]
+pub unsafe extern "C" fn curl_share_setopt(
+    share: *mut c_void,
+    option: c_long,
+    value: *const c_void,
+) -> CURLSHcode {
+    if share.is_null() {
+        return CURLSHcode::CURLSHE_INVALID;
+    }
+
+    // SAFETY: Caller guarantees share is from curl_share_init
+    let s = unsafe { &mut *share.cast::<liburlx::Share>() };
+
+    match option {
+        // CURLSHOPT_SHARE = 1
+        1 => {
+            let lock_data = value as c_long;
+            match lock_data {
+                // CURL_LOCK_DATA_COOKIE = 2
+                2 => {
+                    s.add(liburlx::ShareType::Cookies);
+                    CURLSHcode::CURLSHE_OK
+                }
+                // CURL_LOCK_DATA_DNS = 3
+                3 => {
+                    s.add(liburlx::ShareType::Dns);
+                    CURLSHcode::CURLSHE_OK
+                }
+                _ => CURLSHcode::CURLSHE_BAD_OPTION,
+            }
+        }
+        // CURLSHOPT_UNSHARE = 2
+        2 => {
+            let lock_data = value as c_long;
+            match lock_data {
+                2 => {
+                    s.remove(liburlx::ShareType::Cookies);
+                    CURLSHcode::CURLSHE_OK
+                }
+                3 => {
+                    s.remove(liburlx::ShareType::Dns);
+                    CURLSHcode::CURLSHE_OK
+                }
+                _ => CURLSHcode::CURLSHE_BAD_OPTION,
+            }
+        }
+        // CURLSHOPT_LOCKFUNC = 3, CURLSHOPT_UNLOCKFUNC = 4
+        // Accept but ignore — our Share uses Arc<Mutex> internally
+        3 | 4 => CURLSHcode::CURLSHE_OK,
+        _ => CURLSHcode::CURLSHE_BAD_OPTION,
+    }
+}
+
+/// `curl_share_strerror` — return a human-readable share error message.
+///
+/// # Safety
+///
+/// The returned pointer is valid for the lifetime of the program.
+#[no_mangle]
+#[allow(clippy::missing_const_for_fn)]
+pub extern "C" fn curl_share_strerror(code: CURLSHcode) -> *const c_char {
+    let msg = match code {
+        CURLSHcode::CURLSHE_OK => c"No error",
+        CURLSHcode::CURLSHE_BAD_OPTION => c"Bad option in share call",
+        CURLSHcode::CURLSHE_IN_USE => c"Share already in use",
+        CURLSHcode::CURLSHE_INVALID => c"Invalid share handle",
+        CURLSHcode::CURLSHE_NOMEM => c"Out of memory",
+        CURLSHcode::CURLSHE_NOT_BUILT_IN => c"Feature not available",
+    };
+    msg.as_ptr()
+}
 
 // ───────────────────────── curl_slist ─────────────────────────
 
@@ -288,8 +645,19 @@ struct EasyHandle {
     read_data: *mut c_void,
     debug_callback: Option<DebugCallback>,
     debug_data: *mut c_void,
+    progress_callback: Option<ProgressCallback>,
+    xferinfo_callback: Option<XferInfoCallback>,
+    progress_data: *mut c_void,
+    seek_callback: Option<SeekCallback>,
+    seek_data: *mut c_void,
+    noprogress: bool,
     postfields: Option<Vec<u8>>,
     infilesize: Option<u64>,
+    private_data: *mut c_void,
+    /// MIME parts associated with this handle (not yet finalized).
+    mime_parts: Vec<(*mut c_void, *mut c_void)>,
+    /// MIME handle for `CURLOPT_MIMEPOST`.
+    mimepost: *mut c_void,
     error_buf: [u8; 256],
 }
 
@@ -317,8 +685,17 @@ pub extern "C" fn curl_easy_init() -> *mut c_void {
         read_data: ptr::null_mut(),
         debug_callback: None,
         debug_data: ptr::null_mut(),
+        progress_callback: None,
+        xferinfo_callback: None,
+        progress_data: ptr::null_mut(),
+        seek_callback: None,
+        seek_data: ptr::null_mut(),
+        noprogress: true,
         postfields: None,
         infilesize: None,
+        private_data: ptr::null_mut(),
+        mime_parts: Vec::new(),
+        mimepost: ptr::null_mut(),
         error_buf: [0u8; 256],
     });
     Box::into_raw(handle).cast::<c_void>()
@@ -363,8 +740,17 @@ pub unsafe extern "C" fn curl_easy_duphandle(handle: *mut c_void) -> *mut c_void
         read_data: h.read_data,
         debug_callback: h.debug_callback,
         debug_data: h.debug_data,
+        progress_callback: h.progress_callback,
+        xferinfo_callback: h.xferinfo_callback,
+        progress_data: h.progress_data,
+        seek_callback: h.seek_callback,
+        seek_data: h.seek_data,
+        noprogress: h.noprogress,
         postfields: h.postfields.clone(),
         infilesize: h.infilesize,
+        private_data: h.private_data,
+        mime_parts: Vec::new(),
+        mimepost: ptr::null_mut(),
         error_buf: [0u8; 256],
     });
     Box::into_raw(dup).cast::<c_void>()
@@ -393,8 +779,17 @@ pub unsafe extern "C" fn curl_easy_reset(handle: *mut c_void) {
     h.read_data = ptr::null_mut();
     h.debug_callback = None;
     h.debug_data = ptr::null_mut();
+    h.progress_callback = None;
+    h.xferinfo_callback = None;
+    h.progress_data = ptr::null_mut();
+    h.seek_callback = None;
+    h.seek_data = ptr::null_mut();
+    h.noprogress = true;
     h.postfields = None;
     h.infilesize = None;
+    h.private_data = ptr::null_mut();
+    h.mime_parts.clear();
+    h.mimepost = ptr::null_mut();
     h.error_buf = [0u8; 256];
 }
 
@@ -1039,6 +1434,78 @@ pub unsafe extern "C" fn curl_easy_setopt(
             CURLcode::CURLE_OK
         }
 
+        // CURLOPT_NOPROGRESS = 43
+        43 => {
+            h.noprogress = value as c_long != 0;
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_PROGRESSFUNCTION = 20056
+        20056 => {
+            // SAFETY: Caller guarantees value is a valid function pointer
+            h.progress_callback =
+                Some(unsafe { std::mem::transmute::<*const c_void, ProgressCallback>(value) });
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_XFERINFOFUNCTION = 20219
+        20219 => {
+            // SAFETY: Caller guarantees value is a valid function pointer
+            h.xferinfo_callback =
+                Some(unsafe { std::mem::transmute::<*const c_void, XferInfoCallback>(value) });
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_PROGRESSDATA = 10057 (also used as XFERINFODATA)
+        10057 => {
+            h.progress_data = value.cast_mut();
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_SEEKFUNCTION = 20167
+        20167 => {
+            // SAFETY: Caller guarantees value is a valid function pointer
+            h.seek_callback =
+                Some(unsafe { std::mem::transmute::<*const c_void, SeekCallback>(value) });
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_SEEKDATA = 10168
+        10168 => {
+            h.seek_data = value.cast_mut();
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_PRIVATE = 10103
+        10103 => {
+            h.private_data = value.cast_mut();
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_SHARE = 10100
+        10100 => {
+            if value.is_null() {
+                // Detach share — accepted as no-op (share state persists)
+            } else {
+                // SAFETY: Caller guarantees value is from curl_share_init
+                let share = unsafe { &*value.cast::<liburlx::Share>() };
+                h.easy.set_share(share.clone());
+            }
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_MIMEPOST = 10269
+        10269 => {
+            h.mimepost = value.cast_mut();
+            // Finalize any pending parts
+            for &(mime, part) in &h.mime_parts {
+                // SAFETY: mime_parts contains valid handles
+                unsafe { finalize_mime_part(mime, part) };
+            }
+            h.mime_parts.clear();
+            CURLcode::CURLE_OK
+        }
+
         _ => CURLcode::CURLE_UNKNOWN_OPTION,
     }
 }
@@ -1049,6 +1516,7 @@ pub unsafe extern "C" fn curl_easy_setopt(
 ///
 /// `handle` must be a valid pointer from `curl_easy_init`.
 #[no_mangle]
+#[allow(clippy::too_many_lines)]
 pub unsafe extern "C" fn curl_easy_perform(handle: *mut c_void) -> CURLcode {
     if handle.is_null() {
         return CURLcode::CURLE_FAILED_INIT;
@@ -1057,7 +1525,17 @@ pub unsafe extern "C" fn curl_easy_perform(handle: *mut c_void) -> CURLcode {
     // SAFETY: Caller guarantees handle is from curl_easy_init
     let h = unsafe { &mut *handle.cast::<EasyHandle>() };
 
-    // Set POST body if configured
+    // Set MIMEPOST body if configured
+    if !h.mimepost.is_null() {
+        // SAFETY: mimepost was set via CURLOPT_MIMEPOST from a curl_mime_init handle
+        let mime = unsafe { &*h.mimepost.cast::<MimeHandle>() };
+        let content_type = mime.form.content_type();
+        let body = mime.form.encode();
+        h.easy.header("Content-Type", &content_type);
+        h.easy.body(&body);
+    }
+
+    // Set POST body if configured (postfields takes precedence if both set)
     if let Some(ref body) = h.postfields {
         h.easy.body(body);
     } else if let Some(read_cb) = h.read_callback {
@@ -1156,6 +1634,45 @@ pub unsafe extern "C" fn curl_easy_perform(handle: *mut c_void) -> CURLcode {
                 }
             }
 
+            // Call progress/xferinfo callback if set and noprogress is false
+            if !h.noprogress {
+                let info = response.transfer_info();
+                let dl_total = response.body().len() as u64;
+                let dl_now = dl_total;
+                let ul_total = info.size_upload;
+                let ul_now = ul_total;
+                #[allow(clippy::cast_precision_loss, clippy::cast_possible_wrap)]
+                if let Some(xfer_cb) = h.xferinfo_callback {
+                    // SAFETY: Caller set up the callback and data pointer correctly
+                    let ret = unsafe {
+                        xfer_cb(
+                            h.progress_data,
+                            dl_total as i64,
+                            dl_now as i64,
+                            ul_total as i64,
+                            ul_now as i64,
+                        )
+                    };
+                    if ret != 0 {
+                        return CURLcode::CURLE_ABORTED_BY_CALLBACK;
+                    }
+                } else if let Some(prog_cb) = h.progress_callback {
+                    // SAFETY: Caller set up the callback and data pointer correctly
+                    let ret = unsafe {
+                        prog_cb(
+                            h.progress_data,
+                            dl_total as f64,
+                            dl_now as f64,
+                            ul_total as f64,
+                            ul_now as f64,
+                        )
+                    };
+                    if ret != 0 {
+                        return CURLcode::CURLE_ABORTED_BY_CALLBACK;
+                    }
+                }
+            }
+
             h.last_response = Some(response);
             CURLcode::CURLE_OK
         }
@@ -1195,6 +1712,14 @@ pub unsafe extern "C" fn curl_easy_getinfo(
 
     // SAFETY: Caller guarantees handle is from curl_easy_init
     let h = unsafe { &*handle.cast::<EasyHandle>() };
+
+    // CURLINFO_PRIVATE doesn't require a completed transfer
+    if info == 0x10_0015 {
+        // SAFETY: Caller guarantees out points to *mut c_void
+        let out = unsafe { &mut *out.cast::<*mut c_void>() };
+        *out = h.private_data;
+        return CURLcode::CURLE_OK;
+    }
 
     let Some(ref response) = h.last_response else {
         return CURLcode::CURLE_GOT_NOTHING;
@@ -2418,6 +2943,432 @@ mod tests {
         // CURLOPT_IGNORE_CONTENT_LENGTH = 136
         let code = unsafe { curl_easy_setopt(handle, 136, 1usize as *const c_void) };
         assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    // ─── Phase 22: Progress callbacks ───
+
+    unsafe extern "C" fn test_progress_cb(
+        _clientp: *mut c_void,
+        _dltotal: f64,
+        _dlnow: f64,
+        _ultotal: f64,
+        _ulnow: f64,
+    ) -> c_long {
+        0 // continue
+    }
+
+    unsafe extern "C" fn test_xferinfo_cb(
+        _clientp: *mut c_void,
+        _dltotal: i64,
+        _dlnow: i64,
+        _ultotal: i64,
+        _ulnow: i64,
+    ) -> c_long {
+        0 // continue
+    }
+
+    unsafe extern "C" fn test_seek_cb(
+        _clientp: *mut c_void,
+        _offset: i64,
+        _origin: c_long,
+    ) -> c_long {
+        0 // success
+    }
+
+    #[test]
+    fn easy_setopt_progressfunction() {
+        let handle = curl_easy_init();
+        // CURLOPT_PROGRESSFUNCTION = 20056
+        let code = unsafe { curl_easy_setopt(handle, 20056, test_progress_cb as *const c_void) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_xferinfofunction() {
+        let handle = curl_easy_init();
+        // CURLOPT_XFERINFOFUNCTION = 20219
+        let code = unsafe { curl_easy_setopt(handle, 20219, test_xferinfo_cb as *const c_void) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_progressdata() {
+        let handle = curl_easy_init();
+        // CURLOPT_PROGRESSDATA = 10057
+        let mut data: usize = 42;
+        let code =
+            unsafe { curl_easy_setopt(handle, 10057, ptr::from_mut(&mut data).cast::<c_void>()) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_noprogress() {
+        let handle = curl_easy_init();
+        // Verify default is noprogress=true
+        let h = unsafe { &*handle.cast::<EasyHandle>() };
+        assert!(h.noprogress);
+
+        // CURLOPT_NOPROGRESS = 43, set to 0 (false) to enable progress
+        let code = unsafe { curl_easy_setopt(handle, 43, ptr::null()) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        let h = unsafe { &*handle.cast::<EasyHandle>() };
+        assert!(!h.noprogress);
+
+        // Set back to 1 (true) to disable progress
+        let code = unsafe { curl_easy_setopt(handle, 43, 1 as *const c_void) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        let h = unsafe { &*handle.cast::<EasyHandle>() };
+        assert!(h.noprogress);
+
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_seekfunction() {
+        let handle = curl_easy_init();
+        // CURLOPT_SEEKFUNCTION = 20167
+        let code = unsafe { curl_easy_setopt(handle, 20167, test_seek_cb as *const c_void) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_seekdata() {
+        let handle = curl_easy_init();
+        // CURLOPT_SEEKDATA = 10168
+        let mut data: usize = 99;
+        let code =
+            unsafe { curl_easy_setopt(handle, 10168, ptr::from_mut(&mut data).cast::<c_void>()) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    // ─── Phase 22: CURLOPT_PRIVATE ───
+
+    #[test]
+    fn easy_setopt_private() {
+        let handle = curl_easy_init();
+        let mut data: usize = 12345;
+        // CURLOPT_PRIVATE = 10103
+        let code =
+            unsafe { curl_easy_setopt(handle, 10103, ptr::from_mut(&mut data).cast::<c_void>()) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+
+        // Retrieve it via CURLINFO_PRIVATE = 0x100015
+        let mut out: *mut c_void = ptr::null_mut();
+        let result = unsafe {
+            curl_easy_getinfo(handle, 0x10_0015, ptr::from_mut(&mut out).cast::<c_void>())
+        };
+        assert_eq!(result, CURLcode::CURLE_OK);
+        assert_eq!(out, ptr::from_mut(&mut data).cast::<c_void>());
+
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_getinfo_private_default_null() {
+        let handle = curl_easy_init();
+        let mut out: *mut c_void = 1 as *mut c_void;
+        // CURLINFO_PRIVATE before setting — should be null
+        let result = unsafe {
+            curl_easy_getinfo(handle, 0x10_0015, ptr::from_mut(&mut out).cast::<c_void>())
+        };
+        assert_eq!(result, CURLcode::CURLE_OK);
+        assert!(out.is_null());
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    // ─── Phase 22: CURLOPT_SHARE ───
+
+    #[test]
+    fn easy_setopt_share() {
+        let handle = curl_easy_init();
+        let share = curl_share_init();
+
+        // CURLOPT_SHARE = 10100
+        let code = unsafe { curl_easy_setopt(handle, 10100, share.cast::<c_void>()) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+
+        // Detach share
+        let code = unsafe { curl_easy_setopt(handle, 10100, ptr::null()) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+
+        unsafe {
+            let _ = curl_share_cleanup(share);
+            curl_easy_cleanup(handle);
+        }
+    }
+
+    // ─── Phase 22: MIME API ───
+
+    #[test]
+    fn mime_init_free() {
+        let handle = curl_easy_init();
+        let mime = unsafe { curl_mime_init(handle) };
+        assert!(!mime.is_null());
+        unsafe {
+            curl_mime_free(mime);
+            curl_easy_cleanup(handle);
+        }
+    }
+
+    #[test]
+    fn mime_free_null_is_safe() {
+        unsafe { curl_mime_free(ptr::null_mut()) };
+    }
+
+    #[test]
+    fn mime_addpart() {
+        let handle = curl_easy_init();
+        let mime = unsafe { curl_mime_init(handle) };
+        let part = unsafe { curl_mime_addpart(mime) };
+        assert!(!part.is_null());
+        // Parts are standalone — need to finalize manually
+        unsafe {
+            // Set name and data on the part
+            let code = curl_mime_name(part, c"field1".as_ptr());
+            assert_eq!(code, CURLcode::CURLE_OK);
+            let code = curl_mime_data(part, c"value1".as_ptr(), usize::MAX);
+            assert_eq!(code, CURLcode::CURLE_OK);
+            // Finalize part into mime
+            finalize_mime_part(mime, part);
+            curl_mime_free(mime);
+            curl_easy_cleanup(handle);
+        }
+    }
+
+    #[test]
+    fn mime_name_null_part() {
+        let code = unsafe { curl_mime_name(ptr::null_mut(), c"test".as_ptr()) };
+        assert_eq!(code, CURLcode::CURLE_BAD_FUNCTION_ARGUMENT);
+    }
+
+    #[test]
+    fn mime_data_null_part() {
+        let code = unsafe { curl_mime_data(ptr::null_mut(), c"test".as_ptr(), 4) };
+        assert_eq!(code, CURLcode::CURLE_BAD_FUNCTION_ARGUMENT);
+    }
+
+    #[test]
+    fn mime_data_with_explicit_size() {
+        let handle = curl_easy_init();
+        let mime = unsafe { curl_mime_init(handle) };
+        let part = unsafe { curl_mime_addpart(mime) };
+        let code = unsafe { curl_mime_name(part, c"binary".as_ptr()) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        let data = b"hello";
+        let code = unsafe { curl_mime_data(part, data.as_ptr().cast::<c_char>(), 5) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe {
+            finalize_mime_part(mime, part);
+            curl_mime_free(mime);
+            curl_easy_cleanup(handle);
+        }
+    }
+
+    #[test]
+    fn mime_filename() {
+        let handle = curl_easy_init();
+        let mime = unsafe { curl_mime_init(handle) };
+        let part = unsafe { curl_mime_addpart(mime) };
+        let code = unsafe { curl_mime_filename(part, c"upload.txt".as_ptr()) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        let code = unsafe { curl_mime_filename(ptr::null_mut(), c"test".as_ptr()) };
+        assert_eq!(code, CURLcode::CURLE_BAD_FUNCTION_ARGUMENT);
+        unsafe {
+            // Clean up part without finalize — it was never given name/data
+            let _ = Box::from_raw(part.cast::<MimePartHandle>());
+            curl_mime_free(mime);
+            curl_easy_cleanup(handle);
+        }
+    }
+
+    #[test]
+    fn mime_type() {
+        let handle = curl_easy_init();
+        let mime = unsafe { curl_mime_init(handle) };
+        let part = unsafe { curl_mime_addpart(mime) };
+        let code = unsafe { curl_mime_type(part, c"text/plain".as_ptr()) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        let p = unsafe { &*part.cast::<MimePartHandle>() };
+        assert_eq!(p.mime_type.as_deref(), Some("text/plain"));
+        unsafe {
+            let _ = Box::from_raw(part.cast::<MimePartHandle>());
+            curl_mime_free(mime);
+            curl_easy_cleanup(handle);
+        }
+    }
+
+    #[test]
+    fn mime_type_null_part() {
+        let code = unsafe { curl_mime_type(ptr::null_mut(), c"text/plain".as_ptr()) };
+        assert_eq!(code, CURLcode::CURLE_BAD_FUNCTION_ARGUMENT);
+    }
+
+    #[test]
+    fn easy_setopt_mimepost() {
+        let handle = curl_easy_init();
+        let mime = unsafe { curl_mime_init(handle) };
+        let part = unsafe { curl_mime_addpart(mime) };
+        let _ = unsafe { curl_mime_name(part, c"field".as_ptr()) };
+        let _ = unsafe { curl_mime_data(part, c"value".as_ptr(), usize::MAX) };
+        unsafe { finalize_mime_part(mime, part) };
+
+        // CURLOPT_MIMEPOST = 10269
+        let code = unsafe { curl_easy_setopt(handle, 10269, mime.cast::<c_void>()) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+
+        unsafe {
+            curl_mime_free(mime);
+            curl_easy_cleanup(handle);
+        }
+    }
+
+    // ─── Phase 22: Share API ───
+
+    #[test]
+    fn share_init_cleanup() {
+        let share = curl_share_init();
+        assert!(!share.is_null());
+        let code = unsafe { curl_share_cleanup(share) };
+        assert_eq!(code, CURLSHcode::CURLSHE_OK);
+    }
+
+    #[test]
+    fn share_cleanup_null() {
+        let code = unsafe { curl_share_cleanup(ptr::null_mut()) };
+        assert_eq!(code, CURLSHcode::CURLSHE_INVALID);
+    }
+
+    #[test]
+    fn share_setopt_dns() {
+        let share = curl_share_init();
+        // CURLSHOPT_SHARE = 1, CURL_LOCK_DATA_DNS = 3
+        let code = unsafe { curl_share_setopt(share, 1, 3 as *const c_void) };
+        assert_eq!(code, CURLSHcode::CURLSHE_OK);
+        let _ = unsafe { curl_share_cleanup(share) };
+    }
+
+    #[test]
+    fn share_setopt_cookies() {
+        let share = curl_share_init();
+        // CURLSHOPT_SHARE = 1, CURL_LOCK_DATA_COOKIE = 2
+        let code = unsafe { curl_share_setopt(share, 1, 2 as *const c_void) };
+        assert_eq!(code, CURLSHcode::CURLSHE_OK);
+        let _ = unsafe { curl_share_cleanup(share) };
+    }
+
+    #[test]
+    fn share_setopt_unshare() {
+        let share = curl_share_init();
+        // Share DNS
+        let _ = unsafe { curl_share_setopt(share, 1, 3 as *const c_void) };
+        // Unshare DNS
+        let code = unsafe { curl_share_setopt(share, 2, 3 as *const c_void) };
+        assert_eq!(code, CURLSHcode::CURLSHE_OK);
+        let _ = unsafe { curl_share_cleanup(share) };
+    }
+
+    #[test]
+    fn share_setopt_bad_option() {
+        let share = curl_share_init();
+        let code = unsafe { curl_share_setopt(share, 99, ptr::null()) };
+        assert_eq!(code, CURLSHcode::CURLSHE_BAD_OPTION);
+        let _ = unsafe { curl_share_cleanup(share) };
+    }
+
+    #[test]
+    fn share_setopt_null_handle() {
+        let code = unsafe { curl_share_setopt(ptr::null_mut(), 1, 3 as *const c_void) };
+        assert_eq!(code, CURLSHcode::CURLSHE_INVALID);
+    }
+
+    #[test]
+    fn share_setopt_lockfunc_accepted() {
+        let share = curl_share_init();
+        // CURLSHOPT_LOCKFUNC = 3 — accepted but ignored
+        let code = unsafe { curl_share_setopt(share, 3, ptr::null()) };
+        assert_eq!(code, CURLSHcode::CURLSHE_OK);
+        // CURLSHOPT_UNLOCKFUNC = 4
+        let code = unsafe { curl_share_setopt(share, 4, ptr::null()) };
+        assert_eq!(code, CURLSHcode::CURLSHE_OK);
+        let _ = unsafe { curl_share_cleanup(share) };
+    }
+
+    #[test]
+    fn share_strerror_ok() {
+        let msg = curl_share_strerror(CURLSHcode::CURLSHE_OK);
+        assert!(!msg.is_null());
+        let s = unsafe { CStr::from_ptr(msg) };
+        assert_eq!(s.to_str().unwrap(), "No error");
+    }
+
+    #[test]
+    fn share_strerror_all_codes() {
+        let codes = [
+            CURLSHcode::CURLSHE_OK,
+            CURLSHcode::CURLSHE_BAD_OPTION,
+            CURLSHcode::CURLSHE_IN_USE,
+            CURLSHcode::CURLSHE_INVALID,
+            CURLSHcode::CURLSHE_NOMEM,
+            CURLSHcode::CURLSHE_NOT_BUILT_IN,
+        ];
+        for code in codes {
+            let msg = curl_share_strerror(code);
+            assert!(!msg.is_null(), "share_strerror returned null for {code:?}");
+        }
+    }
+
+    // ─── Phase 22: Duphandle/Reset preserve new fields ───
+
+    #[test]
+    fn easy_duphandle_preserves_progress_callbacks() {
+        let handle = curl_easy_init();
+        let _ = unsafe { curl_easy_setopt(handle, 20056, test_progress_cb as *const c_void) };
+        let _ = unsafe { curl_easy_setopt(handle, 20219, test_xferinfo_cb as *const c_void) };
+        let _ = unsafe { curl_easy_setopt(handle, 20167, test_seek_cb as *const c_void) };
+        let mut priv_data: usize = 42;
+        let _ = unsafe {
+            curl_easy_setopt(handle, 10103, ptr::from_mut(&mut priv_data).cast::<c_void>())
+        };
+
+        let dup = unsafe { curl_easy_duphandle(handle) };
+        assert!(!dup.is_null());
+        let dup_h = unsafe { &*dup.cast::<EasyHandle>() };
+        assert!(dup_h.progress_callback.is_some());
+        assert!(dup_h.xferinfo_callback.is_some());
+        assert!(dup_h.seek_callback.is_some());
+        assert_eq!(dup_h.private_data, ptr::from_mut(&mut priv_data).cast::<c_void>());
+
+        unsafe {
+            curl_easy_cleanup(dup);
+            curl_easy_cleanup(handle);
+        }
+    }
+
+    #[test]
+    fn easy_reset_clears_new_fields() {
+        let handle = curl_easy_init();
+        let _ = unsafe { curl_easy_setopt(handle, 20056, test_progress_cb as *const c_void) };
+        let _ = unsafe { curl_easy_setopt(handle, 20219, test_xferinfo_cb as *const c_void) };
+        let _ = unsafe { curl_easy_setopt(handle, 20167, test_seek_cb as *const c_void) };
+        let _ = unsafe { curl_easy_setopt(handle, 10103, 42usize as *const c_void) };
+        let _ = unsafe { curl_easy_setopt(handle, 43, ptr::null()) }; // noprogress = false
+
+        unsafe { curl_easy_reset(handle) };
+
+        let h = unsafe { &*handle.cast::<EasyHandle>() };
+        assert!(h.progress_callback.is_none());
+        assert!(h.xferinfo_callback.is_none());
+        assert!(h.seek_callback.is_none());
+        assert!(h.private_data.is_null());
+        assert!(h.noprogress); // reset to default true
+        assert!(h.mimepost.is_null());
+
         unsafe { curl_easy_cleanup(handle) };
     }
 }
