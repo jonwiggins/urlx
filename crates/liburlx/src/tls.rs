@@ -5,6 +5,15 @@
 
 use std::path::PathBuf;
 
+/// Minimum TLS protocol version to allow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum TlsVersion {
+    /// TLS 1.2.
+    Tls12,
+    /// TLS 1.3.
+    Tls13,
+}
+
 /// Configuration for TLS connections.
 ///
 /// Controls certificate verification, custom CA bundles, client certificates,
@@ -37,6 +46,18 @@ pub struct TlsConfig {
     ///
     /// Must correspond to the certificate specified in `client_cert`.
     pub client_key: Option<PathBuf>,
+
+    /// Minimum TLS version to allow.
+    ///
+    /// When set, connections using a lower TLS version will be rejected.
+    /// Equivalent to curl's `--tlsv1.2` or `--tlsv1.3`.
+    pub min_tls_version: Option<TlsVersion>,
+
+    /// Maximum TLS version to allow.
+    ///
+    /// When set, connections using a higher TLS version will not be attempted.
+    /// Equivalent to curl's `--tls-max`.
+    pub max_tls_version: Option<TlsVersion>,
 }
 
 impl Default for TlsConfig {
@@ -47,6 +68,8 @@ impl Default for TlsConfig {
             ca_cert: None,
             client_cert: None,
             client_key: None,
+            min_tls_version: None,
+            max_tls_version: None,
         }
     }
 }
@@ -55,10 +78,11 @@ impl Default for TlsConfig {
 mod rustls_impl {
     use std::sync::Arc;
 
+    use rustls::client::WantsClientCert;
     use tokio::net::TcpStream;
     use tokio_rustls::client::TlsStream;
 
-    use super::TlsConfig;
+    use super::{TlsConfig, TlsVersion};
     use crate::error::Error;
 
     /// The negotiated application protocol after TLS handshake.
@@ -83,9 +107,11 @@ mod rustls_impl {
         /// Returns [`Error::Tls`] if the TLS configuration cannot be built,
         /// or if certificate/key files cannot be read.
         pub fn new(tls_config: &TlsConfig) -> Result<Self, Error> {
+            let versions = Self::protocol_versions(tls_config);
+
             let config = if !tls_config.verify_peer {
                 // Insecure mode: accept any certificate
-                let mut config = rustls::ClientConfig::builder()
+                let mut config = Self::config_builder(&versions)
                     .dangerous()
                     .with_custom_certificate_verifier(Arc::new(NoVerifier))
                     .with_no_client_auth();
@@ -96,20 +122,9 @@ mod rustls_impl {
                 // Custom CA bundle
                 let root_store = load_ca_certs(ca_path)?;
 
-                let builder = rustls::ClientConfig::builder().with_root_certificates(root_store);
+                let builder = Self::config_builder(&versions).with_root_certificates(root_store);
 
-                let mut config = if let (Some(ref cert_path), Some(ref key_path)) =
-                    (&tls_config.client_cert, &tls_config.client_key)
-                {
-                    let certs = load_client_certs(cert_path)?;
-                    let key = load_client_key(key_path)?;
-                    builder
-                        .with_client_auth_cert(certs, key)
-                        .map_err(|e| Error::Tls(Box::new(e)))?
-                } else {
-                    builder.with_no_client_auth()
-                };
-
+                let mut config = Self::with_client_auth(builder, tls_config)?;
                 Self::configure_alpn(&mut config);
                 config
             } else {
@@ -117,25 +132,57 @@ mod rustls_impl {
                 let root_store: rustls::RootCertStore =
                     webpki_roots::TLS_SERVER_ROOTS.iter().cloned().collect();
 
-                let builder = rustls::ClientConfig::builder().with_root_certificates(root_store);
+                let builder = Self::config_builder(&versions).with_root_certificates(root_store);
 
-                let mut config = if let (Some(ref cert_path), Some(ref key_path)) =
-                    (&tls_config.client_cert, &tls_config.client_key)
-                {
-                    let certs = load_client_certs(cert_path)?;
-                    let key = load_client_key(key_path)?;
-                    builder
-                        .with_client_auth_cert(certs, key)
-                        .map_err(|e| Error::Tls(Box::new(e)))?
-                } else {
-                    builder.with_no_client_auth()
-                };
-
+                let mut config = Self::with_client_auth(builder, tls_config)?;
                 Self::configure_alpn(&mut config);
                 config
             };
 
             Ok(Self { config: Arc::new(config) })
+        }
+
+        /// Determine the allowed TLS protocol versions based on config.
+        fn protocol_versions(
+            tls_config: &TlsConfig,
+        ) -> Vec<&'static rustls::SupportedProtocolVersion> {
+            let all = [
+                (TlsVersion::Tls12, &rustls::version::TLS12),
+                (TlsVersion::Tls13, &rustls::version::TLS13),
+            ];
+
+            let min = tls_config.min_tls_version.unwrap_or(TlsVersion::Tls12);
+            let max = tls_config.max_tls_version.unwrap_or(TlsVersion::Tls13);
+
+            all.iter().filter(|(v, _)| *v >= min && *v <= max).map(|(_, proto)| *proto).collect()
+        }
+
+        /// Create a config builder with the given protocol versions.
+        fn config_builder(
+            versions: &[&'static rustls::SupportedProtocolVersion],
+        ) -> rustls::ConfigBuilder<rustls::ClientConfig, rustls::WantsVerifier> {
+            if versions.is_empty() {
+                // Fallback: use defaults (shouldn't happen with valid min/max)
+                rustls::ClientConfig::builder()
+            } else {
+                rustls::ClientConfig::builder_with_protocol_versions(versions)
+            }
+        }
+
+        /// Apply client auth configuration to a builder.
+        fn with_client_auth(
+            builder: rustls::ConfigBuilder<rustls::ClientConfig, WantsClientCert>,
+            tls_config: &TlsConfig,
+        ) -> Result<rustls::ClientConfig, Error> {
+            if let (Some(ref cert_path), Some(ref key_path)) =
+                (&tls_config.client_cert, &tls_config.client_key)
+            {
+                let certs = load_client_certs(cert_path)?;
+                let key = load_client_key(key_path)?;
+                builder.with_client_auth_cert(certs, key).map_err(|e| Error::Tls(Box::new(e)))
+            } else {
+                Ok(builder.with_no_client_auth())
+            }
         }
 
         /// Configure ALPN protocols on a `ClientConfig`.
@@ -334,5 +381,50 @@ mod tests {
         };
         let result = TlsConnector::new(&config);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn tls_version_ordering() {
+        assert!(TlsVersion::Tls12 < TlsVersion::Tls13);
+    }
+
+    #[cfg(feature = "rustls")]
+    #[test]
+    fn tls_connector_with_min_tls13() {
+        let config = TlsConfig { min_tls_version: Some(TlsVersion::Tls13), ..TlsConfig::default() };
+        let connector = TlsConnector::new(&config);
+        assert!(connector.is_ok());
+    }
+
+    #[cfg(feature = "rustls")]
+    #[test]
+    fn tls_connector_with_max_tls12() {
+        let config = TlsConfig { max_tls_version: Some(TlsVersion::Tls12), ..TlsConfig::default() };
+        let connector = TlsConnector::new(&config);
+        assert!(connector.is_ok());
+    }
+
+    #[cfg(feature = "rustls")]
+    #[test]
+    fn tls_connector_tls12_only() {
+        let config = TlsConfig {
+            min_tls_version: Some(TlsVersion::Tls12),
+            max_tls_version: Some(TlsVersion::Tls12),
+            ..TlsConfig::default()
+        };
+        let connector = TlsConnector::new(&config);
+        assert!(connector.is_ok());
+    }
+
+    #[cfg(feature = "rustls")]
+    #[test]
+    fn tls_connector_tls13_only() {
+        let config = TlsConfig {
+            min_tls_version: Some(TlsVersion::Tls13),
+            max_tls_version: Some(TlsVersion::Tls13),
+            ..TlsConfig::default()
+        };
+        let connector = TlsConnector::new(&config);
+        assert!(connector.is_ok());
     }
 }
