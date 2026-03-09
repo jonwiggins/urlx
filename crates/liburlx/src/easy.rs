@@ -325,6 +325,17 @@ impl Easy {
         self.progress_callback = Some(callback);
     }
 
+    /// Set proxy authentication credentials (Basic).
+    ///
+    /// Adds a `Proxy-Authorization: Basic <base64>` header for proxy requests.
+    /// Equivalent to curl's `--proxy-user user:pass`.
+    pub fn proxy_auth(&mut self, user: &str, password: &str) {
+        use base64::Engine;
+        let credentials = format!("{user}:{password}");
+        let encoded = base64::engine::general_purpose::STANDARD.encode(credentials.as_bytes());
+        self.header("Proxy-Authorization", &format!("Basic {encoded}"));
+    }
+
     /// Set Digest authentication credentials.
     ///
     /// When set, the request is first sent without credentials. If the server
@@ -861,7 +872,7 @@ async fn do_single_request(
                             eprintln!("* Establishing tunnel to {host}:{port} via proxy");
                         }
                     }
-                    establish_connect_tunnel(tcp_stream, &host, port).await?
+                    establish_connect_tunnel(tcp_stream, &host, port, &effective_headers).await?
                 } else {
                     tcp_stream
                 };
@@ -973,18 +984,30 @@ fn maybe_decompress(response: Response, accept_encoding: bool) -> Result<Respons
 ///
 /// Sends a CONNECT request to the proxy and validates the 200 response
 /// before returning the raw TCP stream for TLS negotiation.
+/// If the request headers include `Proxy-Authorization`, it is forwarded
+/// to the proxy.
 async fn establish_connect_tunnel(
     mut stream: tokio::net::TcpStream,
     target_host: &str,
     target_port: u16,
+    headers: &[(String, String)],
 ) -> Result<tokio::net::TcpStream, Error> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let connect_req = format!(
+    let mut connect_req = format!(
         "CONNECT {target_host}:{target_port} HTTP/1.1\r\n\
-         Host: {target_host}:{target_port}\r\n\
-         \r\n"
+         Host: {target_host}:{target_port}\r\n"
     );
+
+    // Forward Proxy-Authorization header if present
+    for (name, value) in headers {
+        if name.eq_ignore_ascii_case("proxy-authorization") {
+            use std::fmt::Write as _;
+            let _ = write!(connect_req, "{name}: {value}\r\n");
+        }
+    }
+
+    connect_req.push_str("\r\n");
 
     stream
         .write_all(connect_req.as_bytes())

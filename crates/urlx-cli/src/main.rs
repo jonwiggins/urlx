@@ -67,6 +67,7 @@ fn print_usage() {
     eprintln!("      --cert <file>         Client certificate (PEM format)");
     eprintln!("      --key <file>          Client private key (PEM format)");
     eprintln!("      --digest              Use HTTP Digest authentication");
+    eprintln!("      --proxy-user <u:p>    Proxy authentication (user:password)");
 }
 
 /// Parse CLI arguments into options.
@@ -288,6 +289,13 @@ fn parse_args(args: &[String]) -> Option<CliOptions> {
             }
             "--digest" => {
                 opts.use_digest = true;
+            }
+            "--proxy-user" => {
+                i += 1;
+                let val = require_arg(args, i, "--proxy-user")?;
+                let (user, pass) =
+                    if let Some((u, p)) = val.split_once(':') { (u, p) } else { (val, "") };
+                opts.easy.proxy_auth(user, pass);
             }
             arg if arg.starts_with('-') => {
                 eprintln!("urlx: unknown option: {arg}");
