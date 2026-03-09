@@ -14,12 +14,12 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 26 — Integration Test Infrastructure + End-to-End Scenarios
-**Last completed:** Phase 25 (1000+ tests milestone, API audit) — 2026-03-08
-**Total tests:** 1013
-**In progress:** Planning Phase 26
+**Phase:** 27 — Test Deduplication + Coverage Gaps
+**Last completed:** Phase 26 (shared TestServer, E2E workflows) — 2026-03-08
+**Total tests:** 1044
+**In progress:** Planning Phase 27
 **Blockers:** None
-**Next up:** Shared test server infrastructure, end-to-end scenario tests
+**Next up:** Deduplicate TestServer from existing files, fill remaining coverage gaps
 
 ---
 
@@ -579,36 +579,38 @@ Set-Cookie joining, malformed responses). 18 Easy config completeness tests
 (max_redirects, verbose, hsts, resolve, form_field, range, resume_from,
 fail_on_error, method_is_default, clone). 1013 total tests passing.
 
-### Phase 26: Integration Test Infrastructure + End-to-End Scenarios
+### Phase 26: Integration Test Infrastructure + E2E Scenarios — COMPLETED (2026-03-08)
 
-**Scope:** Create a shared test server module to reduce boilerplate across
-integration tests, then add end-to-end scenario tests that exercise
-multi-step workflows (redirect chains with cookies, auth + retry,
-conditional requests, connection reuse patterns).
+Shared TestServer module (common/mod.rs) with graceful shutdown. 16 E2E workflow
+tests (redirect+cookies, multi-hop redirects, auth, 303/307 semantics, cookie
+accumulation, Multi concurrent, HEAD, custom headers, fail_on_error+redirect,
+large body integrity, bearer token). 15 error recovery tests (4xx/5xx codes,
+binary/JSON content, connection refused, no URL, fail_on_error). 1044 total tests.
 
-**Step 26.1: Shared TestServer module**
-- Extract the TestServer pattern (currently duplicated in ~8 test files) into
-  a shared test helper crate or module
-- Support configurable handlers, custom response headers, request recording
+### Phase 27: Test Deduplication + Coverage Gaps
 
-**Step 26.2: Multi-step workflow tests**
-- Redirect chain with cookie propagation (3xx → cookie set → follow → cookie sent)
-- Auth challenge flow (401 → retry with credentials → 200)
-- Conditional GET (If-None-Match → 304 Not Modified)
-- Connection reuse verification across sequential requests
+**Scope:** Migrate existing test files to use the shared TestServer module
+(reducing ~800 lines of duplication across 19 files), and fill remaining
+coverage gaps in CookieJar public API and URL edge cases.
 
-**Step 26.3: Error recovery scenarios**
-- Server drops connection mid-transfer → error reported correctly
-- Timeout during slow response → proper timeout error
-- Invalid Content-Length (shorter than actual body)
-- Chunked encoding with premature close
+**Step 27.1: Migrate test files to shared TestServer**
+- Update files that duplicate TestServer to use `mod common; use common::TestServer;`
+- Remove inline TestServer structs from each migrated file
+- Verify all tests still pass after migration
 
-**Step 26.4: CLI end-to-end tests**
-- Multi-URL download with progress
-- Cookie jar file persistence across invocations
-- Write-out format with timing variables
+**Step 27.2: CookieJar public API tests**
+- Test `CookieJar::new()`, `len()`, `is_empty()`
+- Test `store_cookies` with domain/path matching
+- Test `cookie_header` generation
+- Test `remove_expired` cleanup
 
-**Exit criteria:** 1050+ tests. Shared test infrastructure eliminates duplication.
+**Step 27.3: URL edge case tests**
+- IPv6 address URLs
+- Credentials with special characters
+- Fragment-only URLs
+- Extremely long paths
+
+**Exit criteria:** 1070+ tests. TestServer deduplication complete across all files.
 
 ---
 
