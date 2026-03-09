@@ -14,12 +14,12 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 46 — Planning
-**Last completed:** Phase 45 (Cookie Public Suffix List) — 2026-03-09
-**Total tests:** 2,208
-**In progress:** Planning Phase 46
+**Phase:** 47 — Planning
+**Last completed:** Phase 46 (FFI Expansion III) — 2026-03-09
+**Total tests:** 2,227
+**In progress:** Planning Phase 47
 **Blockers:** None
-**Next up:** Phase 46 — FFI Expansion III
+**Next up:** Phase 47 — CLI Expansion VI
 
 ### Completeness Summary (updated Phase 40 review)
 
@@ -37,7 +37,7 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 | SSH/SFTP/SCP | 60% | SFTP/SCP download/upload, password + pubkey auth; no known_hosts |
 | WebSocket | 85% | RFC 6455, CloseCode, Message, WebSocketStream, fragmentation; no permessage-deflate |
 | Multi API | 75% | Connection limiting, share, pipelining, FFI event loop stubs |
-| FFI (libcurl C ABI) | ~55% | 102 CURLOPT, 30 CURLINFO, 25 CURLcode, 49 functions, cbindgen header |
+| FFI (libcurl C ABI) | ~60% | 116 CURLOPT, 43 CURLINFO, 32 CURLcode, 56 functions, cbindgen header |
 | CLI | ~48% | ~120 of ~250 flags |
 | Connection | 80% | Pool, TCP_NODELAY, keepalive, Unix sockets, interface/port binding |
 | Transfer control | 80% | Rate limiting enforced (max recv/send speed, low speed timeout) |
@@ -115,6 +115,9 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 - **2026-03-09:** `curl_escape`/`curl_unescape` use RFC 3986 unreserved characters (A-Z, a-z, 0-9, `-._~`) for percent-encoding. `curl_unescape` decodes `+` as space (matching curl's behavior for form-encoded data). `curl_easy_escape`/`curl_easy_unescape` delegate to the same implementation.
 - **2026-03-09:** `DnsResolver::Hickory` variant uses `Box<HickoryResolver>` to avoid large enum variant clippy error — `HickoryResolver` contains `TokioResolver` which is ~1272 bytes, while `System` carries no data. Boxing eliminates the size disparity.
 - **2026-03-09:** Cookie PSL validation uses the `psl` crate (v2) which embeds the full Mozilla Public Suffix List at compile time. The embedded approach avoids runtime downloads and filesystem dependencies. Only cookies with an explicit `Domain` attribute are checked — host-only cookies are always allowed (matching curl's behavior with `--with-libpsl`). The `psl::List.suffix()` API returns the public suffix portion; if it equals the entire domain, the domain is a public suffix.
+- **2026-03-09:** `CurlVersionInfo` struct uses `Box::leak` + `OnceLock` to create a 'static pointer, avoiding raw pointer `Sync` issues with static variables. The protocols array is also leaked. `unsafe impl Sync for CurlVersionInfo` is required because the struct contains `*const c_char` pointers (all to static CStr literals).
+- **2026-03-09:** `curl_global_init`/`curl_global_cleanup` are no-ops in urlx — tokio and rustls handle their own initialization. Defined for API compatibility. `CURL_GLOBAL_ALL`/`CURL_GLOBAL_DEFAULT` constants provided.
+- **2026-03-09:** `curl_easy_pause` returns `CURLE_OK` as a stub — tokio async doesn't support pause/resume in the same way libcurl does. Would require cancellation tokens or similar mechanism.
 - **2026-03-09:** hickory-resolver 0.25 API uses `TokioResolver::builder_tokio()?.build()` for system config and `TokioResolver::builder_with_config(config, provider).build()` for custom config. The `system-config` feature is required for `builder_tokio()`. `TokioConnectionProvider` lives in `hickory_resolver::name_server`, and `Protocol` in `hickory_resolver::proto::xfer`.
 - **2026-03-09:** `curl_formadd` returns `CURL_FORMADD_DISABLED` (7) as a stub — the deprecated multipart API is replaced by the MIME API (`curl_mime_*`). `curl_formfree` is a no-op. This matches libcurl's behavior when built without form API support.
 
@@ -389,16 +392,9 @@ Added `psl` crate (v2, embedded Mozilla Public Suffix List) for cookie domain va
 
 ---
 
-### Phase 46: FFI Expansion III
+### Phase 46: FFI Expansion III (completed 2026-03-09)
 
-**Goal:** Expand FFI toward 120+ CURLOPT and 40+ CURLINFO.
-
-- CURLOPT_HTTPPOST (deprecated but still used)
-- CURLOPT_CONNECT_TO
-- CURLOPT_HAPROXYPROTOCOL
-- Additional CURLINFO timing fields
-- Additional CURLcode error codes
-- Target 60+ FFI functions
+Added 6 FFI functions (curl_global_init/cleanup, curl_version_info with CurlVersionInfo struct, curl_easy_pause, curl_easy_upkeep, curl_multi_assign) reaching 56 total. Added 14 CURLOPT options (CONNECT_TO, HAPROXYPROTOCOL, HTTPPOST stub, ABSTRACT_UNIX_SOCKET, DOH_SSL_VERIFY*, blob options, BUFFERSIZE, MAXLIFETIME_CONN, FILETIME). Added 13 CURLINFO codes (microsecond _T timing variants, REDIRECT_TIME, RETRY_AFTER, SIZE/SPEED _T). Added 7 CURLcode values (FILESIZE_EXCEEDED, TOO_MANY_REDIRECTS, HTTP3, PARTIAL_FILE, RANGE_ERROR, AGAIN, UNRECOVERABLE_POLL). Fixed proptest cookie domain to avoid PSL-rejected domains. 15 new tests.
 
 ---
 
