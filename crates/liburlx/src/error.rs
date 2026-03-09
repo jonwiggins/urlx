@@ -29,6 +29,10 @@ pub enum Error {
     #[error("timeout after {0:?}")]
     Timeout(Duration),
 
+    /// An I/O error (file operations, etc.).
+    #[error("I/O error: {0}")]
+    Io(#[source] std::io::Error),
+
     /// A transfer error with a numeric code (maps to `CURLcode`).
     #[error("transfer error (code {code}): {message}")]
     Transfer {
@@ -60,6 +64,13 @@ mod tests {
     fn error_display_transfer() {
         let err = Error::Transfer { code: 7, message: "connection refused".to_string() };
         assert_eq!(err.to_string(), "transfer error (code 7): connection refused");
+    }
+
+    #[test]
+    fn error_display_io() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "file not found");
+        let err = Error::Io(io_err);
+        assert!(err.to_string().contains("file not found"));
     }
 
     #[test]

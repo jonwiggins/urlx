@@ -55,6 +55,7 @@ pub struct Easy {
     proxy: Option<Url>,
     noproxy: Option<String>,
     cookie_jar: Option<CookieJar>,
+    cookie_jar_path: Option<String>,
     hsts_cache: Option<HstsCache>,
     multipart: Option<MultipartForm>,
     range: Option<String>,
@@ -76,6 +77,10 @@ pub struct Easy {
     share: Option<crate::share::Share>,
     http_version: HttpVersion,
     expect_100_timeout: Option<Duration>,
+    max_recv_speed: Option<u64>,
+    max_send_speed: Option<u64>,
+    low_speed_limit: Option<u32>,
+    low_speed_time: Option<Duration>,
 }
 
 impl std::fmt::Debug for Easy {
@@ -94,6 +99,7 @@ impl std::fmt::Debug for Easy {
             .field("proxy", &self.proxy)
             .field("noproxy", &self.noproxy)
             .field("cookie_jar", &self.cookie_jar.as_ref().map(|_| "<CookieJar>"))
+            .field("cookie_jar_path", &self.cookie_jar_path)
             .field("hsts_cache", &self.hsts_cache.as_ref().map(|_| "<HstsCache>"))
             .field("multipart", &self.multipart)
             .field("range", &self.range)
@@ -115,6 +121,10 @@ impl std::fmt::Debug for Easy {
             .field("share", &self.share)
             .field("http_version", &self.http_version)
             .field("expect_100_timeout", &self.expect_100_timeout)
+            .field("max_recv_speed", &self.max_recv_speed)
+            .field("max_send_speed", &self.max_send_speed)
+            .field("low_speed_limit", &self.low_speed_limit)
+            .field("low_speed_time", &self.low_speed_time)
             .finish()
     }
 }
@@ -135,6 +145,7 @@ impl Clone for Easy {
             proxy: self.proxy.clone(),
             noproxy: self.noproxy.clone(),
             cookie_jar: self.cookie_jar.clone(),
+            cookie_jar_path: self.cookie_jar_path.clone(),
             hsts_cache: self.hsts_cache.clone(),
             multipart: self.multipart.clone(),
             range: self.range.clone(),
@@ -156,6 +167,10 @@ impl Clone for Easy {
             share: self.share.clone(),
             http_version: self.http_version,
             expect_100_timeout: self.expect_100_timeout,
+            max_recv_speed: self.max_recv_speed,
+            max_send_speed: self.max_send_speed,
+            low_speed_limit: self.low_speed_limit,
+            low_speed_time: self.low_speed_time,
         }
     }
 }
@@ -178,6 +193,7 @@ impl Easy {
             proxy: None,
             noproxy: None,
             cookie_jar: None,
+            cookie_jar_path: None,
             hsts_cache: None,
             multipart: None,
             range: None,
@@ -199,6 +215,10 @@ impl Easy {
             share: None,
             http_version: HttpVersion::None,
             expect_100_timeout: None,
+            max_recv_speed: None,
+            max_send_speed: None,
+            low_speed_limit: None,
+            low_speed_time: None,
         }
     }
 
@@ -301,6 +321,50 @@ impl Easy {
         } else {
             self.cookie_jar = None;
         }
+    }
+
+    /// Load cookies from a Netscape-format cookie file.
+    ///
+    /// Enables the cookie engine and loads cookies from the given file path.
+    /// Equivalent to curl's `CURLOPT_COOKIEFILE` / `-b <file>`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Io`] if the file cannot be read.
+    pub fn cookie_file<P: AsRef<Path>>(&mut self, path: P) -> Result<(), Error> {
+        let jar = CookieJar::load_from_file(path).map_err(Error::Io)?;
+        self.cookie_jar = Some(jar);
+        Ok(())
+    }
+
+    /// Set the cookie jar output file path.
+    ///
+    /// After the transfer completes, cookies are saved to this file in
+    /// Netscape format. Call [`save_cookie_jar`](Self::save_cookie_jar)
+    /// after `perform()` to write the file.
+    ///
+    /// Equivalent to curl's `CURLOPT_COOKIEJAR` / `-c <file>`.
+    pub fn cookie_jar_file(&mut self, path: &str) {
+        self.cookie_jar_path = Some(path.to_string());
+        // Ensure cookie engine is enabled
+        if self.cookie_jar.is_none() {
+            self.cookie_jar = Some(CookieJar::new());
+        }
+    }
+
+    /// Save the current cookies to the configured cookie jar file.
+    ///
+    /// This must be called after `perform()` to persist cookies.
+    /// Does nothing if no cookie jar file path has been set.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Io`] if the file cannot be written.
+    pub fn save_cookie_jar(&self) -> Result<(), Error> {
+        if let (Some(ref path), Some(ref jar)) = (&self.cookie_jar_path, &self.cookie_jar) {
+            jar.save_to_file(path).map_err(Error::Io)?;
+        }
+        Ok(())
     }
 
     /// Set the proxy URL.
@@ -600,6 +664,42 @@ impl Easy {
     /// Equivalent to `CURLOPT_EXPECT_100_TIMEOUT_MS`.
     pub fn expect_100_timeout(&mut self, timeout: Duration) {
         self.expect_100_timeout = Some(timeout);
+    }
+
+    /// Set the maximum download speed in bytes per second.
+    ///
+    /// Equivalent to `CURLOPT_MAX_RECV_SPEED_LARGE`.
+    pub fn max_recv_speed(&mut self, bytes_per_sec: u64) {
+        self.max_recv_speed = Some(bytes_per_sec);
+    }
+
+    /// Set the maximum upload speed in bytes per second.
+    ///
+    /// Equivalent to `CURLOPT_MAX_SEND_SPEED_LARGE`.
+    pub fn max_send_speed(&mut self, bytes_per_sec: u64) {
+        self.max_send_speed = Some(bytes_per_sec);
+    }
+
+    /// Set the minimum transfer speed in bytes per second.
+    ///
+    /// If the transfer speed drops below this limit for longer than
+    /// the duration set by [`low_speed_time`](Self::low_speed_time),
+    /// the transfer is aborted.
+    ///
+    /// Equivalent to `CURLOPT_LOW_SPEED_LIMIT`.
+    pub fn low_speed_limit(&mut self, bytes_per_sec: u32) {
+        self.low_speed_limit = Some(bytes_per_sec);
+    }
+
+    /// Set the time window for minimum speed enforcement.
+    ///
+    /// If the transfer speed stays below the limit set by
+    /// [`low_speed_limit`](Self::low_speed_limit) for this duration,
+    /// the transfer is aborted with a timeout error.
+    ///
+    /// Equivalent to `CURLOPT_LOW_SPEED_TIME`.
+    pub fn low_speed_time(&mut self, duration: Duration) {
+        self.low_speed_time = Some(duration);
     }
 
     /// Perform the transfer and return the response (blocking).
@@ -2281,5 +2381,78 @@ mod tests {
         let cloned = easy.clone();
         assert_eq!(cloned.http_version, HttpVersion::Http11);
         assert_eq!(cloned.expect_100_timeout, Some(Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn easy_cookie_jar_file() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("urlx_test_cookie_file.txt");
+        std::fs::write(
+            &path,
+            "# Netscape HTTP Cookie File\n.example.com\tTRUE\t/\tFALSE\t0\ttest\tval\n",
+        )
+        .unwrap();
+
+        let mut easy = Easy::new();
+        easy.cookie_file(&path).unwrap();
+        assert!(easy.cookie_jar.is_some());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn easy_cookie_jar_file_not_found() {
+        let mut easy = Easy::new();
+        assert!(easy.cookie_file("/nonexistent/path.txt").is_err());
+    }
+
+    #[test]
+    fn easy_cookie_jar_path() {
+        let mut easy = Easy::new();
+        easy.cookie_jar_file("/tmp/output_cookies.txt");
+        assert_eq!(easy.cookie_jar_path, Some("/tmp/output_cookies.txt".to_string()));
+        assert!(easy.cookie_jar.is_some()); // Cookie engine should be enabled
+    }
+
+    #[test]
+    fn easy_max_recv_speed() {
+        let mut easy = Easy::new();
+        easy.max_recv_speed(1024);
+        assert_eq!(easy.max_recv_speed, Some(1024));
+    }
+
+    #[test]
+    fn easy_max_send_speed() {
+        let mut easy = Easy::new();
+        easy.max_send_speed(2048);
+        assert_eq!(easy.max_send_speed, Some(2048));
+    }
+
+    #[test]
+    fn easy_low_speed_limit() {
+        let mut easy = Easy::new();
+        easy.low_speed_limit(100);
+        assert_eq!(easy.low_speed_limit, Some(100));
+    }
+
+    #[test]
+    fn easy_low_speed_time() {
+        let mut easy = Easy::new();
+        easy.low_speed_time(Duration::from_secs(30));
+        assert_eq!(easy.low_speed_time, Some(Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn easy_rate_limit_clone() {
+        let mut easy = Easy::new();
+        easy.max_recv_speed(1024);
+        easy.max_send_speed(2048);
+        easy.low_speed_limit(100);
+        easy.low_speed_time(Duration::from_secs(30));
+        let cloned = easy.clone();
+        assert_eq!(cloned.max_recv_speed, Some(1024));
+        assert_eq!(cloned.max_send_speed, Some(2048));
+        assert_eq!(cloned.low_speed_limit, Some(100));
+        assert_eq!(cloned.low_speed_time, Some(Duration::from_secs(30)));
     }
 }

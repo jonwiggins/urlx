@@ -35,6 +35,10 @@ struct CliOptions {
     retry_max_time_secs: u64,
     parallel: bool,
     parallel_max: usize,
+    cookie_jar_file: Option<String>,
+    limit_rate: Option<String>,
+    speed_limit: Option<u32>,
+    speed_time: Option<u64>,
 }
 
 /// Print usage information to stderr.
@@ -98,6 +102,10 @@ fn print_usage() {
     eprintln!("      --tcp-keepalive <s>   TCP keepalive idle time (seconds)");
     eprintln!("      --hsts                Enable HSTS (HTTP Strict Transport Security)");
     eprintln!("      --bearer <token>      Bearer token authentication");
+    eprintln!("  -c, --cookie-jar <file>   Write cookies to file after transfer");
+    eprintln!("      --limit-rate <speed>  Limit transfer speed (e.g., 100K, 1M)");
+    eprintln!("      --speed-limit <bps>   Minimum transfer speed in bytes/sec");
+    eprintln!("      --speed-time <s>      Time for speed-limit check (default: 30)");
 }
 
 /// Parse CLI arguments into options.
@@ -125,6 +133,10 @@ fn parse_args(args: &[String]) -> Option<CliOptions> {
         retry_max_time_secs: 0,
         parallel: false,
         parallel_max: 50,
+        cookie_jar_file: None,
+        limit_rate: None,
+        speed_limit: None,
+        speed_time: None,
     };
 
     let mut i = 1;
@@ -407,9 +419,17 @@ fn parse_args(args: &[String]) -> Option<CliOptions> {
             "-b" | "--cookie" => {
                 i += 1;
                 let val = require_arg(args, i, "-b")?;
-                // Enable cookie engine and set initial cookies via header
-                opts.easy.cookie_jar(true);
-                opts.easy.header("Cookie", val);
+                // If the value looks like a file path (contains no = and exists on disk), load from file
+                if !val.contains('=') && std::path::Path::new(val).exists() {
+                    if let Err(e) = opts.easy.cookie_file(val) {
+                        eprintln!("urlx: error reading cookie file '{val}': {e}");
+                        return None;
+                    }
+                } else {
+                    // Treat as inline cookie string
+                    opts.easy.cookie_jar(true);
+                    opts.easy.header("Cookie", val);
+                }
             }
             "--data-binary" => {
                 i += 1;
@@ -545,6 +565,46 @@ fn parse_args(args: &[String]) -> Option<CliOptions> {
                 opts.easy.bearer_token(val);
                 opts.use_bearer = true;
             }
+            "-c" | "--cookie-jar" => {
+                i += 1;
+                let val = require_arg(args, i, "-c")?;
+                opts.cookie_jar_file = Some(val.to_string());
+                opts.easy.cookie_jar_file(val);
+            }
+            "--limit-rate" => {
+                i += 1;
+                let val = require_arg(args, i, "--limit-rate")?;
+                opts.limit_rate = Some(val.to_string());
+                if let Some(bps) = parse_rate_limit(val) {
+                    opts.easy.max_recv_speed(bps);
+                    opts.easy.max_send_speed(bps);
+                } else {
+                    eprintln!("urlx: invalid rate limit: {val}");
+                    return None;
+                }
+            }
+            "--speed-limit" => {
+                i += 1;
+                let val = require_arg(args, i, "--speed-limit")?;
+                if let Ok(limit) = val.parse::<u32>() {
+                    opts.speed_limit = Some(limit);
+                    opts.easy.low_speed_limit(limit);
+                } else {
+                    eprintln!("urlx: invalid speed limit: {val}");
+                    return None;
+                }
+            }
+            "--speed-time" => {
+                i += 1;
+                let val = require_arg(args, i, "--speed-time")?;
+                if let Ok(secs) = val.parse::<u64>() {
+                    opts.speed_time = Some(secs);
+                    opts.easy.low_speed_time(std::time::Duration::from_secs(secs));
+                } else {
+                    eprintln!("urlx: invalid speed time: {val}");
+                    return None;
+                }
+            }
             arg if arg.starts_with('-') => {
                 eprintln!("urlx: unknown option: {arg}");
                 return None;
@@ -603,6 +663,26 @@ fn percent_encode(input: &str) -> String {
 
 /// Hex lookup table for percent encoding.
 const HEX_CHARS: [u8; 16] = *b"0123456789ABCDEF";
+
+/// Parse a rate limit string like "100K", "1M", "500" into bytes per second.
+///
+/// Supports suffixes: K/k (1024), M/m (1024*1024), G/g (1024^3).
+/// Returns `None` if the value cannot be parsed.
+fn parse_rate_limit(input: &str) -> Option<u64> {
+    let input = input.trim();
+    if input.is_empty() {
+        return None;
+    }
+
+    let (num_str, multiplier) = match input.as_bytes().last()? {
+        b'k' | b'K' => (&input[..input.len() - 1], 1024_u64),
+        b'm' | b'M' => (&input[..input.len() - 1], 1024 * 1024),
+        b'g' | b'G' => (&input[..input.len() - 1], 1024 * 1024 * 1024),
+        _ => (input, 1_u64),
+    };
+
+    num_str.parse::<u64>().ok().map(|n| n * multiplier)
+}
 
 /// Helper to require an argument value for an option flag.
 fn require_arg<'a>(args: &'a [String], i: usize, flag: &str) -> Option<&'a str> {
@@ -669,6 +749,15 @@ fn run(args: &[String]) -> ExitCode {
     }
 
     let result = perform_with_retry(&mut opts);
+
+    // Save cookie jar after transfer (even on error)
+    if opts.cookie_jar_file.is_some() {
+        if let Err(e) = opts.easy.save_cookie_jar() {
+            if !opts.silent || opts.show_error {
+                eprintln!("urlx: error saving cookies: {e}");
+            }
+        }
+    }
 
     match result {
         Ok(response) => {
@@ -1829,5 +1918,105 @@ mod tests {
         for code in [200, 301, 400, 401, 403, 404] {
             assert!(!is_retryable_status(code), "status {code} should not be retryable");
         }
+    }
+
+    #[test]
+    fn parse_rate_limit_plain() {
+        assert_eq!(parse_rate_limit("1000"), Some(1000));
+    }
+
+    #[test]
+    fn parse_rate_limit_kilobytes() {
+        assert_eq!(parse_rate_limit("100K"), Some(100 * 1024));
+        assert_eq!(parse_rate_limit("100k"), Some(100 * 1024));
+    }
+
+    #[test]
+    fn parse_rate_limit_megabytes() {
+        assert_eq!(parse_rate_limit("1M"), Some(1024 * 1024));
+        assert_eq!(parse_rate_limit("1m"), Some(1024 * 1024));
+    }
+
+    #[test]
+    fn parse_rate_limit_gigabytes() {
+        assert_eq!(parse_rate_limit("1G"), Some(1024 * 1024 * 1024));
+    }
+
+    #[test]
+    fn parse_rate_limit_invalid() {
+        assert_eq!(parse_rate_limit(""), None);
+        assert_eq!(parse_rate_limit("abc"), None);
+        assert_eq!(parse_rate_limit("K"), None);
+    }
+
+    #[test]
+    fn parse_args_cookie_jar() {
+        let args = vec![
+            "urlx".to_string(),
+            "-c".to_string(),
+            "/tmp/cookies.txt".to_string(),
+            "http://example.com".to_string(),
+        ];
+        let opts = parse_args(&args).unwrap();
+        assert_eq!(opts.cookie_jar_file, Some("/tmp/cookies.txt".to_string()));
+    }
+
+    #[test]
+    fn parse_args_cookie_jar_long() {
+        let args = vec![
+            "urlx".to_string(),
+            "--cookie-jar".to_string(),
+            "/tmp/cookies.txt".to_string(),
+            "http://example.com".to_string(),
+        ];
+        let opts = parse_args(&args).unwrap();
+        assert_eq!(opts.cookie_jar_file, Some("/tmp/cookies.txt".to_string()));
+    }
+
+    #[test]
+    fn parse_args_limit_rate() {
+        let args = vec![
+            "urlx".to_string(),
+            "--limit-rate".to_string(),
+            "100K".to_string(),
+            "http://example.com".to_string(),
+        ];
+        let opts = parse_args(&args).unwrap();
+        assert_eq!(opts.limit_rate, Some("100K".to_string()));
+    }
+
+    #[test]
+    fn parse_args_limit_rate_invalid() {
+        let args = vec![
+            "urlx".to_string(),
+            "--limit-rate".to_string(),
+            "notanumber".to_string(),
+            "http://example.com".to_string(),
+        ];
+        assert!(parse_args(&args).is_none());
+    }
+
+    #[test]
+    fn parse_args_speed_limit() {
+        let args = vec![
+            "urlx".to_string(),
+            "--speed-limit".to_string(),
+            "1000".to_string(),
+            "http://example.com".to_string(),
+        ];
+        let opts = parse_args(&args).unwrap();
+        assert_eq!(opts.speed_limit, Some(1000));
+    }
+
+    #[test]
+    fn parse_args_speed_time() {
+        let args = vec![
+            "urlx".to_string(),
+            "--speed-time".to_string(),
+            "60".to_string(),
+            "http://example.com".to_string(),
+        ];
+        let opts = parse_args(&args).unwrap();
+        assert_eq!(opts.speed_time, Some(60));
     }
 }
