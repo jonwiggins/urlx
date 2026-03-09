@@ -14,12 +14,12 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 24 — Planning
-**Last completed:** Phase 23 (URL API & FFI Expansion) — 2026-03-09
-**Total tests:** 1,840
-**In progress:** Planning Phase 24
+**Phase:** 25 — Planning
+**Last completed:** Phase 24 (CLI Expansion II) — 2026-03-09
+**Total tests:** 1,881
+**In progress:** Planning Phase 25
 **Blockers:** None
-**Next up:** Phase 24 — CLI Expansion II
+**Next up:** Phase 25 — FTPS & Active Mode FTP
 
 ### Completeness Summary (updated Phase 20 review)
 
@@ -37,7 +37,7 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 | SSH/SFTP/SCP | 0% | Not implemented |
 | Multi API | 55% | Connection limiting, message queue, share interface, pipelining config; no poll/socket/timer callbacks |
 | FFI (libcurl C ABI) | ~42% | 87 options, 20 info codes, 25 error codes, 32 functions |
-| CLI | ~34% | ~84 of ~250 flags |
+| CLI | ~39% | ~98 of ~250 flags |
 | Connection | 80% | Pool, TCP_NODELAY, keepalive, Unix sockets, interface/port binding |
 | Transfer control | 80% | Rate limiting enforced in transfer engine (max recv/send speed, low speed timeout) |
 | Overall | ~56% | ~92% for basic HTTP/HTTPS use cases |
@@ -83,6 +83,9 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 - **2026-03-09:** `curl_share_setopt` lock/unlock function callbacks (options 3/4) are accepted but ignored. The Rust `Share` type uses `Arc<Mutex>` internally, making external locking unnecessary.
 - **2026-03-09:** `curl_url_*` API uses an FFI-specific `UrlHandle` struct with mutable component storage, since the core `Url` type is immutable. Components are stored individually and reassembled on `curl_url_get(CURLUPART_URL)`. Strings returned by `curl_url_get` are allocated via `CString::into_raw` and must be freed with `curl_free`.
 - **2026-03-09:** `CURLOPT_NOSIGNAL`, `CURLOPT_AUTOREFERER`, `CURLOPT_LOCALPORTRANGE`, and `CURLOPT_AWS_SIGV4` are accepted as no-ops. NOSIGNAL is irrelevant (tokio doesn't use signals), AUTOREFERER is not yet implemented, LOCALPORTRANGE supplements LOCALPORT (which is implemented), and AWS_SIGV4 auth is configured through separate credential setters.
+- **2026-03-09:** `.netrc` credential loading is deferred from argument parsing to the `run()` function, where the URL is known. This allows extracting the hostname for lookup. `--netrc-optional` silently ignores missing files; `--netrc` fails if the file doesn't exist.
+- **2026-03-09:** `--remote-time` uses the `filetime` crate for cross-platform file mtime setting. HTTP date parsing is inline (RFC 7231 format only) to avoid adding a date-parsing dependency for a single use case.
+- **2026-03-09:** `--post301/--post302/--post303` flags map to `post301`/`post302`/`post303` bool fields on Easy. The redirect logic in `perform_transfer` checks these before converting POST→GET on 301/302/303 redirects. This matches curl's `CURLOPT_POSTREDIR` bitmask approach.
 
 ---
 
@@ -260,21 +263,22 @@ Built from scratch over 20 phases. All features below are implemented and tested
 - URL API: Mutable UrlHandle with component-level get/set (scheme, user, password, host, port, path, query, fragment).
 - Memory: Box<[u8]>-based slist string allocation (exact-size, no capacity mismatch). catch_unwind on all FFI boundaries.
 
-**CLI (urlx) — ~84 flags:**
-- HTTP: -X, -H, -d, --data-raw, --data-binary, --data-urlencode, -L, --max-redirs, -I, -A, -e, -G, -F, -r, -C, --compressed, --http1.0, --http1.1, --http2, --expect100-timeout.
-- Output: -o, -O, -D, -i, -w, --create-dirs, -v, -s, -S, -f, -#.
-- Auth: -u, --digest, --bearer, --aws-sigv4, -b, -c.
+**CLI (urlx) — ~98 flags:**
+- HTTP: -X, -H, -d, --data-raw, --data-binary, --data-urlencode, -L, --max-redirs, -I, -A, -e, -G, -F, -r, -C, --compressed, --http1.0, --http1.1, --http2, --expect100-timeout, --post301, --post302, --post303.
+- Output: -o, -O, -D, -i, -w, --create-dirs, -v, -s, -S, -f, -#, -R/--remote-time.
+- Auth: -u, --digest, --bearer, --aws-sigv4, -b, -c, --netrc, --netrc-file, --netrc-optional.
 - TLS: -k, --cacert, --cert, --key, --tlsv1.2, --tlsv1.3, --tls-max, --pinnedpubkey.
-- Proxy: -x, --noproxy, --socks5-hostname, --proxy-user, --proxy-digest, --proxy-ntlm.
+- Proxy: -x, --noproxy, --socks5-hostname, --proxy-user, --proxy-digest, --proxy-ntlm, --proxy-header.
 - Transfer: -m, --connect-timeout, --retry/--retry-delay/--retry-max-time, --limit-rate, --speed-limit, --speed-time, -T, --unrestricted-auth, --ignore-content-length.
 - Connection: --tcp-nodelay, --tcp-keepalive, --no-keepalive, --unix-socket, --interface, --local-port, --resolve.
 - DNS: --dns-shuffle, --dns-servers, --doh-url, --happy-eyeballs-timeout-ms.
 - Concurrency: -Z, --parallel-max.
-- Debug/Config: --trace, --trace-ascii, --trace-time, -K/--config, --libcurl, --proto, --proto-redir, --max-filesize, --hsts.
-- Features: .curlrc-style config file parser, protocol restriction, max filesize enforcement (exit 63), libcurl C code generation, retry logic (408/429/5xx).
+- Debug/Config: --trace, --trace-ascii, --trace-time, -K/--config, --libcurl, --proto, --proto-redir, --max-filesize, --hsts, --next.
+- FTP: --ftp-pasv, --ftp-ssl, --ssl, --ftp-ssl-reqd, --ssl-reqd.
+- Features: .curlrc-style config file parser, protocol restriction, max filesize enforcement (exit 63), libcurl C code generation, retry logic (408/429/5xx), netrc credential lookup.
 
-**Testing — 1,788 tests (0 failures):**
-- Unit: 455 (liburlx) + 133 (FFI) + 134 (CLI) = 722
+**Testing — 1,881 tests (0 failures):**
+- Unit: 462 (liburlx) + 133 (FFI) + 158 (CLI) = 753
 - Integration: 1,048 (hyper-based test servers)
 - Property-based: 60 (proptest — URL, cookie, FTP, HTTP, HSTS, multipart, protocols, WebSocket)
 - Doc tests: 3
@@ -283,7 +287,7 @@ Built from scratch over 20 phases. All features below are implemented and tested
 
 **Guardrails:** Zero TODO/FIXME/HACK. Zero `unwrap()` in production code. `#![deny(unsafe_code)]` in liburlx and urlx-cli. GitHub Actions CI (fmt, clippy, test on 3 OS, doc, cargo-deny, MSRV 1.83, commit lint). Pre-commit hooks (fmt, clippy, test, deny, doc, conventional commit).
 
-**Known gaps (as of Phase 23):** Trace file writing not fully wired. HTTP/3 QUIC transport not implemented. SSH/SFTP/SCP not implemented. FTPS not implemented. Poll/socket/timer Multi APIs not implemented. Missing FFI: CURLOPT_HTTPPOST (deprecated).
+**Known gaps (as of Phase 24):** Trace file writing not fully wired. HTTP/3 QUIC transport not implemented. SSH/SFTP/SCP not implemented. FTPS not implemented. Poll/socket/timer Multi APIs not implemented. Missing FFI: CURLOPT_HTTPPOST (deprecated). URL globbing (--glob) not yet implemented.
 
 ---
 
@@ -305,16 +309,9 @@ Added curl_url_* API (6 functions: curl_url/cleanup/dup/set/get + curl_free), CU
 
 ---
 
-### Phase 24: CLI Expansion II
+### Phase 24: CLI Expansion II (completed 2026-03-09)
 
-**Goal:** Continue CLI toward full curl parity.
-
-- `--netrc` / `--netrc-optional` (credential file support)
-- `--proxy-header` (proxy-only headers)
-- `--post301` / `--post302` / `--post303` (method preservation on redirect)
-- `--remote-time` (set local file timestamp from server)
-- `--ftp-*` flags (FTP-specific: `--ftp-pasv`, `--ftp-port`, `--ftp-ssl`, etc.)
-- `--glob` / `--next` (URL globbing and request chaining)
+Added 14 new CLI flags (~98 total): `--netrc`, `--netrc-file`, `--netrc-optional` (credential file support with .netrc parsing), `--proxy-header` (proxy-only headers), `--post301`/`--post302`/`--post303` (redirect method preservation), `-R`/`--remote-time` (file mtime from Last-Modified), `--next` (option group separator), `--ftp-pasv`/`--ftp-ssl`/`--ssl`/`--ftp-ssl-reqd`/`--ssl-reqd` (FTP compat flags). Library: added netrc module, post_redir fields on Easy, proxy_header method. New dep: `filetime`. 42 new tests. Total: 1,881 tests.
 
 ---
 
