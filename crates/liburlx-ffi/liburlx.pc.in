@@ -1,0 +1,10 @@
+prefix=@PREFIX@
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib
+includedir=${prefix}/include
+
+Name: liburlx
+Description: URL transfer library — libcurl-compatible C API
+Version: @VERSION@
+Libs: -L${libdir} -lurlx_ffi
+Cflags: -I${includedir}

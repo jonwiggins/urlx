@@ -14,3 +14,6 @@ workspace = true
 
 [dependencies]
 liburlx = { path = "../liburlx", version = "0.1.0" }
+
+[build-dependencies]
+cbindgen = "0.28"
