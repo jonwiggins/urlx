@@ -39,6 +39,8 @@ struct CliOptions {
     limit_rate: Option<String>,
     speed_limit: Option<u32>,
     speed_time: Option<u64>,
+    remote_name: bool,
+    create_dirs: bool,
 }
 
 /// Print usage information to stderr.
@@ -55,6 +57,7 @@ fn print_usage() {
     eprintln!("      --max-redirs <num>    Maximum number of redirects (default: 50)");
     eprintln!("  -I, --head                Send HEAD request");
     eprintln!("  -o, --output <file>       Write output to file");
+    eprintln!("  -O, --remote-name         Save as remote filename from URL");
     eprintln!("  -D, --dump-header <file>  Write response headers to file");
     eprintln!("  -i, --include             Include response headers in output");
     eprintln!("  -v, --verbose             Verbose output");
@@ -85,6 +88,9 @@ fn print_usage() {
     eprintln!("      --dns-shuffle         Randomize DNS resolution order");
     eprintln!("  -T, --upload-file <file>  Upload file (PUT)");
     eprintln!("  -b, --cookie <data>       Send cookies (e.g., 'name=value; name2=value2')");
+    eprintln!("  -e, --referer <url>       Set Referer header");
+    eprintln!("  -G, --get                 Force GET even with --data (append to URL query)");
+    eprintln!("      --create-dirs         Create output directories as needed");
     eprintln!("      --data-binary <data>  POST binary data (use @filename)");
     eprintln!("      --data-urlencode <d>  POST URL-encoded data");
     eprintln!("      --resolve <h:p:a>     Resolve host:port to address");
@@ -137,6 +143,8 @@ fn parse_args(args: &[String]) -> Option<CliOptions> {
         limit_rate: None,
         speed_limit: None,
         speed_time: None,
+        remote_name: false,
+        create_dirs: false,
     };
 
     let mut i = 1;
@@ -204,6 +212,20 @@ fn parse_args(args: &[String]) -> Option<CliOptions> {
                 i += 1;
                 let val = require_arg(args, i, "-o")?;
                 opts.output_file = Some(val.to_string());
+            }
+            "-O" | "--remote-name" => {
+                opts.remote_name = true;
+            }
+            "-e" | "--referer" => {
+                i += 1;
+                let val = require_arg(args, i, "-e")?;
+                opts.easy.header("Referer", val);
+            }
+            "-G" | "--get" => {
+                opts.easy.method("GET");
+            }
+            "--create-dirs" => {
+                opts.create_dirs = true;
             }
             "-D" | "--dump-header" => {
                 i += 1;
@@ -664,6 +686,36 @@ fn percent_encode(input: &str) -> String {
 /// Hex lookup table for percent encoding.
 const HEX_CHARS: [u8; 16] = *b"0123456789ABCDEF";
 
+/// Extract filename from URL for `-O/--remote-name`.
+///
+/// Takes the last path segment. Falls back to `"index.html"` if no filename.
+fn remote_name_from_url(url: &str) -> String {
+    // Strip scheme (e.g., "http://")
+    let without_scheme = url.find("://").map_or(url, |pos| &url[pos + 3..]);
+
+    // Strip query string and fragment
+    let without_query = without_scheme
+        .split('?')
+        .next()
+        .unwrap_or(without_scheme)
+        .split('#')
+        .next()
+        .unwrap_or(without_scheme);
+
+    // Find the path part (after the first '/')
+    if let Some(slash_pos) = without_query.find('/') {
+        let path = &without_query[slash_pos..];
+        if let Some(name) = path.rsplit('/').next() {
+            if name.is_empty() {
+                return "index.html".to_string();
+            }
+            return name.to_string();
+        }
+    }
+
+    "index.html".to_string()
+}
+
 /// Parse a rate limit string like "100K", "1M", "500" into bytes per second.
 ///
 /// Supports suffixes: K/k (1024), M/m (1024*1024), G/g (1024^3).
@@ -727,6 +779,27 @@ fn run(args: &[String]) -> ExitCode {
                 eprintln!("urlx: error parsing URL: {e}");
             }
             return ExitCode::FAILURE;
+        }
+
+        // -O/--remote-name: derive output filename from URL
+        if opts.remote_name && opts.output_file.is_none() {
+            opts.output_file = Some(remote_name_from_url(url));
+        }
+    }
+
+    // --create-dirs: create parent directories for output file
+    if opts.create_dirs {
+        if let Some(ref path) = opts.output_file {
+            if let Some(parent) = std::path::Path::new(path).parent() {
+                if !parent.as_os_str().is_empty() {
+                    if let Err(e) = std::fs::create_dir_all(parent) {
+                        if !opts.silent || opts.show_error {
+                            eprintln!("urlx: error creating directories: {e}");
+                        }
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
         }
     }
 
@@ -2018,5 +2091,83 @@ mod tests {
         ];
         let opts = parse_args(&args).unwrap();
         assert_eq!(opts.speed_time, Some(60));
+    }
+
+    #[test]
+    fn parse_args_referer() {
+        let args = vec![
+            "urlx".to_string(),
+            "-e".to_string(),
+            "http://prev.com".to_string(),
+            "http://example.com".to_string(),
+        ];
+        let opts = parse_args(&args).unwrap();
+        assert!(opts.urls.contains(&"http://example.com".to_string()));
+    }
+
+    #[test]
+    fn parse_args_referer_long() {
+        let args = vec![
+            "urlx".to_string(),
+            "--referer".to_string(),
+            "http://prev.com".to_string(),
+            "http://example.com".to_string(),
+        ];
+        assert!(parse_args(&args).is_some());
+    }
+
+    #[test]
+    fn parse_args_remote_name() {
+        let args = vec![
+            "urlx".to_string(),
+            "-O".to_string(),
+            "http://example.com/file.tar.gz".to_string(),
+        ];
+        let opts = parse_args(&args).unwrap();
+        assert!(opts.remote_name);
+    }
+
+    #[test]
+    fn parse_args_get_flag() {
+        let args = vec!["urlx".to_string(), "-G".to_string(), "http://example.com".to_string()];
+        assert!(parse_args(&args).is_some());
+    }
+
+    #[test]
+    fn parse_args_create_dirs() {
+        let args = vec![
+            "urlx".to_string(),
+            "--create-dirs".to_string(),
+            "-o".to_string(),
+            "a/b/c/file.txt".to_string(),
+            "http://example.com".to_string(),
+        ];
+        let opts = parse_args(&args).unwrap();
+        assert!(opts.create_dirs);
+    }
+
+    #[test]
+    fn remote_name_from_url_basic() {
+        assert_eq!(remote_name_from_url("http://example.com/file.tar.gz"), "file.tar.gz");
+    }
+
+    #[test]
+    fn remote_name_from_url_with_query() {
+        assert_eq!(remote_name_from_url("http://example.com/download.zip?v=1"), "download.zip");
+    }
+
+    #[test]
+    fn remote_name_from_url_no_filename() {
+        assert_eq!(remote_name_from_url("http://example.com/"), "index.html");
+    }
+
+    #[test]
+    fn remote_name_from_url_root() {
+        assert_eq!(remote_name_from_url("http://example.com"), "index.html");
+    }
+
+    #[test]
+    fn remote_name_from_url_path_segments() {
+        assert_eq!(remote_name_from_url("http://example.com/path/to/file.txt"), "file.txt");
     }
 }
