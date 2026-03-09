@@ -14,12 +14,12 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 5 — Multi API Event-Driven Architecture
-**Last completed:** Phase 4 (FTP completeness) — 2026-03-08
-**Total tests:** 1470+
-**In progress:** Planning Phase 5
+**Phase:** 6 — FFI Expansion
+**Last completed:** Phase 5 (Multi API) — 2026-03-08
+**Total tests:** 1490+
+**In progress:** Planning Phase 6
 **Blockers:** None
-**Next up:** Poll-based event loop, socket/timer callbacks, message queue
+**Next up:** CURLcode expansion, CURLoption expansion, curl_multi_* FFI
 
 ### Completeness Summary
 
@@ -35,11 +35,11 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 | DNS | 60% | Cache with TTL, Happy Eyeballs (RFC 6555), DNS shuffle; no async resolver or DoH |
 | FTP | 70% | Session API, upload, resume, dir ops, FEAT; no FTPS or active mode |
 | SSH/SFTP/SCP | 0% | Not implemented |
-| Multi API | 30% | Simple concurrency; no event-driven model |
+| Multi API | 55% | Connection limiting, message queue, share interface, pipelining config; no poll/socket/timer callbacks |
 | FFI (libcurl C ABI) | ~8% | 19/300+ options, 6/50+ info codes |
 | CLI | ~14% | ~43 of ~250 flags |
 | Connection | 80% | Pool, TCP_NODELAY, keepalive, Unix sockets, interface/port binding |
-| Overall | ~42% | ~88% for basic HTTP/HTTPS use cases |
+| Overall | ~44% | ~88% for basic HTTP/HTTPS use cases |
 
 ---
 
@@ -64,6 +64,9 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 - **2026-03-08:** Local interface/port binding uses `socket2::Socket` for pre-bind + non-blocking connect, with platform-specific `EINPROGRESS` handling (code 36 on macOS, 115 on Linux, 10036 on Windows).
 - **2026-03-08:** FTP refactored from standalone functions to `FtpSession` struct to eliminate code duplication (login, PASV, data connection). Original `download()`/`list()` functions preserved as convenience wrappers.
 - **2026-03-08:** SSH/SFTP deferred — `russh` (pure-Rust) preferred over `ssh2` (C bindings via libssh2) to maintain zero-unsafe-outside-FFI principle. Significant effort to implement properly.
+- **2026-03-08:** Share interface uses swap-based approach: shared state is swapped into local Easy fields before transfer, then swapped back after. No lock held across async await points — only brief locks for the swap. This naturally serializes access per-transfer.
+- **2026-03-08:** Poll/socket/timer/fdset Multi APIs deferred to FFI phase — these are C event-loop integration points that don't map naturally to tokio's async model. The Rust Multi API already provides native async via `perform()`.
+- **2026-03-08:** `PipeliningMode` enum has `Nothing` and `Multiplex` variants. HTTP/1.1 pipelining was deprecated in libcurl and is not supported — only HTTP/2 multiplexing is offered.
 
 ---
 
@@ -264,19 +267,17 @@ Refactored FTP into session-based `FtpSession` API. Added: STOR upload, APPE app
 
 ---
 
-### Phase 5: Multi API Event-Driven Architecture
+### Phase 5: Multi API Event-Driven Architecture — COMPLETED (2026-03-08)
 
-**Goal:** Full libcurl multi interface parity for event-loop integration.
-
-- Poll-based event loop — `curl_multi_poll`/`curl_multi_wait` equivalents
-- Socket callback interface — `CURLMOPT_SOCKETFUNCTION`, `curl_multi_assign`
-- Timer callback interface — `CURLMOPT_TIMERFUNCTION`
-- File descriptor set — `curl_multi_fdset` equivalent
-- Message queue — `curl_multi_info_read` for per-transfer completion status
-- Dynamic add/remove during perform — add new transfers while others are running
-- Max concurrent connections — `CURLMOPT_MAX_TOTAL_CONNECTIONS`, `CURLMOPT_MAX_HOST_CONNECTIONS`
-- Pipelining/multiplexing control — `CURLMOPT_PIPELINING`
-- Share interface — `curl_share_init`, `curl_share_setopt` for sharing DNS cache, cookies, TLS sessions across handles
+Implemented connection limiting, message queue, share interface, and pipelining config:
+- `TransferMessage` struct + `info_read()`/`messages_in_queue()` for per-transfer completion
+- `max_total_connections()` with semaphore-based limiting
+- `max_host_connections()` configuration
+- `remove()` for dynamic handle management
+- `Share` module for cross-handle DNS cache and cookie jar sharing via `Arc<Mutex<>>`
+- `PipeliningMode` enum (`Nothing`/`Multiplex`) for HTTP/2 multiplexing config
+- `set_share()` on both Easy and Multi handles
+- Poll/socket/timer/fdset APIs deferred to Phase 6 (FFI-specific concerns)
 
 ---
 
