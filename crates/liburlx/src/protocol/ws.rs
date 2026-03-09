@@ -230,16 +230,24 @@ pub async fn write_frame<S: AsyncWrite + Unpin>(
 #[must_use]
 pub fn generate_ws_key() -> String {
     use base64::Engine;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
     let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
+    let count = COUNTER.fetch_add(1, Ordering::Relaxed);
 
     #[allow(clippy::cast_possible_truncation)]
     let bytes: [u8; 16] = {
         let mut buf = [0u8; 16];
-        for (i, b) in buf.iter_mut().enumerate() {
-            // Simple pseudo-random using nanos and index
-            *b = ((nanos >> (i * 4)) & 0xFF) as u8;
+        // Mix timestamp into first 8 bytes
+        for (i, b) in buf[..8].iter_mut().enumerate() {
+            *b = ((nanos >> (i * 8)) & 0xFF) as u8;
+        }
+        // Mix counter into last 8 bytes for uniqueness within the same nanosecond
+        for (i, b) in buf[8..].iter_mut().enumerate() {
+            *b = ((count >> (i * 8)) & 0xFF) as u8;
         }
         buf
     };
