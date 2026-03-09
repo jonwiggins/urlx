@@ -104,6 +104,10 @@ pub struct Easy {
     post303: bool,
     /// Headers to send only to the proxy, not the target server.
     proxy_headers: Vec<(String, String)>,
+    /// FTP SSL/TLS mode.
+    ftp_ssl_mode: crate::protocol::ftp::FtpSslMode,
+    /// FTP active mode address (None = passive mode).
+    ftp_active_port: Option<String>,
 }
 
 impl std::fmt::Debug for Easy {
@@ -167,6 +171,8 @@ impl std::fmt::Debug for Easy {
             .field("post302", &self.post302)
             .field("post303", &self.post303)
             .field("proxy_headers", &self.proxy_headers)
+            .field("ftp_ssl_mode", &self.ftp_ssl_mode)
+            .field("ftp_active_port", &self.ftp_active_port)
             .finish()
     }
 }
@@ -229,6 +235,8 @@ impl Clone for Easy {
             post302: self.post302,
             post303: self.post303,
             proxy_headers: self.proxy_headers.clone(),
+            ftp_ssl_mode: self.ftp_ssl_mode,
+            ftp_active_port: self.ftp_active_port.clone(),
         }
     }
 }
@@ -293,6 +301,8 @@ impl Easy {
             post302: false,
             post303: false,
             proxy_headers: Vec::new(),
+            ftp_ssl_mode: crate::protocol::ftp::FtpSslMode::None,
+            ftp_active_port: None,
         }
     }
 
@@ -1038,6 +1048,27 @@ impl Easy {
         self.proxy_headers.push((name.to_string(), value.to_string()));
     }
 
+    /// Set the FTP SSL/TLS mode.
+    ///
+    /// - `None`: plain FTP (default)
+    /// - `Explicit`: start plain, upgrade with AUTH TLS (RFC 4217)
+    /// - `Implicit`: connect directly over TLS (port 990)
+    ///
+    /// Equivalent to curl's `--ftp-ssl` (explicit) or `--ftp-ssl-reqd`.
+    pub fn ftp_ssl_mode(&mut self, mode: crate::protocol::ftp::FtpSslMode) {
+        self.ftp_ssl_mode = mode;
+    }
+
+    /// Set the address for FTP active mode data connections.
+    ///
+    /// When set, PORT/EPRT commands are used instead of PASV.
+    /// Use `"-"` to use the control connection's local address.
+    ///
+    /// Equivalent to curl's `--ftp-port`.
+    pub fn ftp_active_port(&mut self, addr: &str) {
+        self.ftp_active_port = Some(addr.to_string());
+    }
+
     /// Perform the transfer and return the response (blocking).
     ///
     /// Creates a new tokio runtime internally. Do not call from within
@@ -1202,6 +1233,7 @@ impl Easy {
             self.post301,
             self.post302,
             self.post303,
+            self.ftp_ssl_mode,
         );
 
         // Apply total transfer timeout if set.
@@ -1301,6 +1333,7 @@ async fn perform_transfer(
     post301: bool,
     post302: bool,
     post303: bool,
+    ftp_ssl_mode: crate::protocol::ftp::FtpSslMode,
 ) -> Result<Response, Error> {
     let transfer_start = Instant::now();
     let original_url = url.clone();
@@ -1359,6 +1392,7 @@ async fn perform_transfer(
             happy_eyeballs_timeout,
             ignore_content_length,
             speed_limits,
+            ftp_ssl_mode,
         ))
         .await?;
 
@@ -1418,6 +1452,7 @@ async fn perform_transfer(
                                 happy_eyeballs_timeout,
                                 ignore_content_length,
                                 speed_limits,
+                                ftp_ssl_mode,
                             ))
                             .await?;
                         }
@@ -1553,16 +1588,23 @@ async fn do_single_request(
     happy_eyeballs_timeout: Option<Duration>,
     ignore_content_length: bool,
     speed_limits: &SpeedLimits,
+    ftp_ssl_mode: crate::protocol::ftp::FtpSslMode,
 ) -> Result<Response, Error> {
     // Handle non-HTTP schemes directly
     match url.scheme() {
         "file" => return crate::protocol::file::read_file(url),
-        "ftp" => {
+        "ftp" | "ftps" => {
+            // Determine effective SSL mode: ftps:// always uses implicit TLS
+            let effective_ssl_mode = if url.scheme() == "ftps" {
+                crate::protocol::ftp::FtpSslMode::Implicit
+            } else {
+                ftp_ssl_mode
+            };
             return if method == "PUT" {
                 let upload_data = body.unwrap_or(&[]);
-                crate::protocol::ftp::upload(url, upload_data).await
+                crate::protocol::ftp::upload(url, upload_data, effective_ssl_mode, tls_config).await
             } else {
-                crate::protocol::ftp::download(url).await
+                crate::protocol::ftp::download(url, effective_ssl_mode, tls_config).await
             };
         }
         _ => {}
@@ -3399,5 +3441,61 @@ mod tests {
         easy.proxy_header("X-Foo", "bar");
         let cloned = easy.clone();
         assert_eq!(cloned.proxy_headers.len(), 1);
+    }
+
+    #[test]
+    fn easy_ftp_ssl_mode_default() {
+        let easy = Easy::new();
+        assert_eq!(easy.ftp_ssl_mode, crate::protocol::ftp::FtpSslMode::None);
+    }
+
+    #[test]
+    fn easy_ftp_ssl_mode_set() {
+        let mut easy = Easy::new();
+        easy.ftp_ssl_mode(crate::protocol::ftp::FtpSslMode::Explicit);
+        assert_eq!(easy.ftp_ssl_mode, crate::protocol::ftp::FtpSslMode::Explicit);
+    }
+
+    #[test]
+    fn easy_ftp_ssl_mode_implicit() {
+        let mut easy = Easy::new();
+        easy.ftp_ssl_mode(crate::protocol::ftp::FtpSslMode::Implicit);
+        assert_eq!(easy.ftp_ssl_mode, crate::protocol::ftp::FtpSslMode::Implicit);
+    }
+
+    #[test]
+    fn easy_ftp_ssl_mode_cloned() {
+        let mut easy = Easy::new();
+        easy.ftp_ssl_mode(crate::protocol::ftp::FtpSslMode::Explicit);
+        let cloned = easy.clone();
+        assert_eq!(cloned.ftp_ssl_mode, crate::protocol::ftp::FtpSslMode::Explicit);
+    }
+
+    #[test]
+    fn easy_ftp_active_port_default() {
+        let easy = Easy::new();
+        assert!(easy.ftp_active_port.is_none());
+    }
+
+    #[test]
+    fn easy_ftp_active_port_set() {
+        let mut easy = Easy::new();
+        easy.ftp_active_port("-");
+        assert_eq!(easy.ftp_active_port.as_deref(), Some("-"));
+    }
+
+    #[test]
+    fn easy_ftp_active_port_ip() {
+        let mut easy = Easy::new();
+        easy.ftp_active_port("192.168.1.100");
+        assert_eq!(easy.ftp_active_port.as_deref(), Some("192.168.1.100"));
+    }
+
+    #[test]
+    fn easy_ftp_active_port_cloned() {
+        let mut easy = Easy::new();
+        easy.ftp_active_port("10.0.0.1");
+        let cloned = easy.clone();
+        assert_eq!(cloned.ftp_active_port.as_deref(), Some("10.0.0.1"));
     }
 }

@@ -2,12 +2,88 @@
 //!
 //! Implements the File Transfer Protocol (RFC 959) for downloading and
 //! uploading files, directory listing, and file management.
+//! Supports explicit FTPS (AUTH TLS, RFC 4217) and implicit FTPS (port 990).
+//! Supports active mode (PORT/EPRT) and passive mode (PASV).
 
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use std::net::SocketAddr;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+use tokio::io::{
+    AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf,
+};
 use tokio::io::{ReadHalf, WriteHalf};
+use tokio::net::TcpStream;
 
 use crate::error::Error;
 use crate::protocol::http::response::Response;
+
+/// FTPS mode for FTP connections.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FtpSslMode {
+    /// No TLS — plain FTP.
+    None,
+    /// Explicit FTPS: connect plain, then upgrade with AUTH TLS (RFC 4217).
+    Explicit,
+    /// Implicit FTPS: connect directly over TLS (port 990).
+    Implicit,
+}
+
+/// A stream that can be either plain TCP or TLS-wrapped.
+///
+/// Used for both FTP control and data connections.
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum FtpStream {
+    /// Plain TCP connection.
+    Plain(TcpStream),
+    /// TLS-wrapped connection.
+    #[cfg(feature = "rustls")]
+    Tls(tokio_rustls::client::TlsStream<TcpStream>),
+}
+
+impl AsyncRead for FtpStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(s) => Pin::new(s).poll_read(cx, buf),
+            #[cfg(feature = "rustls")]
+            Self::Tls(s) => Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for FtpStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Self::Plain(s) => Pin::new(s).poll_write(cx, buf),
+            #[cfg(feature = "rustls")]
+            Self::Tls(s) => Pin::new(s).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(s) => Pin::new(s).poll_flush(cx),
+            #[cfg(feature = "rustls")]
+            Self::Tls(s) => Pin::new(s).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(s) => Pin::new(s).poll_shutdown(cx),
+            #[cfg(feature = "rustls")]
+            Self::Tls(s) => Pin::new(s).poll_shutdown(cx),
+        }
+    }
+}
 
 /// An FTP response from the server.
 #[derive(Debug, Clone)]
@@ -61,29 +137,45 @@ pub struct FtpFeatures {
     pub size: bool,
     /// Whether the server supports UTF8.
     pub utf8: bool,
+    /// Whether the server supports AUTH TLS.
+    pub auth_tls: bool,
     /// Raw feature list.
     pub raw: Vec<String>,
 }
 
 /// An active FTP session with an established control connection.
 ///
-/// Handles login, passive mode, and data transfer operations.
+/// Handles login, passive/active mode, data transfer operations,
+/// and optional TLS encryption (FTPS).
 pub struct FtpSession {
-    reader: BufReader<ReadHalf<tokio::net::TcpStream>>,
-    writer: WriteHalf<tokio::net::TcpStream>,
+    reader: BufReader<ReadHalf<FtpStream>>,
+    writer: WriteHalf<FtpStream>,
     features: Option<FtpFeatures>,
+    /// Server hostname for TLS SNI.
+    hostname: String,
+    /// Local address of the control connection (for active mode PORT commands).
+    local_addr: SocketAddr,
+    /// Whether data connections should use TLS (set after PROT P).
+    use_tls_data: bool,
+    /// Address for active mode data connections (`None` = use passive mode).
+    active_port: Option<String>,
+    /// TLS connector for wrapping data connections.
+    #[cfg(feature = "rustls")]
+    tls_connector: Option<crate::tls::TlsConnector>,
 }
 
 impl FtpSession {
-    /// Connect to an FTP server and log in.
+    /// Connect to an FTP server and log in (plain FTP, no TLS).
     ///
     /// # Errors
     ///
     /// Returns an error if connection, login, or greeting fails.
     pub async fn connect(host: &str, port: u16, user: &str, pass: &str) -> Result<Self, Error> {
         let addr = format!("{host}:{port}");
-        let tcp = tokio::net::TcpStream::connect(&addr).await.map_err(Error::Connect)?;
-        let (reader, writer) = tokio::io::split(tcp);
+        let tcp = TcpStream::connect(&addr).await.map_err(Error::Connect)?;
+        let local_addr = tcp.local_addr().map_err(Error::Connect)?;
+        let stream = FtpStream::Plain(tcp);
+        let (reader, writer) = tokio::io::split(stream);
         let mut reader = BufReader::new(reader);
 
         // Read server greeting
@@ -95,12 +187,189 @@ impl FtpSession {
             )));
         }
 
-        let mut session = Self { reader, writer, features: None };
+        let mut session = Self {
+            reader,
+            writer,
+            features: None,
+            hostname: host.to_string(),
+            local_addr,
+            use_tls_data: false,
+            active_port: None,
+            #[cfg(feature = "rustls")]
+            tls_connector: None,
+        };
 
         // Login
         session.login(user, pass).await?;
 
         Ok(session)
+    }
+
+    /// Connect to an FTP server with TLS support.
+    ///
+    /// For `FtpSslMode::Explicit`, connects plain, then upgrades with AUTH TLS.
+    /// For `FtpSslMode::Implicit`, connects directly over TLS (port 990).
+    /// For `FtpSslMode::None`, behaves like `connect()`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if connection, TLS negotiation, or login fails.
+    #[cfg(feature = "rustls")]
+    pub async fn connect_with_tls(
+        host: &str,
+        port: u16,
+        user: &str,
+        pass: &str,
+        ssl_mode: FtpSslMode,
+        tls_config: &crate::tls::TlsConfig,
+    ) -> Result<Self, Error> {
+        if ssl_mode == FtpSslMode::None {
+            return Self::connect(host, port, user, pass).await;
+        }
+
+        let tls_connector = crate::tls::TlsConnector::new_no_alpn(tls_config)?;
+
+        let addr = format!("{host}:{port}");
+        let tcp = TcpStream::connect(&addr).await.map_err(Error::Connect)?;
+        let local_addr = tcp.local_addr().map_err(Error::Connect)?;
+
+        let stream = match ssl_mode {
+            FtpSslMode::Implicit => {
+                // Implicit FTPS: wrap immediately with TLS
+                let (tls_stream, _) = tls_connector.connect(tcp, host).await?;
+                FtpStream::Tls(tls_stream)
+            }
+            FtpSslMode::Explicit | FtpSslMode::None => {
+                // Explicit: start plain, upgrade after greeting
+                FtpStream::Plain(tcp)
+            }
+        };
+
+        let (reader, writer) = tokio::io::split(stream);
+        let mut reader = BufReader::new(reader);
+
+        // Read server greeting
+        let greeting = read_response(&mut reader).await?;
+        if !greeting.is_complete() {
+            return Err(Error::Http(format!(
+                "FTP server rejected connection: {} {}",
+                greeting.code, greeting.message
+            )));
+        }
+
+        let mut session = Self {
+            reader,
+            writer,
+            features: None,
+            hostname: host.to_string(),
+            local_addr,
+            use_tls_data: false,
+            active_port: None,
+            tls_connector: Some(tls_connector),
+        };
+
+        // For explicit FTPS, upgrade the control connection to TLS
+        if ssl_mode == FtpSslMode::Explicit {
+            session = session.auth_tls().await?;
+        }
+
+        // Set up data channel protection (PBSZ 0 + PROT P)
+        session.setup_data_protection().await?;
+
+        // Login
+        session.login(user, pass).await?;
+
+        Ok(session)
+    }
+
+    /// Upgrade the control connection to TLS using AUTH TLS (RFC 4217).
+    ///
+    /// Consumes the session and returns a new one with TLS-encrypted
+    /// control connection.
+    #[cfg(feature = "rustls")]
+    async fn auth_tls(mut self) -> Result<Self, Error> {
+        // Send AUTH TLS command on the plain connection
+        send_command(&mut self.writer, "AUTH TLS").await?;
+        let resp = read_response(&mut self.reader).await?;
+        if !resp.is_complete() {
+            return Err(Error::Http(format!(
+                "FTP AUTH TLS failed: {} {}",
+                resp.code, resp.message
+            )));
+        }
+
+        // Reassemble the FtpStream from the split reader/writer halves
+        let reader_inner = self.reader.into_inner();
+        let stream = reader_inner.unsplit(self.writer);
+
+        // Extract TcpStream from the plain stream
+        let tcp = match stream {
+            FtpStream::Plain(tcp) => tcp,
+            FtpStream::Tls(_) => {
+                return Err(Error::Http("AUTH TLS on already-encrypted connection".to_string()));
+            }
+        };
+
+        // Wrap with TLS
+        let connector = self
+            .tls_connector
+            .as_ref()
+            .ok_or_else(|| Error::Http("No TLS connector available for AUTH TLS".to_string()))?;
+        let (tls_stream, _) = connector.connect(tcp, &self.hostname).await?;
+
+        // Re-split the TLS-wrapped stream
+        let ftp_stream = FtpStream::Tls(tls_stream);
+        let (reader, writer) = tokio::io::split(ftp_stream);
+
+        Ok(Self {
+            reader: BufReader::new(reader),
+            writer,
+            features: self.features,
+            hostname: self.hostname,
+            local_addr: self.local_addr,
+            use_tls_data: false,
+            active_port: self.active_port,
+            tls_connector: self.tls_connector,
+        })
+    }
+
+    /// Set up data channel protection with PBSZ 0 and PROT P.
+    ///
+    /// Called after TLS is established on the control connection to
+    /// enable TLS on data connections.
+    #[cfg(feature = "rustls")]
+    async fn setup_data_protection(&mut self) -> Result<(), Error> {
+        // PBSZ 0 (Protection Buffer Size — always 0 for TLS)
+        send_command(&mut self.writer, "PBSZ 0").await?;
+        let pbsz_resp = read_response(&mut self.reader).await?;
+        if !pbsz_resp.is_complete() {
+            return Err(Error::Http(format!(
+                "FTP PBSZ failed: {} {}",
+                pbsz_resp.code, pbsz_resp.message
+            )));
+        }
+
+        // PROT P (Protection level Private — encrypt data connections)
+        send_command(&mut self.writer, "PROT P").await?;
+        let prot_resp = read_response(&mut self.reader).await?;
+        if !prot_resp.is_complete() {
+            return Err(Error::Http(format!(
+                "FTP PROT P failed: {} {}",
+                prot_resp.code, prot_resp.message
+            )));
+        }
+
+        self.use_tls_data = true;
+        Ok(())
+    }
+
+    /// Set the address for active mode data connections.
+    ///
+    /// When set, PORT/EPRT commands are used instead of PASV.
+    /// The address can be an IP address or `"-"` to use the control
+    /// connection's local address.
+    pub fn set_active_port(&mut self, addr: &str) {
+        self.active_port = Some(addr.to_string());
     }
 
     /// Login with USER/PASS sequence.
@@ -167,12 +436,21 @@ impl FtpSession {
         Ok(())
     }
 
-    /// Enter passive mode and open a data connection.
+    /// Open a data connection, choosing passive or active mode.
     ///
-    /// # Errors
-    ///
-    /// Returns an error if PASV fails or data connection cannot be established.
-    async fn open_data_connection(&mut self) -> Result<tokio::net::TcpStream, Error> {
+    /// If `active_port` is set, uses PORT/EPRT (active mode).
+    /// Otherwise, uses PASV (passive mode).
+    async fn open_data_connection(&mut self) -> Result<FtpStream, Error> {
+        if let Some(ref addr) = self.active_port {
+            let addr = addr.clone();
+            self.open_active_data_connection(&addr).await
+        } else {
+            self.open_passive_data_connection().await
+        }
+    }
+
+    /// Enter passive mode and open a data connection (PASV).
+    async fn open_passive_data_connection(&mut self) -> Result<FtpStream, Error> {
         send_command(&mut self.writer, "PASV").await?;
         let pasv_resp = read_response(&mut self.reader).await?;
         if pasv_resp.code != 227 {
@@ -183,10 +461,76 @@ impl FtpSession {
         }
         let (data_host, data_port) = parse_pasv_response(&pasv_resp.message)?;
         let data_addr = format!("{data_host}:{data_port}");
-        let data_stream = tokio::net::TcpStream::connect(&data_addr)
+        let tcp = TcpStream::connect(&data_addr)
             .await
             .map_err(|e| Error::Http(format!("FTP data connection failed: {e}")))?;
-        Ok(data_stream)
+
+        self.maybe_wrap_data_tls(tcp).await
+    }
+
+    /// Open a data connection in active mode (PORT/EPRT).
+    ///
+    /// Binds a listener on a local port, sends PORT/EPRT to the server,
+    /// and waits for the server to connect.
+    async fn open_active_data_connection(&mut self, bind_addr: &str) -> Result<FtpStream, Error> {
+        // Determine the local IP to advertise
+        let local_ip = if bind_addr == "-" {
+            self.local_addr.ip()
+        } else {
+            bind_addr.parse().map_err(|e| {
+                Error::Http(format!("Invalid FTP active address '{bind_addr}': {e}"))
+            })?
+        };
+
+        // Bind a listener on the local IP with port 0 (OS-assigned)
+        let bind = SocketAddr::new(local_ip, 0);
+        let listener = tokio::net::TcpListener::bind(bind)
+            .await
+            .map_err(|e| Error::Http(format!("FTP active mode bind failed: {e}")))?;
+        let listen_addr = listener
+            .local_addr()
+            .map_err(|e| Error::Http(format!("FTP active mode local_addr failed: {e}")))?;
+
+        // Send PORT or EPRT depending on address family
+        let port_cmd = if local_ip.is_ipv4() {
+            format_port_command(&listen_addr)
+        } else {
+            format_eprt_command(&listen_addr)
+        };
+        send_command(&mut self.writer, &port_cmd).await?;
+        let resp = read_response(&mut self.reader).await?;
+        if !resp.is_complete() {
+            return Err(Error::Http(format!(
+                "FTP {} failed: {} {}",
+                if local_ip.is_ipv4() { "PORT" } else { "EPRT" },
+                resp.code,
+                resp.message
+            )));
+        }
+
+        // Accept the incoming data connection from the server
+        let (tcp, _) = listener
+            .accept()
+            .await
+            .map_err(|e| Error::Http(format!("FTP active mode accept failed: {e}")))?;
+
+        self.maybe_wrap_data_tls(tcp).await
+    }
+
+    /// Optionally wrap a data connection TCP stream with TLS.
+    ///
+    /// If `use_tls_data` is true and a TLS connector is available,
+    /// wraps the stream. Otherwise, returns it as plain.
+    async fn maybe_wrap_data_tls(&self, tcp: TcpStream) -> Result<FtpStream, Error> {
+        #[cfg(feature = "rustls")]
+        if self.use_tls_data {
+            if let Some(ref connector) = self.tls_connector {
+                let (tls_stream, _) = connector.connect(tcp, &self.hostname).await?;
+                return Ok(FtpStream::Tls(tls_stream));
+            }
+        }
+
+        Ok(FtpStream::Plain(tcp))
     }
 
     /// Download a file from the server.
@@ -732,6 +1076,8 @@ pub fn parse_feat_response(message: &str) -> FtpFeatures {
             features.size = true;
         } else if feature.starts_with("UTF8") {
             features.utf8 = true;
+        } else if feature.starts_with("AUTH") && feature.contains("TLS") {
+            features.auth_tls = true;
         }
         if !feature.is_empty() {
             features.raw.push(line.trim().to_string());
@@ -740,18 +1086,85 @@ pub fn parse_feat_response(message: &str) -> FtpFeatures {
     features
 }
 
+/// Format a PORT command for active mode FTP (IPv4).
+///
+/// PORT h1,h2,h3,h4,p1,p2 where h1-h4 are IP octets and
+/// p1=port/256, p2=port%256.
+#[must_use]
+pub fn format_port_command(addr: &SocketAddr) -> String {
+    match addr.ip() {
+        std::net::IpAddr::V4(ip) => {
+            let octets = ip.octets();
+            let port = addr.port();
+            format!(
+                "PORT {},{},{},{},{},{}",
+                octets[0],
+                octets[1],
+                octets[2],
+                octets[3],
+                port / 256,
+                port % 256
+            )
+        }
+        std::net::IpAddr::V6(_) => {
+            // PORT doesn't support IPv6; use EPRT instead
+            format_eprt_command(addr)
+        }
+    }
+}
+
+/// Format an EPRT command for active mode FTP (IPv4 and IPv6).
+///
+/// EPRT |net-prt|net-addr|tcp-port| where net-prt is 1 (IPv4) or 2 (IPv6).
+#[must_use]
+pub fn format_eprt_command(addr: &SocketAddr) -> String {
+    let (proto, ip_str) = match addr.ip() {
+        std::net::IpAddr::V4(ip) => (1, ip.to_string()),
+        std::net::IpAddr::V6(ip) => (2, ip.to_string()),
+    };
+    format!("EPRT |{proto}|{ip_str}|{}|", addr.port())
+}
+
+/// Connect an FTP session with the appropriate TLS mode.
+///
+/// Helper that dispatches to `FtpSession::connect` or `connect_with_tls`
+/// based on the SSL mode.
+async fn connect_session(
+    host: &str,
+    port: u16,
+    user: &str,
+    pass: &str,
+    ssl_mode: FtpSslMode,
+    tls_config: &crate::tls::TlsConfig,
+) -> Result<FtpSession, Error> {
+    match ssl_mode {
+        FtpSslMode::None => FtpSession::connect(host, port, user, pass).await,
+        #[cfg(feature = "rustls")]
+        _ => FtpSession::connect_with_tls(host, port, user, pass, ssl_mode, tls_config).await,
+        #[cfg(not(feature = "rustls"))]
+        _ => {
+            let _ = tls_config;
+            Err(Error::Http("FTPS requires the 'rustls' feature".to_string()))
+        }
+    }
+}
+
 /// Perform an FTP download and return the file contents as a Response.
 ///
 /// # Errors
 ///
 /// Returns an error if login fails, passive mode fails, or the file cannot be retrieved.
 #[allow(clippy::too_many_lines)]
-pub async fn download(url: &crate::url::Url) -> Result<Response, Error> {
+pub async fn download(
+    url: &crate::url::Url,
+    ssl_mode: FtpSslMode,
+    tls_config: &crate::tls::TlsConfig,
+) -> Result<Response, Error> {
     let (host, port) = url.host_and_port()?;
     let path = url.path();
     let (user, pass) = url.credentials().unwrap_or(("anonymous", "urlx@"));
 
-    let mut session = FtpSession::connect(&host, port, user, pass).await?;
+    let mut session = connect_session(&host, port, user, pass, ssl_mode, tls_config).await?;
     let data = session.download(path).await?;
     let _ = session.quit().await;
 
@@ -767,12 +1180,16 @@ pub async fn download(url: &crate::url::Url) -> Result<Response, Error> {
 ///
 /// Returns an error if login fails, passive mode fails, or listing fails.
 #[allow(clippy::too_many_lines)]
-pub async fn list(url: &crate::url::Url) -> Result<Response, Error> {
+pub async fn list(
+    url: &crate::url::Url,
+    ssl_mode: FtpSslMode,
+    tls_config: &crate::tls::TlsConfig,
+) -> Result<Response, Error> {
     let (host, port) = url.host_and_port()?;
     let path = url.path();
     let (user, pass) = url.credentials().unwrap_or(("anonymous", "urlx@"));
 
-    let mut session = FtpSession::connect(&host, port, user, pass).await?;
+    let mut session = connect_session(&host, port, user, pass, ssl_mode, tls_config).await?;
     let path_opt = if path.is_empty() || path == "/" { None } else { Some(path) };
     let data = session.list(path_opt).await?;
     let _ = session.quit().await;
@@ -788,12 +1205,17 @@ pub async fn list(url: &crate::url::Url) -> Result<Response, Error> {
 /// # Errors
 ///
 /// Returns an error if login fails, passive mode fails, or the upload fails.
-pub async fn upload(url: &crate::url::Url, data: &[u8]) -> Result<Response, Error> {
+pub async fn upload(
+    url: &crate::url::Url,
+    data: &[u8],
+    ssl_mode: FtpSslMode,
+    tls_config: &crate::tls::TlsConfig,
+) -> Result<Response, Error> {
     let (host, port) = url.host_and_port()?;
     let path = url.path();
     let (user, pass) = url.credentials().unwrap_or(("anonymous", "urlx@"));
 
-    let mut session = FtpSession::connect(&host, port, user, pass).await?;
+    let mut session = connect_session(&host, port, user, pass, ssl_mode, tls_config).await?;
     session.upload(path, data).await?;
     let _ = session.quit().await;
 
@@ -873,14 +1295,14 @@ mod tests {
 
     #[test]
     fn parse_feat_response_full() {
-        let message =
-            "Extensions supported:\n EPSV\n MLST size*;modify*;type*\n REST STREAM\n SIZE\n UTF8";
+        let message = "Extensions supported:\n EPSV\n MLST size*;modify*;type*\n REST STREAM\n SIZE\n UTF8\n AUTH TLS";
         let features = parse_feat_response(message);
         assert!(features.epsv);
         assert!(features.mlst);
         assert!(features.rest_stream);
         assert!(features.size);
         assert!(features.utf8);
+        assert!(features.auth_tls);
     }
 
     #[test]
@@ -901,7 +1323,15 @@ mod tests {
         assert!(!features.rest_stream);
         assert!(!features.size);
         assert!(!features.utf8);
+        assert!(!features.auth_tls);
         assert!(features.raw.is_empty());
+    }
+
+    #[test]
+    fn parse_feat_response_auth_tls() {
+        let message = "AUTH TLS\nAUTH SSL";
+        let features = parse_feat_response(message);
+        assert!(features.auth_tls);
     }
 
     #[test]
@@ -919,6 +1349,122 @@ mod tests {
         assert!(!features.rest_stream);
         assert!(!features.size);
         assert!(!features.utf8);
+        assert!(!features.auth_tls);
         assert!(features.raw.is_empty());
+    }
+
+    #[test]
+    fn ftp_ssl_mode_equality() {
+        assert_eq!(FtpSslMode::None, FtpSslMode::None);
+        assert_eq!(FtpSslMode::Explicit, FtpSslMode::Explicit);
+        assert_eq!(FtpSslMode::Implicit, FtpSslMode::Implicit);
+        assert_ne!(FtpSslMode::None, FtpSslMode::Explicit);
+        assert_ne!(FtpSslMode::Explicit, FtpSslMode::Implicit);
+    }
+
+    #[test]
+    fn format_port_ipv4() {
+        let addr: SocketAddr = "192.168.1.100:12345".parse().unwrap();
+        let cmd = format_port_command(&addr);
+        // 12345 = 48*256 + 57
+        assert_eq!(cmd, "PORT 192,168,1,100,48,57");
+    }
+
+    #[test]
+    fn format_port_low_port() {
+        let addr: SocketAddr = "10.0.0.1:21".parse().unwrap();
+        let cmd = format_port_command(&addr);
+        // 21 = 0*256 + 21
+        assert_eq!(cmd, "PORT 10,0,0,1,0,21");
+    }
+
+    #[test]
+    fn format_port_high_port() {
+        let addr: SocketAddr = "127.0.0.1:65535".parse().unwrap();
+        let cmd = format_port_command(&addr);
+        // 65535 = 255*256 + 255
+        assert_eq!(cmd, "PORT 127,0,0,1,255,255");
+    }
+
+    #[test]
+    fn format_eprt_ipv4() {
+        let addr: SocketAddr = "192.168.1.100:12345".parse().unwrap();
+        let cmd = format_eprt_command(&addr);
+        assert_eq!(cmd, "EPRT |1|192.168.1.100|12345|");
+    }
+
+    #[test]
+    fn format_eprt_ipv6() {
+        let addr: SocketAddr = "[::1]:54321".parse().unwrap();
+        let cmd = format_eprt_command(&addr);
+        assert_eq!(cmd, "EPRT |2|::1|54321|");
+    }
+
+    #[test]
+    fn format_port_roundtrip() {
+        // Generate a PORT command and verify it can be parsed back
+        let addr: SocketAddr = "10.20.30.40:5000".parse().unwrap();
+        let cmd = format_port_command(&addr);
+        // PORT 10,20,30,40,19,136  (5000 = 19*256 + 136)
+        assert!(cmd.starts_with("PORT "));
+        let nums: Vec<&str> = cmd[5..].split(',').collect();
+        assert_eq!(nums.len(), 6);
+        let h1: u16 = nums[0].parse().unwrap();
+        let h2: u16 = nums[1].parse().unwrap();
+        let h3: u16 = nums[2].parse().unwrap();
+        let h4: u16 = nums[3].parse().unwrap();
+        let p1: u16 = nums[4].parse().unwrap();
+        let p2: u16 = nums[5].parse().unwrap();
+        assert_eq!(format!("{h1}.{h2}.{h3}.{h4}"), "10.20.30.40");
+        assert_eq!(p1 * 256 + p2, 5000);
+    }
+
+    #[tokio::test]
+    async fn send_command_format() {
+        let mut buf = Vec::new();
+        send_command(&mut buf, "USER test").await.unwrap();
+        assert_eq!(buf, b"USER test\r\n");
+    }
+
+    #[tokio::test]
+    async fn send_command_feat() {
+        let mut buf = Vec::new();
+        send_command(&mut buf, "FEAT").await.unwrap();
+        assert_eq!(buf, b"FEAT\r\n");
+    }
+
+    #[tokio::test]
+    async fn read_auth_tls_response() {
+        let data = b"234 AUTH TLS OK\r\n";
+        let mut reader = BufReader::new(std::io::Cursor::new(data.to_vec()));
+        let resp = read_response(&mut reader).await.unwrap();
+        assert_eq!(resp.code, 234);
+        assert!(resp.is_complete());
+    }
+
+    #[tokio::test]
+    async fn read_pbsz_response() {
+        let data = b"200 PBSZ=0\r\n";
+        let mut reader = BufReader::new(std::io::Cursor::new(data.to_vec()));
+        let resp = read_response(&mut reader).await.unwrap();
+        assert_eq!(resp.code, 200);
+        assert!(resp.is_complete());
+    }
+
+    #[tokio::test]
+    async fn read_prot_p_response() {
+        let data = b"200 Protection set to Private\r\n";
+        let mut reader = BufReader::new(std::io::Cursor::new(data.to_vec()));
+        let resp = read_response(&mut reader).await.unwrap();
+        assert_eq!(resp.code, 200);
+        assert!(resp.is_complete());
+    }
+
+    #[cfg(feature = "rustls")]
+    #[test]
+    fn tls_connector_no_alpn_creates_ok() {
+        let tls_config = crate::tls::TlsConfig::default();
+        let connector = crate::tls::TlsConnector::new_no_alpn(&tls_config);
+        assert!(connector.is_ok());
     }
 }

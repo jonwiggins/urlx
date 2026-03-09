@@ -48,9 +48,15 @@ impl Url {
     }
 
     /// Returns the effective port (explicit or default for the scheme).
+    ///
+    /// Supports additional schemes beyond what the `url` crate knows about:
+    /// - `ftps://` defaults to port 990
     #[must_use]
     pub fn port_or_default(&self) -> Option<u16> {
-        self.inner.port_or_known_default()
+        self.inner.port_or_known_default().or_else(|| match self.inner.scheme() {
+            "ftps" => Some(990),
+            _ => None,
+        })
     }
 
     /// Returns the path component.
@@ -318,6 +324,31 @@ mod tests {
         assert_eq!(url.host_str(), Some("files.example.com"));
         assert_eq!(url.path(), "/pub/readme.txt");
         assert_eq!(url.port_or_default(), Some(21));
+    }
+
+    #[test]
+    fn parse_ftps_scheme() {
+        let url = Url::parse("ftps://secure.example.com/data/file.csv").unwrap();
+        assert_eq!(url.scheme(), "ftps");
+        assert_eq!(url.host_str(), Some("secure.example.com"));
+        assert_eq!(url.path(), "/data/file.csv");
+        assert_eq!(url.port_or_default(), Some(990));
+    }
+
+    #[test]
+    fn parse_ftps_custom_port() {
+        let url = Url::parse("ftps://secure.example.com:2121/file.txt").unwrap();
+        assert_eq!(url.scheme(), "ftps");
+        assert_eq!(url.port(), Some(2121));
+        assert_eq!(url.port_or_default(), Some(2121));
+    }
+
+    #[test]
+    fn parse_ftps_with_credentials() {
+        let url = Url::parse("ftps://user:pass@ftp.example.com/pub/").unwrap();
+        let (user, pass) = url.credentials().unwrap();
+        assert_eq!(user, "user");
+        assert_eq!(pass, "pass");
     }
 
     #[test]

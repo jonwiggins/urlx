@@ -155,8 +155,9 @@ fn print_usage() {
     eprintln!("  -R, --remote-time         Set local file time from server");
     eprintln!("      --next                Separate URL option groups");
     eprintln!("      --ftp-pasv            Use passive mode for FTP (default)");
-    eprintln!("      --ftp-ssl             Try SSL/TLS for FTP");
+    eprintln!("      --ftp-ssl             Try SSL/TLS for FTP (explicit, AUTH TLS)");
     eprintln!("      --ftp-ssl-reqd        Require SSL/TLS for FTP");
+    eprintln!("      --ftp-port <addr>     Use active mode, bind to address ('-' for auto)");
 }
 
 /// Parse CLI arguments into options.
@@ -824,9 +825,21 @@ fn parse_args(args: &[String]) -> Option<CliOptions> {
             "--remote-time" | "-R" => {
                 opts.remote_time = true;
             }
-            // Accepted but no-op: --next separates option groups,
-            // FTP flags accepted for compat but not yet fully implemented.
-            "--next" | "--ftp-pasv" | "--ftp-ssl" | "--ssl" | "--ftp-ssl-reqd" | "--ssl-reqd" => {}
+            // --next separates option groups (no-op for now)
+            // --ftp-pasv is the default (no-op)
+            "--next" | "--ftp-pasv" => {}
+            // FTPS: explicit mode (AUTH TLS)
+            "--ftp-ssl" | "--ssl" | "--ftp-ssl-reqd" | "--ssl-reqd" => {
+                opts.easy.ftp_ssl_mode(liburlx::protocol::ftp::FtpSslMode::Explicit);
+            }
+            "--ftp-port" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("urlx: --ftp-port requires an argument");
+                    return None;
+                }
+                opts.easy.ftp_active_port(&args[i]);
+            }
             arg if arg.starts_with('-') => {
                 eprintln!("urlx: unknown option: {arg}");
                 return None;

@@ -126,11 +126,32 @@ mod rustls_impl {
     impl TlsConnector {
         /// Create a new TLS connector with the given configuration.
         ///
+        /// Configures HTTP ALPN protocols (h2, http/1.1) for use with
+        /// HTTP/HTTPS connections.
+        ///
         /// # Errors
         ///
         /// Returns [`Error::Tls`] if the TLS configuration cannot be built,
         /// or if certificate/key files cannot be read.
         pub fn new(tls_config: &TlsConfig) -> Result<Self, Error> {
+            Self::build(tls_config, true)
+        }
+
+        /// Create a new TLS connector without HTTP ALPN negotiation.
+        ///
+        /// Suitable for non-HTTP protocols (FTP, SMTP, etc.) where
+        /// HTTP-specific ALPN extensions would be inappropriate.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`Error::Tls`] if the TLS configuration cannot be built,
+        /// or if certificate/key files cannot be read.
+        pub fn new_no_alpn(tls_config: &TlsConfig) -> Result<Self, Error> {
+            Self::build(tls_config, false)
+        }
+
+        /// Internal builder shared by `new()` and `new_no_alpn()`.
+        fn build(tls_config: &TlsConfig, use_http_alpn: bool) -> Result<Self, Error> {
             let versions = Self::protocol_versions(tls_config);
 
             let config = if !tls_config.verify_peer {
@@ -140,7 +161,9 @@ mod rustls_impl {
                     .with_custom_certificate_verifier(Arc::new(NoVerifier))
                     .with_no_client_auth();
 
-                Self::configure_alpn(&mut config);
+                if use_http_alpn {
+                    Self::configure_alpn(&mut config);
+                }
                 config
             } else if let Some(ref ca_path) = tls_config.ca_cert {
                 // Custom CA bundle
@@ -149,7 +172,9 @@ mod rustls_impl {
                 let builder = Self::config_builder(&versions).with_root_certificates(root_store);
 
                 let mut config = Self::with_client_auth(builder, tls_config)?;
-                Self::configure_alpn(&mut config);
+                if use_http_alpn {
+                    Self::configure_alpn(&mut config);
+                }
                 config
             } else {
                 // Default: system root certificates
@@ -159,7 +184,9 @@ mod rustls_impl {
                 let builder = Self::config_builder(&versions).with_root_certificates(root_store);
 
                 let mut config = Self::with_client_auth(builder, tls_config)?;
-                Self::configure_alpn(&mut config);
+                if use_http_alpn {
+                    Self::configure_alpn(&mut config);
+                }
                 config
             };
 
