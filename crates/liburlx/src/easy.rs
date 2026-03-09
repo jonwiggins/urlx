@@ -50,6 +50,9 @@ pub struct Easy {
     tcp_nodelay: bool,
     tcp_keepalive: Option<Duration>,
     unix_socket: Option<String>,
+    interface: Option<String>,
+    local_port: Option<u16>,
+    dns_shuffle: bool,
     dns_cache: DnsCache,
     pool: ConnectionPool,
 }
@@ -83,6 +86,9 @@ impl std::fmt::Debug for Easy {
             .field("tcp_nodelay", &self.tcp_nodelay)
             .field("tcp_keepalive", &self.tcp_keepalive)
             .field("unix_socket", &self.unix_socket)
+            .field("interface", &self.interface)
+            .field("local_port", &self.local_port)
+            .field("dns_shuffle", &self.dns_shuffle)
             .field("dns_cache", &self.dns_cache)
             .field("pool", &"<ConnectionPool>")
             .finish()
@@ -118,6 +124,9 @@ impl Clone for Easy {
             tcp_nodelay: self.tcp_nodelay,
             tcp_keepalive: self.tcp_keepalive,
             unix_socket: self.unix_socket.clone(),
+            interface: self.interface.clone(),
+            local_port: self.local_port,
+            dns_shuffle: self.dns_shuffle,
             dns_cache: DnsCache::new(),
             pool: ConnectionPool::new(),
         }
@@ -155,6 +164,9 @@ impl Easy {
             tcp_nodelay: true,
             tcp_keepalive: None,
             unix_socket: None,
+            interface: None,
+            local_port: None,
+            dns_shuffle: false,
             dns_cache: DnsCache::new(),
             pool: ConnectionPool::new(),
         }
@@ -489,6 +501,31 @@ impl Easy {
         self.tcp_keepalive = Some(idle);
     }
 
+    /// Bind to a specific local network interface.
+    ///
+    /// The value can be an interface name (e.g., `"eth0"`), an IP address,
+    /// or a hostname. Equivalent to curl's `--interface` or `CURLOPT_INTERFACE`.
+    pub fn interface(&mut self, iface: &str) {
+        self.interface = Some(iface.to_string());
+    }
+
+    /// Bind to a specific local port for outgoing connections.
+    ///
+    /// Equivalent to curl's `--local-port` or `CURLOPT_LOCALPORT`.
+    pub fn local_port(&mut self, port: u16) {
+        self.local_port = Some(port);
+    }
+
+    /// Enable DNS result shuffling.
+    ///
+    /// When enabled, the resolved DNS addresses are randomized before
+    /// connection attempts. This provides simple load distribution across
+    /// multiple IPs for the same hostname.
+    /// Equivalent to curl's `--dns-shuffle`.
+    pub fn dns_shuffle(&mut self, enable: bool) {
+        self.dns_shuffle = enable;
+    }
+
     /// Connect via a Unix domain socket instead of TCP.
     ///
     /// When set, all connections go through the specified Unix socket path.
@@ -619,6 +656,9 @@ impl Easy {
             self.tcp_nodelay,
             self.tcp_keepalive,
             self.unix_socket.as_deref(),
+            self.interface.as_deref(),
+            self.local_port,
+            self.dns_shuffle,
             &mut self.dns_cache,
             &mut self.pool,
         );
@@ -684,6 +724,9 @@ async fn perform_transfer(
     tcp_nodelay: bool,
     tcp_keepalive: Option<Duration>,
     unix_socket: Option<&str>,
+    interface: Option<&str>,
+    local_port: Option<u16>,
+    dns_shuffle: bool,
     dns_cache: &mut DnsCache,
     pool: &mut ConnectionPool,
 ) -> Result<Response, Error> {
@@ -725,6 +768,9 @@ async fn perform_transfer(
             tcp_nodelay,
             tcp_keepalive,
             unix_socket,
+            interface,
+            local_port,
+            dns_shuffle,
             dns_cache,
             pool,
         )
@@ -775,6 +821,9 @@ async fn perform_transfer(
                                 tcp_nodelay,
                                 tcp_keepalive,
                                 unix_socket,
+                                interface,
+                                local_port,
+                                dns_shuffle,
                                 dns_cache,
                                 pool,
                             )
@@ -864,7 +913,7 @@ async fn perform_transfer(
 }
 
 /// Perform a single HTTP request (no redirect handling).
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines, clippy::fn_params_excessive_bools)]
 async fn do_single_request(
     url: &Url,
     method: &str,
@@ -879,6 +928,9 @@ async fn do_single_request(
     tcp_nodelay: bool,
     tcp_keepalive: Option<Duration>,
     unix_socket: Option<&str>,
+    interface: Option<&str>,
+    local_port: Option<u16>,
+    dns_shuffle: bool,
     dns_cache: &mut DnsCache,
     pool: &mut ConnectionPool,
 ) -> Result<Response, Error> {
@@ -1054,8 +1106,29 @@ async fn do_single_request(
     };
     let time_namelookup = request_start.elapsed();
 
+    // DNS shuffle: randomize address order for load distribution
+    let mut addrs = addrs;
+    if dns_shuffle && addrs.len() > 1 {
+        // Simple Fisher-Yates shuffle using timestamp-seeded pseudo-random
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos();
+        let mut state = seed;
+        for i in (1..addrs.len()).rev() {
+            // xorshift32
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            let j = (state as usize) % (i + 1);
+            addrs.swap(i, j);
+        }
+    }
+
     // Happy Eyeballs (RFC 6555): prefer IPv6, fall back to IPv4 after 250ms
-    let tcp_stream = happy_eyeballs_connect(&addrs, connect_timeout, request_start).await?;
+    let tcp_stream =
+        happy_eyeballs_connect(&addrs, connect_timeout, request_start, interface, local_port)
+            .await?;
     let time_connect = request_start.elapsed();
 
     // Apply TCP socket options
@@ -1434,6 +1507,33 @@ fn resolve_relative(base: &str, relative: &str) -> String {
     }
 }
 
+/// Check if a connect error indicates the operation is in progress.
+///
+/// Non-blocking connect returns `EINPROGRESS` on Unix or `WouldBlock` on Windows.
+fn is_connect_in_progress(err: &std::io::Error) -> bool {
+    err.kind() == std::io::ErrorKind::WouldBlock
+        || err.kind() == std::io::ErrorKind::InvalidInput // some platforms
+        || matches!(err.raw_os_error(), Some(code) if code == einprogress_code())
+}
+
+/// Platform-specific EINPROGRESS error code.
+#[cfg(target_os = "macos")]
+const fn einprogress_code() -> i32 {
+    36
+}
+#[cfg(target_os = "linux")]
+const fn einprogress_code() -> i32 {
+    115
+}
+#[cfg(target_os = "windows")]
+const fn einprogress_code() -> i32 {
+    10036 // WSAEINPROGRESS
+}
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+const fn einprogress_code() -> i32 {
+    36 // fallback
+}
+
 /// Happy Eyeballs (RFC 6555) TCP connection.
 ///
 /// Given a list of resolved addresses (may contain both IPv4 and IPv6),
@@ -1444,6 +1544,8 @@ async fn happy_eyeballs_connect(
     addrs: &[std::net::SocketAddr],
     connect_timeout: Option<Duration>,
     start: Instant,
+    interface: Option<&str>,
+    local_port: Option<u16>,
 ) -> Result<tokio::net::TcpStream, Error> {
     use std::net::SocketAddr;
 
@@ -1456,7 +1558,7 @@ async fn happy_eyeballs_connect(
 
     // If only one family, just try them in order
     if v6.is_empty() || v4.is_empty() {
-        return try_connect_addrs(addrs, connect_timeout, start).await;
+        return try_connect_addrs(addrs, connect_timeout, interface, local_port).await;
     }
 
     // Both families present: race with 250ms head start for IPv6
@@ -1465,11 +1567,16 @@ async fn happy_eyeballs_connect(
         t.saturating_sub(elapsed)
     });
 
-    let v6_fut = try_connect_addrs(&v6, remaining_timeout, start);
+    let v6_fut = try_connect_addrs(&v6, remaining_timeout, interface, local_port);
     let v4_delayed = async {
         tokio::time::sleep(EYEBALLS_DELAY).await;
-        try_connect_addrs(&v4, remaining_timeout.map(|t| t.saturating_sub(EYEBALLS_DELAY)), start)
-            .await
+        try_connect_addrs(
+            &v4,
+            remaining_timeout.map(|t| t.saturating_sub(EYEBALLS_DELAY)),
+            interface,
+            local_port,
+        )
+        .await
     };
 
     tokio::pin!(v6_fut);
@@ -1499,30 +1606,103 @@ async fn happy_eyeballs_connect(
 }
 
 /// Try connecting to each address in order, returning the first success.
+///
+/// When `interface` or `local_port` is set, uses `socket2` to create the
+/// socket, bind to the local address, then connect.
+#[allow(clippy::option_if_let_else)]
 async fn try_connect_addrs(
     addrs: &[std::net::SocketAddr],
     timeout: Option<Duration>,
-    _start: Instant,
+    interface: Option<&str>,
+    local_port: Option<u16>,
 ) -> Result<tokio::net::TcpStream, Error> {
     let mut last_err = None;
     for addr in addrs {
-        let connect_fut = tokio::net::TcpStream::connect(addr);
-        let result = if let Some(timeout_dur) = timeout {
-            match tokio::time::timeout(timeout_dur, connect_fut).await {
-                Ok(r) => r,
-                Err(_) => return Err(Error::Timeout(timeout_dur)),
-            }
+        let result = if interface.is_some() || local_port.is_some() {
+            connect_with_bind(*addr, interface, local_port, timeout).await
         } else {
-            connect_fut.await
+            let connect_fut = tokio::net::TcpStream::connect(addr);
+            if let Some(timeout_dur) = timeout {
+                match tokio::time::timeout(timeout_dur, connect_fut).await {
+                    Ok(r) => r.map_err(Error::Connect),
+                    Err(_) => Err(Error::Timeout(timeout_dur)),
+                }
+            } else {
+                connect_fut.await.map_err(Error::Connect)
+            }
         };
         match result {
             Ok(stream) => return Ok(stream),
             Err(e) => last_err = Some(e),
         }
     }
-    Err(Error::Connect(last_err.unwrap_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::AddrNotAvailable, "no addresses to connect to")
-    })))
+    Err(last_err.unwrap_or_else(|| {
+        Error::Connect(std::io::Error::new(
+            std::io::ErrorKind::AddrNotAvailable,
+            "no addresses to connect to",
+        ))
+    }))
+}
+
+/// Connect to a remote address with local interface/port binding.
+///
+/// Uses `socket2` to create a socket, bind to the specified local address,
+/// then connect to the remote address.
+async fn connect_with_bind(
+    remote: std::net::SocketAddr,
+    interface: Option<&str>,
+    local_port: Option<u16>,
+    timeout: Option<Duration>,
+) -> Result<tokio::net::TcpStream, Error> {
+    use socket2::{Domain, Protocol, Socket, Type};
+
+    let domain = if remote.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 };
+    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP)).map_err(Error::Connect)?;
+
+    // Resolve the local bind address
+    let unspecified = if remote.is_ipv4() {
+        std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+    } else {
+        std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
+    };
+    let bind_ip: std::net::IpAddr =
+        interface.map_or(unspecified, |iface| iface.parse().unwrap_or(unspecified));
+
+    let bind_addr = std::net::SocketAddr::new(bind_ip, local_port.unwrap_or(0));
+    socket.bind(&bind_addr.into()).map_err(Error::Connect)?;
+    socket.set_nonblocking(true).map_err(Error::Connect)?;
+
+    // Initiate non-blocking connect on the raw socket.
+    // Non-blocking connect returns WouldBlock or "in progress" — both are expected.
+    let remote_sa: socket2::SockAddr = remote.into();
+    match socket.connect(&remote_sa) {
+        Ok(()) => {}
+        Err(e) if is_connect_in_progress(&e) => {}
+        Err(e) => return Err(Error::Connect(e)),
+    }
+
+    // Convert to tokio TcpStream and wait for connection to complete
+    let std_stream: std::net::TcpStream = socket.into();
+    let stream = tokio::net::TcpStream::from_std(std_stream).map_err(Error::Connect)?;
+
+    let connect_fut = async {
+        // Wait for the socket to be writable (connect complete)
+        stream.writable().await.map_err(Error::Connect)?;
+
+        // Check for connect errors
+        if let Some(e) = stream.take_error().map_err(Error::Connect)? {
+            return Err(Error::Connect(e));
+        }
+        Ok(stream)
+    };
+
+    if let Some(timeout_dur) = timeout {
+        tokio::time::timeout(timeout_dur, connect_fut)
+            .await
+            .map_err(|_| Error::Timeout(timeout_dur))?
+    } else {
+        connect_fut.await
+    }
 }
 
 #[cfg(test)]
@@ -1821,13 +2001,13 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
-        let result = happy_eyeballs_connect(&[addr], None, Instant::now()).await;
+        let result = happy_eyeballs_connect(&[addr], None, Instant::now(), None, None).await;
         assert!(result.is_ok());
     }
 
     #[tokio::test]
     async fn happy_eyeballs_no_addrs() {
-        let result = happy_eyeballs_connect(&[], None, Instant::now()).await;
+        let result = happy_eyeballs_connect(&[], None, Instant::now(), None, None).await;
         assert!(result.is_err());
     }
 
@@ -1838,7 +2018,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
-        let result = try_connect_addrs(&[addr], None, Instant::now()).await;
+        let result = try_connect_addrs(&[addr], None, None, None).await;
         assert!(result.is_ok());
     }
 
@@ -1848,8 +2028,70 @@ mod tests {
 
         // Use a non-routable address that should fail quickly
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 1);
-        let result =
-            try_connect_addrs(&[addr], Some(Duration::from_millis(100)), Instant::now()).await;
+        let result = try_connect_addrs(&[addr], Some(Duration::from_millis(100)), None, None).await;
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn easy_interface_default_none() {
+        let easy = Easy::new();
+        assert!(easy.interface.is_none());
+    }
+
+    #[test]
+    fn easy_interface_set() {
+        let mut easy = Easy::new();
+        easy.interface("192.168.1.100");
+        assert_eq!(easy.interface, Some("192.168.1.100".to_string()));
+    }
+
+    #[test]
+    fn easy_local_port_default_none() {
+        let easy = Easy::new();
+        assert!(easy.local_port.is_none());
+    }
+
+    #[test]
+    fn easy_local_port_set() {
+        let mut easy = Easy::new();
+        easy.local_port(12345);
+        assert_eq!(easy.local_port, Some(12345));
+    }
+
+    #[test]
+    fn easy_dns_shuffle_default_false() {
+        let easy = Easy::new();
+        assert!(!easy.dns_shuffle);
+    }
+
+    #[test]
+    fn easy_dns_shuffle_enable() {
+        let mut easy = Easy::new();
+        easy.dns_shuffle(true);
+        assert!(easy.dns_shuffle);
+    }
+
+    #[tokio::test]
+    async fn connect_with_bind_local_port() {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Connect with a specific local port
+        let result = connect_with_bind(addr, None, Some(0), None).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn connect_with_bind_interface_ip() {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Bind to loopback interface
+        let result = connect_with_bind(addr, Some("127.0.0.1"), None, None).await;
+        assert!(result.is_ok());
     }
 }

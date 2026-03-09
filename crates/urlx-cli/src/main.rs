@@ -70,6 +70,9 @@ fn print_usage() {
     eprintln!("      --digest              Use HTTP Digest authentication");
     eprintln!("      --proxy-user <u:p>    Proxy authentication (user:password)");
     eprintln!("      --unix-socket <path>  Connect via Unix domain socket");
+    eprintln!("      --interface <name>    Use network interface/address for outgoing connections");
+    eprintln!("      --local-port <port>   Bind to local port for outgoing connections");
+    eprintln!("      --dns-shuffle         Randomize DNS resolution order");
 }
 
 /// Parse CLI arguments into options.
@@ -333,6 +336,26 @@ fn parse_args(args: &[String]) -> Option<CliOptions> {
                 i += 1;
                 let val = require_arg(args, i, "--unix-socket")?;
                 opts.easy.unix_socket(val);
+            }
+            "--interface" => {
+                i += 1;
+                let val = require_arg(args, i, "--interface")?;
+                opts.easy.interface(val);
+            }
+            "--local-port" => {
+                i += 1;
+                let val = require_arg(args, i, "--local-port")?;
+                let port: u16 = val.parse().ok().unwrap_or_else(|| {
+                    eprintln!("urlx: invalid port: {val}");
+                    0
+                });
+                if port == 0 {
+                    return None;
+                }
+                opts.easy.local_port(port);
+            }
+            "--dns-shuffle" => {
+                opts.easy.dns_shuffle(true);
             }
             arg if arg.starts_with('-') => {
                 eprintln!("urlx: unknown option: {arg}");
