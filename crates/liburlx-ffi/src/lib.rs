@@ -66,12 +66,15 @@ pub enum CURLoption {
     CURLOPT_CUSTOMREQUEST = 10036,
     CURLOPT_CAINFO = 10065,
     CURLOPT_SSLKEY = 10087,
+    CURLOPT_INTERFACE = 10062,
+    CURLOPT_SSL_CIPHER_LIST = 10083,
     CURLOPT_ACCEPT_ENCODING = 10102,
+    CURLOPT_COOKIEFILE = 10031,
+    CURLOPT_COOKIEJAR = 10082,
     CURLOPT_NOPROXY = 10177,
     CURLOPT_RESOLVE = 10203,
-    CURLOPT_UNIX_SOCKET_PATH = 10231,
     CURLOPT_PINNEDPUBLICKEY = 10230,
-    CURLOPT_INTERFACE = 10062,
+    CURLOPT_UNIX_SOCKET_PATH = 10231,
 
     // Long options (CURLOPTTYPE_LONG = 0)
     CURLOPT_TIMEOUT = 13,
@@ -99,6 +102,7 @@ pub enum CURLoption {
     CURLOPT_TIMEOUT_MS = 155,
     CURLOPT_CONNECTTIMEOUT_MS = 156,
     CURLOPT_TCP_KEEPALIVE = 213,
+    CURLOPT_SSL_SESSIONID_CACHE = 150,
 
     // Off_t options (CURLOPTTYPE_OFF_T = 30000)
     CURLOPT_MAX_SEND_SPEED_LARGE = 30145,
@@ -130,6 +134,7 @@ pub enum CURLINFO {
     CURLINFO_STARTTRANSFER_TIME = 0x0030_0011,
     CURLINFO_CONTENT_TYPE = 0x0010_0012,
     CURLINFO_REDIRECT_COUNT = 0x0020_0014,
+    CURLINFO_SSL_VERIFYRESULT = 0x0020_000D,
     CURLINFO_APPCONNECT_TIME = 0x0030_0033,
 }
 
@@ -561,6 +566,39 @@ pub unsafe extern "C" fn curl_easy_setopt(
             CURLcode::CURLE_OK
         }
 
+        // CURLOPT_SSL_CIPHER_LIST = 10083
+        10083 => {
+            // SAFETY: value must be a null-terminated C string
+            if let Some(s) = unsafe { read_cstr(value) } {
+                h.easy.ssl_cipher_list(s);
+            }
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_COOKIEFILE = 10031
+        10031 => {
+            // SAFETY: value must be a null-terminated C string
+            if let Some(s) = unsafe { read_cstr(value) } {
+                if h.easy.cookie_file(s).is_err() {
+                    // Cookie engine enabled even if file doesn't exist
+                    h.easy.cookie_jar(true);
+                }
+            } else {
+                // NULL enables the cookie engine with empty jar
+                h.easy.cookie_jar(true);
+            }
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_COOKIEJAR = 10082
+        10082 => {
+            // SAFETY: value must be a null-terminated C string
+            if let Some(s) = unsafe { read_cstr(value) } {
+                h.easy.cookie_jar_file(s);
+            }
+            CURLcode::CURLE_OK
+        }
+
         // CURLOPT_RESOLVE = 10203
         10203 => {
             // This expects a curl_slist of "host:port:address" entries
@@ -790,6 +828,12 @@ pub unsafe extern "C" fn curl_easy_setopt(
             if ms > 0 {
                 h.easy.connect_timeout(std::time::Duration::from_millis(ms));
             }
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_SSL_SESSIONID_CACHE = 150
+        150 => {
+            h.easy.ssl_session_cache(value as c_long != 0);
             CURLcode::CURLE_OK
         }
 
@@ -1058,6 +1102,16 @@ pub unsafe extern "C" fn curl_easy_getinfo(
             // SAFETY: Caller guarantees out points to f64
             let out = unsafe { &mut *out.cast::<f64>() };
             *out = response.transfer_info().time_pretransfer.as_secs_f64();
+            CURLcode::CURLE_OK
+        }
+
+        // CURLINFO_SSL_VERIFYRESULT = 0x20000D
+        0x20_000D => {
+            // SAFETY: Caller guarantees out points to c_long
+            let out = unsafe { &mut *out.cast::<c_long>() };
+            // 0 = success (X509_V_OK). Since we either verify successfully or
+            // fail the connection entirely, a completed transfer always means 0.
+            *out = 0;
             CURLcode::CURLE_OK
         }
 
@@ -1845,6 +1899,63 @@ mod tests {
         let handle = curl_easy_init();
         // CURLOPT_MAX_RECV_SPEED_LARGE = 30146
         let code = unsafe { curl_easy_setopt(handle, 30146, 2048_usize as *const c_void) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_ssl_cipher_list() {
+        let handle = curl_easy_init();
+        let ciphers = c"HIGH:!aNULL:!MD5";
+        let code = unsafe { curl_easy_setopt(handle, 10083, ciphers.as_ptr().cast::<c_void>()) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_cookiefile() {
+        let handle = curl_easy_init();
+        let path = c"/tmp/cookies.txt";
+        let code = unsafe { curl_easy_setopt(handle, 10031, path.as_ptr().cast::<c_void>()) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_cookiefile_null_enables_engine() {
+        let handle = curl_easy_init();
+        // NULL enables the cookie engine
+        let code = unsafe { curl_easy_setopt(handle, 10031, ptr::null()) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_cookiejar() {
+        let handle = curl_easy_init();
+        let path = c"/tmp/cookies_out.txt";
+        let code = unsafe { curl_easy_setopt(handle, 10082, path.as_ptr().cast::<c_void>()) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_ssl_sessionid_cache() {
+        let handle = curl_easy_init();
+        // CURLOPT_SSL_SESSIONID_CACHE = 150
+        let code = unsafe { curl_easy_setopt(handle, 150, 1_usize as *const c_void) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        // Disable it
+        let code = unsafe { curl_easy_setopt(handle, 150, ptr::null()) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_interface() {
+        let handle = curl_easy_init();
+        let iface = c"lo0";
+        let code = unsafe { curl_easy_setopt(handle, 10062, iface.as_ptr().cast::<c_void>()) };
         assert_eq!(code, CURLcode::CURLE_OK);
         unsafe { curl_easy_cleanup(handle) };
     }

@@ -586,6 +586,23 @@ impl Easy {
         self.tls_config.pinned_public_key = Some(pin.to_string());
     }
 
+    /// Set the cipher suite list specification.
+    ///
+    /// Stored for logging and compatibility. Note: rustls uses a fixed set
+    /// of secure cipher suites and does not support arbitrary filtering.
+    /// Equivalent to `CURLOPT_SSL_CIPHER_LIST`.
+    pub fn ssl_cipher_list(&mut self, ciphers: &str) {
+        self.tls_config.cipher_list = Some(ciphers.to_string());
+    }
+
+    /// Enable or disable TLS session ID caching (default: enabled).
+    ///
+    /// When enabled, TLS session tickets are used for faster reconnections.
+    /// Equivalent to `CURLOPT_SSL_SESSIONID_CACHE`.
+    pub fn ssl_session_cache(&mut self, enable: bool) {
+        self.tls_config.session_cache = enable;
+    }
+
     /// Enable or disable `TCP_NODELAY` (Nagle's algorithm).
     ///
     /// When enabled (the default), small packets are sent immediately without

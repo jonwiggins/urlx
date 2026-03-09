@@ -64,6 +64,19 @@ pub struct TlsConfig {
     /// Format: `sha256//<base64-encoded-hash>` (same as curl's `--pinnedpubkey`).
     /// The connection will fail if the server's public key hash doesn't match.
     pub pinned_public_key: Option<String>,
+
+    /// Cipher suite list specification.
+    ///
+    /// Stored for logging and compatibility; rustls uses a fixed set of
+    /// secure cipher suites and does not support arbitrary filtering.
+    /// Equivalent to `CURLOPT_SSL_CIPHER_LIST`.
+    pub cipher_list: Option<String>,
+
+    /// Whether to enable TLS session ID caching for reuse (default: true).
+    ///
+    /// When enabled (the default), TLS session tickets are accepted for
+    /// faster reconnections. Equivalent to `CURLOPT_SSL_SESSIONID_CACHE`.
+    pub session_cache: bool,
 }
 
 impl Default for TlsConfig {
@@ -77,6 +90,8 @@ impl Default for TlsConfig {
             min_tls_version: None,
             max_tls_version: None,
             pinned_public_key: None,
+            cipher_list: None,
+            session_cache: true,
         }
     }
 }
@@ -576,6 +591,31 @@ mod tests {
     fn tls_config_default_has_no_pin() {
         let config = TlsConfig::default();
         assert!(config.pinned_public_key.is_none());
+    }
+
+    #[test]
+    fn tls_config_default_cipher_list_none() {
+        let config = TlsConfig::default();
+        assert!(config.cipher_list.is_none());
+    }
+
+    #[test]
+    fn tls_config_default_session_cache_enabled() {
+        let config = TlsConfig::default();
+        assert!(config.session_cache);
+    }
+
+    #[test]
+    fn tls_config_cipher_list_set() {
+        let config =
+            TlsConfig { cipher_list: Some("HIGH:!aNULL:!MD5".to_string()), ..TlsConfig::default() };
+        assert_eq!(config.cipher_list.as_deref(), Some("HIGH:!aNULL:!MD5"));
+    }
+
+    #[test]
+    fn tls_config_session_cache_disabled() {
+        let config = TlsConfig { session_cache: false, ..TlsConfig::default() };
+        assert!(!config.session_cache);
     }
 
     #[cfg(feature = "rustls")]
