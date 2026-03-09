@@ -58,6 +58,7 @@ struct CliOptions {
     post302: bool,
     post303: bool,
     remote_time: bool,
+    stderr_file: Option<String>,
 }
 
 /// Print usage information to stderr.
@@ -209,6 +210,7 @@ fn parse_args(args: &[String]) -> Option<CliOptions> {
         post302: false,
         post303: false,
         remote_time: false,
+        stderr_file: None,
     };
 
     let mut i = 1;
@@ -744,6 +746,11 @@ fn parse_args(args: &[String]) -> Option<CliOptions> {
             }
             "--trace-time" => {
                 opts.trace_time = true;
+            }
+            "--stderr" => {
+                i += 1;
+                let val = require_arg(args, i, "--stderr")?;
+                opts.stderr_file = Some(val.to_string());
             }
             "-K" | "--config" => {
                 i += 1;
@@ -1327,6 +1334,36 @@ fn run(args: &[String]) -> ExitCode {
                 }
             }
 
+            // --trace / --trace-ascii: write trace to file
+            if opts.trace_file.is_some() || opts.trace_ascii_file.is_some() {
+                let url_str = opts.urls.first().map_or("", String::as_str);
+                let method = opts.easy.method_str().unwrap_or("GET");
+                let request_headers = opts.easy.header_list();
+
+                if let Some(ref path) = opts.trace_file {
+                    write_trace_file(
+                        path,
+                        &response,
+                        url_str,
+                        method,
+                        request_headers,
+                        true,
+                        opts.trace_time,
+                    );
+                }
+                if let Some(ref path) = opts.trace_ascii_file {
+                    write_trace_file(
+                        path,
+                        &response,
+                        url_str,
+                        method,
+                        request_headers,
+                        false,
+                        opts.trace_time,
+                    );
+                }
+            }
+
             // --libcurl: output equivalent C code
             if opts.libcurl {
                 let c_code = generate_libcurl_code(&opts);
@@ -1440,6 +1477,123 @@ fn format_headers(response: &liburlx::Response) -> String {
     }
     result.push_str("\r\n");
     result
+}
+
+/// Write trace output to a file.
+///
+/// `--trace` writes hex + ASCII dump; `--trace-ascii` writes plain text.
+/// If `trace_time` is true, each section is prefixed with a timestamp.
+fn write_trace_file(
+    path: &str,
+    response: &liburlx::Response,
+    url: &str,
+    method: &str,
+    request_headers: &[(String, String)],
+    is_hex: bool,
+    trace_time: bool,
+) {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+
+    // Timestamp prefix helper
+    let time_prefix = || -> String {
+        if trace_time {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default();
+            format!("{}.{:06} ", now.as_secs(), now.subsec_micros())
+        } else {
+            String::new()
+        }
+    };
+
+    // Reconstruct approximate request headers
+    let request_line = format!("{method} {url} HTTP/1.1\r\n");
+    let mut req_text = request_line;
+    for (name, value) in request_headers {
+        req_text.push_str(name);
+        req_text.push_str(": ");
+        req_text.push_str(value);
+        req_text.push_str("\r\n");
+    }
+    req_text.push_str("\r\n");
+
+    // Write request headers section
+    let _ = writeln!(out, "{}== Info: Request to {url}", time_prefix());
+    let _ = writeln!(out, "{}=> Send header, {} bytes", time_prefix(), req_text.len());
+    if is_hex {
+        hex_dump(&mut out, req_text.as_bytes(), &time_prefix);
+    } else {
+        for line in req_text.lines() {
+            let _ = writeln!(out, "{}=> {line}", time_prefix());
+        }
+    }
+
+    // Write response headers section
+    let resp_headers = format_headers(response);
+    let _ = writeln!(out, "{}<= Recv header, {} bytes", time_prefix(), resp_headers.len());
+    if is_hex {
+        hex_dump(&mut out, resp_headers.as_bytes(), &time_prefix);
+    } else {
+        for line in resp_headers.lines() {
+            let _ = writeln!(out, "{}<= {line}", time_prefix());
+        }
+    }
+
+    // Write response body section
+    let body = response.body();
+    if !body.is_empty() {
+        let _ = writeln!(out, "{}<= Recv data, {} bytes", time_prefix(), body.len());
+        if is_hex {
+            hex_dump(&mut out, body, &time_prefix);
+        } else {
+            let text = String::from_utf8_lossy(body);
+            for line in text.lines() {
+                let _ = writeln!(out, "{}{line}", time_prefix());
+            }
+        }
+    }
+
+    if let Err(e) = std::fs::write(path, out) {
+        eprintln!("urlx: error writing trace file '{path}': {e}");
+    }
+}
+
+/// Write a hex dump of data, 16 bytes per line.
+fn hex_dump(out: &mut String, data: &[u8], time_prefix: &dyn Fn() -> String) {
+    use std::fmt::Write;
+
+    for (offset, chunk) in data.chunks(16).enumerate() {
+        let _ = write!(out, "{}{:04x}: ", time_prefix(), offset * 16);
+
+        // Hex bytes
+        for (i, &byte) in chunk.iter().enumerate() {
+            let _ = write!(out, "{byte:02x} ");
+            if i == 7 {
+                out.push(' ');
+            }
+        }
+
+        // Padding for incomplete lines
+        for i in chunk.len()..16 {
+            out.push_str("   ");
+            if i == 7 {
+                out.push(' ');
+            }
+        }
+
+        // ASCII representation
+        out.push(' ');
+        for &byte in chunk {
+            if byte.is_ascii_graphic() || byte == b' ' {
+                out.push(byte as char);
+            } else {
+                out.push('.');
+            }
+        }
+        out.push('\n');
+    }
 }
 
 /// Get a human-readable HTTP status text.
@@ -3091,5 +3245,117 @@ mod tests {
         assert!(is_leap_year(2024));
         assert!(!is_leap_year(1900));
         assert!(!is_leap_year(2023));
+    }
+
+    #[test]
+    fn parse_args_stderr() {
+        let args = vec![
+            "urlx".into(),
+            "--stderr".into(),
+            "/tmp/err.log".into(),
+            "http://example.com".into(),
+        ];
+        let opts = parse_args(&args).unwrap();
+        assert_eq!(opts.stderr_file, Some("/tmp/err.log".to_string()));
+    }
+
+    #[test]
+    fn hex_dump_basic() {
+        let mut out = String::new();
+        let data = b"Hello, World!";
+        hex_dump(&mut out, data, &|| String::new());
+        assert!(out.contains("0000:"));
+        assert!(out.contains("48 65 6c 6c 6f"));
+        assert!(out.contains("Hello, World!"));
+    }
+
+    #[test]
+    fn hex_dump_multiline() {
+        let mut out = String::new();
+        let data: Vec<u8> = (0..32).collect();
+        hex_dump(&mut out, &data, &|| String::new());
+        assert!(out.contains("0000:"));
+        assert!(out.contains("0010:"));
+    }
+
+    #[test]
+    fn hex_dump_with_timestamp() {
+        let mut out = String::new();
+        let data = b"test";
+        hex_dump(&mut out, data, &|| "12345.000000 ".to_string());
+        assert!(out.starts_with("12345.000000 0000:"));
+    }
+
+    #[test]
+    #[allow(unused_results)]
+    fn write_trace_file_ascii() {
+        let tmp = std::env::temp_dir().join("urlx_trace_test_ascii.txt");
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("content-type".to_string(), "text/plain".to_string());
+        let response =
+            liburlx::Response::new(200, headers, b"Hello".to_vec(), "http://example.com".into());
+        let req_headers = vec![("Host".to_string(), "example.com".to_string())];
+        write_trace_file(
+            tmp.to_str().unwrap(),
+            &response,
+            "http://example.com",
+            "GET",
+            &req_headers,
+            false,
+            false,
+        );
+        let content = std::fs::read_to_string(&tmp).unwrap();
+        assert!(content.contains("=> Send header"));
+        assert!(content.contains("<= Recv header"));
+        assert!(content.contains("Hello"));
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn write_trace_file_hex() {
+        let tmp = std::env::temp_dir().join("urlx_trace_test_hex.txt");
+        let response = liburlx::Response::new(
+            200,
+            std::collections::HashMap::new(),
+            b"data".to_vec(),
+            "http://example.com".into(),
+        );
+        write_trace_file(
+            tmp.to_str().unwrap(),
+            &response,
+            "http://example.com",
+            "GET",
+            &[],
+            true,
+            false,
+        );
+        let content = std::fs::read_to_string(&tmp).unwrap();
+        assert!(content.contains("0000:"));
+        assert!(content.contains("64 61 74 61")); // "data" in hex
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn write_trace_file_with_time() {
+        let tmp = std::env::temp_dir().join("urlx_trace_test_time.txt");
+        let response = liburlx::Response::new(
+            200,
+            std::collections::HashMap::new(),
+            Vec::new(),
+            "http://example.com".into(),
+        );
+        write_trace_file(
+            tmp.to_str().unwrap(),
+            &response,
+            "http://example.com",
+            "GET",
+            &[],
+            false,
+            true,
+        );
+        let content = std::fs::read_to_string(&tmp).unwrap();
+        // Should contain timestamp digits
+        assert!(content.contains('.'));
+        let _ = std::fs::remove_file(&tmp);
     }
 }

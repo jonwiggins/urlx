@@ -290,6 +290,41 @@ mod rustls_impl {
             Ok((tls_stream, alpn))
         }
 
+        /// Wrap a generic stream with TLS and return the stream and negotiated ALPN.
+        ///
+        /// Used when the inner stream is not a plain `TcpStream` (e.g., for
+        /// HTTPS proxy tunnels where the stream is already TLS-wrapped).
+        ///
+        /// # Errors
+        ///
+        /// Returns [`Error::Tls`] if the handshake fails.
+        pub async fn connect_generic<S>(
+            &self,
+            stream: S,
+            server_name: &str,
+        ) -> Result<(TlsStream<S>, AlpnProtocol), Error>
+        where
+            S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+        {
+            let server_name = rustls::pki_types::ServerName::try_from(server_name.to_string())
+                .map_err(|e| Error::Tls(Box::new(e)))?;
+
+            let connector = tokio_rustls::TlsConnector::from(self.config.clone());
+            let tls_stream = connector
+                .connect(server_name, stream)
+                .await
+                .map_err(|e| Error::Tls(Box::new(e)))?;
+
+            let alpn = tls_stream
+                .get_ref()
+                .1
+                .alpn_protocol()
+                .and_then(|p| if p == b"h2" { Some(AlpnProtocol::H2) } else { None })
+                .unwrap_or(AlpnProtocol::Http11);
+
+            Ok((tls_stream, alpn))
+        }
+
         /// Verify the server's public key hash matches the pinned value.
         fn verify_pin(
             tls_stream: &TlsStream<TcpStream>,
@@ -709,5 +744,21 @@ mod tests {
         assert_eq!(spki[0], 0x30);
         // SPKI should be non-trivially long
         assert!(spki.len() > 32);
+    }
+
+    #[cfg(feature = "rustls")]
+    #[test]
+    fn tls_connector_no_alpn_creates_ok() {
+        let config = TlsConfig::default();
+        let connector = TlsConnector::new_no_alpn(&config);
+        assert!(connector.is_ok());
+    }
+
+    #[cfg(feature = "rustls")]
+    #[test]
+    fn tls_connector_no_alpn_insecure() {
+        let config = TlsConfig { verify_peer: false, ..TlsConfig::default() };
+        let connector = TlsConnector::new_no_alpn(&config);
+        assert!(connector.is_ok());
     }
 }

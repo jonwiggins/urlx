@@ -383,6 +383,18 @@ impl Easy {
         self.verbose = enable;
     }
 
+    /// Returns the configured HTTP method, or `None` if not explicitly set.
+    #[must_use]
+    pub fn method_str(&self) -> Option<&str> {
+        self.method.as_deref()
+    }
+
+    /// Returns the configured custom headers as a slice.
+    #[must_use]
+    pub fn header_list(&self) -> &[(String, String)] {
+        &self.headers
+    }
+
     /// Set the TCP connection timeout.
     ///
     /// If the connection is not established within this duration,
@@ -1250,6 +1262,7 @@ impl Easy {
             self.post303,
             self.ftp_ssl_mode,
             self.ssh_key_path.as_deref(),
+            self.proxy_tls_config.as_ref(),
         );
 
         // Apply total transfer timeout if set.
@@ -1351,6 +1364,7 @@ async fn perform_transfer(
     post303: bool,
     ftp_ssl_mode: crate::protocol::ftp::FtpSslMode,
     ssh_key_path: Option<&str>,
+    proxy_tls_config: Option<&TlsConfig>,
 ) -> Result<Response, Error> {
     let transfer_start = Instant::now();
     let original_url = url.clone();
@@ -1411,6 +1425,7 @@ async fn perform_transfer(
             speed_limits,
             ftp_ssl_mode,
             ssh_key_path,
+            proxy_tls_config,
         ))
         .await?;
 
@@ -1472,6 +1487,7 @@ async fn perform_transfer(
                                 speed_limits,
                                 ftp_ssl_mode,
                                 ssh_key_path,
+                                proxy_tls_config,
                             ))
                             .await?;
                         }
@@ -1609,6 +1625,7 @@ async fn do_single_request(
     speed_limits: &SpeedLimits,
     ftp_ssl_mode: crate::protocol::ftp::FtpSslMode,
     #[cfg_attr(not(feature = "ssh"), allow(unused_variables))] ssh_key_path: Option<&str>,
+    proxy_tls_config: Option<&TlsConfig>,
 ) -> Result<Response, Error> {
     // Handle non-HTTP schemes directly
     match url.scheme() {
@@ -1917,6 +1934,81 @@ async fn do_single_request(
 
             #[cfg(feature = "rustls")]
             {
+                // HTTPS proxy: TLS to proxy → CONNECT → TLS to target
+                // This is a separate path because it produces TlsStream<TlsStream<TcpStream>>
+                let is_https_proxy =
+                    proxy.is_some_and(|p| p.scheme() == "https") && !is_socks_proxy;
+
+                if is_https_proxy {
+                    if verbose {
+                        #[allow(clippy::print_stderr)]
+                        {
+                            eprintln!(
+                                "* Establishing TLS to HTTPS proxy {connect_host}:{connect_port}"
+                            );
+                        }
+                    }
+
+                    let default_tls = TlsConfig::default();
+                    let ptls_config = proxy_tls_config.unwrap_or(&default_tls);
+                    let proxy_tls = crate::tls::TlsConnector::new_no_alpn(ptls_config)?;
+                    let (proxy_tls_stream, _) =
+                        proxy_tls.connect_generic(tcp_stream, &connect_host).await?;
+
+                    if verbose {
+                        #[allow(clippy::print_stderr)]
+                        {
+                            eprintln!("* Establishing tunnel to {host}:{port} via HTTPS proxy");
+                        }
+                    }
+
+                    let tunnel_stream = establish_connect_tunnel(
+                        proxy_tls_stream,
+                        &host,
+                        port,
+                        &effective_headers,
+                        proxy_credentials,
+                        verbose,
+                    )
+                    .await?;
+
+                    let tls = crate::tls::TlsConnector::new(tls_config)?;
+                    let (mut tls_stream, _alpn) = tls.connect_generic(tunnel_stream, &host).await?;
+                    let time_appconnect = request_start.elapsed();
+
+                    let request_target = url.request_target();
+                    let use_http10 = http_version == HttpVersion::Http10;
+                    let time_pretransfer = request_start.elapsed();
+
+                    let (resp, _can_reuse) = crate::protocol::http::h1::request(
+                        &mut tls_stream,
+                        method,
+                        &host_header,
+                        &request_target,
+                        &effective_headers,
+                        body,
+                        url.as_str(),
+                        false, // Don't pool HTTPS proxy connections
+                        use_http10,
+                        expect_100_timeout,
+                        ignore_content_length,
+                        speed_limits,
+                    )
+                    .await?;
+                    let time_starttransfer = request_start.elapsed();
+
+                    let mut resp = maybe_decompress(resp, accept_encoding)?;
+                    let mut info = resp.transfer_info().clone();
+                    info.time_namelookup = time_namelookup;
+                    info.time_connect = time_connect;
+                    info.time_appconnect = time_appconnect;
+                    info.time_pretransfer = time_pretransfer;
+                    info.time_starttransfer = time_starttransfer;
+                    resp.set_transfer_info(info);
+                    return Ok(resp);
+                }
+
+                // Non-HTTPS proxy path: HTTP proxy (CONNECT on plain TCP) or direct
                 let tls_stream_inner = if proxy.is_some() && !is_socks_proxy {
                     if verbose {
                         #[allow(clippy::print_stderr)]
@@ -2086,17 +2178,23 @@ fn maybe_decompress(response: Response, accept_encoding: bool) -> Result<Respons
 /// Establish an HTTP CONNECT tunnel through a proxy.
 ///
 /// Sends a CONNECT request to the proxy and validates the 200 response
-/// before returning the raw TCP stream for TLS negotiation.
+/// before returning the stream for TLS negotiation.
 /// Handles 407 Proxy Authentication Required for Digest and NTLM auth.
+///
+/// The stream type is generic to support both plain TCP (HTTP proxy) and
+/// TLS-wrapped streams (HTTPS proxy).
 #[allow(clippy::too_many_lines)]
-async fn establish_connect_tunnel(
-    mut stream: tokio::net::TcpStream,
+async fn establish_connect_tunnel<S>(
+    mut stream: S,
     target_host: &str,
     target_port: u16,
     headers: &[(String, String)],
     proxy_credentials: Option<&ProxyAuthCredentials>,
     verbose: bool,
-) -> Result<tokio::net::TcpStream, Error> {
+) -> Result<S, Error>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     // Send initial CONNECT request
     let (status, response_headers) =
         send_connect_request(&mut stream, target_host, target_port, headers, None).await?;
@@ -2234,13 +2332,16 @@ async fn establish_connect_tunnel(
 /// Send a CONNECT request and read the response status + headers.
 ///
 /// Returns `(status_code, response_headers)`.
-async fn send_connect_request(
-    stream: &mut tokio::net::TcpStream,
+async fn send_connect_request<S>(
+    stream: &mut S,
     target_host: &str,
     target_port: u16,
     headers: &[(String, String)],
     extra_header: Option<&str>,
-) -> Result<(u16, Vec<(String, String)>), Error> {
+) -> Result<(u16, Vec<(String, String)>), Error>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let mut connect_req = format!(
@@ -3582,5 +3683,54 @@ mod tests {
         easy.ssh_key_path("/home/user/.ssh/id_rsa");
         let cloned = easy.clone();
         assert_eq!(cloned.ssh_key_path.as_deref(), Some("/home/user/.ssh/id_rsa"));
+    }
+
+    #[test]
+    fn easy_method_str_none_by_default() {
+        let easy = Easy::new();
+        assert!(easy.method_str().is_none());
+    }
+
+    #[test]
+    fn easy_method_str_returns_set_method() {
+        let mut easy = Easy::new();
+        easy.method("POST");
+        assert_eq!(easy.method_str(), Some("POST"));
+    }
+
+    #[test]
+    fn easy_header_list_empty_by_default() {
+        let easy = Easy::new();
+        assert!(easy.header_list().is_empty());
+    }
+
+    #[test]
+    fn easy_header_list_returns_headers() {
+        let mut easy = Easy::new();
+        easy.header("Content-Type", "application/json");
+        easy.header("Accept", "text/html");
+        assert_eq!(easy.header_list().len(), 2);
+        assert_eq!(easy.header_list()[0].0, "Content-Type");
+    }
+
+    #[test]
+    fn easy_proxy_tls_config_default_none() {
+        let easy = Easy::new();
+        assert!(easy.proxy_tls_config.is_none());
+    }
+
+    #[test]
+    fn easy_proxy_tls_config_set() {
+        let mut easy = Easy::new();
+        let config = TlsConfig { verify_peer: false, ..TlsConfig::default() };
+        easy.proxy_tls_config(config);
+        assert!(!easy.proxy_tls_config.as_ref().unwrap().verify_peer);
+    }
+
+    #[test]
+    fn easy_proxy_ssl_verify_peer() {
+        let mut easy = Easy::new();
+        easy.proxy_ssl_verify_peer(false);
+        assert!(!easy.proxy_tls_config.as_ref().unwrap().verify_peer);
     }
 }
