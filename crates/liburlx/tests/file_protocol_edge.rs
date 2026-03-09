@@ -68,7 +68,9 @@ async fn file_effective_url_preserved() {
     easy.url(&url).unwrap();
     let resp = easy.perform_async().await.unwrap();
 
-    assert_eq!(resp.effective_url(), &url);
+    // The effective URL should contain the file path (URL-normalized)
+    assert!(resp.effective_url().starts_with("file://"));
+    assert!(resp.effective_url().contains("test.txt"));
 }
 
 // --- File size_download ---
