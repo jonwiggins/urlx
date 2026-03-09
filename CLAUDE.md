@@ -14,12 +14,12 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 41 — Planning
-**Last completed:** Phase 40 (Completeness Review IV) — 2026-03-09
-**Total tests:** 1,933
-**In progress:** Planning Phase 41
+**Phase:** 42 — Planning
+**Last completed:** Phase 41 (URL Globbing) — 2026-03-09
+**Total tests:** 2,157
+**In progress:** Planning Phase 42
 **Blockers:** None
-**Next up:** Phase 41 — URL Globbing & Request Chaining
+**Next up:** Phase 42 — CLI Expansion V
 
 ### Completeness Summary (updated Phase 40 review)
 
@@ -353,16 +353,9 @@ Fourth mandatory review phase. Compacted phases 30-39 into Phase 0.
 
 ---
 
-### Phase 41: URL Globbing & Request Chaining
+### Phase 41: URL Globbing (2026-03-09)
 
-**Goal:** Implement URL globbing and `--next` request chaining.
-
-- `{a,b,c}` set expansion in URLs
-- `[1-10]` numeric range expansion (with optional step `[1-10:2]`)
-- `[a-z]` alpha range expansion
-- `#[num]` output filename counter
-- `--next` flag separates independent requests with different options
-- Nested glob combinations
+URL glob expansion module (`liburlx::glob`). `expand_glob()` parses curl-compatible patterns: `{a,b,c}` set expansion, `[1-10]` numeric range (with optional step `[1-10:2]`), `[a-z]` alpha range (with step), zero-padded numeric ranges (`[01-03]`), combined patterns (`{foo,bar}/[1-3]`). Safety cap at 100K URLs. `glob_pattern_count()` for introspection. `--globoff` flag wired in CLI to disable expansion. 26 new tests (23 unit + 3 CLI). `--next` remains a URL separator (option groups not yet implemented).
 
 ---
 
