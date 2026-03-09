@@ -14,12 +14,12 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 11 — FFI Expansion: Timeout, Transfer & Connection Options
-**Last completed:** Phase 10 (Completeness Review) — 2026-03-08
-**Total tests:** 1,590+
-**In progress:** Planning Phase 11
+**Phase:** 12 — TLS Session Management & Cipher Control
+**Last completed:** Phase 11 (FFI Expansion) — 2026-03-08
+**Total tests:** 1,620+
+**In progress:** Planning Phase 12
 **Blockers:** None
-**Next up:** FFI option expansion, transfer-level rate limiting enforcement
+**Next up:** TLS session caching, cipher suite control
 
 ### Completeness Summary (updated Phase 10 review)
 
@@ -36,7 +36,7 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 | FTP | 70% | Session API, upload, resume, dir ops, FEAT; no FTPS or active mode |
 | SSH/SFTP/SCP | 0% | Not implemented |
 | Multi API | 55% | Connection limiting, message queue, share interface, pipelining config; no poll/socket/timer callbacks |
-| FFI (libcurl C ABI) | ~18% | 37 options, 12 info codes, 25 error codes, multi API, slist, duphandle |
+| FFI (libcurl C ABI) | ~22% | 48 options, 15 info codes, 25 error codes, multi API, slist, duphandle |
 | CLI | ~24% | ~72 of ~250 flags |
 | Connection | 80% | Pool, TCP_NODELAY, keepalive, Unix sockets, interface/port binding |
 | Transfer control | 40% | Rate limiting, speed enforcement API; not wired into transfer engine yet |
@@ -346,16 +346,9 @@ Planned Phases 11-20 based on gap analysis (see below).
 
 ---
 
-### Phase 11: FFI Expansion — Timeout, Transfer & Connection Options
+### Phase 11: FFI Expansion — COMPLETED (2026-03-08)
 
-**Goal:** Close low-hanging FFI gaps; enforce rate limiting in transfer engine.
-
-- Expose CURLOPT_TIMEOUT_MS, CURLOPT_CONNECTTIMEOUT_MS in FFI
-- Expose CURLOPT_MAX_SEND_SPEED_LARGE, CURLOPT_MAX_RECV_SPEED_LARGE in FFI
-- Enforce low_speed_limit/low_speed_time in transfer loop (currently stored but not used)
-- Add CURLOPT_FRESH_CONNECT, CURLOPT_FORBID_REUSE
-- Add CURLINFO_SIZE_UPLOAD, CURLINFO_SPEED_UPLOAD
-- Add `timeout_ms()`, `connect_timeout_ms()` methods to Easy
+Added 11 new CURLOPT options (TIMEOUT_MS, CONNECTTIMEOUT_MS, FRESH_CONNECT, FORBID_REUSE, LOW_SPEED_LIMIT, LOW_SPEED_TIME, MAX_SEND_SPEED_LARGE, MAX_RECV_SPEED_LARGE) and 3 new CURLINFO codes (SIZE_UPLOAD, SPEED_UPLOAD, PRETRANSFER_TIME). Added `fresh_connect()` and `forbid_reuse()` to Easy API. 14 new tests. Deferred: transfer-level rate limiting enforcement (requires chunked body reading architecture change).
 
 ---
 
