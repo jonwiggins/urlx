@@ -14,12 +14,12 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 45 — Planning
-**Last completed:** Phase 44 (Async DNS Resolver) — 2026-03-09
-**Total tests:** 2,198
-**In progress:** Planning Phase 45
+**Phase:** 46 — Planning
+**Last completed:** Phase 45 (Cookie Public Suffix List) — 2026-03-09
+**Total tests:** 2,208
+**In progress:** Planning Phase 46
 **Blockers:** None
-**Next up:** Phase 45 — Cookie Public Suffix List
+**Next up:** Phase 46 — FFI Expansion III
 
 ### Completeness Summary (updated Phase 40 review)
 
@@ -30,7 +30,7 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 | HTTP/3 | 55% | QUIC via quinn, Alt-Svc upgrade, 0-RTT; no connection pooling or server push |
 | TLS | 85% | rustls, insecure mode, CA/client certs, pinning, version selection, cipher list, session cache |
 | Authentication | 60% | Basic, Bearer, Digest, AWS SigV4, NTLM skeleton, SASL options |
-| Cookie engine | 92% | Netscape file format, domain-indexed jar; no public suffix list |
+| Cookie engine | 95% | Netscape file format, domain-indexed jar, public suffix list validation |
 | Proxy | 90% | HTTP + SOCKS + HTTPS tunnel (TLS-in-TLS), proxy auth; no PAC |
 | DNS | 85% | Cache, Happy Eyeballs, shuffle, custom servers, DoH, DoT, async hickory-dns resolver |
 | FTP | 87% | Full session API, FTPS (explicit/implicit), active mode, FtpMethod; no MLST |
@@ -114,6 +114,7 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 - **2026-03-09:** `curl_getdate` FFI function implements inline HTTP date parsing supporting three formats: RFC 2822 ("Sun, 06 Nov 1994 08:49:37 GMT"), RFC 850 ("Sunday, 06-Nov-94 08:49:37 GMT"), and asctime ("Sun Nov  6 08:49:37 1994"). Inline Unix timestamp computation avoids adding a `chrono` dependency for a single use case. Two-digit years ≥70 map to 1900s, <70 to 2000s (matching curl).
 - **2026-03-09:** `curl_escape`/`curl_unescape` use RFC 3986 unreserved characters (A-Z, a-z, 0-9, `-._~`) for percent-encoding. `curl_unescape` decodes `+` as space (matching curl's behavior for form-encoded data). `curl_easy_escape`/`curl_easy_unescape` delegate to the same implementation.
 - **2026-03-09:** `DnsResolver::Hickory` variant uses `Box<HickoryResolver>` to avoid large enum variant clippy error — `HickoryResolver` contains `TokioResolver` which is ~1272 bytes, while `System` carries no data. Boxing eliminates the size disparity.
+- **2026-03-09:** Cookie PSL validation uses the `psl` crate (v2) which embeds the full Mozilla Public Suffix List at compile time. The embedded approach avoids runtime downloads and filesystem dependencies. Only cookies with an explicit `Domain` attribute are checked — host-only cookies are always allowed (matching curl's behavior with `--with-libpsl`). The `psl::List.suffix()` API returns the public suffix portion; if it equals the entire domain, the domain is a public suffix.
 - **2026-03-09:** hickory-resolver 0.25 API uses `TokioResolver::builder_tokio()?.build()` for system config and `TokioResolver::builder_with_config(config, provider).build()` for custom config. The `system-config` feature is required for `builder_tokio()`. `TokioConnectionProvider` lives in `hickory_resolver::name_server`, and `Protocol` in `hickory_resolver::proto::xfer`.
 - **2026-03-09:** `curl_formadd` returns `CURL_FORMADD_DISABLED` (7) as a stub — the deprecated multipart API is replaced by the MIME API (`curl_mime_*`). `curl_formfree` is a no-op. This matches libcurl's behavior when built without form API support.
 
@@ -382,14 +383,9 @@ Added `DnsResolver` enum (System/Hickory variants) and `HickoryResolver` struct 
 
 ---
 
-### Phase 45: Cookie Public Suffix List
+### Phase 45: Cookie Public Suffix List (completed 2026-03-09)
 
-**Goal:** Proper domain validation using the public suffix list.
-
-- PSL database (embedded or downloadable)
-- Domain validation on cookie set
-- Prevent super-domain cookie attacks
-- eTLD+1 computation
+Added `psl` crate (v2, embedded Mozilla Public Suffix List) for cookie domain validation. `is_public_suffix()` function checks if a domain is a TLD or public suffix. Integrated into `parse_set_cookie()` — cookies with explicit `Domain` attribute set to a public suffix (e.g., "com", "co.uk", "github.io") are silently rejected. Host-only cookies (no Domain attr) unaffected. Added 11 unit tests covering TLDs, multi-level suffixes, wildcard rules, and eTLD+1 acceptance.
 
 ---
 
