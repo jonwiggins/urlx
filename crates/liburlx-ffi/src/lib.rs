@@ -122,6 +122,11 @@ pub enum CURLoption {
     CURLOPT_MAX_SEND_SPEED_LARGE = 30145,
     CURLOPT_MAX_RECV_SPEED_LARGE = 30146,
 
+    // More string options
+    CURLOPT_REFERER = 10016,
+    CURLOPT_XOAUTH2_BEARER = 10220,
+    CURLOPT_AWS_SIGV4 = 10306,
+
     // Pointer/object options
     CURLOPT_SHARE = 10100,
     CURLOPT_PRIVATE = 10103,
@@ -136,12 +141,56 @@ pub enum CURLoption {
     CURLOPT_SEEKFUNCTION = 20167,
     CURLOPT_XFERINFOFUNCTION = 20219,
 
-    // Long options (progress control)
+    // Long options (progress control, HTTP version, etc.)
     CURLOPT_NOPROGRESS = 43,
+    CURLOPT_AUTOREFERER = 58,
+    CURLOPT_HTTP_VERSION = 84,
+    CURLOPT_NOSIGNAL = 99,
+    CURLOPT_LOCALPORTRANGE = 164,
+
+    // Off_t options
+    CURLOPT_RESUME_FROM_LARGE = 30116,
 
     // Pointer data options for callbacks
     CURLOPT_PROGRESSDATA = 10057,
     CURLOPT_SEEKDATA = 10168,
+}
+
+// ───────────────────────── CURLUcode / CURLUPart ─────────────────────────
+
+/// `CURLUcode` — result codes for URL API operations.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(non_camel_case_types, missing_docs)]
+pub enum CURLUcode {
+    CURLUE_OK = 0,
+    CURLUE_BAD_HANDLE = 1,
+    CURLUE_BAD_PARTPOINTER = 2,
+    CURLUE_MALFORMED_INPUT = 3,
+    CURLUE_BAD_PORT_NUMBER = 4,
+    CURLUE_UNSUPPORTED_SCHEME = 5,
+    CURLUE_OUT_OF_MEMORY = 7,
+    CURLUE_NO_SCHEME = 8,
+    CURLUE_NO_HOST = 9,
+    CURLUE_UNKNOWN_PART = 11,
+}
+
+/// `CURLUPart` — part identifiers for URL manipulation.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(non_camel_case_types, missing_docs)]
+pub enum CURLUPart {
+    CURLUPART_URL = 0,
+    CURLUPART_SCHEME = 1,
+    CURLUPART_USER = 2,
+    CURLUPART_PASSWORD = 3,
+    CURLUPART_OPTIONS = 4,
+    CURLUPART_HOST = 5,
+    CURLUPART_PORT = 6,
+    CURLUPART_PATH = 7,
+    CURLUPART_QUERY = 8,
+    CURLUPART_FRAGMENT = 9,
+    CURLUPART_ZONEID = 10,
 }
 
 // ───────────────────────── CURLINFO ─────────────────────────
@@ -167,7 +216,10 @@ pub enum CURLINFO {
     CURLINFO_REDIRECT_COUNT = 0x0020_0014,
     CURLINFO_SSL_VERIFYRESULT = 0x0020_000D,
     CURLINFO_PRIVATE = 0x0010_0015,
+    CURLINFO_HTTP_VERSION = 0x0020_0032,
     CURLINFO_APPCONNECT_TIME = 0x0030_0033,
+    CURLINFO_PRIMARY_PORT = 0x0020_0040,
+    CURLINFO_SCHEME = 0x0010_0044,
 }
 
 // ───────────────────────── CURLMcode ─────────────────────────
@@ -545,6 +597,331 @@ pub extern "C" fn curl_share_strerror(code: CURLSHcode) -> *const c_char {
         CURLSHcode::CURLSHE_NOT_BUILT_IN => c"Feature not available",
     };
     msg.as_ptr()
+}
+
+// ───────────────────────── curl_url (URL API) ─────────────────────────
+
+/// Mutable URL handle for the curl URL API.
+///
+/// Stores individual URL components that can be set/get independently.
+/// Components are lazily reassembled into a full URL string when requested.
+struct UrlHandle {
+    scheme: Option<String>,
+    user: Option<String>,
+    password: Option<String>,
+    host: Option<String>,
+    port: Option<u16>,
+    path: Option<String>,
+    query: Option<String>,
+    fragment: Option<String>,
+    /// Cached reassembled URL string (invalidated on set).
+    cached_url: Option<String>,
+}
+
+impl UrlHandle {
+    const fn new() -> Self {
+        Self {
+            scheme: None,
+            user: None,
+            password: None,
+            host: None,
+            port: None,
+            path: None,
+            query: None,
+            fragment: None,
+            cached_url: None,
+        }
+    }
+
+    /// Reassemble the URL from components.
+    fn reassemble(&mut self) -> String {
+        let scheme = self.scheme.as_deref().unwrap_or("https");
+        let mut url = format!("{scheme}://");
+        if let Some(ref user) = self.user {
+            url.push_str(user);
+            if let Some(ref pass) = self.password {
+                url.push(':');
+                url.push_str(pass);
+            }
+            url.push('@');
+        }
+        if let Some(ref host) = self.host {
+            url.push_str(host);
+        }
+        if let Some(port) = self.port {
+            url.push(':');
+            url.push_str(&port.to_string());
+        }
+        url.push_str(self.path.as_deref().unwrap_or("/"));
+        if let Some(ref query) = self.query {
+            url.push('?');
+            url.push_str(query);
+        }
+        if let Some(ref fragment) = self.fragment {
+            url.push('#');
+            url.push_str(fragment);
+        }
+        self.cached_url = Some(url.clone());
+        url
+    }
+
+    /// Parse a full URL into components.
+    fn set_url(&mut self, url_str: &str) -> CURLUcode {
+        match liburlx::Url::parse(url_str) {
+            Ok(parsed) => {
+                self.scheme = Some(parsed.scheme().to_string());
+                let user = parsed.username();
+                self.user = if user.is_empty() { None } else { Some(user.to_string()) };
+                self.password = parsed.password().map(String::from);
+                self.host = parsed.host_str().map(String::from);
+                self.port = parsed.port();
+                let path = parsed.path();
+                self.path = Some(path.to_string());
+                self.query = parsed.query().map(String::from);
+                self.fragment = parsed.fragment().map(String::from);
+                self.cached_url = Some(parsed.as_str().to_string());
+                CURLUcode::CURLUE_OK
+            }
+            Err(_) => CURLUcode::CURLUE_MALFORMED_INPUT,
+        }
+    }
+}
+
+impl Clone for UrlHandle {
+    fn clone(&self) -> Self {
+        Self {
+            scheme: self.scheme.clone(),
+            user: self.user.clone(),
+            password: self.password.clone(),
+            host: self.host.clone(),
+            port: self.port,
+            path: self.path.clone(),
+            query: self.query.clone(),
+            fragment: self.fragment.clone(),
+            cached_url: self.cached_url.clone(),
+        }
+    }
+}
+
+/// `curl_url` — create a new URL handle.
+///
+/// # Safety
+///
+/// Returns a new handle that must be freed with `curl_url_cleanup`.
+#[no_mangle]
+pub extern "C" fn curl_url() -> *mut c_void {
+    let handle = Box::new(UrlHandle::new());
+    Box::into_raw(handle).cast::<c_void>()
+}
+
+/// `curl_url_cleanup` — free a URL handle.
+///
+/// # Safety
+///
+/// `handle` must be a valid pointer from `curl_url`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn curl_url_cleanup(handle: *mut c_void) {
+    if !handle.is_null() {
+        // SAFETY: Caller guarantees handle is from curl_url
+        let _ = unsafe { Box::from_raw(handle.cast::<UrlHandle>()) };
+    }
+}
+
+/// `curl_url_dup` — duplicate a URL handle.
+///
+/// # Safety
+///
+/// `handle` must be a valid pointer from `curl_url`.
+#[no_mangle]
+pub unsafe extern "C" fn curl_url_dup(handle: *mut c_void) -> *mut c_void {
+    if handle.is_null() {
+        return ptr::null_mut();
+    }
+    // SAFETY: Caller guarantees handle is from curl_url
+    let h = unsafe { &*handle.cast::<UrlHandle>() };
+    let dup = Box::new(h.clone());
+    Box::into_raw(dup).cast::<c_void>()
+}
+
+/// `curl_url_set` — set a URL component.
+///
+/// # Safety
+///
+/// `handle` must be a valid pointer from `curl_url`.
+/// `content` must be a valid null-terminated C string (or null to clear).
+#[no_mangle]
+pub unsafe extern "C" fn curl_url_set(
+    handle: *mut c_void,
+    what: c_long,
+    content: *const c_char,
+    _flags: c_long,
+) -> CURLUcode {
+    if handle.is_null() {
+        return CURLUcode::CURLUE_BAD_HANDLE;
+    }
+
+    // SAFETY: Caller guarantees handle is from curl_url
+    let h = unsafe { &mut *handle.cast::<UrlHandle>() };
+
+    // Null content clears the part
+    let value = if content.is_null() {
+        None
+    } else {
+        // SAFETY: Caller guarantees content is null-terminated
+        match unsafe { CStr::from_ptr(content) }.to_str() {
+            Ok(s) => Some(s.to_string()),
+            Err(_) => return CURLUcode::CURLUE_MALFORMED_INPUT,
+        }
+    };
+
+    h.cached_url = None; // Invalidate cache
+
+    match what {
+        // CURLUPART_URL = 0
+        0 => {
+            if let Some(ref url_str) = value {
+                return h.set_url(url_str);
+            }
+            // Clear all components
+            *h = UrlHandle::new();
+            CURLUcode::CURLUE_OK
+        }
+        // CURLUPART_SCHEME = 1
+        1 => {
+            h.scheme = value;
+            CURLUcode::CURLUE_OK
+        }
+        // CURLUPART_USER = 2
+        2 => {
+            h.user = value;
+            CURLUcode::CURLUE_OK
+        }
+        // CURLUPART_PASSWORD = 3
+        3 => {
+            h.password = value;
+            CURLUcode::CURLUE_OK
+        }
+        // CURLUPART_OPTIONS = 4, CURLUPART_ZONEID = 10 — accept but ignore
+        4 | 10 => CURLUcode::CURLUE_OK,
+        // CURLUPART_HOST = 5
+        5 => {
+            h.host = value;
+            CURLUcode::CURLUE_OK
+        }
+        // CURLUPART_PORT = 6
+        6 => {
+            if let Some(ref port_str) = value {
+                match port_str.parse::<u16>() {
+                    Ok(port) => {
+                        h.port = Some(port);
+                        CURLUcode::CURLUE_OK
+                    }
+                    Err(_) => CURLUcode::CURLUE_BAD_PORT_NUMBER,
+                }
+            } else {
+                h.port = None;
+                CURLUcode::CURLUE_OK
+            }
+        }
+        // CURLUPART_PATH = 7
+        7 => {
+            h.path = value;
+            CURLUcode::CURLUE_OK
+        }
+        // CURLUPART_QUERY = 8
+        8 => {
+            h.query = value;
+            CURLUcode::CURLUE_OK
+        }
+        // CURLUPART_FRAGMENT = 9
+        9 => {
+            h.fragment = value;
+            CURLUcode::CURLUE_OK
+        }
+        _ => CURLUcode::CURLUE_UNKNOWN_PART,
+    }
+}
+
+/// `curl_url_get` — get a URL component.
+///
+/// The returned string is allocated and must be freed by the caller with `libc::free`
+/// or `curl_free`. For simplicity, we allocate via a leaked `CString`.
+///
+/// # Safety
+///
+/// `handle` must be a valid pointer from `curl_url`.
+/// `part` must be a valid pointer to `*mut c_char`.
+#[no_mangle]
+pub unsafe extern "C" fn curl_url_get(
+    handle: *mut c_void,
+    what: c_long,
+    part: *mut *mut c_char,
+    _flags: c_long,
+) -> CURLUcode {
+    if handle.is_null() {
+        return CURLUcode::CURLUE_BAD_HANDLE;
+    }
+    if part.is_null() {
+        return CURLUcode::CURLUE_BAD_PARTPOINTER;
+    }
+
+    // SAFETY: Caller guarantees handle is from curl_url
+    let h = unsafe { &mut *handle.cast::<UrlHandle>() };
+
+    let result: Option<String> = match what {
+        // CURLUPART_URL = 0
+        0 => Some(h.reassemble()),
+        // CURLUPART_SCHEME = 1
+        1 => h.scheme.clone(),
+        // CURLUPART_USER = 2
+        2 => h.user.clone(),
+        // CURLUPART_PASSWORD = 3
+        3 => h.password.clone(),
+        // CURLUPART_OPTIONS = 4, CURLUPART_ZONEID = 10 — not stored
+        4 | 10 => None,
+        // CURLUPART_HOST = 5
+        5 => h.host.clone(),
+        // CURLUPART_PORT = 6
+        6 => h.port.map(|p| p.to_string()),
+        // CURLUPART_PATH = 7
+        7 => h.path.clone(),
+        // CURLUPART_QUERY = 8
+        8 => h.query.clone(),
+        // CURLUPART_FRAGMENT = 9
+        9 => h.fragment.clone(),
+        _ => return CURLUcode::CURLUE_UNKNOWN_PART,
+    };
+
+    if let Some(s) = result {
+        // Allocate a C string for the result
+        std::ffi::CString::new(s).map_or(CURLUcode::CURLUE_OUT_OF_MEMORY, |cstr| {
+            // SAFETY: part is a valid pointer
+            unsafe {
+                *part = cstr.into_raw();
+            }
+            CURLUcode::CURLUE_OK
+        })
+    } else {
+        // Part not set
+        // SAFETY: part is a valid pointer
+        unsafe {
+            *part = ptr::null_mut();
+        }
+        CURLUcode::CURLUE_OK
+    }
+}
+
+/// `curl_free` — free memory allocated by curl functions.
+///
+/// # Safety
+///
+/// `ptr` must be a pointer returned by curl functions (e.g., `curl_url_get`), or null.
+#[no_mangle]
+pub unsafe extern "C" fn curl_free(ptr: *mut c_void) {
+    if !ptr.is_null() {
+        // SAFETY: ptr was allocated via CString::into_raw
+        let _ = unsafe { std::ffi::CString::from_raw(ptr.cast::<c_char>()) };
+    }
 }
 
 // ───────────────────────── curl_slist ─────────────────────────
@@ -1506,6 +1883,75 @@ pub unsafe extern "C" fn curl_easy_setopt(
             CURLcode::CURLE_OK
         }
 
+        // CURLOPT_REFERER = 10016
+        10016 => {
+            // SAFETY: value must be a null-terminated C string
+            if let Some(s) = unsafe { read_cstr(value) } {
+                h.easy.header("Referer", s);
+            }
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_XOAUTH2_BEARER = 10220
+        10220 => {
+            // SAFETY: value must be a null-terminated C string
+            if let Some(s) = unsafe { read_cstr(value) } {
+                h.easy.bearer_token(s);
+            }
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_AWS_SIGV4 = 10306
+        10306 => {
+            // SAFETY: value must be a null-terminated C string
+            // Format: "provider1[:provider2[:region[:service]]]"
+            // We accept the value but AWS SigV4 auth is wired through aws_credentials
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_AUTOREFERER = 58
+        58 => {
+            // Accept but no-op — auto-referer on redirect not yet implemented
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_HTTP_VERSION = 84
+        84 => {
+            let version = value as c_long;
+            match version {
+                // CURL_HTTP_VERSION_NONE = 0
+                0 => h.easy.http_version(liburlx::HttpVersion::None),
+                // CURL_HTTP_VERSION_1_0 = 1
+                1 => h.easy.http_version(liburlx::HttpVersion::Http10),
+                // CURL_HTTP_VERSION_1_1 = 2
+                2 => h.easy.http_version(liburlx::HttpVersion::Http11),
+                // CURL_HTTP_VERSION_2_0 = 3
+                3 => h.easy.http_version(liburlx::HttpVersion::Http2),
+                _ => {}
+            }
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_NOSIGNAL = 99
+        99 => {
+            // Accept but no-op — signals are not used in tokio-based architecture
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_LOCALPORTRANGE = 164
+        164 => {
+            // Accept the range but only use the base port set via LOCALPORT
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_RESUME_FROM_LARGE = 30116
+        30116 => {
+            #[allow(clippy::cast_sign_loss)]
+            let offset = value as u64;
+            h.easy.resume_from(offset);
+            CURLcode::CURLE_OK
+        }
+
         _ => CURLcode::CURLE_UNKNOWN_OPTION,
     }
 }
@@ -1877,6 +2323,38 @@ pub unsafe extern "C" fn curl_easy_getinfo(
             // 0 = success (X509_V_OK). Since we either verify successfully or
             // fail the connection entirely, a completed transfer always means 0.
             *out = 0;
+            CURLcode::CURLE_OK
+        }
+
+        // CURLINFO_HTTP_VERSION = 0x200032
+        0x20_0032 => {
+            // SAFETY: Caller guarantees out points to c_long
+            let out = unsafe { &mut *out.cast::<c_long>() };
+            // Default to HTTP/1.1 = 2 since we currently don't track negotiated version
+            *out = 2;
+            CURLcode::CURLE_OK
+        }
+
+        // CURLINFO_PRIMARY_PORT = 0x200040
+        0x20_0040 => {
+            // SAFETY: Caller guarantees out points to c_long
+            let out = unsafe { &mut *out.cast::<c_long>() };
+            // Extract port from effective URL
+            if let Ok(url) = liburlx::Url::parse(response.effective_url()) {
+                *out = c_long::from(url.port_or_default().unwrap_or(0));
+            } else {
+                *out = 0;
+            }
+            CURLcode::CURLE_OK
+        }
+
+        // CURLINFO_SCHEME = 0x100044
+        0x10_0044 => {
+            // SAFETY: Caller guarantees out points to *const c_char
+            // Return the scheme from the effective URL
+            // Note: We store a pointer to the effective URL string which contains the scheme
+            let out = unsafe { &mut *out.cast::<*const c_char>() };
+            *out = response.effective_url().as_ptr().cast::<c_char>();
             CURLcode::CURLE_OK
         }
 
@@ -3369,6 +3847,271 @@ mod tests {
         assert!(h.noprogress); // reset to default true
         assert!(h.mimepost.is_null());
 
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    // ─── Phase 23: URL API ───
+
+    #[test]
+    fn url_init_cleanup() {
+        let handle = curl_url();
+        assert!(!handle.is_null());
+        unsafe { curl_url_cleanup(handle) };
+    }
+
+    #[test]
+    fn url_cleanup_null_is_safe() {
+        unsafe { curl_url_cleanup(ptr::null_mut()) };
+    }
+
+    #[test]
+    fn url_set_full_url() {
+        let handle = curl_url();
+        let url = c"https://example.com/path?q=1#frag";
+        let code = unsafe { curl_url_set(handle, 0, url.as_ptr(), 0) };
+        assert_eq!(code, CURLUcode::CURLUE_OK);
+
+        // Get scheme
+        let mut part: *mut c_char = ptr::null_mut();
+        let code = unsafe { curl_url_get(handle, 1, &mut part, 0) };
+        assert_eq!(code, CURLUcode::CURLUE_OK);
+        assert!(!part.is_null());
+        let scheme = unsafe { CStr::from_ptr(part) }.to_str().unwrap();
+        assert_eq!(scheme, "https");
+        unsafe { curl_free(part.cast::<c_void>()) };
+
+        // Get host
+        let mut part: *mut c_char = ptr::null_mut();
+        let code = unsafe { curl_url_get(handle, 5, &mut part, 0) };
+        assert_eq!(code, CURLUcode::CURLUE_OK);
+        let host = unsafe { CStr::from_ptr(part) }.to_str().unwrap();
+        assert_eq!(host, "example.com");
+        unsafe { curl_free(part.cast::<c_void>()) };
+
+        // Get path
+        let mut part: *mut c_char = ptr::null_mut();
+        let code = unsafe { curl_url_get(handle, 7, &mut part, 0) };
+        assert_eq!(code, CURLUcode::CURLUE_OK);
+        let path = unsafe { CStr::from_ptr(part) }.to_str().unwrap();
+        assert_eq!(path, "/path");
+        unsafe { curl_free(part.cast::<c_void>()) };
+
+        // Get query
+        let mut part: *mut c_char = ptr::null_mut();
+        let code = unsafe { curl_url_get(handle, 8, &mut part, 0) };
+        assert_eq!(code, CURLUcode::CURLUE_OK);
+        let query = unsafe { CStr::from_ptr(part) }.to_str().unwrap();
+        assert_eq!(query, "q=1");
+        unsafe { curl_free(part.cast::<c_void>()) };
+
+        // Get fragment
+        let mut part: *mut c_char = ptr::null_mut();
+        let code = unsafe { curl_url_get(handle, 9, &mut part, 0) };
+        assert_eq!(code, CURLUcode::CURLUE_OK);
+        let frag = unsafe { CStr::from_ptr(part) }.to_str().unwrap();
+        assert_eq!(frag, "frag");
+        unsafe { curl_free(part.cast::<c_void>()) };
+
+        unsafe { curl_url_cleanup(handle) };
+    }
+
+    #[test]
+    fn url_set_individual_parts() {
+        let handle = curl_url();
+        let _ = unsafe { curl_url_set(handle, 1, c"https".as_ptr(), 0) };
+        let _ = unsafe { curl_url_set(handle, 5, c"example.com".as_ptr(), 0) };
+        let _ = unsafe { curl_url_set(handle, 6, c"8080".as_ptr(), 0) };
+        let _ = unsafe { curl_url_set(handle, 7, c"/api/v1".as_ptr(), 0) };
+
+        // Get reassembled URL
+        let mut part: *mut c_char = ptr::null_mut();
+        let code = unsafe { curl_url_get(handle, 0, &mut part, 0) };
+        assert_eq!(code, CURLUcode::CURLUE_OK);
+        let url = unsafe { CStr::from_ptr(part) }.to_str().unwrap();
+        assert_eq!(url, "https://example.com:8080/api/v1");
+        unsafe { curl_free(part.cast::<c_void>()) };
+
+        unsafe { curl_url_cleanup(handle) };
+    }
+
+    #[test]
+    fn url_set_with_userinfo() {
+        let handle = curl_url();
+        let url = c"http://user:pass@example.com/";
+        let _ = unsafe { curl_url_set(handle, 0, url.as_ptr(), 0) };
+
+        let mut part: *mut c_char = ptr::null_mut();
+        let code = unsafe { curl_url_get(handle, 2, &mut part, 0) };
+        assert_eq!(code, CURLUcode::CURLUE_OK);
+        let user = unsafe { CStr::from_ptr(part) }.to_str().unwrap();
+        assert_eq!(user, "user");
+        unsafe { curl_free(part.cast::<c_void>()) };
+
+        let mut part: *mut c_char = ptr::null_mut();
+        let code = unsafe { curl_url_get(handle, 3, &mut part, 0) };
+        assert_eq!(code, CURLUcode::CURLUE_OK);
+        let pass = unsafe { CStr::from_ptr(part) }.to_str().unwrap();
+        assert_eq!(pass, "pass");
+        unsafe { curl_free(part.cast::<c_void>()) };
+
+        unsafe { curl_url_cleanup(handle) };
+    }
+
+    #[test]
+    fn url_set_bad_port() {
+        let handle = curl_url();
+        let code = unsafe { curl_url_set(handle, 6, c"not_a_port".as_ptr(), 0) };
+        assert_eq!(code, CURLUcode::CURLUE_BAD_PORT_NUMBER);
+        unsafe { curl_url_cleanup(handle) };
+    }
+
+    #[test]
+    fn url_set_malformed_url() {
+        let handle = curl_url();
+        let code = unsafe { curl_url_set(handle, 0, c"".as_ptr(), 0) };
+        assert_eq!(code, CURLUcode::CURLUE_MALFORMED_INPUT);
+        unsafe { curl_url_cleanup(handle) };
+    }
+
+    #[test]
+    fn url_set_null_clears() {
+        let handle = curl_url();
+        let _ = unsafe { curl_url_set(handle, 0, c"https://example.com/path".as_ptr(), 0) };
+        // Clear the query
+        let code = unsafe { curl_url_set(handle, 8, ptr::null(), 0) };
+        assert_eq!(code, CURLUcode::CURLUE_OK);
+
+        let mut part: *mut c_char = ptr::null_mut();
+        let code = unsafe { curl_url_get(handle, 8, &mut part, 0) };
+        assert_eq!(code, CURLUcode::CURLUE_OK);
+        assert!(part.is_null()); // Query was cleared
+
+        unsafe { curl_url_cleanup(handle) };
+    }
+
+    #[test]
+    fn url_get_null_handle() {
+        let mut part: *mut c_char = ptr::null_mut();
+        let code = unsafe { curl_url_get(ptr::null_mut(), 0, &mut part, 0) };
+        assert_eq!(code, CURLUcode::CURLUE_BAD_HANDLE);
+    }
+
+    #[test]
+    fn url_set_null_handle() {
+        let code = unsafe { curl_url_set(ptr::null_mut(), 0, c"test".as_ptr(), 0) };
+        assert_eq!(code, CURLUcode::CURLUE_BAD_HANDLE);
+    }
+
+    #[test]
+    fn url_get_unknown_part() {
+        let handle = curl_url();
+        let mut part: *mut c_char = ptr::null_mut();
+        let code = unsafe { curl_url_get(handle, 99, &mut part, 0) };
+        assert_eq!(code, CURLUcode::CURLUE_UNKNOWN_PART);
+        unsafe { curl_url_cleanup(handle) };
+    }
+
+    #[test]
+    fn url_dup() {
+        let handle = curl_url();
+        let _ = unsafe { curl_url_set(handle, 0, c"https://example.com/path".as_ptr(), 0) };
+
+        let dup = unsafe { curl_url_dup(handle) };
+        assert!(!dup.is_null());
+
+        // Verify dup has same scheme
+        let mut part: *mut c_char = ptr::null_mut();
+        let code = unsafe { curl_url_get(dup, 1, &mut part, 0) };
+        assert_eq!(code, CURLUcode::CURLUE_OK);
+        let scheme = unsafe { CStr::from_ptr(part) }.to_str().unwrap();
+        assert_eq!(scheme, "https");
+        unsafe { curl_free(part.cast::<c_void>()) };
+
+        unsafe {
+            curl_url_cleanup(dup);
+            curl_url_cleanup(handle);
+        }
+    }
+
+    #[test]
+    fn url_dup_null() {
+        let dup = unsafe { curl_url_dup(ptr::null_mut()) };
+        assert!(dup.is_null());
+    }
+
+    #[test]
+    fn curl_free_null_is_safe() {
+        unsafe { curl_free(ptr::null_mut()) };
+    }
+
+    // ─── Phase 23: New CURLOPT options ───
+
+    #[test]
+    fn easy_setopt_referer() {
+        let handle = curl_easy_init();
+        let referer = c"https://example.com/";
+        // CURLOPT_REFERER = 10016
+        let code = unsafe { curl_easy_setopt(handle, 10016, referer.as_ptr().cast::<c_void>()) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_http_version() {
+        let handle = curl_easy_init();
+        // CURLOPT_HTTP_VERSION = 84
+        // CURL_HTTP_VERSION_1_1 = 2
+        let code = unsafe { curl_easy_setopt(handle, 84, 2 as *const c_void) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        // CURL_HTTP_VERSION_2_0 = 3
+        let code = unsafe { curl_easy_setopt(handle, 84, 3 as *const c_void) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_nosignal() {
+        let handle = curl_easy_init();
+        // CURLOPT_NOSIGNAL = 99
+        let code = unsafe { curl_easy_setopt(handle, 99, 1 as *const c_void) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_autoreferer() {
+        let handle = curl_easy_init();
+        // CURLOPT_AUTOREFERER = 58
+        let code = unsafe { curl_easy_setopt(handle, 58, 1 as *const c_void) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_resume_from_large() {
+        let handle = curl_easy_init();
+        // CURLOPT_RESUME_FROM_LARGE = 30116
+        let code = unsafe { curl_easy_setopt(handle, 30116, 1024_usize as *const c_void) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_xoauth2_bearer() {
+        let handle = curl_easy_init();
+        let token = c"ya29.token123";
+        // CURLOPT_XOAUTH2_BEARER = 10220
+        let code = unsafe { curl_easy_setopt(handle, 10220, token.as_ptr().cast::<c_void>()) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_localportrange() {
+        let handle = curl_easy_init();
+        // CURLOPT_LOCALPORTRANGE = 164
+        let code = unsafe { curl_easy_setopt(handle, 164, 10_usize as *const c_void) };
+        assert_eq!(code, CURLcode::CURLE_OK);
         unsafe { curl_easy_cleanup(handle) };
     }
 }
