@@ -2,78 +2,12 @@
 
 #![allow(clippy::unwrap_used, unused_results, clippy::significant_drop_tightening)]
 
-use std::convert::Infallible;
-use std::net::SocketAddr;
-use std::sync::Arc;
+mod common;
 
+use common::TestServer;
 use http_body_util::Full;
 use hyper::body::Bytes;
-use hyper::server::conn::http1;
-use hyper::service::service_fn;
-use hyper::{Request, Response};
-use tokio::net::TcpListener;
-use tokio::sync::oneshot;
-
-/// A simple test HTTP server.
-struct TestServer {
-    addr: SocketAddr,
-    shutdown: Option<oneshot::Sender<()>>,
-}
-
-impl TestServer {
-    async fn start<F>(handler: F) -> Self
-    where
-        F: Fn(Request<hyper::body::Incoming>) -> Response<Full<Bytes>> + Send + Sync + 'static,
-    {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let handler = Arc::new(handler);
-        let (tx, mut rx) = oneshot::channel();
-
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    accept_result = listener.accept() => {
-                        if let Ok((stream, _)) = accept_result {
-                            let handler = handler.clone();
-                            let io = hyper_util::rt::TokioIo::new(stream);
-                            tokio::spawn(async move {
-                                let _ = http1::Builder::new()
-                                    .serve_connection(
-                                        io,
-                                        service_fn(move |req| {
-                                            let handler = handler.clone();
-                                            async move {
-                                                Ok::<_, Infallible>(handler(req))
-                                            }
-                                        }),
-                                    )
-                                    .await;
-                            });
-                        }
-                    }
-                    _ = &mut rx => {
-                        break;
-                    }
-                }
-            }
-        });
-
-        Self { addr, shutdown: Some(tx) }
-    }
-
-    fn url(&self, path: &str) -> String {
-        format!("http://127.0.0.1:{}{path}", self.addr.port())
-    }
-}
-
-impl Drop for TestServer {
-    fn drop(&mut self) {
-        if let Some(tx) = self.shutdown.take() {
-            let _ = tx.send(());
-        }
-    }
-}
+use hyper::Response;
 
 #[tokio::test]
 async fn multi_concurrent_gets() {

@@ -3,7 +3,7 @@
 //! Provides a reusable `TestServer` backed by hyper that can be configured
 //! with custom handlers for HTTP integration testing.
 
-#![allow(dead_code)]
+#![allow(dead_code, unused_results, clippy::unwrap_used, clippy::expect_used)]
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
