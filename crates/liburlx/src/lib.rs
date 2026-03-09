@@ -18,6 +18,7 @@ pub mod easy;
 pub mod error;
 pub mod hsts;
 pub mod multi;
+pub mod netrc;
 pub(crate) mod pool;
 pub mod progress;
 pub mod protocol;

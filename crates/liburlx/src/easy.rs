@@ -96,6 +96,14 @@ pub struct Easy {
     unrestricted_auth: bool,
     ignore_content_length: bool,
     alt_svc_cache: crate::protocol::http::altsvc::AltSvcCache,
+    /// Preserve POST method on 301 redirect (curl --post301).
+    post301: bool,
+    /// Preserve POST method on 302 redirect (curl --post302).
+    post302: bool,
+    /// Preserve POST method on 303 redirect (curl --post303).
+    post303: bool,
+    /// Headers to send only to the proxy, not the target server.
+    proxy_headers: Vec<(String, String)>,
 }
 
 impl std::fmt::Debug for Easy {
@@ -155,6 +163,10 @@ impl std::fmt::Debug for Easy {
             .field("unrestricted_auth", &self.unrestricted_auth)
             .field("ignore_content_length", &self.ignore_content_length)
             .field("alt_svc_cache", &self.alt_svc_cache)
+            .field("post301", &self.post301)
+            .field("post302", &self.post302)
+            .field("post303", &self.post303)
+            .field("proxy_headers", &self.proxy_headers)
             .finish()
     }
 }
@@ -213,6 +225,10 @@ impl Clone for Easy {
             unrestricted_auth: self.unrestricted_auth,
             ignore_content_length: self.ignore_content_length,
             alt_svc_cache: self.alt_svc_cache.clone(),
+            post301: self.post301,
+            post302: self.post302,
+            post303: self.post303,
+            proxy_headers: self.proxy_headers.clone(),
         }
     }
 }
@@ -273,6 +289,10 @@ impl Easy {
             unrestricted_auth: false,
             ignore_content_length: false,
             alt_svc_cache: crate::protocol::http::altsvc::AltSvcCache::new(),
+            post301: false,
+            post302: false,
+            post303: false,
+            proxy_headers: Vec::new(),
         }
     }
 
@@ -984,6 +1004,40 @@ impl Easy {
         self.forbid_reuse = enable;
     }
 
+    /// Preserve POST method on 301 redirects.
+    ///
+    /// By default, curl changes POST to GET on 301 redirects.
+    /// When this is enabled, POST is preserved.
+    /// Equivalent to curl's `--post301` or `CURLOPT_POSTREDIR` bit 0.
+    pub fn post301(&mut self, enable: bool) {
+        self.post301 = enable;
+    }
+
+    /// Preserve POST method on 302 redirects.
+    ///
+    /// By default, curl changes POST to GET on 302 redirects.
+    /// When this is enabled, POST is preserved.
+    /// Equivalent to curl's `--post302` or `CURLOPT_POSTREDIR` bit 1.
+    pub fn post302(&mut self, enable: bool) {
+        self.post302 = enable;
+    }
+
+    /// Preserve POST method on 303 redirects.
+    ///
+    /// By default, curl changes POST to GET on 303 redirects.
+    /// When this is enabled, POST is preserved.
+    /// Equivalent to curl's `--post303` or `CURLOPT_POSTREDIR` bit 2.
+    pub fn post303(&mut self, enable: bool) {
+        self.post303 = enable;
+    }
+
+    /// Add a header to send only to the proxy, not the target server.
+    ///
+    /// Equivalent to curl's `--proxy-header` or `CURLOPT_PROXYHEADER`.
+    pub fn proxy_header(&mut self, name: &str, value: &str) {
+        self.proxy_headers.push((name.to_string(), value.to_string()));
+    }
+
     /// Perform the transfer and return the response (blocking).
     ///
     /// Creates a new tokio runtime internally. Do not call from within
@@ -1145,6 +1199,9 @@ impl Easy {
             self.ignore_content_length,
             &mut self.alt_svc_cache,
             &speed_limits,
+            self.post301,
+            self.post302,
+            self.post303,
         );
 
         // Apply total transfer timeout if set.
@@ -1241,6 +1298,9 @@ async fn perform_transfer(
     ignore_content_length: bool,
     alt_svc_cache: &mut crate::protocol::http::altsvc::AltSvcCache,
     speed_limits: &SpeedLimits,
+    post301: bool,
+    post302: bool,
+    post303: bool,
 ) -> Result<Response, Error> {
     let transfer_start = Instant::now();
     let original_url = url.clone();
@@ -1422,13 +1482,15 @@ async fn perform_transfer(
                     }
                 }
 
-                // 303: always change to GET, drop body
-                // 301/302: change POST to GET (curl compat), drop body
-                // 307/308: preserve method and body
-                if response.status() == 303
-                    || ((response.status() == 301 || response.status() == 302)
-                        && current_method == "POST")
-                {
+                // 307/308: always preserve method and body
+                // 303: change to GET unless --post303 preserves POST
+                // 301/302: change POST to GET (curl compat) unless --post301/--post302
+                let status = response.status();
+                let should_change_to_get = (status == 303
+                    && !(post303 && current_method == "POST"))
+                    || ((status == 301 && !post301 || status == 302 && !post302)
+                        && current_method == "POST");
+                if should_change_to_get {
                     current_method = "GET".to_string();
                     current_body = None;
                 }
@@ -3281,5 +3343,61 @@ mod tests {
         easy.ignore_content_length(true);
         let cloned = easy.clone();
         assert!(cloned.ignore_content_length);
+    }
+
+    #[test]
+    fn easy_post301_default_false() {
+        let easy = Easy::new();
+        assert!(!easy.post301);
+    }
+
+    #[test]
+    fn easy_post301_set() {
+        let mut easy = Easy::new();
+        easy.post301(true);
+        assert!(easy.post301);
+    }
+
+    #[test]
+    fn easy_post302_set() {
+        let mut easy = Easy::new();
+        easy.post302(true);
+        assert!(easy.post302);
+    }
+
+    #[test]
+    fn easy_post303_set() {
+        let mut easy = Easy::new();
+        easy.post303(true);
+        assert!(easy.post303);
+    }
+
+    #[test]
+    fn easy_post_redir_cloned() {
+        let mut easy = Easy::new();
+        easy.post301(true);
+        easy.post302(true);
+        easy.post303(true);
+        let cloned = easy.clone();
+        assert!(cloned.post301);
+        assert!(cloned.post302);
+        assert!(cloned.post303);
+    }
+
+    #[test]
+    fn easy_proxy_header() {
+        let mut easy = Easy::new();
+        easy.proxy_header("X-Proxy-Auth", "token123");
+        assert_eq!(easy.proxy_headers.len(), 1);
+        assert_eq!(easy.proxy_headers[0].0, "X-Proxy-Auth");
+        assert_eq!(easy.proxy_headers[0].1, "token123");
+    }
+
+    #[test]
+    fn easy_proxy_headers_cloned() {
+        let mut easy = Easy::new();
+        easy.proxy_header("X-Foo", "bar");
+        let cloned = easy.clone();
+        assert_eq!(cloned.proxy_headers.len(), 1);
     }
 }

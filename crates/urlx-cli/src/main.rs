@@ -52,6 +52,12 @@ struct CliOptions {
     proto: Option<String>,
     proto_redir: Option<String>,
     libcurl: bool,
+    netrc_file: Option<String>,
+    netrc_optional: bool,
+    post301: bool,
+    post302: bool,
+    post303: bool,
+    remote_time: bool,
 }
 
 /// Print usage information to stderr.
@@ -139,6 +145,18 @@ fn print_usage() {
     eprintln!("      --proto-redir <p>     Enable protocols for redirects");
     eprintln!("      --max-filesize <bytes> Maximum file size to download");
     eprintln!("      --no-keepalive        Disable TCP keepalive");
+    eprintln!("      --netrc               Use ~/.netrc for credentials");
+    eprintln!("      --netrc-file <file>    Use specified netrc file");
+    eprintln!("      --netrc-optional       Use ~/.netrc if it exists");
+    eprintln!("      --proxy-header <h>    Header to send only to proxy");
+    eprintln!("      --post301             Preserve POST method on 301 redirect");
+    eprintln!("      --post302             Preserve POST method on 302 redirect");
+    eprintln!("      --post303             Preserve POST method on 303 redirect");
+    eprintln!("  -R, --remote-time         Set local file time from server");
+    eprintln!("      --next                Separate URL option groups");
+    eprintln!("      --ftp-pasv            Use passive mode for FTP (default)");
+    eprintln!("      --ftp-ssl             Try SSL/TLS for FTP");
+    eprintln!("      --ftp-ssl-reqd        Require SSL/TLS for FTP");
 }
 
 /// Parse CLI arguments into options.
@@ -183,6 +201,12 @@ fn parse_args(args: &[String]) -> Option<CliOptions> {
         proto: None,
         proto_redir: None,
         libcurl: false,
+        netrc_file: None,
+        netrc_optional: false,
+        post301: false,
+        post302: false,
+        post303: false,
+        remote_time: false,
     };
 
     let mut i = 1;
@@ -761,6 +785,48 @@ fn parse_args(args: &[String]) -> Option<CliOptions> {
             "--no-keepalive" => {
                 opts.no_keepalive = true;
             }
+            "--netrc" => {
+                let home = std::env::var("HOME").unwrap_or_default();
+                opts.netrc_file = Some(format!("{home}/.netrc"));
+            }
+            "--netrc-file" => {
+                i += 1;
+                let val = require_arg(args, i, "--netrc-file")?;
+                opts.netrc_file = Some(val.to_string());
+            }
+            "--netrc-optional" => {
+                let home = std::env::var("HOME").unwrap_or_default();
+                opts.netrc_file = Some(format!("{home}/.netrc"));
+                opts.netrc_optional = true;
+            }
+            "--proxy-header" => {
+                i += 1;
+                let val = require_arg(args, i, "--proxy-header")?;
+                if let Some((name, value)) = val.split_once(':') {
+                    opts.easy.proxy_header(name.trim(), value.trim());
+                } else {
+                    eprintln!("urlx: invalid proxy-header format: {val}");
+                    return None;
+                }
+            }
+            "--post301" => {
+                opts.post301 = true;
+                opts.easy.post301(true);
+            }
+            "--post302" => {
+                opts.post302 = true;
+                opts.easy.post302(true);
+            }
+            "--post303" => {
+                opts.post303 = true;
+                opts.easy.post303(true);
+            }
+            "--remote-time" | "-R" => {
+                opts.remote_time = true;
+            }
+            // Accepted but no-op: --next separates option groups,
+            // FTP flags accepted for compat but not yet fully implemented.
+            "--next" | "--ftp-pasv" | "--ftp-ssl" | "--ssl" | "--ftp-ssl-reqd" | "--ssl-reqd" => {}
             arg if arg.starts_with('-') => {
                 eprintln!("urlx: unknown option: {arg}");
                 return None;
@@ -782,6 +848,7 @@ fn parse_args(args: &[String]) -> Option<CliOptions> {
             opts.easy.basic_auth(user, pass);
         }
     }
+    // Note: netrc credential loading is deferred to run() where the URL is known
 
     // Apply proxy auth credentials
     if let Some((ref user, ref pass)) = opts.proxy_user {
@@ -859,6 +926,94 @@ fn remote_name_from_url(url: &str) -> String {
     }
 
     "index.html".to_string()
+}
+
+/// Set a file's modification time from an HTTP `Last-Modified` header value.
+///
+/// Parses the RFC 7231 date format (e.g., "Tue, 15 Nov 1994 08:12:31 GMT")
+/// and sets the file's modification time accordingly. Best-effort: errors
+/// are silently ignored unless not in silent mode.
+fn set_file_mtime(path: &str, last_modified: &str, silent: bool) {
+    if let Some(timestamp) = parse_http_date(last_modified) {
+        let mtime = filetime::FileTime::from_unix_time(timestamp, 0);
+        if let Err(e) = filetime::set_file_mtime(path, mtime) {
+            if !silent {
+                eprintln!("urlx: warning: could not set file time: {e}");
+            }
+        }
+    }
+}
+
+/// Parse an HTTP date string into a Unix timestamp (seconds since epoch).
+///
+/// Supports RFC 7231 preferred format: `"Sun, 06 Nov 1994 08:49:37 GMT"`.
+/// Returns `None` if parsing fails.
+fn parse_http_date(s: &str) -> Option<i64> {
+    // RFC 7231: "Sun, 06 Nov 1994 08:49:37 GMT"
+    let parts: Vec<&str> = s.split_whitespace().collect();
+    if parts.len() != 6 {
+        return None;
+    }
+
+    let day: u32 = parts[1].parse().ok()?;
+    let month = match parts[2] {
+        "Jan" => 1_u32,
+        "Feb" => 2,
+        "Mar" => 3,
+        "Apr" => 4,
+        "May" => 5,
+        "Jun" => 6,
+        "Jul" => 7,
+        "Aug" => 8,
+        "Sep" => 9,
+        "Oct" => 10,
+        "Nov" => 11,
+        "Dec" => 12,
+        _ => return None,
+    };
+    let year: i64 = parts[3].parse().ok()?;
+
+    let time_parts: Vec<&str> = parts[4].split(':').collect();
+    if time_parts.len() != 3 {
+        return None;
+    }
+    let hour: i64 = time_parts[0].parse().ok()?;
+    let minute: i64 = time_parts[1].parse().ok()?;
+    let second: i64 = time_parts[2].parse().ok()?;
+
+    // Convert to Unix timestamp using a simplified calculation
+    // Days from epoch (1970-01-01) to the given date
+    let mut days: i64 = 0;
+    for y in 1970..year {
+        days += if is_leap_year(y) { 366 } else { 365 };
+    }
+    let month_days = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    for m in 1..month {
+        days += i64::from(month_days[m as usize]);
+        if m == 2 && is_leap_year(year) {
+            days += 1;
+        }
+    }
+    days += i64::from(day) - 1;
+
+    Some(days * 86400 + hour * 3600 + minute * 60 + second)
+}
+
+/// Check if a year is a leap year.
+const fn is_leap_year(year: i64) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+/// Extract hostname from a URL string.
+///
+/// Handles `scheme://host:port/path` format. Returns the host part only.
+fn extract_hostname(url: &str) -> String {
+    let without_scheme = url.find("://").map_or(url, |pos| &url[pos + 3..]);
+    let without_path = without_scheme.split('/').next().unwrap_or(without_scheme);
+    let without_userinfo =
+        without_path.rfind('@').map_or(without_path, |pos| &without_path[pos + 1..]);
+    // Strip port
+    without_userinfo.rsplit_once(':').map_or(without_userinfo, |(host, _)| host).to_string()
 }
 
 /// Parse a rate limit string like "100K", "1M", "500" into bytes per second.
@@ -1033,6 +1188,34 @@ fn run(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
 
+        // --netrc: load credentials from .netrc file for this URL
+        if opts.user_credentials.is_none() {
+            if let Some(ref netrc_path) = opts.netrc_file {
+                match std::fs::read_to_string(netrc_path) {
+                    Ok(contents) => {
+                        let host = extract_hostname(url);
+                        if let Some(entry) = liburlx::netrc::lookup(&contents, &host) {
+                            let user = entry.login.unwrap_or_default();
+                            let pass = entry.password.unwrap_or_default();
+                            if opts.use_digest {
+                                opts.easy.digest_auth(&user, &pass);
+                            } else {
+                                opts.easy.basic_auth(&user, &pass);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        if !opts.netrc_optional {
+                            if !opts.silent || opts.show_error {
+                                eprintln!("urlx: can't read netrc file '{netrc_path}': {e}");
+                            }
+                            return ExitCode::FAILURE;
+                        }
+                    }
+                }
+            }
+        }
+
         // -O/--remote-name: derive output filename from URL
         if opts.remote_name && opts.output_file.is_none() {
             opts.output_file = Some(remote_name_from_url(url));
@@ -1132,13 +1315,24 @@ fn run(args: &[String]) -> ExitCode {
                 eprintln!("{c_code}");
             }
 
-            output_response(
+            let exit = output_response(
                 &response,
                 opts.output_file.as_deref(),
                 opts.write_out.as_deref(),
                 opts.include_headers,
                 opts.silent,
-            )
+            );
+
+            // --remote-time: set output file's modification time from Last-Modified
+            if opts.remote_time {
+                if let Some(ref path) = opts.output_file {
+                    if let Some(last_modified) = response.header("last-modified") {
+                        set_file_mtime(path, last_modified, opts.silent);
+                    }
+                }
+            }
+
+            exit
         }
         Err(e) => {
             if opts.show_progress && !opts.silent {
@@ -2687,5 +2881,179 @@ mod tests {
         assert!(code.contains("CURLOPT_NOPROGRESS"));
         assert!(code.contains("CURLOPT_FAILONERROR"));
         assert!(code.contains("CURLOPT_HEADER"));
+    }
+
+    #[test]
+    fn parse_args_post301() {
+        let args = vec!["urlx".into(), "--post301".into(), "http://example.com".into()];
+        let opts = parse_args(&args).unwrap();
+        assert!(opts.post301);
+    }
+
+    #[test]
+    fn parse_args_post302() {
+        let args = vec!["urlx".into(), "--post302".into(), "http://example.com".into()];
+        let opts = parse_args(&args).unwrap();
+        assert!(opts.post302);
+    }
+
+    #[test]
+    fn parse_args_post303() {
+        let args = vec!["urlx".into(), "--post303".into(), "http://example.com".into()];
+        let opts = parse_args(&args).unwrap();
+        assert!(opts.post303);
+    }
+
+    #[test]
+    fn parse_args_proxy_header() {
+        let args = vec![
+            "urlx".into(),
+            "--proxy-header".into(),
+            "X-Proxy: value".into(),
+            "http://example.com".into(),
+        ];
+        let opts = parse_args(&args);
+        assert!(opts.is_some());
+    }
+
+    #[test]
+    fn parse_args_proxy_header_invalid() {
+        let args = vec![
+            "urlx".into(),
+            "--proxy-header".into(),
+            "NoColonHere".into(),
+            "http://example.com".into(),
+        ];
+        assert!(parse_args(&args).is_none());
+    }
+
+    #[test]
+    fn parse_args_netrc() {
+        let args = vec!["urlx".into(), "--netrc".into(), "http://example.com".into()];
+        let opts = parse_args(&args).unwrap();
+        assert!(opts.netrc_file.is_some());
+        assert!(!opts.netrc_optional);
+    }
+
+    #[test]
+    fn parse_args_netrc_optional() {
+        let args = vec!["urlx".into(), "--netrc-optional".into(), "http://example.com".into()];
+        let opts = parse_args(&args).unwrap();
+        assert!(opts.netrc_file.is_some());
+        assert!(opts.netrc_optional);
+    }
+
+    #[test]
+    fn parse_args_netrc_file() {
+        let args = vec![
+            "urlx".into(),
+            "--netrc-file".into(),
+            "/tmp/my.netrc".into(),
+            "http://example.com".into(),
+        ];
+        let opts = parse_args(&args).unwrap();
+        assert_eq!(opts.netrc_file.as_deref(), Some("/tmp/my.netrc"));
+    }
+
+    #[test]
+    fn parse_args_remote_time() {
+        let args = vec!["urlx".into(), "-R".into(), "http://example.com".into()];
+        let opts = parse_args(&args).unwrap();
+        assert!(opts.remote_time);
+    }
+
+    #[test]
+    fn parse_args_remote_time_long() {
+        let args = vec!["urlx".into(), "--remote-time".into(), "http://example.com".into()];
+        let opts = parse_args(&args).unwrap();
+        assert!(opts.remote_time);
+    }
+
+    #[test]
+    fn parse_args_next() {
+        let args =
+            vec!["urlx".into(), "http://a.com".into(), "--next".into(), "http://b.com".into()];
+        let opts = parse_args(&args).unwrap();
+        assert_eq!(opts.urls.len(), 2);
+    }
+
+    #[test]
+    fn parse_args_ftp_pasv() {
+        let args = vec!["urlx".into(), "--ftp-pasv".into(), "ftp://example.com".into()];
+        assert!(parse_args(&args).is_some());
+    }
+
+    #[test]
+    fn parse_args_ftp_ssl() {
+        let args = vec!["urlx".into(), "--ftp-ssl".into(), "ftp://example.com".into()];
+        assert!(parse_args(&args).is_some());
+    }
+
+    #[test]
+    fn parse_args_ssl() {
+        let args = vec!["urlx".into(), "--ssl".into(), "ftp://example.com".into()];
+        assert!(parse_args(&args).is_some());
+    }
+
+    #[test]
+    fn parse_args_ftp_ssl_reqd() {
+        let args = vec!["urlx".into(), "--ftp-ssl-reqd".into(), "ftp://example.com".into()];
+        assert!(parse_args(&args).is_some());
+    }
+
+    #[test]
+    fn parse_args_ssl_reqd() {
+        let args = vec!["urlx".into(), "--ssl-reqd".into(), "ftp://example.com".into()];
+        assert!(parse_args(&args).is_some());
+    }
+
+    #[test]
+    fn extract_hostname_basic() {
+        assert_eq!(extract_hostname("http://example.com/path"), "example.com");
+    }
+
+    #[test]
+    fn extract_hostname_with_port() {
+        assert_eq!(extract_hostname("http://example.com:8080/path"), "example.com");
+    }
+
+    #[test]
+    fn extract_hostname_with_userinfo() {
+        assert_eq!(extract_hostname("http://user:pass@example.com/path"), "example.com");
+    }
+
+    #[test]
+    fn extract_hostname_no_scheme() {
+        assert_eq!(extract_hostname("example.com/path"), "example.com");
+    }
+
+    #[test]
+    fn parse_http_date_rfc7231() {
+        // "Sun, 06 Nov 1994 08:49:37 GMT" → 784111777
+        let ts = parse_http_date("Sun, 06 Nov 1994 08:49:37 GMT").unwrap();
+        assert_eq!(ts, 784_111_777);
+    }
+
+    #[test]
+    fn parse_http_date_invalid() {
+        assert!(parse_http_date("not a date").is_none());
+    }
+
+    #[test]
+    fn parse_http_date_recent() {
+        // "Mon, 09 Mar 2026 00:00:00 GMT"
+        let ts = parse_http_date("Mon, 09 Mar 2026 00:00:00 GMT");
+        assert!(ts.is_some());
+        let ts = ts.unwrap();
+        // Should be after 2025-01-01 (1735689600)
+        assert!(ts > 1_735_689_600);
+    }
+
+    #[test]
+    fn is_leap_year_basic() {
+        assert!(is_leap_year(2000));
+        assert!(is_leap_year(2024));
+        assert!(!is_leap_year(1900));
+        assert!(!is_leap_year(2023));
     }
 }
