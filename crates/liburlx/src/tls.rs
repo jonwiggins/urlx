@@ -344,10 +344,11 @@ mod rustls_impl {
 
     /// Load CA certificates from a PEM file.
     fn load_ca_certs(path: &std::path::Path) -> Result<rustls::RootCertStore, Error> {
-        let file = std::fs::File::open(path).map_err(|e| Error::Tls(Box::new(e)))?;
-        let mut reader = std::io::BufReader::new(file);
+        use rustls::pki_types::pem::PemObject;
+        use rustls::pki_types::CertificateDer;
 
-        let certs = rustls_pemfile::certs(&mut reader)
+        let certs = CertificateDer::pem_file_iter(path)
+            .map_err(|e| Error::Tls(Box::new(e)))?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| Error::Tls(Box::new(e)))?;
 
@@ -367,10 +368,11 @@ mod rustls_impl {
     fn load_client_certs(
         path: &std::path::Path,
     ) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>, Error> {
-        let file = std::fs::File::open(path).map_err(|e| Error::Tls(Box::new(e)))?;
-        let mut reader = std::io::BufReader::new(file);
+        use rustls::pki_types::pem::PemObject;
+        use rustls::pki_types::CertificateDer;
 
-        let certs = rustls_pemfile::certs(&mut reader)
+        let certs = CertificateDer::pem_file_iter(path)
+            .map_err(|e| Error::Tls(Box::new(e)))?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| Error::Tls(Box::new(e)))?;
 
@@ -385,13 +387,10 @@ mod rustls_impl {
     fn load_client_key(
         path: &std::path::Path,
     ) -> Result<rustls::pki_types::PrivateKeyDer<'static>, Error> {
-        let file = std::fs::File::open(path).map_err(|e| Error::Tls(Box::new(e)))?;
-        let mut reader = std::io::BufReader::new(file);
+        use rustls::pki_types::pem::PemObject;
+        use rustls::pki_types::PrivateKeyDer;
 
-        // Try loading PKCS#8, RSA, or EC keys
-        let key = rustls_pemfile::private_key(&mut reader)
-            .map_err(|e| Error::Tls(Box::new(e)))?
-            .ok_or_else(|| Error::Tls("no valid private key found in file".into()))?;
+        let key = PrivateKeyDer::from_pem_file(path).map_err(|e| Error::Tls(Box::new(e)))?;
 
         Ok(key)
     }
