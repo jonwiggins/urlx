@@ -7,7 +7,7 @@
 
 #![warn(missing_docs)]
 
-use std::ffi::{c_char, c_long, c_void, CStr};
+use std::ffi::{c_char, c_long, c_short, c_void, CStr};
 use std::ptr;
 
 // ───────────────────────── CURLcode ─────────────────────────
@@ -236,6 +236,56 @@ pub enum CURLMcode {
     CURLM_INTERNAL_ERROR = -4,
     CURLM_UNKNOWN_OPTION = -6,
 }
+
+/// `CURLMSG` — message types from `curl_multi_info_read`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(non_camel_case_types, missing_docs)]
+pub enum CURLMSG {
+    CURLMSG_DONE = 1,
+}
+
+/// `CURLMsg` — completion message from `curl_multi_info_read`.
+#[repr(C)]
+#[allow(non_camel_case_types, missing_docs)]
+pub struct CURLMsg {
+    pub msg: CURLMSG,
+    pub easy_handle: *mut c_void,
+    pub result: CURLcode,
+}
+
+/// `CURLMoption` — option codes for `curl_multi_setopt`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(non_camel_case_types, missing_docs)]
+pub enum CURLMoption {
+    CURLMOPT_SOCKETFUNCTION = 20001,
+    CURLMOPT_SOCKETDATA = 10002,
+    CURLMOPT_PIPELINING = 3,
+    CURLMOPT_TIMERFUNCTION = 20004,
+    CURLMOPT_TIMERDATA = 10005,
+    CURLMOPT_MAXCONNECTS = 6,
+    CURLMOPT_MAX_HOST_CONNECTIONS = 7,
+    CURLMOPT_MAX_TOTAL_CONNECTIONS = 13,
+}
+
+/// `curl_waitfd` — extra file descriptor for `curl_multi_wait`/`curl_multi_poll`.
+#[repr(C)]
+#[allow(non_camel_case_types, missing_docs)]
+pub struct curl_waitfd {
+    pub fd: c_long,
+    pub events: c_short,
+    pub revents: c_short,
+}
+
+/// Socket callback type matching libcurl's `CURLMOPT_SOCKETFUNCTION`.
+#[allow(non_camel_case_types)]
+type CurlSocketCallback =
+    unsafe extern "C" fn(*mut c_void, c_long, c_long, *mut c_void, *mut c_void) -> c_long;
+
+/// Timer callback type matching libcurl's `CURLMOPT_TIMERFUNCTION`.
+#[allow(non_camel_case_types)]
+type CurlTimerCallback = unsafe extern "C" fn(*mut c_void, c_long, *mut c_void) -> c_long;
 
 // ───────────────────────── Callback types ─────────────────────────
 
@@ -2408,9 +2458,22 @@ pub extern "C" fn curl_easy_strerror(code: CURLcode) -> *const c_char {
 struct MultiHandle {
     multi: liburlx::Multi,
     easy_handles: Vec<*mut c_void>,
+    /// Stored completion messages for `curl_multi_info_read`.
+    msg_queue: Vec<CURLMsg>,
+    /// Socket callback (accepted but not actively called).
+    socket_callback: Option<CurlSocketCallback>,
+    /// Socket callback user data.
+    socket_data: *mut c_void,
+    /// Timer callback (accepted but not actively called).
+    timer_callback: Option<CurlTimerCallback>,
+    /// Timer callback user data.
+    timer_data: *mut c_void,
 }
 
-// SAFETY: Easy handles are only accessed from the perform thread
+// SAFETY: Easy handles and callback pointers are only accessed from the perform thread.
+// The raw pointers (socket_data, timer_data) are C caller-provided and only dereferenced
+// inside callback invocations, matching libcurl's thread-safety model.
+#[allow(clippy::non_send_fields_in_send_ty)]
 unsafe impl Send for MultiHandle {}
 
 /// `curl_multi_init` — create a new multi handle.
@@ -2420,7 +2483,15 @@ unsafe impl Send for MultiHandle {}
 /// Returns a new handle that must be freed with `curl_multi_cleanup`.
 #[no_mangle]
 pub extern "C" fn curl_multi_init() -> *mut c_void {
-    let handle = Box::new(MultiHandle { multi: liburlx::Multi::new(), easy_handles: Vec::new() });
+    let handle = Box::new(MultiHandle {
+        multi: liburlx::Multi::new(),
+        easy_handles: Vec::new(),
+        msg_queue: Vec::new(),
+        socket_callback: None,
+        socket_data: ptr::null_mut(),
+        timer_callback: None,
+        timer_data: ptr::null_mut(),
+    });
     Box::into_raw(handle).cast::<c_void>()
 }
 
@@ -2510,27 +2581,42 @@ pub unsafe extern "C" fn curl_multi_perform(
     // SAFETY: Caller guarantees multi is from curl_multi_init
     let m = unsafe { &mut *multi.cast::<MultiHandle>() };
 
+    // Snapshot easy handle pointers before perform (which drains internal handles)
+    let easy_ptrs: Vec<*mut c_void> = m.easy_handles.clone();
+
     let result = m.multi.perform_blocking();
 
     match result {
         Ok(results) => {
-            // Store results back into easy handles
+            // Clear any stale messages from a previous perform
+            m.msg_queue.clear();
+
+            // Store results back into easy handles and build msg_queue
             for (i, result) in results.into_iter().enumerate() {
-                if i < m.easy_handles.len() {
+                if i < easy_ptrs.len() {
                     // SAFETY: easy_handles[i] is from curl_easy_init
-                    let eh = unsafe { &mut *m.easy_handles[i].cast::<EasyHandle>() };
-                    match result {
+                    let eh = unsafe { &mut *easy_ptrs[i].cast::<EasyHandle>() };
+                    let curl_result = match result {
                         Ok(response) => {
                             eh.last_response = Some(response);
+                            CURLcode::CURLE_OK
                         }
                         Err(e) => {
+                            let code = error_to_curlcode(&e);
                             let msg = e.to_string();
                             let bytes = msg.as_bytes();
                             let len = bytes.len().min(eh.error_buf.len() - 1);
                             eh.error_buf[..len].copy_from_slice(&bytes[..len]);
                             eh.error_buf[len] = 0;
+                            code
                         }
-                    }
+                    };
+
+                    m.msg_queue.push(CURLMsg {
+                        msg: CURLMSG::CURLMSG_DONE,
+                        easy_handle: easy_ptrs[i],
+                        result: curl_result,
+                    });
                 }
             }
 
@@ -2545,6 +2631,361 @@ pub unsafe extern "C" fn curl_multi_perform(
         }
         Err(_) => CURLMcode::CURLM_INTERNAL_ERROR,
     }
+}
+
+/// `curl_multi_info_read` — read a completion message from the multi handle.
+///
+/// Returns a pointer to a `CURLMsg` struct, or null if no messages remain.
+/// The `msgs_in_queue` output parameter is set to the number of remaining messages.
+///
+/// # Safety
+///
+/// `multi` must be from `curl_multi_init`.
+/// `msgs_in_queue` must be a valid pointer to a `c_long`, or null.
+/// The returned pointer is valid until the next call to `curl_multi_info_read`
+/// or `curl_multi_perform`.
+#[no_mangle]
+pub unsafe extern "C" fn curl_multi_info_read(
+    multi: *mut c_void,
+    msgs_in_queue: *mut c_long,
+) -> *const CURLMsg {
+    if multi.is_null() {
+        if !msgs_in_queue.is_null() {
+            // SAFETY: Caller guarantees msgs_in_queue is valid
+            unsafe {
+                *msgs_in_queue = 0;
+            }
+        }
+        return ptr::null();
+    }
+
+    // SAFETY: Caller guarantees multi is from curl_multi_init
+    let m = unsafe { &mut *multi.cast::<MultiHandle>() };
+
+    if m.msg_queue.is_empty() {
+        if !msgs_in_queue.is_null() {
+            // SAFETY: Caller guarantees pointer is valid
+            unsafe {
+                *msgs_in_queue = 0;
+            }
+        }
+        return ptr::null();
+    }
+
+    // Pop the first message and return a pointer to the last element
+    // We rotate: remove from front, but we need a stable pointer.
+    // Strategy: swap-remove from front, store "current" separately.
+    let msg = m.msg_queue.remove(0);
+
+    // Store remaining count
+    if !msgs_in_queue.is_null() {
+        // SAFETY: Caller guarantees pointer is valid
+        unsafe {
+            #[allow(clippy::cast_possible_wrap)]
+            {
+                *msgs_in_queue = m.msg_queue.len() as c_long;
+            }
+        }
+    }
+
+    // We need to return a pointer that remains valid until next call.
+    // Push to the end and return pointer to last element.
+    m.msg_queue.push(msg);
+    let last_idx = m.msg_queue.len() - 1;
+    &m.msg_queue[last_idx]
+}
+
+/// `curl_multi_setopt` — set options on a multi handle.
+///
+/// # Safety
+///
+/// `multi` must be from `curl_multi_init`.
+/// The interpretation of `value` depends on the option.
+#[no_mangle]
+pub unsafe extern "C" fn curl_multi_setopt(
+    multi: *mut c_void,
+    option: c_long,
+    value: *const c_void,
+) -> CURLMcode {
+    if multi.is_null() {
+        return CURLMcode::CURLM_BAD_HANDLE;
+    }
+
+    // SAFETY: Caller guarantees multi is from curl_multi_init
+    let m = unsafe { &mut *multi.cast::<MultiHandle>() };
+
+    match option {
+        // CURLMOPT_PIPELINING = 3
+        3 => {
+            let val = value as c_long;
+            if val == 0 {
+                m.multi.pipelining(liburlx::PipeliningMode::Nothing);
+            } else {
+                m.multi.pipelining(liburlx::PipeliningMode::Multiplex);
+            }
+            CURLMcode::CURLM_OK
+        }
+        // CURLMOPT_MAXCONNECTS = 6, CURLMOPT_MAX_TOTAL_CONNECTIONS = 13
+        6 | 13 => {
+            let val = value as usize;
+            if val > 0 {
+                m.multi.max_total_connections(val);
+            }
+            CURLMcode::CURLM_OK
+        }
+        // CURLMOPT_MAX_HOST_CONNECTIONS = 7
+        7 => {
+            let val = value as usize;
+            if val > 0 {
+                m.multi.max_host_connections(val);
+            }
+            CURLMcode::CURLM_OK
+        }
+        // CURLMOPT_SOCKETDATA = 10002
+        10002 => {
+            m.socket_data = value.cast_mut();
+            CURLMcode::CURLM_OK
+        }
+        // CURLMOPT_TIMERDATA = 10005
+        10005 => {
+            m.timer_data = value.cast_mut();
+            CURLMcode::CURLM_OK
+        }
+        // CURLMOPT_SOCKETFUNCTION = 20001
+        20001 => {
+            if value.is_null() {
+                m.socket_callback = None;
+            } else {
+                // SAFETY: Caller guarantees value is a valid function pointer
+                m.socket_callback = Some(unsafe {
+                    std::mem::transmute::<*const c_void, CurlSocketCallback>(value)
+                });
+            }
+            CURLMcode::CURLM_OK
+        }
+        // CURLMOPT_TIMERFUNCTION = 20004
+        20004 => {
+            if value.is_null() {
+                m.timer_callback = None;
+            } else {
+                // SAFETY: Caller guarantees value is a valid function pointer
+                m.timer_callback =
+                    Some(unsafe { std::mem::transmute::<*const c_void, CurlTimerCallback>(value) });
+            }
+            CURLMcode::CURLM_OK
+        }
+        _ => CURLMcode::CURLM_UNKNOWN_OPTION,
+    }
+}
+
+/// `curl_multi_timeout` — return the timeout value for the multi handle.
+///
+/// Returns the number of milliseconds until the application should call
+/// `curl_multi_perform` or similar. Returns -1 if no timeout is set.
+///
+/// # Safety
+///
+/// `multi` must be from `curl_multi_init`.
+/// `timeout_ms` must be a valid pointer to a `c_long`.
+#[no_mangle]
+pub unsafe extern "C" fn curl_multi_timeout(
+    multi: *mut c_void,
+    timeout_ms: *mut c_long,
+) -> CURLMcode {
+    if multi.is_null() {
+        return CURLMcode::CURLM_BAD_HANDLE;
+    }
+    if timeout_ms.is_null() {
+        return CURLMcode::CURLM_BAD_HANDLE;
+    }
+
+    // Since tokio owns the event loop, we report -1 (no timeout needed)
+    // when no transfers are running, or 0 (call immediately) when there are
+    // pending messages to read.
+    // SAFETY: Caller guarantees multi is from curl_multi_init
+    let m = unsafe { &*multi.cast::<MultiHandle>() };
+
+    // SAFETY: Caller guarantees timeout_ms is valid
+    unsafe {
+        if m.msg_queue.is_empty() && m.easy_handles.is_empty() {
+            *timeout_ms = -1; // No work to do
+        } else if !m.msg_queue.is_empty() {
+            *timeout_ms = 0; // Messages ready
+        } else {
+            *timeout_ms = 100; // Transfers pending, suggest polling at 100ms
+        }
+    }
+
+    CURLMcode::CURLM_OK
+}
+
+/// `curl_multi_wait` — wait for activity on any of the multi handle's transfers.
+///
+/// Since tokio manages I/O internally, this function simply sleeps for the
+/// specified timeout (or a default of 1000ms if `timeout_ms` is 0).
+///
+/// # Safety
+///
+/// `multi` must be from `curl_multi_init`.
+/// `extra_fds` and `extra_nfds` specify additional file descriptors to wait on (ignored).
+/// `numfds` receives the number of ready file descriptors (always 0 in this implementation).
+#[no_mangle]
+pub unsafe extern "C" fn curl_multi_wait(
+    multi: *mut c_void,
+    _extra_fds: *mut curl_waitfd,
+    _extra_nfds: c_long,
+    timeout_ms: c_long,
+    numfds: *mut c_long,
+) -> CURLMcode {
+    if multi.is_null() {
+        return CURLMcode::CURLM_BAD_HANDLE;
+    }
+
+    // Sleep for the requested timeout. Since tokio handles I/O internally,
+    // we just provide a simple delay for C consumers that expect poll-style behavior.
+    #[allow(clippy::cast_sign_loss)]
+    let ms = if timeout_ms <= 0 { 100 } else { timeout_ms as u64 };
+    std::thread::sleep(std::time::Duration::from_millis(ms));
+
+    if !numfds.is_null() {
+        // SAFETY: Caller guarantees numfds is valid
+        unsafe {
+            *numfds = 0;
+        }
+    }
+
+    CURLMcode::CURLM_OK
+}
+
+/// `curl_multi_poll` — poll for activity on any of the multi handle's transfers.
+///
+/// Equivalent to `curl_multi_wait` but with a guaranteed wakeup mechanism.
+/// Since tokio handles I/O, this has the same behavior as `curl_multi_wait`.
+///
+/// # Safety
+///
+/// Same safety requirements as `curl_multi_wait`.
+#[no_mangle]
+pub unsafe extern "C" fn curl_multi_poll(
+    multi: *mut c_void,
+    fds: *mut curl_waitfd,
+    nfds: c_long,
+    timeout_ms: c_long,
+    numfds: *mut c_long,
+) -> CURLMcode {
+    // SAFETY: Same guarantees apply — delegating to curl_multi_wait
+    unsafe { curl_multi_wait(multi, fds, nfds, timeout_ms, numfds) }
+}
+
+/// `curl_multi_wakeup` — wake up a sleeping `curl_multi_poll`.
+///
+/// Since our poll is a simple sleep, this is a no-op that returns OK.
+///
+/// # Safety
+///
+/// `multi` must be from `curl_multi_init`.
+#[no_mangle]
+pub unsafe extern "C" fn curl_multi_wakeup(multi: *mut c_void) -> CURLMcode {
+    if multi.is_null() {
+        return CURLMcode::CURLM_BAD_HANDLE;
+    }
+    // No-op: tokio manages I/O internally
+    CURLMcode::CURLM_OK
+}
+
+/// `curl_multi_fdset` — extract file descriptors from the multi handle.
+///
+/// Since tokio manages all I/O internally, no file descriptors are exposed.
+/// All output fd values are set to -1.
+///
+/// # Safety
+///
+/// `multi` must be from `curl_multi_init`.
+/// `max_fd` must be a valid pointer to a `c_long`.
+/// `read_fd_set`, `write_fd_set`, and `exc_fd_set` are ignored (accept null).
+#[no_mangle]
+pub unsafe extern "C" fn curl_multi_fdset(
+    multi: *mut c_void,
+    _read_fd_set: *mut c_void,
+    _write_fd_set: *mut c_void,
+    _exc_fd_set: *mut c_void,
+    max_fd: *mut c_long,
+) -> CURLMcode {
+    if multi.is_null() {
+        return CURLMcode::CURLM_BAD_HANDLE;
+    }
+
+    if !max_fd.is_null() {
+        // SAFETY: Caller guarantees max_fd is valid
+        unsafe {
+            *max_fd = -1; // No fds exposed — tokio owns socket polling
+        }
+    }
+
+    CURLMcode::CURLM_OK
+}
+
+/// `curl_multi_socket_action` — socket action interface for event-driven programs.
+///
+/// Since tokio handles all socket I/O internally, this delegates to a blocking
+/// perform when called with `CURL_SOCKET_TIMEOUT` (-1). For specific socket
+/// actions, it is a no-op.
+///
+/// # Safety
+///
+/// `multi` must be from `curl_multi_init`.
+/// `running_handles` must be a valid pointer to a `c_long`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn curl_multi_socket_action(
+    multi: *mut c_void,
+    sockfd: c_long,
+    _ev_bitmask: c_long,
+    running_handles: *mut c_long,
+) -> CURLMcode {
+    if multi.is_null() {
+        return CURLMcode::CURLM_BAD_HANDLE;
+    }
+
+    // CURL_SOCKET_TIMEOUT = -1 means "timeout expired, check for work"
+    if sockfd == -1 {
+        // Delegate to perform
+        // SAFETY: Same guarantees apply
+        return unsafe { curl_multi_perform(multi, running_handles) };
+    }
+
+    // For specific socket events, report current state
+    if !running_handles.is_null() {
+        // SAFETY: Caller guarantees multi is from curl_multi_init
+        let m = unsafe { &*multi.cast::<MultiHandle>() };
+        // SAFETY: Caller guarantees running_handles is valid
+        unsafe {
+            #[allow(clippy::cast_possible_wrap)]
+            {
+                *running_handles = m.easy_handles.len() as c_long;
+            }
+        }
+    }
+
+    CURLMcode::CURLM_OK
+}
+
+/// `curl_multi_strerror` — return a human-readable multi error message.
+///
+/// # Safety
+///
+/// The returned pointer is valid for the lifetime of the program.
+#[no_mangle]
+#[allow(clippy::missing_const_for_fn)]
+pub extern "C" fn curl_multi_strerror(code: CURLMcode) -> *const c_char {
+    let msg = match code {
+        CURLMcode::CURLM_OK => c"No error",
+        CURLMcode::CURLM_BAD_HANDLE => c"Invalid multi handle",
+        CURLMcode::CURLM_BAD_EASY_HANDLE => c"Invalid easy handle",
+        CURLMcode::CURLM_OUT_OF_MEMORY => c"Out of memory",
+        CURLMcode::CURLM_INTERNAL_ERROR => c"Internal error",
+        CURLMcode::CURLM_UNKNOWN_OPTION => c"Unknown option",
+    };
+    msg.as_ptr()
 }
 
 // ───────────────────────── Version ─────────────────────────
@@ -4113,5 +4554,321 @@ mod tests {
         let code = unsafe { curl_easy_setopt(handle, 164, 10_usize as *const c_void) };
         assert_eq!(code, CURLcode::CURLE_OK);
         unsafe { curl_easy_cleanup(handle) };
+    }
+
+    // ─── Phase 27: Multi API Event Loop Integration ───
+
+    #[test]
+    fn multi_info_read_empty() {
+        let multi = curl_multi_init();
+        let mut msgs_in_queue: c_long = 99;
+        let msg = unsafe { curl_multi_info_read(multi, &mut msgs_in_queue) };
+        assert!(msg.is_null());
+        assert_eq!(msgs_in_queue, 0);
+        let _ = unsafe { curl_multi_cleanup(multi) };
+    }
+
+    #[test]
+    fn multi_info_read_null_handle() {
+        let mut msgs_in_queue: c_long = 99;
+        let msg = unsafe { curl_multi_info_read(ptr::null_mut(), &mut msgs_in_queue) };
+        assert!(msg.is_null());
+        assert_eq!(msgs_in_queue, 0);
+    }
+
+    #[test]
+    fn multi_setopt_pipelining() {
+        let multi = curl_multi_init();
+        // CURLMOPT_PIPELINING = 3, value 2 = multiplex
+        let code = unsafe { curl_multi_setopt(multi, 3, 2 as *const c_void) };
+        assert_eq!(code, CURLMcode::CURLM_OK);
+        // Verify via internal state
+        let m = unsafe { &*multi.cast::<MultiHandle>() };
+        assert_eq!(m.multi.pipelining_mode(), liburlx::PipeliningMode::Multiplex);
+
+        // Set back to 0 (nothing)
+        let code = unsafe { curl_multi_setopt(multi, 3, ptr::null()) };
+        assert_eq!(code, CURLMcode::CURLM_OK);
+        let m = unsafe { &*multi.cast::<MultiHandle>() };
+        assert_eq!(m.multi.pipelining_mode(), liburlx::PipeliningMode::Nothing);
+
+        let _ = unsafe { curl_multi_cleanup(multi) };
+    }
+
+    #[test]
+    fn multi_setopt_max_total_connections() {
+        let multi = curl_multi_init();
+        // CURLMOPT_MAX_TOTAL_CONNECTIONS = 13
+        let code = unsafe { curl_multi_setopt(multi, 13, 4 as *const c_void) };
+        assert_eq!(code, CURLMcode::CURLM_OK);
+        let _ = unsafe { curl_multi_cleanup(multi) };
+    }
+
+    #[test]
+    fn multi_setopt_max_host_connections() {
+        let multi = curl_multi_init();
+        // CURLMOPT_MAX_HOST_CONNECTIONS = 7
+        let code = unsafe { curl_multi_setopt(multi, 7, 2 as *const c_void) };
+        assert_eq!(code, CURLMcode::CURLM_OK);
+        let _ = unsafe { curl_multi_cleanup(multi) };
+    }
+
+    #[test]
+    fn multi_setopt_maxconnects() {
+        let multi = curl_multi_init();
+        // CURLMOPT_MAXCONNECTS = 6
+        let code = unsafe { curl_multi_setopt(multi, 6, 10 as *const c_void) };
+        assert_eq!(code, CURLMcode::CURLM_OK);
+        let _ = unsafe { curl_multi_cleanup(multi) };
+    }
+
+    #[test]
+    fn multi_setopt_unknown_option() {
+        let multi = curl_multi_init();
+        let code = unsafe { curl_multi_setopt(multi, 99999, ptr::null()) };
+        assert_eq!(code, CURLMcode::CURLM_UNKNOWN_OPTION);
+        let _ = unsafe { curl_multi_cleanup(multi) };
+    }
+
+    #[test]
+    fn multi_setopt_null_handle() {
+        let code = unsafe { curl_multi_setopt(ptr::null_mut(), 3, ptr::null()) };
+        assert_eq!(code, CURLMcode::CURLM_BAD_HANDLE);
+    }
+
+    #[test]
+    fn multi_setopt_socket_data() {
+        let multi = curl_multi_init();
+        let mut data: usize = 42;
+        // CURLMOPT_SOCKETDATA = 10002
+        let code =
+            unsafe { curl_multi_setopt(multi, 10002, ptr::from_mut(&mut data).cast::<c_void>()) };
+        assert_eq!(code, CURLMcode::CURLM_OK);
+        let m = unsafe { &*multi.cast::<MultiHandle>() };
+        assert_eq!(m.socket_data, ptr::from_mut(&mut data).cast::<c_void>());
+        let _ = unsafe { curl_multi_cleanup(multi) };
+    }
+
+    #[test]
+    fn multi_setopt_timer_data() {
+        let multi = curl_multi_init();
+        let mut data: usize = 99;
+        // CURLMOPT_TIMERDATA = 10005
+        let code =
+            unsafe { curl_multi_setopt(multi, 10005, ptr::from_mut(&mut data).cast::<c_void>()) };
+        assert_eq!(code, CURLMcode::CURLM_OK);
+        let m = unsafe { &*multi.cast::<MultiHandle>() };
+        assert_eq!(m.timer_data, ptr::from_mut(&mut data).cast::<c_void>());
+        let _ = unsafe { curl_multi_cleanup(multi) };
+    }
+
+    unsafe extern "C" fn test_socket_cb(
+        _easy: *mut c_void,
+        _s: c_long,
+        _what: c_long,
+        _userp: *mut c_void,
+        _socketp: *mut c_void,
+    ) -> c_long {
+        0
+    }
+
+    unsafe extern "C" fn test_timer_cb(
+        _multi: *mut c_void,
+        _timeout_ms: c_long,
+        _userp: *mut c_void,
+    ) -> c_long {
+        0
+    }
+
+    #[test]
+    fn multi_setopt_socket_function() {
+        let multi = curl_multi_init();
+        // CURLMOPT_SOCKETFUNCTION = 20001
+        let code = unsafe { curl_multi_setopt(multi, 20001, test_socket_cb as *const c_void) };
+        assert_eq!(code, CURLMcode::CURLM_OK);
+        let m = unsafe { &*multi.cast::<MultiHandle>() };
+        assert!(m.socket_callback.is_some());
+
+        // Clear callback
+        let code = unsafe { curl_multi_setopt(multi, 20001, ptr::null()) };
+        assert_eq!(code, CURLMcode::CURLM_OK);
+        let m = unsafe { &*multi.cast::<MultiHandle>() };
+        assert!(m.socket_callback.is_none());
+
+        let _ = unsafe { curl_multi_cleanup(multi) };
+    }
+
+    #[test]
+    fn multi_setopt_timer_function() {
+        let multi = curl_multi_init();
+        // CURLMOPT_TIMERFUNCTION = 20004
+        let code = unsafe { curl_multi_setopt(multi, 20004, test_timer_cb as *const c_void) };
+        assert_eq!(code, CURLMcode::CURLM_OK);
+        let m = unsafe { &*multi.cast::<MultiHandle>() };
+        assert!(m.timer_callback.is_some());
+
+        // Clear callback
+        let code = unsafe { curl_multi_setopt(multi, 20004, ptr::null()) };
+        assert_eq!(code, CURLMcode::CURLM_OK);
+        let m = unsafe { &*multi.cast::<MultiHandle>() };
+        assert!(m.timer_callback.is_none());
+
+        let _ = unsafe { curl_multi_cleanup(multi) };
+    }
+
+    #[test]
+    fn multi_timeout_no_work() {
+        let multi = curl_multi_init();
+        let mut timeout_ms: c_long = 99;
+        let code = unsafe { curl_multi_timeout(multi, &mut timeout_ms) };
+        assert_eq!(code, CURLMcode::CURLM_OK);
+        assert_eq!(timeout_ms, -1); // No work
+        let _ = unsafe { curl_multi_cleanup(multi) };
+    }
+
+    #[test]
+    fn multi_timeout_null_handle() {
+        let mut timeout_ms: c_long = 0;
+        let code = unsafe { curl_multi_timeout(ptr::null_mut(), &mut timeout_ms) };
+        assert_eq!(code, CURLMcode::CURLM_BAD_HANDLE);
+    }
+
+    #[test]
+    fn multi_timeout_null_output() {
+        let multi = curl_multi_init();
+        let code = unsafe { curl_multi_timeout(multi, ptr::null_mut()) };
+        assert_eq!(code, CURLMcode::CURLM_BAD_HANDLE);
+        let _ = unsafe { curl_multi_cleanup(multi) };
+    }
+
+    #[test]
+    fn multi_timeout_with_handles() {
+        let multi = curl_multi_init();
+        let easy = curl_easy_init();
+        let url = c"http://127.0.0.1:1";
+        let _ = unsafe { curl_easy_setopt(easy, 10002, url.as_ptr().cast::<c_void>()) };
+        let _ = unsafe { curl_multi_add_handle(multi, easy) };
+
+        let mut timeout_ms: c_long = 0;
+        let code = unsafe { curl_multi_timeout(multi, &mut timeout_ms) };
+        assert_eq!(code, CURLMcode::CURLM_OK);
+        assert_eq!(timeout_ms, 100); // Transfers pending
+
+        let _ = unsafe { curl_multi_remove_handle(multi, easy) };
+        unsafe { curl_easy_cleanup(easy) };
+        let _ = unsafe { curl_multi_cleanup(multi) };
+    }
+
+    #[test]
+    fn multi_wakeup() {
+        let multi = curl_multi_init();
+        let code = unsafe { curl_multi_wakeup(multi) };
+        assert_eq!(code, CURLMcode::CURLM_OK);
+        let _ = unsafe { curl_multi_cleanup(multi) };
+    }
+
+    #[test]
+    fn multi_wakeup_null() {
+        let code = unsafe { curl_multi_wakeup(ptr::null_mut()) };
+        assert_eq!(code, CURLMcode::CURLM_BAD_HANDLE);
+    }
+
+    #[test]
+    fn multi_fdset_empty() {
+        let multi = curl_multi_init();
+        let mut max_fd: c_long = 99;
+        let code = unsafe {
+            curl_multi_fdset(multi, ptr::null_mut(), ptr::null_mut(), ptr::null_mut(), &mut max_fd)
+        };
+        assert_eq!(code, CURLMcode::CURLM_OK);
+        assert_eq!(max_fd, -1); // No fds exposed
+        let _ = unsafe { curl_multi_cleanup(multi) };
+    }
+
+    #[test]
+    fn multi_fdset_null_handle() {
+        let mut max_fd: c_long = 0;
+        let code = unsafe {
+            curl_multi_fdset(
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                &mut max_fd,
+            )
+        };
+        assert_eq!(code, CURLMcode::CURLM_BAD_HANDLE);
+    }
+
+    #[test]
+    fn multi_fdset_null_maxfd() {
+        let multi = curl_multi_init();
+        let code = unsafe {
+            curl_multi_fdset(
+                multi,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+            )
+        };
+        assert_eq!(code, CURLMcode::CURLM_OK);
+        let _ = unsafe { curl_multi_cleanup(multi) };
+    }
+
+    #[test]
+    fn multi_socket_action_null_handle() {
+        let mut running: c_long = 0;
+        let code = unsafe { curl_multi_socket_action(ptr::null_mut(), 0, 0, &mut running) };
+        assert_eq!(code, CURLMcode::CURLM_BAD_HANDLE);
+    }
+
+    #[test]
+    fn multi_socket_action_specific_socket() {
+        let multi = curl_multi_init();
+        let mut running: c_long = 99;
+        // Socket 5 with no action — should report 0 running handles
+        let code = unsafe { curl_multi_socket_action(multi, 5, 0, &mut running) };
+        assert_eq!(code, CURLMcode::CURLM_OK);
+        assert_eq!(running, 0);
+        let _ = unsafe { curl_multi_cleanup(multi) };
+    }
+
+    #[test]
+    fn multi_strerror_ok() {
+        let msg = curl_multi_strerror(CURLMcode::CURLM_OK);
+        assert!(!msg.is_null());
+        let s = unsafe { CStr::from_ptr(msg) };
+        assert_eq!(s.to_str().unwrap(), "No error");
+    }
+
+    #[test]
+    fn multi_strerror_all_codes() {
+        let codes = [
+            CURLMcode::CURLM_OK,
+            CURLMcode::CURLM_BAD_HANDLE,
+            CURLMcode::CURLM_BAD_EASY_HANDLE,
+            CURLMcode::CURLM_OUT_OF_MEMORY,
+            CURLMcode::CURLM_INTERNAL_ERROR,
+            CURLMcode::CURLM_UNKNOWN_OPTION,
+        ];
+        for code in codes {
+            let msg = curl_multi_strerror(code);
+            assert!(!msg.is_null(), "multi_strerror returned null for {code:?}");
+        }
+    }
+
+    #[test]
+    fn multi_wait_null_handle() {
+        let mut numfds: c_long = 0;
+        let code = unsafe { curl_multi_wait(ptr::null_mut(), ptr::null_mut(), 0, 0, &mut numfds) };
+        assert_eq!(code, CURLMcode::CURLM_BAD_HANDLE);
+    }
+
+    #[test]
+    fn multi_poll_null_handle() {
+        let mut numfds: c_long = 0;
+        let code = unsafe { curl_multi_poll(ptr::null_mut(), ptr::null_mut(), 0, 0, &mut numfds) };
+        assert_eq!(code, CURLMcode::CURLM_BAD_HANDLE);
     }
 }
