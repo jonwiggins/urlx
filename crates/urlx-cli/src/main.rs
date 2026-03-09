@@ -69,6 +69,7 @@ fn print_usage() {
     eprintln!("      --key <file>          Client private key (PEM format)");
     eprintln!("      --digest              Use HTTP Digest authentication");
     eprintln!("      --proxy-user <u:p>    Proxy authentication (user:password)");
+    eprintln!("      --unix-socket <path>  Connect via Unix domain socket");
 }
 
 /// Parse CLI arguments into options.
@@ -327,6 +328,11 @@ fn parse_args(args: &[String]) -> Option<CliOptions> {
                 let val = require_arg(args, i, "--aws-sigv4")?;
                 opts.easy.aws_sigv4(val);
                 opts.use_aws_sigv4 = true;
+            }
+            "--unix-socket" => {
+                i += 1;
+                let val = require_arg(args, i, "--unix-socket")?;
+                opts.easy.unix_socket(val);
             }
             arg if arg.starts_with('-') => {
                 eprintln!("urlx: unknown option: {arg}");

@@ -48,6 +48,7 @@ pub struct Easy {
     aws_credentials: Option<(String, String)>,
     tcp_nodelay: bool,
     tcp_keepalive: Option<Duration>,
+    unix_socket: Option<String>,
     pool: ConnectionPool,
 }
 
@@ -79,6 +80,7 @@ impl std::fmt::Debug for Easy {
             .field("aws_credentials", &self.aws_credentials.as_ref().map(|_| "<credentials>"))
             .field("tcp_nodelay", &self.tcp_nodelay)
             .field("tcp_keepalive", &self.tcp_keepalive)
+            .field("unix_socket", &self.unix_socket)
             .field("pool", &"<ConnectionPool>")
             .finish()
     }
@@ -112,6 +114,7 @@ impl Clone for Easy {
             aws_credentials: self.aws_credentials.clone(),
             tcp_nodelay: self.tcp_nodelay,
             tcp_keepalive: self.tcp_keepalive,
+            unix_socket: self.unix_socket.clone(),
             pool: ConnectionPool::new(),
         }
     }
@@ -147,6 +150,7 @@ impl Easy {
             aws_credentials: None,
             tcp_nodelay: true,
             tcp_keepalive: None,
+            unix_socket: None,
             pool: ConnectionPool::new(),
         }
     }
@@ -480,6 +484,16 @@ impl Easy {
         self.tcp_keepalive = Some(idle);
     }
 
+    /// Connect via a Unix domain socket instead of TCP.
+    ///
+    /// When set, all connections go through the specified Unix socket path.
+    /// The hostname from the URL is used for the `Host` header and TLS SNI,
+    /// but the actual connection is made to the socket.
+    /// Equivalent to curl's `--unix-socket` or `CURLOPT_UNIX_SOCKET_PATH`.
+    pub fn unix_socket(&mut self, path: &str) {
+        self.unix_socket = Some(path.to_string());
+    }
+
     /// Perform the transfer and return the response (blocking).
     ///
     /// Creates a new tokio runtime internally. Do not call from within
@@ -599,6 +613,7 @@ impl Easy {
             &self.tls_config,
             self.tcp_nodelay,
             self.tcp_keepalive,
+            self.unix_socket.as_deref(),
             &mut self.pool,
         );
 
@@ -662,6 +677,7 @@ async fn perform_transfer(
     tls_config: &TlsConfig,
     tcp_nodelay: bool,
     tcp_keepalive: Option<Duration>,
+    unix_socket: Option<&str>,
     pool: &mut ConnectionPool,
 ) -> Result<Response, Error> {
     let transfer_start = Instant::now();
@@ -701,6 +717,7 @@ async fn perform_transfer(
             tls_config,
             tcp_nodelay,
             tcp_keepalive,
+            unix_socket,
             pool,
         )
         .await?;
@@ -749,6 +766,7 @@ async fn perform_transfer(
                                 tls_config,
                                 tcp_nodelay,
                                 tcp_keepalive,
+                                unix_socket,
                                 pool,
                             )
                             .await?;
@@ -851,6 +869,7 @@ async fn do_single_request(
     tls_config: &TlsConfig,
     tcp_nodelay: bool,
     tcp_keepalive: Option<Duration>,
+    unix_socket: Option<&str>,
     pool: &mut ConnectionPool,
 ) -> Result<Response, Error> {
     // Handle non-HTTP schemes directly
@@ -938,8 +957,61 @@ async fn do_single_request(
         .find(|(h, _)| h == &connect_host.to_lowercase())
         .map_or_else(|| connect_host.clone(), |(_, addr)| addr.clone());
 
-    // Connect via TCP (with optional connect timeout)
+    // Connect via Unix socket or TCP
     let request_start = Instant::now();
+
+    // Unix domain socket path — bypasses DNS, TCP, proxy, SOCKS, and TLS
+    #[cfg(unix)]
+    if let Some(socket_path) = unix_socket {
+        if verbose {
+            #[allow(clippy::print_stderr)]
+            {
+                eprintln!("* Connecting via Unix socket: {socket_path}");
+            }
+        }
+        let uds_fut = tokio::net::UnixStream::connect(socket_path);
+        let uds_stream = if let Some(timeout_dur) = connect_timeout {
+            tokio::time::timeout(timeout_dur, uds_fut)
+                .await
+                .map_err(|_| Error::Timeout(timeout_dur))?
+                .map_err(Error::Connect)?
+        } else {
+            uds_fut.await.map_err(Error::Connect)?
+        };
+        let time_connect = request_start.elapsed();
+        let time_namelookup = time_connect;
+        let time_pretransfer = request_start.elapsed();
+
+        let request_target = url.request_target();
+        let mut stream = PooledStream::Unix(uds_stream);
+        let (resp, _can_reuse) = crate::protocol::http::h1::request(
+            &mut stream,
+            method,
+            &host_header,
+            &request_target,
+            &effective_headers,
+            body,
+            url.as_str(),
+            false, // Don't pool Unix socket connections
+        )
+        .await?;
+        let time_starttransfer = request_start.elapsed();
+
+        let mut resp = maybe_decompress(resp, accept_encoding)?;
+        let mut info = resp.transfer_info().clone();
+        info.time_namelookup = time_namelookup;
+        info.time_connect = time_connect;
+        info.time_pretransfer = time_pretransfer;
+        info.time_starttransfer = time_starttransfer;
+        resp.set_transfer_info(info);
+        return Ok(resp);
+    }
+
+    #[cfg(not(unix))]
+    if unix_socket.is_some() {
+        return Err(Error::Http("Unix sockets are not supported on this platform".to_string()));
+    }
+
     let addr = format!("{resolved_host}:{connect_port}");
     let connect_fut = tokio::net::TcpStream::connect(&addr);
     let tcp_stream = if let Some(timeout_dur) = connect_timeout {
@@ -1591,5 +1663,18 @@ mod tests {
         let mut easy = Easy::new();
         easy.tcp_keepalive(Duration::from_secs(60));
         assert_eq!(easy.tcp_keepalive, Some(Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn easy_unix_socket_default_none() {
+        let easy = Easy::new();
+        assert!(easy.unix_socket.is_none());
+    }
+
+    #[test]
+    fn easy_unix_socket_set() {
+        let mut easy = Easy::new();
+        easy.unix_socket("/var/run/docker.sock");
+        assert_eq!(easy.unix_socket, Some("/var/run/docker.sock".to_string()));
     }
 }

@@ -13,8 +13,8 @@ use tokio::net::TcpStream;
 
 /// A connection that can be stored in the pool.
 ///
-/// Wraps either a plain TCP stream or a TLS stream, implementing
-/// [`AsyncRead`] and [`AsyncWrite`] so it can be used generically.
+/// Wraps either a plain TCP stream, a TLS stream, or a Unix stream,
+/// implementing [`AsyncRead`] and [`AsyncWrite`] so it can be used generically.
 #[allow(clippy::large_enum_variant)]
 pub enum PooledStream {
     /// Plain TCP connection (HTTP).
@@ -22,6 +22,9 @@ pub enum PooledStream {
     /// TLS-wrapped connection (HTTPS).
     #[cfg(feature = "rustls")]
     Tls(tokio_rustls::client::TlsStream<TcpStream>),
+    /// Unix domain socket connection.
+    #[cfg(unix)]
+    Unix(tokio::net::UnixStream),
 }
 
 impl AsyncRead for PooledStream {
@@ -34,6 +37,8 @@ impl AsyncRead for PooledStream {
             Self::Tcp(s) => Pin::new(s).poll_read(cx, buf),
             #[cfg(feature = "rustls")]
             Self::Tls(s) => Pin::new(s).poll_read(cx, buf),
+            #[cfg(unix)]
+            Self::Unix(s) => Pin::new(s).poll_read(cx, buf),
         }
     }
 }
@@ -48,6 +53,8 @@ impl AsyncWrite for PooledStream {
             Self::Tcp(s) => Pin::new(s).poll_write(cx, buf),
             #[cfg(feature = "rustls")]
             Self::Tls(s) => Pin::new(s).poll_write(cx, buf),
+            #[cfg(unix)]
+            Self::Unix(s) => Pin::new(s).poll_write(cx, buf),
         }
     }
 
@@ -56,6 +63,8 @@ impl AsyncWrite for PooledStream {
             Self::Tcp(s) => Pin::new(s).poll_flush(cx),
             #[cfg(feature = "rustls")]
             Self::Tls(s) => Pin::new(s).poll_flush(cx),
+            #[cfg(unix)]
+            Self::Unix(s) => Pin::new(s).poll_flush(cx),
         }
     }
 
@@ -64,6 +73,8 @@ impl AsyncWrite for PooledStream {
             Self::Tcp(s) => Pin::new(s).poll_shutdown(cx),
             #[cfg(feature = "rustls")]
             Self::Tls(s) => Pin::new(s).poll_shutdown(cx),
+            #[cfg(unix)]
+            Self::Unix(s) => Pin::new(s).poll_shutdown(cx),
         }
     }
 }
