@@ -299,6 +299,7 @@ impl CookieJar {
         let mut expires: Option<SystemTime> = None;
         let mut secure = false;
         let mut http_only = false;
+        let mut has_explicit_domain = false;
 
         // Parse attributes
         if parts.len() > 1 {
@@ -313,6 +314,7 @@ impl CookieJar {
                             // Strip leading dot (RFC 6265 §5.2.3)
                             domain =
                                 attr_value.strip_prefix('.').unwrap_or(attr_value).to_lowercase();
+                            has_explicit_domain = true;
                         }
                     } else if attr_name.eq_ignore_ascii_case("path") {
                         if !attr_value.is_empty() {
@@ -337,6 +339,13 @@ impl CookieJar {
             }
         }
 
+        // Reject cookies with explicit Domain attribute set to a public suffix
+        // (e.g., "com", "co.uk", "github.io") to prevent super-domain cookie attacks.
+        // Host-only cookies (no Domain attr) are always allowed.
+        if has_explicit_domain && is_public_suffix(&domain) {
+            return;
+        }
+
         // Replace existing cookie with same name+domain+path
         self.cookies.retain(|c| !(c.name == name && c.domain == domain && c.path == path));
 
@@ -353,6 +362,22 @@ impl CookieJar {
             self.domain_index.entry(cookie.domain.clone()).or_default().push(idx);
         }
     }
+}
+
+/// Check if a domain is a public suffix (e.g., "com", "co.uk", "github.io").
+///
+/// Uses the embedded public suffix list to prevent cookies from being set
+/// for top-level domains, which would be a security issue (super-domain
+/// cookie attack).
+fn is_public_suffix(domain: &str) -> bool {
+    use psl::Psl;
+    let domain_bytes = domain.as_bytes();
+    // psl::List.suffix() returns the public suffix portion of the domain.
+    // If the suffix IS the entire domain, then the domain is a public suffix.
+    let Some(suffix) = psl::List.suffix(domain_bytes) else {
+        return false;
+    };
+    suffix.as_bytes().eq_ignore_ascii_case(domain_bytes)
 }
 
 /// Check if a request host matches a cookie domain.
@@ -756,6 +781,95 @@ mod tests {
         assert_eq!(jar.len(), 1);
         assert_eq!(jar.domain_index["example.com"].len(), 1);
         assert_eq!(jar.cookie_header("example.com", "/", false), Some("k=new".to_string()));
+    }
+
+    // --- Public Suffix List tests ---
+
+    #[test]
+    fn psl_rejects_cookie_for_tld() {
+        // Setting a cookie for ".com" should be rejected
+        let mut jar = CookieJar::new();
+        jar.parse_set_cookie("name=value; Domain=com", "example.com", "/");
+        assert!(jar.is_empty(), "cookie for TLD 'com' should be rejected");
+    }
+
+    #[test]
+    fn psl_rejects_cookie_for_co_uk() {
+        // ".co.uk" is a public suffix
+        let mut jar = CookieJar::new();
+        jar.parse_set_cookie("name=value; Domain=co.uk", "example.co.uk", "/");
+        assert!(jar.is_empty(), "cookie for public suffix 'co.uk' should be rejected");
+    }
+
+    #[test]
+    fn psl_allows_cookie_for_etld_plus_one() {
+        // "example.com" is eTLD+1, should be allowed
+        let mut jar = CookieJar::new();
+        jar.parse_set_cookie("name=value; Domain=example.com", "www.example.com", "/");
+        assert_eq!(jar.len(), 1, "cookie for eTLD+1 should be allowed");
+    }
+
+    #[test]
+    fn psl_allows_cookie_for_subdomain() {
+        let mut jar = CookieJar::new();
+        jar.parse_set_cookie("name=value; Domain=sub.example.com", "sub.example.com", "/");
+        assert_eq!(jar.len(), 1);
+    }
+
+    #[test]
+    fn psl_rejects_cookie_for_github_io() {
+        // "github.io" is a public suffix (wildcard rule)
+        let mut jar = CookieJar::new();
+        jar.parse_set_cookie("name=value; Domain=github.io", "foo.github.io", "/");
+        assert!(jar.is_empty(), "cookie for public suffix 'github.io' should be rejected");
+    }
+
+    #[test]
+    fn psl_allows_cookie_for_specific_github_io() {
+        // "foo.github.io" is eTLD+1 under the wildcard rule
+        let mut jar = CookieJar::new();
+        jar.parse_set_cookie("name=value; Domain=foo.github.io", "foo.github.io", "/");
+        assert_eq!(jar.len(), 1, "cookie for eTLD+1 under wildcard should be allowed");
+    }
+
+    #[test]
+    fn psl_allows_cookie_without_domain_attr() {
+        // Host-only cookies (no Domain attr) are always allowed
+        let mut jar = CookieJar::new();
+        jar.parse_set_cookie("name=value", "example.com", "/");
+        assert_eq!(jar.len(), 1, "host-only cookie should always be allowed");
+    }
+
+    #[test]
+    fn psl_rejects_cookie_for_org() {
+        let mut jar = CookieJar::new();
+        jar.parse_set_cookie("name=value; Domain=org", "example.org", "/");
+        assert!(jar.is_empty());
+    }
+
+    #[test]
+    fn psl_rejects_cookie_for_tokyo_jp() {
+        // "tokyo.jp" is a public suffix
+        let mut jar = CookieJar::new();
+        jar.parse_set_cookie("name=value; Domain=tokyo.jp", "example.tokyo.jp", "/");
+        assert!(jar.is_empty());
+    }
+
+    #[test]
+    fn psl_allows_cookie_for_etld1_tokyo_jp() {
+        let mut jar = CookieJar::new();
+        jar.parse_set_cookie("name=value; Domain=example.tokyo.jp", "example.tokyo.jp", "/");
+        assert_eq!(jar.len(), 1);
+    }
+
+    #[test]
+    fn is_public_suffix_basic() {
+        assert!(is_public_suffix("com"));
+        assert!(is_public_suffix("org"));
+        assert!(is_public_suffix("net"));
+        assert!(is_public_suffix("co.uk"));
+        assert!(!is_public_suffix("example.com"));
+        assert!(!is_public_suffix("www.example.com"));
     }
 
     #[test]
