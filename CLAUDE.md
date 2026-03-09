@@ -14,12 +14,12 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 38 — Planning
-**Last completed:** Phase 37 (Platform & Build) — 2026-03-09
-**Total tests:** 2,069
-**In progress:** Planning Phase 38
+**Phase:** 39 — Planning
+**Last completed:** Phase 38 (CLI Expansion IV) — 2026-03-09
+**Total tests:** 2,090
+**In progress:** Planning Phase 39
 **Blockers:** None
-**Next up:** Phase 38 — CLI Expansion IV
+**Next up:** Phase 39 — Differential Testing
 
 ### Completeness Summary (updated Phase 30 review)
 
@@ -37,7 +37,7 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 | SSH/SFTP/SCP | 60% | SFTP download/upload/list, SCP download/upload, password + pubkey auth; no known_hosts |
 | Multi API | 75% | Connection limiting, message queue, share, pipelining, wait/poll/wakeup/fdset/socket_action/timeout/info_read |
 | FFI (libcurl C ABI) | ~55% | 102 options, 32 info codes, 25 error codes, 50 functions |
-| CLI | ~40% | ~100 of ~250 flags |
+| CLI | ~44% | ~112 of ~250 flags |
 | Connection | 80% | Pool, TCP_NODELAY, keepalive, Unix sockets, interface/port binding |
 | Transfer control | 80% | Rate limiting enforced in transfer engine (max recv/send speed, low speed timeout) |
 | Performance | — | Hot-path string allocation optimizations, criterion benchmarks |
@@ -294,22 +294,23 @@ Built from scratch over 29 phases. All features below are implemented and tested
 - Utility: URL percent-encoding/decoding (RFC 3986), HTTP date parsing (RFC 2822/850/asctime), curl_formadd stub (returns DISABLED).
 - Memory: Box<[u8]>-based slist string allocation (exact-size, no capacity mismatch). catch_unwind on all FFI boundaries.
 
-**CLI (urlx) — ~100 long flags + short aliases:**
+**CLI (urlx) — ~112 long flags + short aliases:**
 - HTTP: -X, -H, -d, --data-raw, --data-binary, --data-urlencode, -L, --max-redirs, -I, -A, -e, -G, -F, -r, -C, --compressed, --http1.0, --http1.1, --http2, --http3, --expect100-timeout, --post301, --post302, --post303, --json, --raw, --path-as-is, --url-query.
 - Output: -o, -O, -J/--remote-header-name, -D, -i, -w, --create-dirs, -v, -s, -S, -f, -#, -R/--remote-time, --styled-output, --no-styled-output.
-- Auth: -u, --digest, --bearer, --aws-sigv4, -b, -c, --netrc, --netrc-file, --netrc-optional.
-- TLS/SSH: -k, --cacert, --cert, --key (TLS client key + SSH identity), --tlsv1.2, --tlsv1.3, --tls-max, --pinnedpubkey.
+- Auth: -u, --digest, --ntlm, --negotiate, --bearer, --aws-sigv4, -b, -c, --netrc, --netrc-file, --netrc-optional, --delegation, --sasl-authzid, --sasl-ir.
+- TLS/SSH: -k, --cacert, --cert, --key (TLS client key + SSH identity), --tlsv1.2, --tlsv1.3, --tls-max, --pinnedpubkey, --ciphers.
 - Proxy: -x, --noproxy, --socks5-hostname, --proxy-user, --proxy-digest, --proxy-ntlm, --proxy-header.
 - Transfer: -m, --connect-timeout, --retry/--retry-delay/--retry-max-time, --limit-rate, --speed-limit, --speed-time, -T, --unrestricted-auth, --ignore-content-length.
 - Connection: --tcp-nodelay, --tcp-keepalive, --no-keepalive, --unix-socket, --interface, --local-port, --resolve.
 - DNS: --dns-shuffle, --dns-servers, --doh-url, --happy-eyeballs-timeout-ms.
 - Concurrency: -Z, --parallel-max, --rate.
 - Debug/Config: --trace, --trace-ascii, --trace-time, --stderr, -K/--config, --libcurl, --proto, --proto-redir, --max-filesize, --hsts, --next.
-- FTP: --ftp-pasv, --ftp-ssl, --ssl, --ftp-ssl-reqd, --ssl-reqd, --ftp-port.
+- FTP: --ftp-pasv, --ftp-ssl, --ssl, --ftp-ssl-reqd, --ssl-reqd, --ftp-port, --ftp-create-dirs, --ftp-method.
+- SMTP: --mail-from, --mail-rcpt, --mail-auth.
 - Features: .curlrc-style config file parser, protocol restriction, max filesize enforcement (exit 63), libcurl C code generation, retry logic (408/429/5xx), netrc credential lookup, Content-Disposition filename extraction, URL query parameter appending.
 - Misc: --globoff (no-op, no URL globbing).
 
-**Testing — 2,069 tests (0 failures):**
+**Testing — 2,090 tests (0 failures):**
 - Unit + integration tests across all crates
 - Integration: 1,048 (hyper-based test servers)
 - Property-based: 60 (proptest — URL, cookie, FTP, HTTP, HSTS, multipart, protocols, WebSocket)
@@ -397,16 +398,9 @@ cbindgen `build.rs` auto-regenerates `include/urlx.h` (829 lines) when source ch
 
 ---
 
-### Phase 38: CLI Expansion IV
+### Phase 38: CLI Expansion IV (2026-03-09)
 
-**Goal:** Additional CLI flags for specialized use cases.
-
-- `--ciphers` (TLS cipher selection)
-- `--negotiate` / `--ntlm` (auth flags)
-- `--delegation` (Kerberos delegation)
-- `--sasl-authzid` / `--sasl-ir` (SASL options)
-- `--mail-from` / `--mail-rcpt` / `--mail-auth` (SMTP flags)
-- `--ftp-create-dirs` / `--ftp-method` (FTP flags)
+Added 12 CLI flags: `--ciphers` (TLS cipher selection via `ssl_cipher_list()`), `--ntlm` (HTTP NTLM auth with `-u`), `--negotiate` (no-op, Kerberos/SPNEGO placeholder), `--delegation` (no-op, GSS-API placeholder), `--sasl-authzid`/`--sasl-ir` (SASL options stored on Easy), `--mail-from`/`--mail-rcpt`/`--mail-auth` (SMTP envelope settings), `--ftp-create-dirs` (create missing FTP dirs), `--ftp-method` (multicwd/singlecwd/nocwd). Added `FtpMethod` enum, `ntlm_auth()` Easy method, SMTP/FTP/SASL Easy API fields. 21 new tests.
 
 ---
 
