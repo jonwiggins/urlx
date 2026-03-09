@@ -10,6 +10,68 @@
 typedef void CURL;
 
 /**
+ * Bitmask constants for `curl_global_init`.
+ * `CURL_GLOBAL_SSL` — initialize SSL.
+ */
+#define CURL_GLOBAL_SSL 1
+
+/**
+ * `CURL_GLOBAL_WIN32` — initialize Win32 sockets.
+ */
+#define CURL_GLOBAL_WIN32 2
+
+/**
+ * `CURL_GLOBAL_ALL` — initialize everything.
+ */
+#define CURL_GLOBAL_ALL 3
+
+/**
+ * `CURL_GLOBAL_DEFAULT` — same as ALL.
+ */
+#define CURL_GLOBAL_DEFAULT 3
+
+/**
+ * Feature bit: SSL support.
+ */
+#define CURL_VERSION_SSL (1 << 2)
+
+/**
+ * Feature bit: HTTP/2 support.
+ */
+#define CURL_VERSION_HTTP2 (1 << 16)
+
+/**
+ * Feature bit: async DNS support.
+ */
+#define CURL_VERSION_ASYNCHDNS (1 << 7)
+
+/**
+ * Feature bit: PSL support.
+ */
+#define CURL_VERSION_PSL (1 << 20)
+
+/**
+ * Pause direction constants.
+ * `CURLPAUSE_RECV` — pause receiving.
+ */
+#define CURLPAUSE_RECV 1
+
+/**
+ * `CURLPAUSE_SEND` — pause sending.
+ */
+#define CURLPAUSE_SEND 4
+
+/**
+ * `CURLPAUSE_ALL` — pause both directions.
+ */
+#define CURLPAUSE_ALL 5
+
+/**
+ * `CURLPAUSE_CONT` — unpause both directions.
+ */
+#define CURLPAUSE_CONT 0
+
+/**
  * `CURLINFO` — info codes for `curl_easy_getinfo`.
  */
 typedef enum CURLINFO {
@@ -43,6 +105,19 @@ typedef enum CURLINFO {
     CURLINFO_PRIMARY_PORT = 2097216,
     CURLINFO_LOCAL_PORT = 2097218,
     CURLINFO_SCHEME = 1048644,
+    CURLINFO_REDIRECT_TIME = 3145747,
+    CURLINFO_TOTAL_TIME_T = 6291518,
+    CURLINFO_NAMELOOKUP_TIME_T = 6291519,
+    CURLINFO_CONNECT_TIME_T = 6291520,
+    CURLINFO_PRETRANSFER_TIME_T = 6291521,
+    CURLINFO_STARTTRANSFER_TIME_T = 6291522,
+    CURLINFO_REDIRECT_TIME_T = 6291523,
+    CURLINFO_APPCONNECT_TIME_T = 6291524,
+    CURLINFO_RETRY_AFTER = 2097210,
+    CURLINFO_SIZE_UPLOAD_T = 6291525,
+    CURLINFO_SIZE_DOWNLOAD_T = 6291526,
+    CURLINFO_SPEED_DOWNLOAD_T = 6291527,
+    CURLINFO_SPEED_UPLOAD_T = 6291528,
 } CURLINFO;
 
 /**
@@ -120,7 +195,14 @@ typedef enum CURLcode {
     CURLE_RECV_ERROR = 56,
     CURLE_SSL_CERTPROBLEM = 58,
     CURLE_PEER_FAILED_VERIFICATION = 60,
+    CURLE_FILESIZE_EXCEEDED = 63,
     CURLE_LOGIN_DENIED = 67,
+    CURLE_TOO_MANY_REDIRECTS = 47,
+    CURLE_HTTP3 = 95,
+    CURLE_PARTIAL_FILE = 18,
+    CURLE_RANGE_ERROR = 33,
+    CURLE_AGAIN = 81,
+    CURLE_UNRECOVERABLE_POLL = 99,
 } CURLcode;
 
 /**
@@ -264,6 +346,51 @@ typedef struct curl_waitfd {
     short events;
     short revents;
 } curl_waitfd;
+
+/**
+ * Version info struct returned by `curl_version_info`.
+ *
+ * Matches the `curl_version_info_data` struct from libcurl.
+ * Only the essential fields are populated.
+ */
+typedef struct CurlVersionInfo {
+    /**
+     * Age of this struct (`CURLVERSION_FIRST` = 0).
+     */
+    long age;
+    /**
+     * Version string (e.g., "0.1.0").
+     */
+    const char *version;
+    /**
+     * Numeric version (major*0x10000 + minor*0x100 + patch).
+     */
+    long version_num;
+    /**
+     * Host system description.
+     */
+    const char *host;
+    /**
+     * Feature bitmask.
+     */
+    long features;
+    /**
+     * SSL version string or NULL.
+     */
+    const char *ssl_version;
+    /**
+     * Unused (libssl version number).
+     */
+    long ssl_version_num;
+    /**
+     * libz version string or NULL.
+     */
+    const char *libz_version;
+    /**
+     * Null-terminated array of supported protocols.
+     */
+    const char *const *protocols;
+} CurlVersionInfo;
 
 #ifdef __cplusplus
 extern "C" {
@@ -819,6 +946,66 @@ enum CURLMcode curl_multi_socket_action(void *multi,
  * The returned pointer is valid for the lifetime of the program.
  */
  const char *urlx_version(void) ;
+
+/**
+ * `curl_global_init` — global initialization (no-op in urlx).
+ *
+ * In libcurl this initializes SSL, Win32 sockets, etc. In urlx, tokio
+ * and rustls handle their own initialization, so this is a no-op.
+ *
+ * # Safety
+ *
+ * This function is always safe to call.
+ */
+ enum CURLcode curl_global_init(long _flags) ;
+
+/**
+ * `curl_global_cleanup` — global cleanup (no-op in urlx).
+ *
+ * # Safety
+ *
+ * This function is always safe to call.
+ */
+ void curl_global_cleanup(void) ;
+
+/**
+ * `curl_version_info` — return version info struct.
+ *
+ * Returns a pointer to a static struct with version information.
+ * The pointer is valid for the lifetime of the program.
+ *
+ * # Safety
+ *
+ * The returned pointer is valid for the lifetime of the program.
+ */
+ const struct CurlVersionInfo *curl_version_info(long _age) ;
+
+/**
+ * `curl_easy_pause` — pause/unpause a transfer (stub).
+ *
+ * # Safety
+ *
+ * `handle` must be a valid pointer from `curl_easy_init`.
+ */
+ enum CURLcode curl_easy_pause(void *_handle, long _bitmask) ;
+
+/**
+ * `curl_easy_upkeep` — perform connection upkeep (no-op).
+ *
+ * # Safety
+ *
+ * `handle` must be a valid pointer from `curl_easy_init`.
+ */
+ enum CURLcode curl_easy_upkeep(void *_handle) ;
+
+/**
+ * `curl_multi_assign` — assign custom pointer to socket (no-op stub).
+ *
+ * # Safety
+ *
+ * `multi_handle` must be a valid pointer from `curl_multi_init`.
+ */
+ enum CURLMcode curl_multi_assign(void *_multi_handle, long _sockfd, void *_sockp) ;
 
 #ifdef __cplusplus
 }  // extern "C"

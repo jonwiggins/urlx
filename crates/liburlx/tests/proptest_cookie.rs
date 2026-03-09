@@ -80,8 +80,11 @@ proptest! {
     fn domain_case_insensitive(
         name in "[a-zA-Z]{1,10}",
         value in "[a-zA-Z0-9]{1,10}",
-        domain in "[a-z]{1,8}\\.[a-z]{2,4}"
+        subdomain in "[a-z]{1,8}"
     ) {
+        // Use a fixed TLD to ensure the domain is always eTLD+1,
+        // not a public suffix (PSL validation would reject it otherwise).
+        let domain = format!("{subdomain}.example.com");
         let mut jar = liburlx::CookieJar::new();
         let header = format!("{name}={value}; Domain={domain}");
         jar.store_cookies(&[&header], &domain, "/");
