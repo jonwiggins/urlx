@@ -14,12 +14,12 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 19 — Planning
-**Last completed:** Phase 18 (HTTP/3 & Alt-Svc) — 2026-03-08
-**Total tests:** 1,745+
-**In progress:** Planning Phase 19
+**Phase:** 20 — Planning
+**Last completed:** Phase 19 (CLI Expansion & Debug Tools) — 2026-03-08
+**Total tests:** 1,774+
+**In progress:** Planning Phase 20
 **Blockers:** None
-**Next up:** Phase 19 — CLI Expansion & Debug Tools
+**Next up:** Phase 20 — Completeness Review + Curl Test Suite Porting
 
 ### Completeness Summary (updated Phase 10 review)
 
@@ -37,7 +37,7 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 | SSH/SFTP/SCP | 0% | Not implemented |
 | Multi API | 55% | Connection limiting, message queue, share interface, pipelining config; no poll/socket/timer callbacks |
 | FFI (libcurl C ABI) | ~27% | 67 options, 16 info codes, 25 error codes, multi API, slist, duphandle |
-| CLI | ~26% | ~77 of ~250 flags |
+| CLI | ~28% | ~86 of ~250 flags |
 | Connection | 80% | Pool, TCP_NODELAY, keepalive, Unix sockets, interface/port binding |
 | Transfer control | 40% | Rate limiting, speed enforcement API; not wired into transfer engine yet |
 | Overall | ~53% | ~90% for basic HTTP/HTTPS use cases |
@@ -395,15 +395,9 @@ Alt-Svc cache with TTL-based expiry, automatic Alt-Svc header processing in tran
 
 ---
 
-### Phase 19: CLI Expansion & Debug Tools
+### Phase 19: CLI Expansion & Debug Tools — COMPLETED (2026-03-08)
 
-**Goal:** Expand CLI towards curl parity.
-
-- `--trace`, `--trace-ascii`, `--trace-time` (wire debugging)
-- `-K/--config` (config file support)
-- `--libcurl` (output equivalent C code)
-- `--proto`, `--proto-redir` (protocol restriction)
-- `--max-filesize`, `--no-keepalive`
+Added 9 new CLI flags: `--trace`, `--trace-ascii`, `--trace-time`, `-K/--config`, `--libcurl`, `--proto`, `--proto-redir`, `--max-filesize`, `--no-keepalive`. Config file parser for .curlrc-style format (comments, quotes, `=` syntax). Protocol restriction with URL scheme validation. Max filesize enforcement (exit code 63). `--libcurl` generates equivalent C code. 29 new unit tests (134 total in CLI).
 
 ---
 
