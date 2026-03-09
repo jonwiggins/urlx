@@ -34,6 +34,8 @@ pub enum HttpVersion {
     Http11,
     /// Prefer HTTP/2 via ALPN (fallback to HTTP/1.1 if not negotiated).
     Http2,
+    /// Request HTTP/3 via QUIC (requires `http3` feature).
+    Http3,
 }
 
 /// A handle for performing a single URL transfer.
@@ -92,6 +94,7 @@ pub struct Easy {
     doh_url: Option<String>,
     unrestricted_auth: bool,
     ignore_content_length: bool,
+    alt_svc_cache: crate::protocol::http::altsvc::AltSvcCache,
 }
 
 impl std::fmt::Debug for Easy {
@@ -150,6 +153,7 @@ impl std::fmt::Debug for Easy {
             .field("doh_url", &self.doh_url)
             .field("unrestricted_auth", &self.unrestricted_auth)
             .field("ignore_content_length", &self.ignore_content_length)
+            .field("alt_svc_cache", &self.alt_svc_cache)
             .finish()
     }
 }
@@ -207,6 +211,7 @@ impl Clone for Easy {
             doh_url: self.doh_url.clone(),
             unrestricted_auth: self.unrestricted_auth,
             ignore_content_length: self.ignore_content_length,
+            alt_svc_cache: self.alt_svc_cache.clone(),
         }
     }
 }
@@ -266,6 +271,7 @@ impl Easy {
             doh_url: None,
             unrestricted_auth: false,
             ignore_content_length: false,
+            alt_svc_cache: crate::protocol::http::altsvc::AltSvcCache::new(),
         }
     }
 
@@ -1129,6 +1135,7 @@ impl Easy {
             self.happy_eyeballs_timeout,
             self.unrestricted_auth,
             self.ignore_content_length,
+            &mut self.alt_svc_cache,
         );
 
         // Apply total transfer timeout if set
@@ -1221,6 +1228,7 @@ async fn perform_transfer(
     happy_eyeballs_timeout: Option<Duration>,
     unrestricted_auth: bool,
     ignore_content_length: bool,
+    alt_svc_cache: &mut crate::protocol::http::altsvc::AltSvcCache,
 ) -> Result<Response, Error> {
     let transfer_start = Instant::now();
     let original_url = url.clone();
@@ -1358,6 +1366,20 @@ async fn perform_transfer(
                     let host = current_url.host_str().unwrap_or("");
                     cache.store(host, sts_value);
                 }
+            }
+        }
+
+        // Store Alt-Svc headers from response
+        if let Some(alt_svc_value) = response.header("alt-svc") {
+            let scheme = current_url.scheme();
+            let host = current_url.host_str().unwrap_or("");
+            let port = current_url.port_or_default().unwrap_or(if scheme == "https" { 443 } else { 80 });
+            let origin = format!("{scheme}://{host}:{port}");
+            let entries = crate::protocol::http::altsvc::parse_alt_svc(alt_svc_value);
+            if entries.is_empty() && alt_svc_value.trim() == "clear" {
+                alt_svc_cache.clear_origin(&origin);
+            } else if !entries.is_empty() {
+                alt_svc_cache.store(&origin, &entries);
             }
         }
 

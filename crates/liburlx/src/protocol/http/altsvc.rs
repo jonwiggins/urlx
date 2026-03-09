@@ -4,7 +4,8 @@
 //! (e.g., HTTP/3 via QUIC). Currently provides parsing only; caching
 //! and automatic upgrade are planned for future phases.
 
-use std::time::Duration;
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 /// A single alternative service entry from an `Alt-Svc` header.
 ///
@@ -158,6 +159,113 @@ pub fn parse_retry_after(value: &str) -> Option<Duration> {
     None
 }
 
+/// A cached Alt-Svc entry with expiry time.
+#[derive(Debug, Clone)]
+struct AltSvcEntry {
+    /// The alternative service information.
+    alt_svc: AltSvc,
+    /// When this entry expires.
+    expires_at: Instant,
+}
+
+/// An in-memory cache for Alt-Svc entries.
+///
+/// Stores alternative service entries per origin (scheme + host + port)
+/// with TTL-based expiry. Used to remember that a server supports HTTP/3
+/// or other alternative protocols.
+#[derive(Debug)]
+pub struct AltSvcCache {
+    /// Cached entries keyed by origin (e.g., `"https://example.com:443"`).
+    entries: HashMap<String, Vec<AltSvcEntry>>,
+}
+
+impl AltSvcCache {
+    /// Create a new, empty Alt-Svc cache.
+    #[must_use]
+    pub fn new() -> Self {
+        Self { entries: HashMap::new() }
+    }
+
+    /// Store Alt-Svc entries for an origin.
+    ///
+    /// The origin should be in the format "scheme://host:port".
+    pub fn store(&mut self, origin: &str, services: &[AltSvc]) {
+        let now = Instant::now();
+        let entries: Vec<AltSvcEntry> = services
+            .iter()
+            .map(|svc| AltSvcEntry { alt_svc: svc.clone(), expires_at: now + svc.max_age })
+            .collect();
+        let _ = self.entries.insert(origin.to_string(), entries);
+    }
+
+    /// Clear all entries for an origin (used when server sends `Alt-Svc: clear`).
+    pub fn clear_origin(&mut self, origin: &str) {
+        let _ = self.entries.remove(origin);
+    }
+
+    /// Look up valid (non-expired) Alt-Svc entries for an origin.
+    #[must_use]
+    pub fn get(&self, origin: &str) -> Vec<&AltSvc> {
+        let now = Instant::now();
+        self.entries
+            .get(origin)
+            .map(|entries| {
+                entries.iter().filter(|e| now < e.expires_at).map(|e| &e.alt_svc).collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Look up a specific protocol (e.g., "h3") for an origin.
+    #[must_use]
+    pub fn get_protocol(&self, origin: &str, protocol_id: &str) -> Option<&AltSvc> {
+        let now = Instant::now();
+        self.entries.get(origin).and_then(|entries| {
+            entries
+                .iter()
+                .find(|e| now < e.expires_at && e.alt_svc.protocol_id == protocol_id)
+                .map(|e| &e.alt_svc)
+        })
+    }
+
+    /// Remove expired entries from the cache.
+    pub fn purge_expired(&mut self) {
+        let now = Instant::now();
+        self.entries.retain(|_, entries| {
+            entries.retain(|e| now < e.expires_at);
+            !entries.is_empty()
+        });
+    }
+
+    /// Clear all entries from the cache.
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    /// Returns the number of origins in the cache.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Returns true if the cache is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+impl Default for AltSvcCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Clone for AltSvcCache {
+    fn clone(&self) -> Self {
+        Self { entries: self.entries.clone() }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -286,5 +394,169 @@ mod tests {
         let (host, port) = parse_authority("example.com:8080").unwrap();
         assert_eq!(host, "example.com");
         assert_eq!(port, 8080);
+    }
+
+    // --- AltSvcCache tests ---
+
+    #[test]
+    fn cache_new_is_empty() {
+        let cache = AltSvcCache::new();
+        assert!(cache.is_empty());
+        assert_eq!(cache.len(), 0);
+    }
+
+    #[test]
+    fn cache_store_and_get() {
+        let mut cache = AltSvcCache::new();
+        let services = vec![AltSvc {
+            protocol_id: "h3".to_string(),
+            host: String::new(),
+            port: 443,
+            max_age: Duration::from_secs(3600),
+        }];
+        cache.store("https://example.com:443", &services);
+
+        let result = cache.get("https://example.com:443");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].protocol_id, "h3");
+        assert_eq!(result[0].port, 443);
+    }
+
+    #[test]
+    fn cache_get_missing_returns_empty() {
+        let cache = AltSvcCache::new();
+        assert!(cache.get("https://example.com:443").is_empty());
+    }
+
+    #[test]
+    fn cache_get_protocol() {
+        let mut cache = AltSvcCache::new();
+        let services = vec![
+            AltSvc {
+                protocol_id: "h3".to_string(),
+                host: String::new(),
+                port: 443,
+                max_age: Duration::from_secs(3600),
+            },
+            AltSvc {
+                protocol_id: "h2".to_string(),
+                host: String::new(),
+                port: 443,
+                max_age: Duration::from_secs(3600),
+            },
+        ];
+        cache.store("https://example.com:443", &services);
+
+        assert!(cache.get_protocol("https://example.com:443", "h3").is_some());
+        assert!(cache.get_protocol("https://example.com:443", "h2").is_some());
+        assert!(cache.get_protocol("https://example.com:443", "h1").is_none());
+    }
+
+    #[test]
+    fn cache_expired_entries_not_returned() {
+        let mut cache = AltSvcCache::new();
+        let services = vec![AltSvc {
+            protocol_id: "h3".to_string(),
+            host: String::new(),
+            port: 443,
+            max_age: Duration::ZERO, // Immediately expired
+        }];
+        cache.store("https://example.com:443", &services);
+
+        assert!(cache.get("https://example.com:443").is_empty());
+        assert!(cache.get_protocol("https://example.com:443", "h3").is_none());
+    }
+
+    #[test]
+    fn cache_clear_origin() {
+        let mut cache = AltSvcCache::new();
+        let services = vec![AltSvc {
+            protocol_id: "h3".to_string(),
+            host: String::new(),
+            port: 443,
+            max_age: Duration::from_secs(3600),
+        }];
+        cache.store("https://example.com:443", &services);
+        assert_eq!(cache.len(), 1);
+
+        cache.clear_origin("https://example.com:443");
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn cache_clear_all() {
+        let mut cache = AltSvcCache::new();
+        cache.store(
+            "https://a.com:443",
+            &[AltSvc {
+                protocol_id: "h3".to_string(),
+                host: String::new(),
+                port: 443,
+                max_age: Duration::from_secs(3600),
+            }],
+        );
+        cache.store(
+            "https://b.com:443",
+            &[AltSvc {
+                protocol_id: "h3".to_string(),
+                host: String::new(),
+                port: 443,
+                max_age: Duration::from_secs(3600),
+            }],
+        );
+        assert_eq!(cache.len(), 2);
+
+        cache.clear();
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn cache_purge_expired() {
+        let mut cache = AltSvcCache::new();
+        cache.store(
+            "https://expired.com:443",
+            &[AltSvc {
+                protocol_id: "h3".to_string(),
+                host: String::new(),
+                port: 443,
+                max_age: Duration::ZERO,
+            }],
+        );
+        cache.store(
+            "https://valid.com:443",
+            &[AltSvc {
+                protocol_id: "h3".to_string(),
+                host: String::new(),
+                port: 443,
+                max_age: Duration::from_secs(3600),
+            }],
+        );
+        assert_eq!(cache.len(), 2);
+
+        cache.purge_expired();
+        assert_eq!(cache.len(), 1);
+        assert!(!cache.get("https://valid.com:443").is_empty());
+    }
+
+    #[test]
+    fn cache_default_is_empty() {
+        let cache = AltSvcCache::default();
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn cache_clone() {
+        let mut cache = AltSvcCache::new();
+        cache.store(
+            "https://example.com:443",
+            &[AltSvc {
+                protocol_id: "h3".to_string(),
+                host: String::new(),
+                port: 443,
+                max_age: Duration::from_secs(3600),
+            }],
+        );
+        let cloned = cache.clone();
+        assert_eq!(cloned.len(), 1);
     }
 }
