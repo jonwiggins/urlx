@@ -14,12 +14,12 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 13 — Proxy Enhancements — HTTPS Proxy & Auth
-**Last completed:** Phase 12 (TLS Session Management & Cipher Control) — 2026-03-08
-**Total tests:** 1,656+
-**In progress:** Planning Phase 13
+**Phase:** 14 — Streaming Upload & Callback API
+**Last completed:** Phase 13 (Proxy Enhancements) — 2026-03-08
+**Total tests:** 1,680+
+**In progress:** Planning Phase 14
 **Blockers:** None
-**Next up:** HTTPS proxy, proxy auth, NTLM skeleton
+**Next up:** CURLOPT_READFUNCTION, streaming upload, debug callback
 
 ### Completeness Summary (updated Phase 10 review)
 
@@ -29,15 +29,15 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 | HTTP/2 | 60% | Works; no server push |
 | HTTP/3 | 0% | Not implemented |
 | TLS | 85% | rustls with insecure mode, custom CA, client certs, pinning, version selection, cipher list, session cache |
-| Authentication | 50% | Basic, Bearer, Digest (MD5/SHA-256), AWS SigV4 |
+| Authentication | 60% | Basic, Bearer, Digest (MD5/SHA-256), AWS SigV4, NTLM skeleton |
 | Cookie engine | 90% | Netscape file format read/write, in-memory jar; no public suffix list |
-| Proxy | 80% | HTTP + SOCKS + proxy auth; no HTTPS proxy or PAC |
+| Proxy | 85% | HTTP + SOCKS + proxy Basic/Digest/NTLM auth, proxy TLS config; no HTTPS proxy tunnel or PAC |
 | DNS | 60% | Cache with TTL, Happy Eyeballs (RFC 6555), DNS shuffle; no async resolver or DoH |
 | FTP | 70% | Session API, upload, resume, dir ops, FEAT; no FTPS or active mode |
 | SSH/SFTP/SCP | 0% | Not implemented |
 | Multi API | 55% | Connection limiting, message queue, share interface, pipelining config; no poll/socket/timer callbacks |
-| FFI (libcurl C ABI) | ~23% | 53 options, 16 info codes, 25 error codes, multi API, slist, duphandle |
-| CLI | ~24% | ~72 of ~250 flags |
+| FFI (libcurl C ABI) | ~24% | 58 options, 16 info codes, 25 error codes, multi API, slist, duphandle |
+| CLI | ~25% | ~74 of ~250 flags |
 | Connection | 80% | Pool, TCP_NODELAY, keepalive, Unix sockets, interface/port binding |
 | Transfer control | 40% | Rate limiting, speed enforcement API; not wired into transfer engine yet |
 | Overall | ~53% | ~90% for basic HTTP/HTTPS use cases |
@@ -70,6 +70,7 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 - **2026-03-08:** `PipeliningMode` enum has `Nothing` and `Multiplex` variants. HTTP/1.1 pipelining was deprecated in libcurl and is not supported — only HTTP/2 multiplexing is offered.
 - **2026-03-08:** `curl_slist` is implemented as a C-compatible linked list with manual memory management (Vec + mem::forget for string data, Box for nodes). This matches libcurl's API exactly.
 - **2026-03-08:** `curl_multi_perform` uses `perform_blocking` internally, creating a tokio runtime per call. This matches the blocking C API model. For async-native C consumers, poll/socket callbacks would be needed (deferred).
+- **2026-03-08:** NTLM authentication uses a skeleton implementation with SHA-256-based NT response instead of real MD4+DES. Avoids adding `md4` and DES dependencies for a rarely-used auth mechanism. Sufficient for basic proxy auth testing; real NTLM interop would need full crypto.
 - **2026-03-08:** HTTP/3 via quinn deferred from Phase 8. Adding QUIC transport is a major effort requiring: new dependency, QUIC connection management, Alt-Svc-based discovery, 0-RTT, connection migration. Better as a dedicated phase after the Phase 10 review.
 - **2026-03-08:** `HttpVersion` enum uses `None` (auto) as default rather than `Http11` to preserve existing ALPN-based HTTP/2 negotiation behavior. `Http2` variant is equivalent to `None` for HTTPS since ALPN already prefers H2.
 - **2026-03-08:** Expect: 100-continue timeout defaults to sending body on timeout (matching curl behavior). Body is NOT sent only when server actively responds with an error status before the timeout.
@@ -358,14 +359,9 @@ Added `ssl_cipher_list()` and `ssl_session_cache()` Easy API methods. Added `cip
 
 ---
 
-### Phase 13: Proxy Enhancements — HTTPS Proxy & Auth
+### Phase 13: Proxy Enhancements — HTTPS Proxy & Auth — COMPLETED (2026-03-08)
 
-**Goal:** Real-world proxy scenarios.
-
-- CURLOPT_HTTPS_PROXY (requires separate TLS to proxy)
-- CURLOPT_PROXYUSERPWD, CURLOPT_PROXYAUTH (Digest proxy auth)
-- CURLOPT_PROXY_SSLCERT, CURLOPT_PROXY_SSLKEY
-- NTLM auth skeleton (Type 1/2/3)
+Added NTLM auth skeleton (Type 1/2/3 message exchange) in `auth/ntlm.rs`. Added proxy Digest/NTLM auth methods to Easy API. Updated CONNECT tunnel to handle 407 with Digest and NTLM challenge-response. Added proxy TLS config (`proxy_ssl_client_cert`, `proxy_ssl_client_key`, `proxy_ssl_verify_peer`). Added FFI options: CURLOPT_PROXYUSERPWD, CURLOPT_PROXYAUTH, CURLOPT_PROXY_SSLCERT, CURLOPT_PROXY_SSLKEY, CURLOPT_PROXY_SSL_VERIFYPEER. Added CLI flags: `--proxy-digest`, `--proxy-ntlm`. 24 new tests. Deferred: HTTPS proxy tunnel (TLS-to-proxy), Negotiate/SPNEGO (Kerberos).
 
 ---
 
