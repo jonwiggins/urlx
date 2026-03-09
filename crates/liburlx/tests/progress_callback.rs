@@ -3,7 +3,12 @@
 //! Tests that progress callbacks are called during transfers and
 //! receive accurate download size information.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, unused_results, clippy::significant_drop_tightening)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    unused_results,
+    clippy::significant_drop_tightening
+)]
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
