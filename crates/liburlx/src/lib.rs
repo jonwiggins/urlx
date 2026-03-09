@@ -16,6 +16,7 @@ pub mod cookie;
 pub mod dns;
 pub mod easy;
 pub mod error;
+pub mod glob;
 pub mod hsts;
 pub mod multi;
 pub mod netrc;
