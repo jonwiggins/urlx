@@ -14,12 +14,12 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 30 — Error Variant Coverage + Connection Pool Stress + CLI Edge Cases
-**Last completed:** Phase 29 (Multi API edge cases, Response builder, form upload integration) — 2026-03-08
-**Total tests:** 1161
-**In progress:** Planning Phase 30
+**Phase:** 31 — Protocol Codec Property Tests + Transfer State Machine
+**Last completed:** Phase 30 (multipart encoding, error interop, Easy method coverage) — 2026-03-08
+**Total tests:** 1222
+**In progress:** Planning Phase 31
 **Blockers:** None
-**Next up:** Error variant exhaustive tests, connection pool stress scenarios, CLI argument edge cases
+**Next up:** Protocol codec property tests, transfer state machine edge cases
 
 ---
 
@@ -609,35 +609,38 @@ custom headers, redirects). 25 Response builder tests (construction, with_info, 
 body_str, is_redirect, content_type, size_download, TransferInfo, clone). 6 form upload
 integration tests (multipart, methods, special chars, handle reuse). 1161 total tests.
 
-### Phase 30: Error Variant Coverage + Connection Pool Stress + CLI Edge Cases
+### Phase 30: Multipart Encoding + Error Interop + Easy Method Coverage — COMPLETED (2026-03-08)
 
-**Scope:** Exhaustive testing of error types, connection pool under stress,
-and CLI argument parsing edge cases to close remaining coverage gaps.
+20 multipart encoding tests (construction, field structure, file data, binary, mixed,
+clone, debug, empty form, large data). 25 error interop tests (variant matching, display
+formats, source chain, thread safety, debug, edge cases). 16 Easy method coverage tests
+(method_is_default, verbose, max_redirects, timeout, perform_async, clone settings,
+method override). 1222 total tests.
 
-**Step 30.1: Error variant exhaustive tests** (`error_variant_coverage.rs`)
-- Every Error variant constructible and displayable
-- Error source chains (Connect→io::Error, Tls→Box<dyn Error>)
-- Error Send+Sync bounds verification
-- Error Debug formatting for all variants
-- UrlxError vs nested error type distinctions
+### Phase 31: Protocol Codec Property Tests + Transfer State Machine
 
-**Step 30.2: Connection pool stress** (`pool_stress.rs`)
-- Pool with many concurrent connections
-- Pool key isolation (different hosts don't share)
-- Pool connection eviction under pressure
-- Pool behavior after connection errors
-- Pool with mixed HTTP/HTTPS (Tcp vs Tls variants)
+**Scope:** Property-based tests for protocol codecs beyond URL parser,
+and integration tests for transfer state machine edge cases.
 
-**Step 30.3: CLI argument edge cases** (`cli_edge_cases.rs`)
-- Unknown flags rejected
-- Conflicting options (e.g. -I with -d)
-- Multiple -H headers accumulate
-- -o with - means stdout
-- Empty URL rejected
-- Multiple URLs with --next semantics
-- Write-out variable edge cases (%{unknown}, empty format)
+**Step 31.1: HTTP codec property tests** (`proptest_http.rs`)
+- Status code roundtrip (any valid code 100-599)
+- Content-Length body size consistency
+- Header name/value preservation
+- Chunked encoding roundtrip
 
-**Exit criteria:** 1200+ tests.
+**Step 31.2: Cookie property tests** (`proptest_cookie.rs`)
+- Cookie name=value roundtrip
+- Domain matching transitivity
+- Path matching prefix property
+- Max-Age expiry ordering
+
+**Step 31.3: Transfer edge cases** (`transfer_edge_cases.rs`)
+- Empty response body handling
+- Connection drop mid-transfer
+- Multiple Set-Cookie headers aggregation
+- Redirect with body (should read and discard)
+
+**Exit criteria:** 1270+ tests.
 
 ---
 
