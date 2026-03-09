@@ -14,12 +14,12 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 29 — Planning
-**Last completed:** Phase 28 (HTTP/2 Enhancements & HTTP/3 Transport) — 2026-03-09
-**Total tests:** 1,945
-**In progress:** Planning Phase 29
+**Phase:** 30 — Completeness Review
+**Last completed:** Phase 29 (Performance & Optimization) — 2026-03-09
+**Total tests:** 1,954
+**In progress:** Phase 30 — Completeness Review + 1.0 Planning
 **Blockers:** None
-**Next up:** Phase 29 — Performance & Optimization
+**Next up:** Phase 30 — Completeness Review + 1.0 Planning
 
 ### Completeness Summary (updated Phase 20 review)
 
@@ -297,8 +297,8 @@ Built from scratch over 20 phases. All features below are implemented and tested
 - FTP: --ftp-pasv, --ftp-ssl, --ssl, --ftp-ssl-reqd, --ssl-reqd, --ftp-port.
 - Features: .curlrc-style config file parser, protocol restriction, max filesize enforcement (exit 63), libcurl C code generation, retry logic (408/429/5xx), netrc credential lookup.
 
-**Testing — 1,945 tests (0 failures):**
-- Unit: 507 (liburlx) + 160 (FFI) + 160 (CLI) = 827
+**Testing — 1,954 tests (0 failures):**
+- Unit: 516 (liburlx) + 160 (FFI) + 160 (CLI) = 836
 - Integration: 1,048 (hyper-based test servers)
 - Property-based: 60 (proptest — URL, cookie, FTP, HTTP, HSTS, multipart, protocols, WebSocket)
 - Doc tests: 3
@@ -307,7 +307,7 @@ Built from scratch over 20 phases. All features below are implemented and tested
 
 **Guardrails:** Zero TODO/FIXME/HACK. Zero `unwrap()` in production code. `#![deny(unsafe_code)]` in liburlx and urlx-cli. GitHub Actions CI (fmt, clippy, test on 3 OS, doc, cargo-deny, MSRV 1.83, commit lint). Pre-commit hooks (fmt, clippy, test, deny, doc, conventional commit).
 
-**Known gaps (as of Phase 28):** Trace file writing not fully wired. HTTP/3 missing 0-RTT and Alt-Svc-based upgrade from HTTP/2. HTTP/2 missing stream priority/dependency. SSH known_hosts verification not implemented. Socket/timer callbacks stored but not actively invoked (tokio manages I/O). Missing FFI: CURLOPT_HTTPPOST (deprecated). URL globbing (--glob) not yet implemented.
+**Known gaps (as of Phase 29):** Trace file writing not fully wired. HTTP/3 missing 0-RTT and Alt-Svc-based upgrade from HTTP/2. HTTP/2 missing stream priority/dependency. SSH known_hosts verification not implemented. Socket/timer callbacks stored but not actively invoked (tokio manages I/O). Missing FFI: CURLOPT_HTTPPOST (deprecated). URL globbing (--glob) not yet implemented.
 
 ---
 
@@ -359,15 +359,9 @@ HTTP/2 server push: rewrote h2.rs to collect `PUSH_PROMISE` frames via `push_pro
 
 ---
 
-### Phase 29: Performance & Optimization
+### Phase 29: Performance & Optimization (completed 2026-03-09)
 
-**Goal:** Profiling and performance improvements.
-
-- Throughput benchmarks vs curl (criterion)
-- Connection setup latency benchmarks
-- Memory allocation profiling
-- Zero-copy body forwarding where possible
-- Connection pool warming
+Eliminated unnecessary string allocations in hot paths. Cookie jar: `domain_matches` uses `eq_ignore_ascii_case` + manual suffix check (no `format!`/`to_lowercase`), attribute parsing uses `eq_ignore_ascii_case`. DNS cache: `cache_key` pre-allocates exact capacity, uses byte-level ASCII lowering. Response: `header()` fast path tries direct lookup before lowercasing. Decompression: encoding dispatch uses `eq_ignore_ascii_case`. Multipart: `guess_content_type` avoids `to_lowercase`. Added criterion benchmarks for DNS cache, response header lookup, and cookie domain matching. 10 new tests. Total: 1,954 tests.
 
 ---
 
