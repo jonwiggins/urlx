@@ -14,12 +14,12 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 28 — Fail-on-Error Integration + Transfer Robustness
-**Last completed:** Phase 27 (TestServer dedup, CookieJar/URL coverage) — 2026-03-08
-**Total tests:** 1087
-**In progress:** Planning Phase 28
+**Phase:** 29 — Multi API Hardening + Response Builder Tests
+**Last completed:** Phase 28 (fail_on_error integration, timeouts, HSTS upgrade) — 2026-03-08
+**Total tests:** 1124
+**In progress:** Planning Phase 29
 **Blockers:** None
-**Next up:** Integration tests for fail_on_error edge cases, transfer timeout scenarios
+**Next up:** Multi API edge cases, Response construction tests, form upload integration
 
 ---
 
@@ -595,28 +595,36 @@ secure filtering, replacement, remove_expired, clone). 23 URL edge case tests
 (IPv6, fragments, queries, credentials, paths, ports, host methods, roundtrip).
 1087 total tests.
 
-### Phase 28: Fail-on-Error Integration + Transfer Robustness
+### Phase 28: Fail-on-Error + Timeouts + HSTS Upgrade — COMPLETED (2026-03-08)
 
-**Scope:** Add integration tests for fail_on_error edge cases with real
-servers, transfer timeout scenarios, and HSTS upgrade integration tests.
+15 fail_on_error integration tests (399/400 boundary, 4xx/5xx codes, redirect
+chains, toggle). 9 timeout scenario tests (connection timing, both timeouts,
+persistence). 14 HSTS upgrade tests (cache behavior, Easy config, header variants).
+Fixed proptest_url.rs port normalization bug. 1124 total tests.
 
-**Step 28.1: fail_on_error integration tests**
-- fail_on_error with 4xx vs 2xx boundary (399 passes, 400 fails)
-- fail_on_error with redirect chain ending in error
-- fail_on_error disabled preserves error status responses
-- fail_on_error with chunked response body
+### Phase 29: Multi API Hardening + Response Builder Tests
 
-**Step 28.2: Transfer timeout scenarios**
-- Slow server response triggers timeout
-- Connect timeout vs transfer timeout distinction
-- Timeout error message contains duration
+**Scope:** Strengthen Multi API edge case coverage, test Response construction
+and manipulation, and add multipart form upload integration tests.
 
-**Step 28.3: HSTS upgrade integration**
-- HTTP → HTTPS upgrade when HSTS cached
-- No upgrade without HSTS header
-- includeSubDomains upgrade for subdomains
+**Step 29.1: Multi API edge cases**
+- Multi with fail_on_error handles
+- Multi with timeout handles
+- Multi reuse after perform
+- Multi with mixed methods and bodies
 
-**Exit criteria:** 1110+ tests. Edge cases for fail_on_error and timeouts covered.
+**Step 29.2: Response builder/manipulation**
+- Response::new construction variants
+- Response with_info transfer info attachment
+- Response header case-insensitive lookup
+- Response body_str with non-UTF-8 data
+
+**Step 29.3: Multipart form upload integration**
+- Form field sent correctly to server
+- File upload with correct content type
+- Mixed fields and files
+
+**Exit criteria:** 1160+ tests.
 
 ---
 
