@@ -59,9 +59,13 @@ struct CliOptions {
     post303: bool,
     remote_time: bool,
     stderr_file: Option<String>,
+    remote_header_name: bool,
+    url_queries: Vec<String>,
+    rate: Option<String>,
 }
 
 /// Print usage information to stderr.
+#[allow(clippy::too_many_lines)]
 fn print_usage() {
     eprintln!("urlx 0.1.0 — a memory-safe curl replacement");
     eprintln!("Usage: urlx [options] <url>");
@@ -160,6 +164,15 @@ fn print_usage() {
     eprintln!("      --ftp-ssl             Try SSL/TLS for FTP (explicit, AUTH TLS)");
     eprintln!("      --ftp-ssl-reqd        Require SSL/TLS for FTP");
     eprintln!("      --ftp-port <addr>     Use active mode, bind to address ('-' for auto)");
+    eprintln!("      --globoff             Disable URL globbing");
+    eprintln!("      --path-as-is          Don't normalize . and .. in URL path");
+    eprintln!("      --raw                 Disable HTTP content decoding");
+    eprintln!("  -J, --remote-header-name  Use Content-Disposition filename with -O");
+    eprintln!("      --styled-output       Enable styled output (no-op)");
+    eprintln!("      --no-styled-output    Disable styled output (no-op)");
+    eprintln!("      --url-query <params>  Append query parameters to URL");
+    eprintln!("      --json <data>         JSON POST (sets Content-Type and Accept)");
+    eprintln!("      --rate <rate>         Request rate for parallel transfers");
 }
 
 /// Parse CLI arguments into options.
@@ -211,6 +224,9 @@ fn parse_args(args: &[String]) -> Option<CliOptions> {
         post303: false,
         remote_time: false,
         stderr_file: None,
+        remote_header_name: false,
+        url_queries: Vec::new(),
+        rate: None,
     };
 
     let mut i = 1;
@@ -837,9 +853,9 @@ fn parse_args(args: &[String]) -> Option<CliOptions> {
             "--remote-time" | "-R" => {
                 opts.remote_time = true;
             }
-            // --next separates option groups (no-op for now)
-            // --ftp-pasv is the default (no-op)
-            "--next" | "--ftp-pasv" => {}
+            // No-op flags: --next (option groups), --ftp-pasv (default), --globoff (no URL
+            // globbing), --styled-output/--no-styled-output (no terminal styling)
+            "--next" | "--ftp-pasv" | "--globoff" | "--styled-output" | "--no-styled-output" => {}
             // FTPS: explicit mode (AUTH TLS)
             "--ftp-ssl" | "--ssl" | "--ftp-ssl-reqd" | "--ssl-reqd" => {
                 opts.easy.ftp_ssl_mode(liburlx::protocol::ftp::FtpSslMode::Explicit);
@@ -851,6 +867,36 @@ fn parse_args(args: &[String]) -> Option<CliOptions> {
                     return None;
                 }
                 opts.easy.ftp_active_port(&args[i]);
+            }
+            "--path-as-is" => {
+                opts.easy.path_as_is(true);
+            }
+            "--raw" => {
+                opts.easy.raw(true);
+            }
+            "-J" | "--remote-header-name" => {
+                opts.remote_header_name = true;
+                opts.remote_name = true;
+            }
+            "--url-query" => {
+                i += 1;
+                let val = require_arg(args, i, "--url-query")?;
+                opts.url_queries.push(val.to_string());
+            }
+            "--json" => {
+                i += 1;
+                let val = require_arg(args, i, "--json")?;
+                opts.easy.body(val.as_bytes());
+                opts.easy.header("Content-Type", "application/json");
+                opts.easy.header("Accept", "application/json");
+                if opts.easy.method_is_default() {
+                    opts.easy.method("POST");
+                }
+            }
+            "--rate" => {
+                i += 1;
+                let val = require_arg(args, i, "--rate")?;
+                opts.rate = Some(val.to_string());
             }
             arg if arg.starts_with('-') => {
                 eprintln!("urlx: unknown option: {arg}");
@@ -1041,6 +1087,56 @@ fn extract_hostname(url: &str) -> String {
     without_userinfo.rsplit_once(':').map_or(without_userinfo, |(host, _)| host).to_string()
 }
 
+/// Append query parameters to a URL string.
+///
+/// Each query string is appended with `&` if the URL already has a `?`,
+/// or with `?` if it doesn't. Values containing `=` are used as-is;
+/// plain values are URL-encoded.
+fn append_url_queries(url: &str, queries: &[String]) -> String {
+    let mut result = url.to_string();
+    for query in queries {
+        let separator = if result.contains('?') { '&' } else { '?' };
+        result.push(separator);
+        if query.contains('=') {
+            // name=value format: encode only the value
+            if let Some((name, value)) = query.split_once('=') {
+                result.push_str(name);
+                result.push('=');
+                result.push_str(&percent_encode(value));
+            }
+        } else {
+            // Plain string: use as-is (already encoded or literal)
+            result.push_str(query);
+        }
+    }
+    result
+}
+
+/// Extract filename from a `Content-Disposition` response header.
+///
+/// Supports both `filename="quoted"` and `filename=unquoted` forms.
+/// Returns `None` if the header is absent or doesn't contain a filename.
+fn content_disposition_filename(response: &liburlx::Response) -> Option<String> {
+    let header = response.header("content-disposition")?;
+    // Look for filename= parameter
+    let filename_start = header.find("filename=")?;
+    let after = &header[filename_start + 9..];
+    if let Some(quoted) = after.strip_prefix('"') {
+        // Quoted filename: extract until closing quote
+        let end = quoted.find('"')?;
+        Some(quoted[..end].to_string())
+    } else {
+        // Unquoted: take until semicolon or end
+        let end = after.find(';').unwrap_or(after.len());
+        let name = after[..end].trim();
+        if name.is_empty() {
+            None
+        } else {
+            Some(name.to_string())
+        }
+    }
+}
+
 /// Parse a rate limit string like "100K", "1M", "500" into bytes per second.
 ///
 /// Supports suffixes: K/k (1024), M/m (1024*1024), G/g (1024^3).
@@ -1196,9 +1292,16 @@ fn run(args: &[String]) -> ExitCode {
 
     // Single URL: use Easy API
     if let Some(url) = opts.urls.first() {
+        // --url-query: append query parameters to URL
+        let url = if opts.url_queries.is_empty() {
+            url.clone()
+        } else {
+            append_url_queries(url, &opts.url_queries)
+        };
+
         // --proto: validate URL scheme against allowed protocols
         if let Some(ref proto_list) = opts.proto {
-            if !is_protocol_allowed(url, proto_list) {
+            if !is_protocol_allowed(&url, proto_list) {
                 if !opts.silent || opts.show_error {
                     eprintln!("urlx: protocol not allowed by --proto");
                 }
@@ -1206,7 +1309,7 @@ fn run(args: &[String]) -> ExitCode {
             }
         }
 
-        if let Err(e) = opts.easy.url(url) {
+        if let Err(e) = opts.easy.url(&url) {
             if !opts.silent || opts.show_error {
                 eprintln!("urlx: error parsing URL: {e}");
             }
@@ -1218,7 +1321,7 @@ fn run(args: &[String]) -> ExitCode {
             if let Some(ref netrc_path) = opts.netrc_file {
                 match std::fs::read_to_string(netrc_path) {
                     Ok(contents) => {
-                        let host = extract_hostname(url);
+                        let host = extract_hostname(&url);
                         if let Some(entry) = liburlx::netrc::lookup(&contents, &host) {
                             let user = entry.login.unwrap_or_default();
                             let pass = entry.password.unwrap_or_default();
@@ -1243,7 +1346,7 @@ fn run(args: &[String]) -> ExitCode {
 
         // -O/--remote-name: derive output filename from URL
         if opts.remote_name && opts.output_file.is_none() {
-            opts.output_file = Some(remote_name_from_url(url));
+            opts.output_file = Some(remote_name_from_url(&url));
         }
     }
 
@@ -1320,6 +1423,13 @@ fn run(args: &[String]) -> ExitCode {
                         );
                     }
                     return ExitCode::from(63);
+                }
+            }
+
+            // -J/--remote-header-name: override output filename from Content-Disposition
+            if opts.remote_header_name {
+                if let Some(name) = content_disposition_filename(&response) {
+                    opts.output_file = Some(name);
                 }
             }
 
@@ -3357,5 +3467,168 @@ mod tests {
         // Should contain timestamp digits
         assert!(content.contains('.'));
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    // --- Phase 33 tests ---
+
+    #[test]
+    fn parse_args_globoff() {
+        let args = vec!["urlx".into(), "--globoff".into(), "http://x.com".into()];
+        assert!(parse_args(&args).is_some());
+    }
+
+    #[test]
+    fn parse_args_path_as_is() {
+        let args = vec!["urlx".into(), "--path-as-is".into(), "http://x.com/a/../b".into()];
+        assert!(parse_args(&args).is_some());
+    }
+
+    #[test]
+    fn parse_args_raw() {
+        let args = vec!["urlx".into(), "--raw".into(), "http://x.com".into()];
+        assert!(parse_args(&args).is_some());
+    }
+
+    #[test]
+    fn parse_args_remote_header_name_short() {
+        let args = vec!["urlx".into(), "-J".into(), "http://x.com/file".into()];
+        let opts = parse_args(&args).unwrap();
+        assert!(opts.remote_header_name);
+        assert!(opts.remote_name);
+    }
+
+    #[test]
+    fn parse_args_remote_header_name_long() {
+        let args = vec!["urlx".into(), "--remote-header-name".into(), "http://x.com/file".into()];
+        let opts = parse_args(&args).unwrap();
+        assert!(opts.remote_header_name);
+    }
+
+    #[test]
+    fn parse_args_styled_output() {
+        let args = vec!["urlx".into(), "--styled-output".into(), "http://x.com".into()];
+        assert!(parse_args(&args).is_some());
+    }
+
+    #[test]
+    fn parse_args_no_styled_output() {
+        let args = vec!["urlx".into(), "--no-styled-output".into(), "http://x.com".into()];
+        assert!(parse_args(&args).is_some());
+    }
+
+    #[test]
+    fn parse_args_url_query() {
+        let args =
+            vec!["urlx".into(), "--url-query".into(), "key=value".into(), "http://x.com".into()];
+        let opts = parse_args(&args).unwrap();
+        assert_eq!(opts.url_queries, vec!["key=value"]);
+    }
+
+    #[test]
+    fn parse_args_url_query_multiple() {
+        let args = vec![
+            "urlx".into(),
+            "--url-query".into(),
+            "a=1".into(),
+            "--url-query".into(),
+            "b=2".into(),
+            "http://x.com".into(),
+        ];
+        let opts = parse_args(&args).unwrap();
+        assert_eq!(opts.url_queries, vec!["a=1", "b=2"]);
+    }
+
+    #[test]
+    fn parse_args_json() {
+        let args =
+            vec!["urlx".into(), "--json".into(), r#"{"key":"val"}"#.into(), "http://x.com".into()];
+        let opts = parse_args(&args);
+        assert!(opts.is_some());
+    }
+
+    #[test]
+    fn parse_args_rate() {
+        let args = vec!["urlx".into(), "--rate".into(), "10/s".into(), "http://x.com".into()];
+        let opts = parse_args(&args).unwrap();
+        assert_eq!(opts.rate, Some("10/s".to_string()));
+    }
+
+    #[test]
+    fn append_url_queries_basic() {
+        let result = append_url_queries("http://example.com", &["key=value".to_string()]);
+        assert_eq!(result, "http://example.com?key=value");
+    }
+
+    #[test]
+    fn append_url_queries_existing_query() {
+        let result = append_url_queries("http://example.com?a=1", &["b=2".to_string()]);
+        assert_eq!(result, "http://example.com?a=1&b=2");
+    }
+
+    #[test]
+    fn append_url_queries_multiple() {
+        let result = append_url_queries(
+            "http://example.com",
+            &["a=1".to_string(), "b=hello world".to_string()],
+        );
+        assert!(result.starts_with("http://example.com?a=1&b=hello%20world"));
+    }
+
+    #[test]
+    fn append_url_queries_no_equals() {
+        let result = append_url_queries("http://example.com", &["raw_string".to_string()]);
+        assert_eq!(result, "http://example.com?raw_string");
+    }
+
+    #[test]
+    fn content_disposition_filename_quoted() {
+        let mut headers = std::collections::HashMap::new();
+        let _old = headers.insert(
+            "content-disposition".to_string(),
+            "attachment; filename=\"report.pdf\"".to_string(),
+        );
+        let response = liburlx::Response::new(200, headers, Vec::new(), String::new());
+        assert_eq!(content_disposition_filename(&response), Some("report.pdf".to_string()));
+    }
+
+    #[test]
+    fn content_disposition_filename_unquoted() {
+        let mut headers = std::collections::HashMap::new();
+        let _old = headers.insert(
+            "content-disposition".to_string(),
+            "attachment; filename=report.pdf".to_string(),
+        );
+        let response = liburlx::Response::new(200, headers, Vec::new(), String::new());
+        assert_eq!(content_disposition_filename(&response), Some("report.pdf".to_string()));
+    }
+
+    #[test]
+    fn content_disposition_filename_missing() {
+        let response = liburlx::Response::new(
+            200,
+            std::collections::HashMap::new(),
+            Vec::new(),
+            String::new(),
+        );
+        assert_eq!(content_disposition_filename(&response), None);
+    }
+
+    #[test]
+    fn content_disposition_filename_no_filename() {
+        let mut headers = std::collections::HashMap::new();
+        let _old = headers.insert("content-disposition".to_string(), "inline".to_string());
+        let response = liburlx::Response::new(200, headers, Vec::new(), String::new());
+        assert_eq!(content_disposition_filename(&response), None);
+    }
+
+    #[test]
+    fn content_disposition_filename_with_semicolon() {
+        let mut headers = std::collections::HashMap::new();
+        let _old = headers.insert(
+            "content-disposition".to_string(),
+            "attachment; filename=data.csv; size=1234".to_string(),
+        );
+        let response = liburlx::Response::new(200, headers, Vec::new(), String::new());
+        assert_eq!(content_disposition_filename(&response), Some("data.csv".to_string()));
     }
 }

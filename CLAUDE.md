@@ -14,12 +14,12 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 32 — HTTPS Proxy & Trace Output
-**Last completed:** Phase 31 (Cookie Domain Indexing) — 2026-03-09
+**Phase:** 33 — CLI Expansion III
+**Last completed:** Phase 32 (HTTPS Proxy & Trace Output) — 2026-03-09
 **Total tests:** 1,958
-**In progress:** Phase 32 — HTTPS Proxy & Trace Output
+**In progress:** Phase 33 — CLI Expansion III
 **Blockers:** None
-**Next up:** Phase 32 — HTTPS Proxy & Trace Output
+**Next up:** Phase 33 — CLI Expansion III
 
 ### Completeness Summary (updated Phase 30 review)
 
@@ -31,13 +31,13 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 | TLS | 85% | rustls with insecure mode, custom CA, client certs, pinning, version selection, cipher list, session cache |
 | Authentication | 60% | Basic, Bearer, Digest (MD5/SHA-256), AWS SigV4, NTLM skeleton |
 | Cookie engine | 92% | Netscape file format read/write, domain-indexed jar; no public suffix list |
-| Proxy | 85% | HTTP + SOCKS + proxy Basic/Digest/NTLM auth, proxy TLS config; no HTTPS proxy tunnel or PAC |
+| Proxy | 90% | HTTP + SOCKS + HTTPS proxy tunnel (TLS-in-TLS) + proxy Basic/Digest/NTLM auth, proxy TLS config; no PAC |
 | DNS | 75% | Cache with configurable TTL, Happy Eyeballs, DNS shuffle, DNS server config, DoH URL config; no async resolver |
 | FTP | 85% | Session API, upload, resume, dir ops, FEAT, explicit/implicit FTPS, active mode (PORT/EPRT) |
 | SSH/SFTP/SCP | 60% | SFTP download/upload/list, SCP download/upload, password + pubkey auth; no known_hosts |
 | Multi API | 75% | Connection limiting, message queue, share, pipelining, wait/poll/wakeup/fdset/socket_action/timeout/info_read |
 | FFI (libcurl C ABI) | ~48% | 86 options, 22 info codes, 25 error codes, 43 functions |
-| CLI | ~36% | ~89 of ~250 flags |
+| CLI | ~37% | ~92 of ~250 flags |
 | Connection | 80% | Pool, TCP_NODELAY, keepalive, Unix sockets, interface/port binding |
 | Transfer control | 80% | Rate limiting enforced in transfer engine (max recv/send speed, low speed timeout) |
 | Performance | — | Hot-path string allocation optimizations, criterion benchmarks |
@@ -104,6 +104,8 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 - **2026-03-09:** HTTP/2 server push uses `response_fut.push_promises()` which clones h2 internal state, allowing independent collection in a background task without blocking the main response await. Spawned as a `tokio::spawn` task that runs concurrently with response body reading.
 - **2026-03-09:** HTTP/3 via quinn/h3/h3-quinn uses `bytes` crate as a direct dependency (feature-gated behind `http3`) because h3's `recv_data()` returns `impl Buf` which requires the `Buf` trait in scope. The `bytes` crate is already a transitive dependency via h3/quinn.
 - **2026-03-09:** HTTP/3 dispatch in easy.rs bypasses TCP connection and TLS — it uses the resolved DNS address directly for QUIC (UDP). The QUIC endpoint binds to 0.0.0.0:0 (OS-assigned port). Connection errors map to `Error::Connect` to match the existing error taxonomy.
+- **2026-03-09:** HTTPS proxy tunnel uses TLS-in-TLS: first TLS-wrap TCP to the proxy (via `new_no_alpn`), then HTTP CONNECT through the TLS stream, then TLS-wrap the tunnel to the target. The result is `TlsStream<TlsStream<TcpStream>>` which doesn't fit `PooledStream::Tls(TlsStream<TcpStream>)`, so the HTTPS proxy path uses a separate early-return block with `h1::request` directly on the generic stream.
+- **2026-03-09:** WebSocket key generation uses `AtomicU64` counter mixed with nanosecond timestamp to ensure uniqueness even when called within the same nanosecond. Previous approach used only timestamp, causing identical keys on fast CI machines.
 
 ---
 
@@ -263,7 +265,7 @@ Built from scratch over 29 phases. All features below are implemented and tested
 - **Authentication:** Basic, Bearer, Digest (MD5/SHA-256 with qop=auth), AWS SigV4 (inline HMAC-SHA256), NTLM skeleton (SHA-256-based, sufficient for proxy auth testing).
 - **Cookie engine:** RFC 6265 parsing, domain/path matching, Netscape file format persistence (read/write), HttpOnly, Secure, SameSite (stored). Domain-indexed jar (HashMap by domain for O(1) lookup). No public suffix list.
 - **HSTS cache:** STS parsing, HTTP→HTTPS upgrade, includeSubDomains.
-- **Proxy:** HTTP forward, HTTP CONNECT tunnel (with Digest/NTLM 407 challenge-response), SOCKS4/4a/5 with auth, noproxy bypass, proxy TLS config.
+- **Proxy:** HTTP forward, HTTP CONNECT tunnel (with Digest/NTLM 407 challenge-response), HTTPS proxy tunnel (TLS-in-TLS via `connect_generic<S>`), SOCKS4/4a/5 with auth, noproxy bypass, proxy TLS config.
 - **Connection:** Pool with stale retry, TCP_NODELAY (default on), TCP keepalive (socket2), Unix domain sockets, interface/port binding, Happy Eyeballs (250ms, configurable).
 - **DNS:** Cache with configurable TTL, shuffle (inline xorshift32), custom server addresses, DoH URL config. No async resolver.
 - **FTP:** Session-based API — STOR, APPE, REST, FEAT, MKD/RMD/DELE, RNFR/RNTO, SITE, PWD/CWD, SIZE, MLSD, TYPE A/I. Explicit FTPS (AUTH TLS + PBSZ 0 + PROT P, RFC 4217), implicit FTPS (port 990, direct TLS). Active mode (PORT for IPv4, EPRT for IPv4/IPv6). `FtpStream` enum (Plain/Tls) with `AsyncRead`/`AsyncWrite` delegation. `ftps://` URL scheme with default port 990. `TlsConnector::new_no_alpn()` for non-HTTP TLS.
@@ -285,7 +287,7 @@ Built from scratch over 29 phases. All features below are implemented and tested
 - URL API: Mutable UrlHandle with component-level get/set (scheme, user, password, host, port, path, query, fragment).
 - Memory: Box<[u8]>-based slist string allocation (exact-size, no capacity mismatch). catch_unwind on all FFI boundaries.
 
-**CLI (urlx) — ~89 long flags + short aliases:**
+**CLI (urlx) — ~92 long flags + short aliases:**
 - HTTP: -X, -H, -d, --data-raw, --data-binary, --data-urlencode, -L, --max-redirs, -I, -A, -e, -G, -F, -r, -C, --compressed, --http1.0, --http1.1, --http2, --http3, --expect100-timeout, --post301, --post302, --post303.
 - Output: -o, -O, -D, -i, -w, --create-dirs, -v, -s, -S, -f, -#, -R/--remote-time.
 - Auth: -u, --digest, --bearer, --aws-sigv4, -b, -c, --netrc, --netrc-file, --netrc-optional.
@@ -295,7 +297,7 @@ Built from scratch over 29 phases. All features below are implemented and tested
 - Connection: --tcp-nodelay, --tcp-keepalive, --no-keepalive, --unix-socket, --interface, --local-port, --resolve.
 - DNS: --dns-shuffle, --dns-servers, --doh-url, --happy-eyeballs-timeout-ms.
 - Concurrency: -Z, --parallel-max.
-- Debug/Config: --trace, --trace-ascii, --trace-time, -K/--config, --libcurl, --proto, --proto-redir, --max-filesize, --hsts, --next.
+- Debug/Config: --trace, --trace-ascii, --trace-time, --stderr, -K/--config, --libcurl, --proto, --proto-redir, --max-filesize, --hsts, --next.
 - FTP: --ftp-pasv, --ftp-ssl, --ssl, --ftp-ssl-reqd, --ssl-reqd, --ftp-port.
 - Features: .curlrc-style config file parser, protocol restriction, max filesize enforcement (exit 63), libcurl C code generation, retry logic (408/429/5xx), netrc credential lookup.
 
@@ -309,7 +311,7 @@ Built from scratch over 29 phases. All features below are implemented and tested
 
 **Guardrails:** Zero TODO/FIXME/HACK. Zero `unwrap()` in production code. `#![deny(unsafe_code)]` in liburlx and urlx-cli. GitHub Actions CI (fmt, clippy, test on 3 OS, doc, cargo-deny, MSRV 1.83, commit lint). Pre-commit hooks (fmt, clippy, test, deny, doc, conventional commit).
 
-**Known gaps (as of Phase 31):** Trace file writing not fully wired. HTTP/3 missing 0-RTT and Alt-Svc-based upgrade from HTTP/2. HTTP/2 missing stream priority/dependency. SSH known_hosts verification not implemented. Socket/timer callbacks stored but not actively invoked (tokio manages I/O). Missing FFI: CURLOPT_HTTPPOST (deprecated). URL globbing (--glob) not yet implemented. No async DNS resolver (hickory-dns). No cookie public suffix list. NTLM auth is skeleton only.
+**Known gaps (as of Phase 32):** HTTP/3 missing 0-RTT and Alt-Svc-based upgrade from HTTP/2. HTTP/2 missing stream priority/dependency. SSH known_hosts verification not implemented. Socket/timer callbacks stored but not actively invoked (tokio manages I/O). Missing FFI: CURLOPT_HTTPPOST (deprecated). URL globbing (--glob) not yet implemented. No async DNS resolver (hickory-dns). No cookie public suffix list. NTLM auth is skeleton only. No PAC proxy auto-config.
 
 ---
 
@@ -351,14 +353,9 @@ Domain-indexed cookie jar for O(1) lookup. HashMap<String, Vec<usize>> maps doma
 
 ---
 
-### Phase 32: HTTPS Proxy & Trace Output
+### Phase 32: HTTPS Proxy & Trace Output (2026-03-09)
 
-**Goal:** Complete proxy and debug features.
-
-- HTTPS proxy tunnel (CONNECT through TLS proxy)
-- PAC file support (basic)
-- Trace file writing (--trace, --trace-ascii output to file)
-- --stderr flag for error output redirection
+HTTPS proxy tunnel (TLS-in-TLS via `connect_generic<S>`), trace file writing (`--trace` hex dump, `--trace-ascii` plain text, `--trace-time` timestamps), `--stderr` flag for error redirection. Generic `establish_connect_tunnel<S>` and `send_connect_request<S>` accepting any `AsyncRead+AsyncWrite+Unpin` stream. `TlsConnector::new_no_alpn()` for proxy TLS. Fixed flaky `ws_key_unique` test (atomic counter for nanosecond-collision uniqueness). 14 new tests.
 
 ---
 

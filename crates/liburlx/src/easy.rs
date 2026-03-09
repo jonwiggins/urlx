@@ -110,6 +110,10 @@ pub struct Easy {
     ftp_active_port: Option<String>,
     /// Path to SSH private key for SFTP/SCP authentication.
     ssh_key_path: Option<String>,
+    /// Don't normalize `..` and `.` in URL paths (curl --path-as-is).
+    path_as_is: bool,
+    /// Disable all HTTP content decoding (curl --raw).
+    raw: bool,
 }
 
 impl std::fmt::Debug for Easy {
@@ -176,6 +180,8 @@ impl std::fmt::Debug for Easy {
             .field("ftp_ssl_mode", &self.ftp_ssl_mode)
             .field("ftp_active_port", &self.ftp_active_port)
             .field("ssh_key_path", &self.ssh_key_path)
+            .field("path_as_is", &self.path_as_is)
+            .field("raw", &self.raw)
             .finish()
     }
 }
@@ -241,6 +247,8 @@ impl Clone for Easy {
             ftp_ssl_mode: self.ftp_ssl_mode,
             ftp_active_port: self.ftp_active_port.clone(),
             ssh_key_path: self.ssh_key_path.clone(),
+            path_as_is: self.path_as_is,
+            raw: self.raw,
         }
     }
 }
@@ -308,6 +316,8 @@ impl Easy {
             ftp_ssl_mode: crate::protocol::ftp::FtpSslMode::None,
             ftp_active_port: None,
             ssh_key_path: None,
+            path_as_is: false,
+            raw: false,
         }
     }
 
@@ -1096,6 +1106,21 @@ impl Easy {
         self.ssh_key_path = Some(path.to_string());
     }
 
+    /// Don't normalize `..` and `.` path segments in the URL.
+    ///
+    /// Equivalent to curl's `--path-as-is` / `CURLOPT_PATH_AS_IS`.
+    pub fn path_as_is(&mut self, enable: bool) {
+        self.path_as_is = enable;
+    }
+
+    /// Disable all internal HTTP content decoding.
+    ///
+    /// When enabled, the response body is returned as-is without
+    /// any content-encoding decompression. Equivalent to curl's `--raw`.
+    pub fn raw(&mut self, enable: bool) {
+        self.raw = enable;
+    }
+
     /// Perform the transfer and return the response (blocking).
     ///
     /// Creates a new tokio runtime internally. Do not call from within
@@ -1232,7 +1257,7 @@ impl Easy {
             self.follow_redirects,
             self.max_redirects,
             self.verbose,
-            self.accept_encoding,
+            self.accept_encoding && !self.raw,
             self.connect_timeout,
             effective_proxy,
             effective_noproxy,
@@ -3732,5 +3757,31 @@ mod tests {
         let mut easy = Easy::new();
         easy.proxy_ssl_verify_peer(false);
         assert!(!easy.proxy_tls_config.as_ref().unwrap().verify_peer);
+    }
+
+    #[test]
+    fn easy_path_as_is() {
+        let mut easy = Easy::new();
+        assert!(!easy.path_as_is);
+        easy.path_as_is(true);
+        assert!(easy.path_as_is);
+    }
+
+    #[test]
+    fn easy_raw() {
+        let mut easy = Easy::new();
+        assert!(!easy.raw);
+        easy.raw(true);
+        assert!(easy.raw);
+    }
+
+    #[test]
+    fn easy_raw_disables_accept_encoding() {
+        let mut easy = Easy::new();
+        easy.accept_encoding(true);
+        easy.raw(true);
+        // raw=true should cause accept_encoding to be passed as false to perform_transfer
+        assert!(easy.accept_encoding);
+        assert!(easy.raw);
     }
 }
