@@ -14,12 +14,12 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 26 — Planning
-**Last completed:** Phase 25 (FTPS & Active Mode FTP) — 2026-03-09
-**Total tests:** 1,906
-**In progress:** Planning Phase 26
+**Phase:** 27 — Planning
+**Last completed:** Phase 26 (SSH/SFTP/SCP) — 2026-03-09
+**Total tests:** 1,914
+**In progress:** Planning Phase 27
 **Blockers:** None
-**Next up:** Phase 26 — SSH/SFTP/SCP
+**Next up:** Phase 27 — Multi API Event Loop Integration
 
 ### Completeness Summary (updated Phase 20 review)
 
@@ -34,7 +34,7 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 | Proxy | 85% | HTTP + SOCKS + proxy Basic/Digest/NTLM auth, proxy TLS config; no HTTPS proxy tunnel or PAC |
 | DNS | 75% | Cache with configurable TTL, Happy Eyeballs, DNS shuffle, DNS server config, DoH URL config; no async resolver |
 | FTP | 85% | Session API, upload, resume, dir ops, FEAT, explicit/implicit FTPS (AUTH TLS, PBSZ, PROT P), active mode (PORT/EPRT) |
-| SSH/SFTP/SCP | 0% | Not implemented |
+| SSH/SFTP/SCP | 60% | SFTP download/upload/list, SCP download/upload, password + pubkey auth; no known_hosts, agent forwarding |
 | Multi API | 55% | Connection limiting, message queue, share interface, pipelining config; no poll/socket/timer callbacks |
 | FFI (libcurl C ABI) | ~42% | 87 options, 20 info codes, 25 error codes, 32 functions |
 | CLI | ~40% | ~99 of ~250 flags |
@@ -91,6 +91,12 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 - **2026-03-09:** Explicit FTPS uses AUTH TLS → PBSZ 0 → PROT P sequence before login (RFC 4217). `auth_tls()` consumes self because it needs to reassemble the split reader/writer, extract TcpStream, TLS-wrap it, and re-split. PBSZ/PROT happen on the (now TLS) control connection after upgrade.
 - **2026-03-09:** Active mode FTP uses `tokio::net::TcpListener::bind(local_ip, 0)` for OS-assigned ports. PORT command formats IPv4 octets; EPRT supports both IPv4/IPv6. `--ftp-port "-"` uses the control connection's local address (stored during connect).
 - **2026-03-09:** `ftps://` URL scheme defaults to port 990 (implicit FTPS). The `url` crate doesn't know about `ftps`, so `port_or_default()` has a fallback match. In `do_single_request`, `ftps://` always maps to `FtpSslMode::Implicit`.
+- **2026-03-09:** SSH/SFTP/SCP uses russh 0.57 + russh-sftp 2.1 (pure-Rust). russh 0.48 does not have a `ring` feature; `ring` support was added in v0.53.0. Using `default-features = false, features = ["ring"]` to match our existing ring 0.17 dependency (from rustls).
+- **2026-03-09:** `SshHandler` accepts all server host keys by default (matching curl's behavior without `--known-hosts`). Known hosts verification deferred to a future phase.
+- **2026-03-09:** `best_supported_rsa_hash()` in russh 0.57 returns `Result<Option<Option<HashAlg>>>` — triple-nested. Flattened with `.ok().flatten().flatten()` to get `Option<HashAlg>` for `PrivateKeyWithHashAlg::new()`.
+- **2026-03-09:** SCP protocol implemented via exec channel (`scp -f` for download, `scp -t` for upload) rather than SFTP subsystem. SCP header parsing extracts file size from "C<mode> <size> <filename>" format. Acknowledgement is single null byte; error codes 1/2 include message text.
+- **2026-03-09:** `--key` flag (CURLOPT_SSH_PRIVATE_KEYFILE in libcurl) sets both TLS client key and SSH identity in the CLI, matching curl's dual-purpose behavior. At transfer time, the appropriate one is used based on URL scheme.
+- **2026-03-09:** SSH auth fallback order: explicit `--key` → URL password → default keys (`~/.ssh/id_ed25519`, `~/.ssh/id_rsa`, `~/.ssh/id_ecdsa`). If no credentials available, returns `Error::Ssh` with guidance message.
 
 ---
 
@@ -254,6 +260,7 @@ Built from scratch over 20 phases. All features below are implemented and tested
 - **Connection:** Pool with stale retry, TCP_NODELAY (default on), TCP keepalive (socket2), Unix domain sockets, interface/port binding, Happy Eyeballs (250ms, configurable).
 - **DNS:** Cache with configurable TTL, shuffle (inline xorshift32), custom server addresses, DoH URL config. No async resolver.
 - **FTP:** Session-based API — STOR, APPE, REST, FEAT, MKD/RMD/DELE, RNFR/RNTO, SITE, PWD/CWD, SIZE, MLSD, TYPE A/I. Explicit FTPS (AUTH TLS + PBSZ 0 + PROT P, RFC 4217), implicit FTPS (port 990, direct TLS). Active mode (PORT for IPv4, EPRT for IPv4/IPv6). `FtpStream` enum (Plain/Tls) with `AsyncRead`/`AsyncWrite` delegation. `ftps://` URL scheme with default port 990. `TlsConnector::new_no_alpn()` for non-HTTP TLS.
+- **SSH/SFTP/SCP:** Via russh + russh-sftp (pure-Rust, async). `SshSession` with password and public key auth. SFTP download/upload/list via `SftpSession`. SCP download/upload via exec channel with SCP protocol parsing. Auto-discovery of `~/.ssh/id_{ed25519,rsa,ecdsa}` keys. Feature-gated behind `ssh` (optional). `sftp://` and `scp://` URL schemes with default port 22. `Error::Ssh` variant.
 - **Other protocols:** WebSocket (RFC 6455), SMTP, IMAP, POP3, MQTT 3.1.1, DICT, TFTP, FILE.
 - **Multi API:** JoinSet-based concurrency, connection limiting (semaphore), message queue, Share interface (DNS cache + cookie jar), PipeliningMode (Nothing/Multiplex). No poll/socket/timer callbacks.
 - **Alt-Svc:** Header parsing (RFC 7838), TTL-based cache, automatic processing in transfers.
@@ -272,7 +279,7 @@ Built from scratch over 20 phases. All features below are implemented and tested
 - HTTP: -X, -H, -d, --data-raw, --data-binary, --data-urlencode, -L, --max-redirs, -I, -A, -e, -G, -F, -r, -C, --compressed, --http1.0, --http1.1, --http2, --expect100-timeout, --post301, --post302, --post303.
 - Output: -o, -O, -D, -i, -w, --create-dirs, -v, -s, -S, -f, -#, -R/--remote-time.
 - Auth: -u, --digest, --bearer, --aws-sigv4, -b, -c, --netrc, --netrc-file, --netrc-optional.
-- TLS: -k, --cacert, --cert, --key, --tlsv1.2, --tlsv1.3, --tls-max, --pinnedpubkey.
+- TLS/SSH: -k, --cacert, --cert, --key (TLS client key + SSH identity), --tlsv1.2, --tlsv1.3, --tls-max, --pinnedpubkey.
 - Proxy: -x, --noproxy, --socks5-hostname, --proxy-user, --proxy-digest, --proxy-ntlm, --proxy-header.
 - Transfer: -m, --connect-timeout, --retry/--retry-delay/--retry-max-time, --limit-rate, --speed-limit, --speed-time, -T, --unrestricted-auth, --ignore-content-length.
 - Connection: --tcp-nodelay, --tcp-keepalive, --no-keepalive, --unix-socket, --interface, --local-port, --resolve.
@@ -282,8 +289,8 @@ Built from scratch over 20 phases. All features below are implemented and tested
 - FTP: --ftp-pasv, --ftp-ssl, --ssl, --ftp-ssl-reqd, --ssl-reqd, --ftp-port.
 - Features: .curlrc-style config file parser, protocol restriction, max filesize enforcement (exit 63), libcurl C code generation, retry logic (408/429/5xx), netrc credential lookup.
 
-**Testing — 1,906 tests (0 failures):**
-- Unit: 487 (liburlx) + 133 (FFI) + 158 (CLI) = 778
+**Testing — 1,914 tests (0 failures):**
+- Unit: 504 (liburlx) + 133 (FFI) + 159 (CLI) = 796
 - Integration: 1,048 (hyper-based test servers)
 - Property-based: 60 (proptest — URL, cookie, FTP, HTTP, HSTS, multipart, protocols, WebSocket)
 - Doc tests: 3
@@ -292,7 +299,7 @@ Built from scratch over 20 phases. All features below are implemented and tested
 
 **Guardrails:** Zero TODO/FIXME/HACK. Zero `unwrap()` in production code. `#![deny(unsafe_code)]` in liburlx and urlx-cli. GitHub Actions CI (fmt, clippy, test on 3 OS, doc, cargo-deny, MSRV 1.83, commit lint). Pre-commit hooks (fmt, clippy, test, deny, doc, conventional commit).
 
-**Known gaps (as of Phase 25):** Trace file writing not fully wired. HTTP/3 QUIC transport not implemented. SSH/SFTP/SCP not implemented. Poll/socket/timer Multi APIs not implemented. Missing FFI: CURLOPT_HTTPPOST (deprecated). URL globbing (--glob) not yet implemented.
+**Known gaps (as of Phase 26):** Trace file writing not fully wired. HTTP/3 QUIC transport not implemented. SSH known_hosts verification not implemented. Poll/socket/timer Multi APIs not implemented. Missing FFI: CURLOPT_HTTPPOST (deprecated). URL globbing (--glob) not yet implemented.
 
 ---
 
@@ -326,15 +333,9 @@ Added FTPS support (explicit via AUTH TLS + PBSZ/PROT P, implicit via direct TLS
 
 ---
 
-### Phase 26: SSH/SFTP/SCP
+### Phase 26: SSH/SFTP/SCP (completed 2026-03-09)
 
-**Goal:** Add SSH-based file transfer protocols.
-
-- `russh` crate integration (pure-Rust SSH)
-- SFTP file download/upload
-- SCP file transfer
-- SSH key authentication
-- `--key` reuse for SSH identity files
+Added SSH/SFTP/SCP protocol support via russh 0.57 + russh-sftp 2.1 (pure-Rust, async). `SshSession` with password and public key auth. SFTP download/upload/list, SCP download/upload via exec channel. Auto-discovery of default SSH keys. Feature-gated behind `ssh`. `sftp://` and `scp://` URL schemes with default port 22. `Error::Ssh` variant. `--key` flag now sets both TLS client key and SSH identity. 20 new tests. Total: 1,914 tests.
 
 ---
 
