@@ -155,24 +155,38 @@ fn generate_boundary() -> String {
 
 /// Guess content type from filename extension.
 fn guess_content_type(filename: &str) -> String {
-    let ext = filename.rsplit('.').next().unwrap_or("").to_lowercase();
-    match ext.as_str() {
-        "txt" => "text/plain",
-        "html" | "htm" => "text/html",
-        "css" => "text/css",
-        "js" => "application/javascript",
-        "json" => "application/json",
-        "xml" => "application/xml",
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "gif" => "image/gif",
-        "svg" => "image/svg+xml",
-        "pdf" => "application/pdf",
-        "zip" => "application/zip",
-        "gz" | "gzip" => "application/gzip",
-        _ => "application/octet-stream",
-    }
-    .to_string()
+    let ext = filename.rsplit('.').next().unwrap_or("");
+    // Use case-insensitive comparison without allocating a lowercased string
+    let mime = if ext.eq_ignore_ascii_case("txt") {
+        "text/plain"
+    } else if ext.eq_ignore_ascii_case("html") || ext.eq_ignore_ascii_case("htm") {
+        "text/html"
+    } else if ext.eq_ignore_ascii_case("css") {
+        "text/css"
+    } else if ext.eq_ignore_ascii_case("js") {
+        "application/javascript"
+    } else if ext.eq_ignore_ascii_case("json") {
+        "application/json"
+    } else if ext.eq_ignore_ascii_case("xml") {
+        "application/xml"
+    } else if ext.eq_ignore_ascii_case("png") {
+        "image/png"
+    } else if ext.eq_ignore_ascii_case("jpg") || ext.eq_ignore_ascii_case("jpeg") {
+        "image/jpeg"
+    } else if ext.eq_ignore_ascii_case("gif") {
+        "image/gif"
+    } else if ext.eq_ignore_ascii_case("svg") {
+        "image/svg+xml"
+    } else if ext.eq_ignore_ascii_case("pdf") {
+        "application/pdf"
+    } else if ext.eq_ignore_ascii_case("zip") {
+        "application/zip"
+    } else if ext.eq_ignore_ascii_case("gz") || ext.eq_ignore_ascii_case("gzip") {
+        "application/gzip"
+    } else {
+        "application/octet-stream"
+    };
+    mime.to_string()
 }
 
 #[cfg(test)]

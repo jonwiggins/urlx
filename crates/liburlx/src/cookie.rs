@@ -278,44 +278,34 @@ impl CookieJar {
             for attr in parts[1].split(';') {
                 let attr = attr.trim();
                 if let Some((attr_name, attr_value)) = attr.split_once('=') {
-                    let attr_name = attr_name.trim().to_lowercase();
+                    let attr_name = attr_name.trim();
                     let attr_value = attr_value.trim();
 
-                    match attr_name.as_str() {
-                        "domain" => {
-                            if !attr_value.is_empty() {
-                                // Strip leading dot (RFC 6265 §5.2.3)
-                                domain = attr_value
-                                    .strip_prefix('.')
-                                    .unwrap_or(attr_value)
-                                    .to_lowercase();
+                    if attr_name.eq_ignore_ascii_case("domain") {
+                        if !attr_value.is_empty() {
+                            // Strip leading dot (RFC 6265 §5.2.3)
+                            domain =
+                                attr_value.strip_prefix('.').unwrap_or(attr_value).to_lowercase();
+                        }
+                    } else if attr_name.eq_ignore_ascii_case("path") {
+                        if !attr_value.is_empty() {
+                            path = attr_value.to_string();
+                        }
+                    } else if attr_name.eq_ignore_ascii_case("max-age") {
+                        if let Ok(seconds) = attr_value.parse::<i64>() {
+                            if seconds <= 0 {
+                                expires = Some(SystemTime::UNIX_EPOCH);
+                            } else {
+                                #[allow(clippy::cast_sign_loss)]
+                                let dur = Duration::from_secs(seconds as u64);
+                                expires = SystemTime::now().checked_add(dur);
                             }
                         }
-                        "path" => {
-                            if !attr_value.is_empty() {
-                                path = attr_value.to_string();
-                            }
-                        }
-                        "max-age" => {
-                            if let Ok(seconds) = attr_value.parse::<i64>() {
-                                if seconds <= 0 {
-                                    expires = Some(SystemTime::UNIX_EPOCH);
-                                } else {
-                                    #[allow(clippy::cast_sign_loss)]
-                                    let dur = Duration::from_secs(seconds as u64);
-                                    expires = SystemTime::now().checked_add(dur);
-                                }
-                            }
-                        }
-                        _ => {}
                     }
-                } else {
-                    let attr_lower = attr.to_lowercase();
-                    if attr_lower == "secure" {
-                        secure = true;
-                    } else if attr_lower == "httponly" {
-                        http_only = true;
-                    }
+                } else if attr.eq_ignore_ascii_case("secure") {
+                    secure = true;
+                } else if attr.eq_ignore_ascii_case("httponly") {
+                    http_only = true;
                 }
             }
         }
@@ -332,15 +322,18 @@ impl CookieJar {
 /// Per RFC 6265 §5.1.3: either exact match or the domain is a suffix
 /// of the host preceded by a dot.
 fn domain_matches(host: &str, cookie_domain: &str) -> bool {
-    let host = host.to_lowercase();
-    let domain = cookie_domain.to_lowercase();
-
-    if host == domain {
+    if host.eq_ignore_ascii_case(cookie_domain) {
         return true;
     }
 
     // Host is foo.example.com, domain is example.com
-    host.ends_with(&format!(".{domain}"))
+    // Check if host ends with ".{domain}" without allocating
+    if host.len() > cookie_domain.len() + 1 {
+        let offset = host.len() - cookie_domain.len() - 1;
+        host.as_bytes()[offset] == b'.' && host[offset + 1..].eq_ignore_ascii_case(cookie_domain)
+    } else {
+        false
+    }
 }
 
 /// Check if a request path matches a cookie path.
@@ -639,5 +632,56 @@ mod tests {
         assert_eq!(fields[3], "TRUE"); // secure
         assert_eq!(fields[5], "k"); // name
         assert_eq!(fields[6], "v"); // value
+    }
+
+    #[test]
+    fn domain_matches_exact() {
+        assert!(domain_matches("example.com", "example.com"));
+    }
+
+    #[test]
+    fn domain_matches_case_insensitive() {
+        assert!(domain_matches("Example.COM", "example.com"));
+        assert!(domain_matches("example.com", "Example.COM"));
+    }
+
+    #[test]
+    fn domain_matches_subdomain() {
+        assert!(domain_matches("www.example.com", "example.com"));
+        assert!(domain_matches("deep.sub.example.com", "example.com"));
+    }
+
+    #[test]
+    fn domain_matches_no_partial() {
+        // "notexample.com" should NOT match "example.com"
+        assert!(!domain_matches("notexample.com", "example.com"));
+    }
+
+    #[test]
+    fn domain_matches_shorter_host() {
+        assert!(!domain_matches("com", "example.com"));
+    }
+
+    #[test]
+    fn path_matches_exact_and_prefix() {
+        assert!(path_matches("/", "/"));
+        assert!(path_matches("/foo", "/foo"));
+        assert!(path_matches("/foo/bar", "/foo"));
+        assert!(path_matches("/foo/bar", "/foo/"));
+        assert!(!path_matches("/foobar", "/foo"));
+    }
+
+    #[test]
+    fn cookie_attr_case_insensitive() {
+        let mut jar = CookieJar::new();
+        jar.parse_set_cookie(
+            "k=v; SECURE; HTTPONLY; PATH=/api; DOMAIN=example.com",
+            "example.com",
+            "/",
+        );
+        assert_eq!(jar.len(), 1);
+        // SECURE flag should be set
+        assert_eq!(jar.cookie_header("example.com", "/api", false), None);
+        assert_eq!(jar.cookie_header("example.com", "/api", true), Some("k=v".to_string()));
     }
 }

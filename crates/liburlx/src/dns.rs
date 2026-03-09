@@ -108,8 +108,18 @@ impl Default for DnsCache {
 }
 
 /// Build a cache key from host and port.
+///
+/// Pre-allocates the exact capacity needed to avoid reallocation.
 fn cache_key(host: &str, port: u16) -> String {
-    format!("{}:{}", host.to_lowercase(), port)
+    use std::fmt::Write;
+    // port is at most 5 digits + 1 colon + host length
+    let mut key = String::with_capacity(host.len() + 6);
+    for b in host.bytes() {
+        key.push(b.to_ascii_lowercase() as char);
+    }
+    key.push(':');
+    let _ = write!(key, "{port}");
+    key
 }
 
 #[cfg(test)]
@@ -244,5 +254,12 @@ mod tests {
     fn with_ttl_returns_custom_ttl() {
         let cache = DnsCache::with_ttl(Duration::from_secs(120));
         assert_eq!(cache.ttl(), Duration::from_secs(120));
+    }
+
+    #[test]
+    fn cache_key_format() {
+        assert_eq!(cache_key("Example.COM", 443), "example.com:443");
+        assert_eq!(cache_key("localhost", 80), "localhost:80");
+        assert_eq!(cache_key("HOST", 65535), "host:65535");
     }
 }

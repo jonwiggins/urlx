@@ -110,5 +110,108 @@ fn bench_hsts_cache(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_url_parsing, bench_cookie_jar, bench_hsts_cache);
+fn bench_dns_cache(c: &mut Criterion) {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    let mut group = c.benchmark_group("dns_cache");
+
+    group.bench_function("put_and_get", |b| {
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 443);
+        b.iter(|| {
+            let mut cache = liburlx::DnsCache::new();
+            cache.put(black_box("example.com"), black_box(443), vec![addr]);
+            let _ = cache.get(black_box("example.com"), black_box(443)).is_some();
+        });
+    });
+
+    group.bench_function("get_hit_10_entries", |b| {
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 443);
+        let mut cache = liburlx::DnsCache::new();
+        for i in 0..10 {
+            cache.put(&format!("host{i}.example.com"), 443, vec![addr]);
+        }
+        cache.put("target.example.com", 443, vec![addr]);
+        b.iter(|| cache.get(black_box("target.example.com"), black_box(443)));
+    });
+
+    group.bench_function("get_miss", |b| {
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 443);
+        let mut cache = liburlx::DnsCache::new();
+        for i in 0..10 {
+            cache.put(&format!("host{i}.example.com"), 443, vec![addr]);
+        }
+        b.iter(|| cache.get(black_box("unknown.com"), black_box(443)));
+    });
+
+    group.finish();
+}
+
+fn bench_response_header(c: &mut Criterion) {
+    use std::collections::HashMap;
+
+    let mut group = c.benchmark_group("response_header");
+
+    group.bench_function("lookup_lowercase", |b| {
+        let mut headers = HashMap::new();
+        headers.insert("content-type".to_string(), "text/html".to_string());
+        headers.insert("content-length".to_string(), "1234".to_string());
+        headers.insert("x-request-id".to_string(), "abc-123".to_string());
+        let resp =
+            liburlx::Response::new(200, headers, Vec::new(), "http://example.com".to_string());
+        b.iter(|| resp.header(black_box("content-type")));
+    });
+
+    group.bench_function("lookup_mixed_case", |b| {
+        let mut headers = HashMap::new();
+        headers.insert("content-type".to_string(), "text/html".to_string());
+        headers.insert("content-length".to_string(), "1234".to_string());
+        let resp =
+            liburlx::Response::new(200, headers, Vec::new(), "http://example.com".to_string());
+        b.iter(|| resp.header(black_box("Content-Type")));
+    });
+
+    group.finish();
+}
+
+fn bench_cookie_domain_matching(c: &mut Criterion) {
+    let mut group = c.benchmark_group("cookie_domain_match");
+
+    group.bench_function("exact_match", |b| {
+        let mut jar = liburlx::CookieJar::new();
+        jar.store_cookies(&["key=val"], "example.com", "/");
+        b.iter(|| jar.cookie_header(black_box("example.com"), black_box("/"), black_box(false)));
+    });
+
+    group.bench_function("subdomain_match", |b| {
+        let mut jar = liburlx::CookieJar::new();
+        jar.store_cookies(&["key=val; Domain=example.com"], "www.example.com", "/");
+        b.iter(|| {
+            jar.cookie_header(
+                black_box("sub.deep.example.com"),
+                black_box("/path"),
+                black_box(false),
+            )
+        });
+    });
+
+    group.bench_function("no_match_1000_cookies", |b| {
+        let mut jar = liburlx::CookieJar::new();
+        for i in 0..1000 {
+            jar.store_cookies(&[&format!("k{i}=v{i}")], &format!("host{i}.com"), "/");
+        }
+        b.iter(|| jar.cookie_header(black_box("other.com"), black_box("/"), black_box(false)));
+    });
+
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_url_parsing,
+    bench_cookie_jar,
+    bench_hsts_cache,
+    bench_dns_cache,
+    bench_response_header,
+    bench_cookie_domain_matching,
+);
 criterion_main!(benches);

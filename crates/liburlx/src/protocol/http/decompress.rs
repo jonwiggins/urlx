@@ -10,15 +10,25 @@ use crate::error::Error;
 ///
 /// Returns [`Error::Http`] if decompression fails.
 pub fn decompress(data: &[u8], encoding: &str) -> Result<Vec<u8>, Error> {
-    match encoding.trim().to_lowercase().as_str() {
-        "gzip" | "x-gzip" => decompress_gzip(data),
-        "deflate" => decompress_deflate(data),
+    let enc = encoding.trim();
+    if enc.eq_ignore_ascii_case("gzip") || enc.eq_ignore_ascii_case("x-gzip") {
+        decompress_gzip(data)
+    } else if enc.eq_ignore_ascii_case("deflate") {
+        decompress_deflate(data)
+    } else if cfg!(feature = "decompression") && enc.eq_ignore_ascii_case("br") {
         #[cfg(feature = "decompression")]
-        "br" => decompress_brotli(data),
+        return decompress_brotli(data);
+        #[cfg(not(feature = "decompression"))]
+        Err(Error::Http(format!("unsupported Content-Encoding: {enc}")))
+    } else if cfg!(feature = "decompression") && enc.eq_ignore_ascii_case("zstd") {
         #[cfg(feature = "decompression")]
-        "zstd" => decompress_zstd(data),
-        "identity" => Ok(data.to_vec()),
-        other => Err(Error::Http(format!("unsupported Content-Encoding: {other}"))),
+        return decompress_zstd(data);
+        #[cfg(not(feature = "decompression"))]
+        Err(Error::Http(format!("unsupported Content-Encoding: {enc}")))
+    } else if enc.eq_ignore_ascii_case("identity") {
+        Ok(data.to_vec())
+    } else {
+        Err(Error::Http(format!("unsupported Content-Encoding: {enc}")))
     }
 }
 

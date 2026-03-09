@@ -129,10 +129,22 @@ impl Response {
     }
 
     /// Returns a specific header value (case-insensitive lookup).
+    ///
+    /// Headers are stored lowercase, so this avoids allocation when the
+    /// caller passes a lowercase name (common case).
     #[must_use]
     pub fn header(&self, name: &str) -> Option<&str> {
+        // Fast path: try direct lookup first (works when name is already lowercase)
+        if let Some(v) = self.headers.get(name) {
+            return Some(v.as_str());
+        }
+        // Slow path: lowercase and retry (only allocates if direct lookup missed)
         let lower = name.to_lowercase();
-        self.headers.get(&lower).map(String::as_str)
+        if lower == name {
+            None
+        } else {
+            self.headers.get(&lower).map(String::as_str)
+        }
     }
 
     /// Returns the response body as bytes.
@@ -296,5 +308,19 @@ mod tests {
         assert_eq!(resp.trailer("X-Custom"), Some("value"));
         assert_eq!(resp.trailer("x-custom"), Some("value"));
         assert_eq!(resp.trailer("X-CUSTOM"), Some("value"));
+    }
+
+    #[test]
+    fn header_lookup_fast_path() {
+        let mut headers = HashMap::new();
+        headers.insert("content-type".to_string(), "text/html".to_string());
+        let resp = Response::new(200, headers, Vec::new(), String::new());
+        // Fast path: lowercase name hits directly
+        assert_eq!(resp.header("content-type"), Some("text/html"));
+        // Slow path: mixed case triggers lowercase conversion
+        assert_eq!(resp.header("Content-Type"), Some("text/html"));
+        // Miss: both paths return None
+        assert_eq!(resp.header("x-missing"), None);
+        assert_eq!(resp.header("X-Missing"), None);
     }
 }
