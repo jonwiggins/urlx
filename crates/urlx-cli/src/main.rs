@@ -297,6 +297,24 @@ fn parse_args(args: &[String]) -> Option<CliOptions> {
                     if let Some((u, p)) = val.split_once(':') { (u, p) } else { (val, "") };
                 opts.easy.proxy_auth(user, pass);
             }
+            "--tlsv1.2" => {
+                opts.easy.ssl_min_version(liburlx::TlsVersion::Tls12);
+            }
+            "--tlsv1.3" => {
+                opts.easy.ssl_min_version(liburlx::TlsVersion::Tls13);
+            }
+            "--tls-max" => {
+                i += 1;
+                let val = require_arg(args, i, "--tls-max")?;
+                match val {
+                    "1.2" => opts.easy.ssl_max_version(liburlx::TlsVersion::Tls12),
+                    "1.3" => opts.easy.ssl_max_version(liburlx::TlsVersion::Tls13),
+                    _ => {
+                        eprintln!("urlx: unsupported TLS version: {val}");
+                        return None;
+                    }
+                }
+            }
             arg if arg.starts_with('-') => {
                 eprintln!("urlx: unknown option: {arg}");
                 return None;
@@ -1093,6 +1111,40 @@ mod tests {
     #[test]
     fn parse_args_cacert_missing_arg() {
         let args = vec!["urlx".to_string(), "--cacert".to_string()];
+        assert!(parse_args(&args).is_none());
+    }
+
+    #[test]
+    fn parse_args_tlsv12() {
+        let args = vec!["urlx".to_string(), "--tlsv1.2".to_string(), "https://x.com".to_string()];
+        assert!(parse_args(&args).is_some());
+    }
+
+    #[test]
+    fn parse_args_tlsv13() {
+        let args = vec!["urlx".to_string(), "--tlsv1.3".to_string(), "https://x.com".to_string()];
+        assert!(parse_args(&args).is_some());
+    }
+
+    #[test]
+    fn parse_args_tls_max() {
+        let args = vec![
+            "urlx".to_string(),
+            "--tls-max".to_string(),
+            "1.2".to_string(),
+            "https://x.com".to_string(),
+        ];
+        assert!(parse_args(&args).is_some());
+    }
+
+    #[test]
+    fn parse_args_tls_max_invalid() {
+        let args = vec![
+            "urlx".to_string(),
+            "--tls-max".to_string(),
+            "1.1".to_string(),
+            "https://x.com".to_string(),
+        ];
         assert!(parse_args(&args).is_none());
     }
 }

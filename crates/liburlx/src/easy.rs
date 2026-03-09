@@ -406,6 +406,20 @@ impl Easy {
         self.tls_config.client_key = Some(path.to_path_buf());
     }
 
+    /// Set the minimum TLS version to allow.
+    ///
+    /// Equivalent to curl's `--tlsv1.2` or `--tlsv1.3`.
+    pub fn ssl_min_version(&mut self, version: crate::tls::TlsVersion) {
+        self.tls_config.min_tls_version = Some(version);
+    }
+
+    /// Set the maximum TLS version to allow.
+    ///
+    /// Equivalent to curl's `--tls-max`.
+    pub fn ssl_max_version(&mut self, version: crate::tls::TlsVersion) {
+        self.tls_config.max_tls_version = Some(version);
+    }
+
     /// Perform the transfer and return the response (blocking).
     ///
     /// Creates a new tokio runtime internally. Do not call from within

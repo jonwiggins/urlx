@@ -393,7 +393,7 @@ impl TestAuthProxy {
                                     let n = client_stream.read(&mut tmp).await.unwrap();
                                     if n == 0 { break; }
                                     buf.extend_from_slice(&tmp[..n]);
-                                    if buf.windows(4).position(|w| w == b"\r\n\r\n").is_some() {
+                                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
                                         break;
                                     }
                                 }
