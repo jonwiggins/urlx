@@ -6,6 +6,7 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use crate::auth::{AuthCredentials, AuthMethod};
 use crate::cookie::CookieJar;
 use crate::error::Error;
 use crate::hsts::HstsCache;
@@ -41,6 +42,7 @@ pub struct Easy {
     resolve_overrides: Vec<(String, String)>,
     progress_callback: Option<ProgressCallback>,
     fail_on_error: bool,
+    auth_credentials: Option<AuthCredentials>,
     tls_config: TlsConfig,
     pool: ConnectionPool,
 }
@@ -67,6 +69,7 @@ impl std::fmt::Debug for Easy {
             .field("resolve_overrides", &self.resolve_overrides)
             .field("progress_callback", &self.progress_callback.as_ref().map(|_| "<callback>"))
             .field("fail_on_error", &self.fail_on_error)
+            .field("auth_credentials", &self.auth_credentials.as_ref().map(|_| "<credentials>"))
             .field("tls_config", &self.tls_config)
             .field("pool", &"<ConnectionPool>")
             .finish()
@@ -95,6 +98,7 @@ impl Clone for Easy {
             resolve_overrides: self.resolve_overrides.clone(),
             progress_callback: self.progress_callback.clone(),
             fail_on_error: self.fail_on_error,
+            auth_credentials: self.auth_credentials.clone(),
             tls_config: self.tls_config.clone(),
             pool: ConnectionPool::new(),
         }
@@ -125,6 +129,7 @@ impl Easy {
             resolve_overrides: Vec::new(),
             progress_callback: None,
             fail_on_error: false,
+            auth_credentials: None,
             tls_config: TlsConfig::default(),
             pool: ConnectionPool::new(),
         }
@@ -320,6 +325,21 @@ impl Easy {
         self.progress_callback = Some(callback);
     }
 
+    /// Set Digest authentication credentials.
+    ///
+    /// When set, the request is first sent without credentials. If the server
+    /// responds with `401 Unauthorized` and a `WWW-Authenticate: Digest` challenge,
+    /// the request is retried with the computed Digest response.
+    ///
+    /// Equivalent to curl's `--digest -u user:pass`.
+    pub fn digest_auth(&mut self, user: &str, password: &str) {
+        self.auth_credentials = Some(AuthCredentials {
+            username: user.to_string(),
+            password: password.to_string(),
+            method: AuthMethod::Digest,
+        });
+    }
+
     /// Enable or disable fail-on-error mode.
     ///
     /// When enabled, HTTP responses with status >= 400 cause
@@ -468,6 +488,7 @@ impl Easy {
             &mut self.cookie_jar,
             &mut self.hsts_cache,
             &self.resolve_overrides,
+            self.auth_credentials.as_ref(),
             &self.tls_config,
             &mut self.pool,
         );
@@ -512,7 +533,7 @@ impl Default for Easy {
 }
 
 /// Internal async transfer implementation.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn perform_transfer(
     url: &Url,
     method: Option<&str>,
@@ -528,6 +549,7 @@ async fn perform_transfer(
     cookie_jar: &mut Option<CookieJar>,
     hsts_cache: &mut Option<HstsCache>,
     resolve_overrides: &[(String, String)],
+    auth_credentials: Option<&AuthCredentials>,
     tls_config: &TlsConfig,
     pool: &mut ConnectionPool,
 ) -> Result<Response, Error> {
@@ -557,7 +579,7 @@ async fn perform_transfer(
         }
 
         let connect_start = Instant::now();
-        let response = do_single_request(
+        let mut response = do_single_request(
             &current_url,
             &current_method,
             &request_headers,
@@ -572,6 +594,57 @@ async fn perform_transfer(
         )
         .await?;
         last_connect_time = connect_start.elapsed();
+
+        // Handle Digest auth: if 401 with WWW-Authenticate: Digest, retry with credentials
+        if response.status() == 401 {
+            if let Some(auth) = auth_credentials {
+                if auth.method == AuthMethod::Digest {
+                    if let Some(www_auth) = response.header("www-authenticate") {
+                        if let Ok(challenge) = crate::auth::digest::DigestChallenge::parse(www_auth)
+                        {
+                            if verbose {
+                                #[allow(clippy::print_stderr)]
+                                {
+                                    eprintln!(
+                                        "* Server auth using Digest with realm '{}'",
+                                        challenge.realm
+                                    );
+                                }
+                            }
+
+                            let uri = current_url.request_target();
+                            let cnonce = crate::auth::digest::generate_cnonce();
+                            let auth_header = challenge.respond(
+                                &auth.username,
+                                &auth.password,
+                                &current_method,
+                                &uri,
+                                1,
+                                &cnonce,
+                            );
+
+                            let mut auth_headers = request_headers.clone();
+                            auth_headers.push(("Authorization".to_string(), auth_header));
+
+                            response = do_single_request(
+                                &current_url,
+                                &current_method,
+                                &auth_headers,
+                                current_body.as_deref(),
+                                verbose,
+                                accept_encoding,
+                                connect_timeout,
+                                effective_proxy,
+                                resolve_overrides,
+                                tls_config,
+                                pool,
+                            )
+                            .await?;
+                        }
+                    }
+                }
+            }
+        }
 
         // Store cookies from response
         if let Some(ref mut jar) = cookie_jar {
@@ -631,7 +704,6 @@ async fn perform_transfer(
             }
         }
 
-        let mut response = response;
         response.set_transfer_info(TransferInfo {
             time_connect: last_connect_time,
             time_total: transfer_start.elapsed(),

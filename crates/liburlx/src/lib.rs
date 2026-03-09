@@ -11,6 +11,7 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod auth;
 pub mod cookie;
 pub mod easy;
 pub mod error;
@@ -23,6 +24,7 @@ pub mod proxy;
 pub mod tls;
 pub mod url;
 
+pub use auth::{AuthCredentials, AuthMethod};
 pub use cookie::CookieJar;
 pub use easy::Easy;
 pub use error::Error;

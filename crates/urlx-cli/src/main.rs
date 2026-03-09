@@ -26,6 +26,8 @@ struct CliOptions {
     fail_on_error: bool,
     include_headers: bool,
     dump_header: Option<String>,
+    use_digest: bool,
+    user_credentials: Option<(String, String)>,
 }
 
 /// Print usage information to stderr.
@@ -64,6 +66,7 @@ fn print_usage() {
     eprintln!("      --cacert <file>       CA certificate bundle (PEM format)");
     eprintln!("      --cert <file>         Client certificate (PEM format)");
     eprintln!("      --key <file>          Client private key (PEM format)");
+    eprintln!("      --digest              Use HTTP Digest authentication");
 }
 
 /// Parse CLI arguments into options.
@@ -82,6 +85,8 @@ fn parse_args(args: &[String]) -> Option<CliOptions> {
         fail_on_error: false,
         include_headers: false,
         dump_header: None,
+        use_digest: false,
+        user_credentials: None,
     };
 
     let mut i = 1;
@@ -214,11 +219,12 @@ fn parse_args(args: &[String]) -> Option<CliOptions> {
             "-u" | "--user" => {
                 i += 1;
                 let val = require_arg(args, i, "-u")?;
-                if let Some((user, pass)) = val.split_once(':') {
-                    opts.easy.basic_auth(user, pass);
+                let (user, pass) = if let Some((u, p)) = val.split_once(':') {
+                    (u.to_string(), p.to_string())
                 } else {
-                    opts.easy.basic_auth(val, "");
-                }
+                    (val.to_string(), String::new())
+                };
+                opts.user_credentials = Some((user, pass));
             }
             "-A" | "--user-agent" => {
                 i += 1;
@@ -280,6 +286,9 @@ fn parse_args(args: &[String]) -> Option<CliOptions> {
                 let val = require_arg(args, i, "--key")?;
                 opts.easy.ssl_client_key(std::path::Path::new(val));
             }
+            "--digest" => {
+                opts.use_digest = true;
+            }
             arg if arg.starts_with('-') => {
                 eprintln!("urlx: unknown option: {arg}");
                 return None;
@@ -289,6 +298,15 @@ fn parse_args(args: &[String]) -> Option<CliOptions> {
             }
         }
         i += 1;
+    }
+
+    // Apply auth credentials after all flags are parsed
+    if let Some((ref user, ref pass)) = opts.user_credentials {
+        if opts.use_digest {
+            opts.easy.digest_auth(user, pass);
+        } else {
+            opts.easy.basic_auth(user, pass);
+        }
     }
 
     Some(opts)
