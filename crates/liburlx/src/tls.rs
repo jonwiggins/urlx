@@ -58,6 +58,12 @@ pub struct TlsConfig {
     /// When set, connections using a higher TLS version will not be attempted.
     /// Equivalent to curl's `--tls-max`.
     pub max_tls_version: Option<TlsVersion>,
+
+    /// SHA-256 hash of the server's public key for pinning.
+    ///
+    /// Format: `sha256//<base64-encoded-hash>` (same as curl's `--pinnedpubkey`).
+    /// The connection will fail if the server's public key hash doesn't match.
+    pub pinned_public_key: Option<String>,
 }
 
 impl Default for TlsConfig {
@@ -70,6 +76,7 @@ impl Default for TlsConfig {
             client_key: None,
             min_tls_version: None,
             max_tls_version: None,
+            pinned_public_key: None,
         }
     }
 }
@@ -97,6 +104,8 @@ mod rustls_impl {
     /// A TLS connector backed by rustls.
     pub struct TlsConnector {
         config: Arc<rustls::ClientConfig>,
+        /// SHA-256 pin of the server's public key (base64-encoded).
+        pinned_public_key: Option<String>,
     }
 
     impl TlsConnector {
@@ -139,7 +148,13 @@ mod rustls_impl {
                 config
             };
 
-            Ok(Self { config: Arc::new(config) })
+            // Extract the base64 hash from the "sha256//..." format
+            let pinned_public_key = tls_config
+                .pinned_public_key
+                .as_ref()
+                .and_then(|pin| pin.strip_prefix("sha256//").map(ToString::to_string));
+
+            Ok(Self { config: Arc::new(config), pinned_public_key })
         }
 
         /// Determine the allowed TLS protocol versions based on config.
@@ -201,7 +216,8 @@ mod rustls_impl {
         ///
         /// # Errors
         ///
-        /// Returns [`Error::Tls`] if the handshake fails.
+        /// Returns [`Error::Tls`] if the handshake fails or certificate pinning
+        /// validation fails.
         pub async fn connect(
             &self,
             stream: TcpStream,
@@ -216,6 +232,11 @@ mod rustls_impl {
                 .await
                 .map_err(|e| Error::Tls(Box::new(e)))?;
 
+            // Verify certificate pinning if configured
+            if let Some(ref expected_hash) = self.pinned_public_key {
+                Self::verify_pin(&tls_stream, expected_hash)?;
+            }
+
             // Check ALPN result
             let alpn = tls_stream
                 .get_ref()
@@ -225,6 +246,44 @@ mod rustls_impl {
                 .unwrap_or(AlpnProtocol::Http11);
 
             Ok((tls_stream, alpn))
+        }
+
+        /// Verify the server's public key hash matches the pinned value.
+        fn verify_pin(
+            tls_stream: &TlsStream<TcpStream>,
+            expected_hash_b64: &str,
+        ) -> Result<(), Error> {
+            use base64::Engine as _;
+            use sha2::Digest as _;
+
+            let peer_certs = tls_stream
+                .get_ref()
+                .1
+                .peer_certificates()
+                .ok_or_else(|| Error::Tls("no peer certificates for pinning check".into()))?;
+
+            let leaf_cert = peer_certs
+                .first()
+                .ok_or_else(|| Error::Tls("no leaf certificate for pinning check".into()))?;
+
+            // Parse the DER certificate to extract the SPKI
+            let spki = extract_spki_der(leaf_cert.as_ref())
+                .ok_or_else(|| Error::Tls("failed to extract SPKI from certificate".into()))?;
+
+            // Hash the SPKI
+            let actual_hash = sha2::Sha256::digest(spki);
+            let actual_hash_b64 = base64::engine::general_purpose::STANDARD.encode(actual_hash);
+
+            if actual_hash_b64 != expected_hash_b64 {
+                return Err(Error::Tls(
+                    format!(
+                        "certificate pinning failed: expected sha256//{expected_hash_b64}, got sha256//{actual_hash_b64}"
+                    )
+                    .into(),
+                ));
+            }
+
+            Ok(())
         }
     }
 
@@ -336,6 +395,92 @@ mod rustls_impl {
 
         Ok(key)
     }
+
+    /// Extract the Subject Public Key Info (SPKI) DER bytes from an X.509 certificate.
+    ///
+    /// This is a minimal DER parser — it walks the ASN.1 structure of the certificate
+    /// to find the `subjectPublicKeyInfo` field (the 7th element of the `TBSCertificate`).
+    ///
+    /// X.509 structure:
+    /// ```text
+    /// Certificate ::= SEQUENCE {
+    ///     tbsCertificate      TBSCertificate,
+    ///     ...
+    /// }
+    /// TBSCertificate ::= SEQUENCE {
+    ///     version         [0] EXPLICIT Version DEFAULT v1,
+    ///     serialNumber    CertificateSerialNumber,
+    ///     signature       AlgorithmIdentifier,
+    ///     issuer          Name,
+    ///     validity        Validity,
+    ///     subject         Name,
+    ///     subjectPublicKeyInfo SubjectPublicKeyInfo,
+    ///     ...
+    /// }
+    /// ```
+    pub fn extract_spki_der(cert_der: &[u8]) -> Option<&[u8]> {
+        // Parse outer SEQUENCE (Certificate)
+        let (_, cert_content) = parse_der_element(cert_der)?;
+        // Parse TBSCertificate SEQUENCE
+        let (_, tbs_content) = parse_der_element(cert_content)?;
+
+        // Skip fields in TBSCertificate to reach subjectPublicKeyInfo (index 6)
+        let mut pos = tbs_content;
+        for _ in 0..6 {
+            let (rest, _) = parse_der_element(pos)?;
+            pos = rest;
+        }
+
+        // The next element is the SPKI — return its full DER encoding (tag + length + content)
+        let (_, _) = parse_der_element(pos)?;
+        let spki_len = pos.len() - parse_der_element(pos)?.0.len();
+        Some(&pos[..spki_len])
+    }
+
+    /// Parse a single DER element, returning (remaining bytes, element content).
+    ///
+    /// For constructed types (SEQUENCE, SET), the content is the inner bytes.
+    /// For primitive types, the content is the value bytes.
+    pub fn parse_der_element(data: &[u8]) -> Option<(&[u8], &[u8])> {
+        if data.is_empty() {
+            return None;
+        }
+
+        // Tag byte at data[0] is consumed but not inspected
+        let (len, header_size) = parse_der_length(&data[1..])?;
+        let total_header = 1 + header_size;
+
+        if data.len() < total_header + len {
+            return None;
+        }
+
+        let content = &data[total_header..total_header + len];
+        let rest = &data[total_header + len..];
+        Some((rest, content))
+    }
+
+    /// Parse a DER length field, returning (length, number of bytes consumed).
+    pub fn parse_der_length(data: &[u8]) -> Option<(usize, usize)> {
+        if data.is_empty() {
+            return None;
+        }
+
+        if data[0] < 0x80 {
+            // Short form
+            Some((data[0] as usize, 1))
+        } else {
+            // Long form
+            let num_bytes = (data[0] & 0x7F) as usize;
+            if num_bytes == 0 || num_bytes > 4 || data.len() < 1 + num_bytes {
+                return None;
+            }
+            let mut len = 0usize;
+            for &b in &data[1..=num_bytes] {
+                len = len.checked_mul(256)?.checked_add(b as usize)?;
+            }
+            Some((len, 1 + num_bytes))
+        }
+    }
 }
 
 #[cfg(feature = "rustls")]
@@ -426,5 +571,77 @@ mod tests {
         };
         let connector = TlsConnector::new(&config);
         assert!(connector.is_ok());
+    }
+
+    #[test]
+    fn tls_config_default_has_no_pin() {
+        let config = TlsConfig::default();
+        assert!(config.pinned_public_key.is_none());
+    }
+
+    #[cfg(feature = "rustls")]
+    #[test]
+    fn tls_connector_with_pin_creates_ok() {
+        let config = TlsConfig {
+            pinned_public_key: Some(
+                "sha256//AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string(),
+            ),
+            ..TlsConfig::default()
+        };
+        let connector = TlsConnector::new(&config);
+        assert!(connector.is_ok());
+    }
+
+    #[cfg(feature = "rustls")]
+    #[test]
+    fn der_parser_short_length() {
+        use rustls_impl::parse_der_length;
+        assert_eq!(parse_der_length(&[0x05]), Some((5, 1)));
+        assert_eq!(parse_der_length(&[0x7F]), Some((127, 1)));
+    }
+
+    #[cfg(feature = "rustls")]
+    #[test]
+    fn der_parser_long_length() {
+        use rustls_impl::parse_der_length;
+        // 0x81 0x80 = 128 in long form (1 byte for length)
+        assert_eq!(parse_der_length(&[0x81, 0x80]), Some((128, 2)));
+        // 0x82 0x01 0x00 = 256 in long form (2 bytes for length)
+        assert_eq!(parse_der_length(&[0x82, 0x01, 0x00]), Some((256, 3)));
+    }
+
+    #[cfg(feature = "rustls")]
+    #[test]
+    fn der_parser_empty() {
+        use rustls_impl::parse_der_length;
+        assert_eq!(parse_der_length(&[]), None);
+    }
+
+    #[cfg(feature = "rustls")]
+    #[test]
+    fn der_parse_element_simple() {
+        use rustls_impl::parse_der_element;
+        // SEQUENCE (tag 0x30) with 2 bytes of content
+        let data = [0x30, 0x02, 0xAA, 0xBB, 0xCC];
+        let (rest, content) = parse_der_element(&data).unwrap();
+        assert_eq!(content, &[0xAA, 0xBB]);
+        assert_eq!(rest, &[0xCC]);
+    }
+
+    #[cfg(feature = "rustls")]
+    #[test]
+    fn extract_spki_from_generated_cert() {
+        use rustls_impl::extract_spki_der;
+        // Generate a self-signed cert using rcgen and verify SPKI extraction
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert_der = cert.cert.der();
+
+        let spki = extract_spki_der(cert_der);
+        assert!(spki.is_some());
+        let spki = spki.unwrap();
+        // SPKI should start with SEQUENCE tag (0x30)
+        assert_eq!(spki[0], 0x30);
+        // SPKI should be non-trivially long
+        assert!(spki.len() > 32);
     }
 }
