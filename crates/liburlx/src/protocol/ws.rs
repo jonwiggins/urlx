@@ -111,14 +111,14 @@ impl Frame {
             #[allow(clippy::cast_possible_truncation)]
             buf.push(mask_bit | len as u8);
         } else if len <= 65535 {
-            buf.push(mask_bit | 126);
+            buf.push(mask_bit | 0x7E);
             #[allow(clippy::cast_possible_truncation)]
             {
                 buf.push((len >> 8) as u8);
                 buf.push(len as u8);
             }
         } else {
-            buf.push(mask_bit | 127);
+            buf.push(mask_bit | 0x7F);
             for i in (0..8).rev() {
                 #[allow(clippy::cast_possible_truncation)]
                 buf.push((len >> (i * 8)) as u8);

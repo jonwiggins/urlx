@@ -464,7 +464,10 @@ pub unsafe extern "C" fn curl_easy_getinfo(
         0x20_0014 => {
             // SAFETY: Caller guarantees out points to c_long
             let out = unsafe { &mut *out.cast::<c_long>() };
-            *out = c_long::from(response.transfer_info().num_redirects);
+            #[allow(clippy::cast_possible_wrap, clippy::cast_lossless)]
+            {
+                *out = response.transfer_info().num_redirects as c_long;
+            }
             CURLcode::CURLE_OK
         }
 
