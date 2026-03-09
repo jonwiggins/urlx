@@ -937,7 +937,14 @@ async fn do_single_request(
     // Handle non-HTTP schemes directly
     match url.scheme() {
         "file" => return crate::protocol::file::read_file(url),
-        "ftp" => return crate::protocol::ftp::download(url).await,
+        "ftp" => {
+            return if method == "PUT" {
+                let upload_data = body.unwrap_or(&[]);
+                crate::protocol::ftp::upload(url, upload_data).await
+            } else {
+                crate::protocol::ftp::download(url).await
+            };
+        }
         _ => {}
     }
 

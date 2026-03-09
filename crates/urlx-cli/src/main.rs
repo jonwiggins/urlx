@@ -73,6 +73,7 @@ fn print_usage() {
     eprintln!("      --interface <name>    Use network interface/address for outgoing connections");
     eprintln!("      --local-port <port>   Bind to local port for outgoing connections");
     eprintln!("      --dns-shuffle         Randomize DNS resolution order");
+    eprintln!("  -T, --upload-file <file>  Upload file (PUT)");
 }
 
 /// Parse CLI arguments into options.
@@ -356,6 +357,22 @@ fn parse_args(args: &[String]) -> Option<CliOptions> {
             }
             "--dns-shuffle" => {
                 opts.easy.dns_shuffle(true);
+            }
+            "-T" | "--upload-file" => {
+                i += 1;
+                let val = require_arg(args, i, "-T")?;
+                match std::fs::read(val) {
+                    Ok(data) => {
+                        opts.easy.body(&data);
+                        if opts.easy.method_is_default() {
+                            opts.easy.method("PUT");
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("urlx: can't read file '{val}': {e}");
+                        return None;
+                    }
+                }
             }
             arg if arg.starts_with('-') => {
                 eprintln!("urlx: unknown option: {arg}");
