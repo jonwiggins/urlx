@@ -14,12 +14,12 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 42 — Planning
-**Last completed:** Phase 41 (URL Globbing) — 2026-03-09
-**Total tests:** 2,157
-**In progress:** Planning Phase 42
+**Phase:** 43 — Planning
+**Last completed:** Phase 42 (CLI Expansion V) — 2026-03-09
+**Total tests:** 2,180
+**In progress:** Planning Phase 43
 **Blockers:** None
-**Next up:** Phase 42 — CLI Expansion V
+**Next up:** Phase 43 — HTTP/2 Stream Priority & Advanced Features
 
 ### Completeness Summary (updated Phase 40 review)
 
@@ -359,18 +359,9 @@ URL glob expansion module (`liburlx::glob`). `expand_glob()` parses curl-compati
 
 ---
 
-### Phase 42: CLI Expansion V
+### Phase 42: CLI Expansion V (2026-03-09)
 
-**Goal:** Continue toward full curl CLI parity.
-
-- `--proxy-tlsv1.2`/`--proxy-tlsv1.3`/`--proxy-cacert`/`--proxy-cert`/`--proxy-key` (proxy TLS config)
-- `--abstract-unix-socket` (Linux abstract sockets)
-- `--alt-svc` (Alt-Svc cache file)
-- `--compressed-ssh` (SSH compression)
-- `--connect-to` (host:port mapping)
-- `--doh-insecure`/`--doh-cert-status` (DoH TLS options)
-- `--etag-save`/`--etag-compare` (ETag conditional requests)
-- `--haproxy-protocol` (HAProxy PROXY protocol)
+Added 14 CLI flags: `--connect-to` (host:port mapping stored on Easy), `--alt-svc` (Alt-Svc cache file path), `--etag-save`/`--etag-compare` (ETag conditional requests — saves/reads ETag from file, sends If-None-Match header), `--haproxy-protocol` (PROXY protocol v1 flag), `--abstract-unix-socket` (Linux abstract socket path), `--proxy-cacert`/`--proxy-cert`/`--proxy-key` (proxy TLS config), `--doh-insecure`/`--doh-cert-status` (DoH TLS options), `--proto-default` (default protocol for schemeless URLs), `--compressed-ssh` (no-op). Added 4 Easy API methods: `connect_to()`, `haproxy_protocol()`, `abstract_unix_socket()`, `doh_insecure()`. 14 new tests (4 Easy + 10 CLI).
 
 ---
 
