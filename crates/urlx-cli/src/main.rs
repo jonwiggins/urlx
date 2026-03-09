@@ -63,6 +63,7 @@ struct CliOptions {
     url_queries: Vec<String>,
     rate: Option<String>,
     use_ntlm: bool,
+    globoff: bool,
 }
 
 /// Print usage information to stderr.
@@ -241,6 +242,7 @@ fn parse_args(args: &[String]) -> Option<CliOptions> {
         url_queries: Vec::new(),
         rate: None,
         use_ntlm: false,
+        globoff: false,
     };
 
     let mut i = 1;
@@ -867,11 +869,13 @@ fn parse_args(args: &[String]) -> Option<CliOptions> {
             "--remote-time" | "-R" => {
                 opts.remote_time = true;
             }
-            // No-op flags: --next (option groups), --ftp-pasv (default), --globoff (no URL
-            // globbing), --styled-output/--no-styled-output (no terminal styling),
-            // --negotiate (Kerberos/SPNEGO not fully implemented)
-            "--next" | "--ftp-pasv" | "--globoff" | "--styled-output" | "--no-styled-output"
-            | "--negotiate" => {}
+            "--globoff" => {
+                opts.globoff = true;
+            }
+            // No-op flags: --ftp-pasv (default), --styled-output/--no-styled-output
+            // (no terminal styling), --negotiate (Kerberos/SPNEGO not fully implemented),
+            // --next (URL option groups — URLs already collected separately)
+            "--next" | "--ftp-pasv" | "--styled-output" | "--no-styled-output" | "--negotiate" => {}
             // FTPS: explicit mode (AUTH TLS)
             "--ftp-ssl" | "--ssl" | "--ftp-ssl-reqd" | "--ssl-reqd" => {
                 opts.easy.ftp_ssl_mode(liburlx::protocol::ftp::FtpSslMode::Explicit);
@@ -1351,6 +1355,23 @@ fn run(args: &[String]) -> ExitCode {
     let Some(mut opts) = parse_args(args) else {
         return ExitCode::FAILURE;
     };
+
+    // Expand URL globs unless --globoff is set
+    if !opts.globoff {
+        let mut expanded = Vec::new();
+        for url in &opts.urls {
+            match liburlx::glob::expand_glob(url) {
+                Ok(urls) => expanded.extend(urls),
+                Err(e) => {
+                    if !opts.silent || opts.show_error {
+                        eprintln!("urlx: glob error: {e}");
+                    }
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        opts.urls = expanded;
+    }
 
     // Multiple URLs: use Multi API for concurrent transfers
     if opts.urls.len() > 1 {
@@ -3558,7 +3579,8 @@ mod tests {
     #[test]
     fn parse_args_globoff() {
         let args = vec!["urlx".into(), "--globoff".into(), "http://x.com".into()];
-        assert!(parse_args(&args).is_some());
+        let opts = parse_args(&args).unwrap();
+        assert!(opts.globoff);
     }
 
     #[test]
@@ -3796,5 +3818,34 @@ mod tests {
     fn parse_ftp_method_invalid() {
         let args = make_args(&["--ftp-method", "invalid", "ftp://example.com/"]);
         assert!(parse_args(&args).is_none());
+    }
+
+    // --- Phase 41 tests: URL globbing ---
+
+    #[test]
+    fn parse_args_globoff_sets_flag() {
+        let args = make_args(&["--globoff", "http://example.com/{a,b}"]);
+        let opts = parse_args(&args).unwrap();
+        assert!(opts.globoff);
+        // With globoff, URL is stored literally (not expanded)
+        assert_eq!(opts.urls, vec!["http://example.com/{a,b}"]);
+    }
+
+    #[test]
+    fn glob_expansion_in_run() {
+        // Verify that glob expansion works at the parse level
+        let args = make_args(&["http://example.com/{a,b}"]);
+        let opts = parse_args(&args).unwrap();
+        assert!(!opts.globoff);
+        // URLs collected as-is at parse time
+        assert_eq!(opts.urls, vec!["http://example.com/{a,b}"]);
+        // Expansion happens in run(), not parse_args()
+    }
+
+    #[test]
+    fn glob_numeric_range_collected() {
+        let args = make_args(&["http://example.com/[1-3]"]);
+        let opts = parse_args(&args).unwrap();
+        assert_eq!(opts.urls, vec!["http://example.com/[1-3]"]);
     }
 }
