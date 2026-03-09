@@ -14,12 +14,12 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 30 — Completeness Review
-**Last completed:** Phase 29 (Performance & Optimization) — 2026-03-09
-**Total tests:** 1,954
-**In progress:** Phase 30 — Completeness Review + 1.0 Planning
+**Phase:** 32 — HTTPS Proxy & Trace Output
+**Last completed:** Phase 31 (Cookie Domain Indexing) — 2026-03-09
+**Total tests:** 1,958
+**In progress:** Phase 32 — HTTPS Proxy & Trace Output
 **Blockers:** None
-**Next up:** Phase 30 — Completeness Review + 1.0 Planning
+**Next up:** Phase 32 — HTTPS Proxy & Trace Output
 
 ### Completeness Summary (updated Phase 30 review)
 
@@ -30,7 +30,7 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 | HTTP/3 | 40% | QUIC transport via quinn, h3 request/response, rate limiting; no 0-RTT or Alt-Svc upgrade |
 | TLS | 85% | rustls with insecure mode, custom CA, client certs, pinning, version selection, cipher list, session cache |
 | Authentication | 60% | Basic, Bearer, Digest (MD5/SHA-256), AWS SigV4, NTLM skeleton |
-| Cookie engine | 90% | Netscape file format read/write, in-memory jar; no public suffix list |
+| Cookie engine | 92% | Netscape file format read/write, domain-indexed jar; no public suffix list |
 | Proxy | 85% | HTTP + SOCKS + proxy Basic/Digest/NTLM auth, proxy TLS config; no HTTPS proxy tunnel or PAC |
 | DNS | 75% | Cache with configurable TTL, Happy Eyeballs, DNS shuffle, DNS server config, DoH URL config; no async resolver |
 | FTP | 85% | Session API, upload, resume, dir ops, FEAT, explicit/implicit FTPS, active mode (PORT/EPRT) |
@@ -261,7 +261,7 @@ Built from scratch over 29 phases. All features below are implemented and tested
 - **HTTP/2:** Via h2 crate with ALPN negotiation. `HttpVersion` enum (None/Http10/Http11/Http2/Http3). Server push collection via `push_promises()` stream — `PushedResponse` struct with URL, status, headers, body.
 - **TLS:** rustls + tokio-rustls. `TlsConfig` with verify_peer/host, CA cert, client cert/key, version selection (TLS 1.2/1.3), certificate pinning (SHA-256 SPKI), cipher list, session cache. Inline DER parser for SPKI extraction.
 - **Authentication:** Basic, Bearer, Digest (MD5/SHA-256 with qop=auth), AWS SigV4 (inline HMAC-SHA256), NTLM skeleton (SHA-256-based, sufficient for proxy auth testing).
-- **Cookie engine:** RFC 6265 parsing, domain/path matching, Netscape file format persistence (read/write), HttpOnly, Secure, SameSite (stored). No public suffix list.
+- **Cookie engine:** RFC 6265 parsing, domain/path matching, Netscape file format persistence (read/write), HttpOnly, Secure, SameSite (stored). Domain-indexed jar (HashMap by domain for O(1) lookup). No public suffix list.
 - **HSTS cache:** STS parsing, HTTP→HTTPS upgrade, includeSubDomains.
 - **Proxy:** HTTP forward, HTTP CONNECT tunnel (with Digest/NTLM 407 challenge-response), SOCKS4/4a/5 with auth, noproxy bypass, proxy TLS config.
 - **Connection:** Pool with stale retry, TCP_NODELAY (default on), TCP keepalive (socket2), Unix domain sockets, interface/port binding, Happy Eyeballs (250ms, configurable).
@@ -299,7 +299,7 @@ Built from scratch over 29 phases. All features below are implemented and tested
 - FTP: --ftp-pasv, --ftp-ssl, --ssl, --ftp-ssl-reqd, --ssl-reqd, --ftp-port.
 - Features: .curlrc-style config file parser, protocol restriction, max filesize enforcement (exit 63), libcurl C code generation, retry logic (408/429/5xx), netrc credential lookup.
 
-**Testing — 1,954 tests (0 failures):**
+**Testing — 1,958 tests (0 failures):**
 - Unit + integration tests across all crates
 - Integration: 1,048 (hyper-based test servers)
 - Property-based: 60 (proptest — URL, cookie, FTP, HTTP, HSTS, multipart, protocols, WebSocket)
@@ -309,7 +309,7 @@ Built from scratch over 29 phases. All features below are implemented and tested
 
 **Guardrails:** Zero TODO/FIXME/HACK. Zero `unwrap()` in production code. `#![deny(unsafe_code)]` in liburlx and urlx-cli. GitHub Actions CI (fmt, clippy, test on 3 OS, doc, cargo-deny, MSRV 1.83, commit lint). Pre-commit hooks (fmt, clippy, test, deny, doc, conventional commit).
 
-**Known gaps (as of Phase 30 review):** Trace file writing not fully wired. HTTP/3 missing 0-RTT and Alt-Svc-based upgrade from HTTP/2. HTTP/2 missing stream priority/dependency. SSH known_hosts verification not implemented. Socket/timer callbacks stored but not actively invoked (tokio manages I/O). Missing FFI: CURLOPT_HTTPPOST (deprecated). URL globbing (--glob) not yet implemented. Cookie jar uses linear scan (O(n)) — domain-indexed lookup would improve performance for large jars. No async DNS resolver (hickory-dns). NTLM auth is skeleton only.
+**Known gaps (as of Phase 31):** Trace file writing not fully wired. HTTP/3 missing 0-RTT and Alt-Svc-based upgrade from HTTP/2. HTTP/2 missing stream priority/dependency. SSH known_hosts verification not implemented. Socket/timer callbacks stored but not actively invoked (tokio manages I/O). Missing FFI: CURLOPT_HTTPPOST (deprecated). URL globbing (--glob) not yet implemented. No async DNS resolver (hickory-dns). No cookie public suffix list. NTLM auth is skeleton only.
 
 ---
 
@@ -333,26 +333,21 @@ Third mandatory review phase. Audited the codebase against curl/libcurl. Compact
 
 **Key gaps for 1.0:**
 1. Async DNS resolver (hickory-dns) for non-blocking resolution
-2. Cookie jar domain-indexed lookup for O(1) matching
-3. HTTP/3 Alt-Svc upgrade and 0-RTT
-4. HTTP/2 stream priority/dependency
-5. HTTPS proxy tunneling
-6. Trace file output (--trace writes to file)
-7. URL globbing (--glob)
-8. Additional FFI functions (curl_formadd, curl_getdate, curl_escape/unescape)
-9. Additional CLI flags (50+ remaining common flags)
+2. HTTP/3 Alt-Svc upgrade and 0-RTT
+3. HTTP/2 stream priority/dependency
+4. HTTPS proxy tunneling
+5. Trace file output (--trace writes to file)
+6. URL globbing (--glob)
+7. Additional FFI functions (curl_formadd, curl_getdate, curl_escape/unescape)
+8. Additional CLI flags (50+ remaining common flags)
+9. Cookie public suffix list
 10. NTLM full implementation (MD4+DES crypto)
 
 ---
 
-### Phase 31: Async DNS & Cookie Indexing
+### Phase 31: Cookie Domain Indexing (2026-03-09)
 
-**Goal:** Improve DNS and cookie performance.
-
-- hickory-dns async resolver (feature-gated)
-- Domain-indexed cookie jar (HashMap by domain for O(1) lookup)
-- Cookie public suffix list support
-- DNS-over-HTTPS implementation (currently config-only)
+Domain-indexed cookie jar for O(1) lookup. HashMap<String, Vec<usize>> maps domains to cookie indices. cookie_header() walks exact + parent domains via index. Index rebuilt on mutation. 4 new tests. Remaining items (hickory-dns async resolver, cookie public suffix list, DoH implementation) deferred to Phase 36+.
 
 ---
 
