@@ -14,12 +14,12 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 6 — FFI Expansion
-**Last completed:** Phase 5 (Multi API) — 2026-03-08
-**Total tests:** 1490+
-**In progress:** Planning Phase 6
+**Phase:** 7 — CLI Completeness
+**Last completed:** Phase 6 (FFI Expansion) — 2026-03-08
+**Total tests:** 1520+
+**In progress:** Planning Phase 7
 **Blockers:** None
-**Next up:** CURLcode expansion, CURLoption expansion, curl_multi_* FFI
+**Next up:** Cookie flags, TLS flags, auth flags, transfer flags, debug flags
 
 ### Completeness Summary
 
@@ -36,10 +36,10 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 | FTP | 70% | Session API, upload, resume, dir ops, FEAT; no FTPS or active mode |
 | SSH/SFTP/SCP | 0% | Not implemented |
 | Multi API | 55% | Connection limiting, message queue, share interface, pipelining config; no poll/socket/timer callbacks |
-| FFI (libcurl C ABI) | ~8% | 19/300+ options, 6/50+ info codes |
+| FFI (libcurl C ABI) | ~18% | 37 options, 12 info codes, 25 error codes, multi API, slist, duphandle |
 | CLI | ~14% | ~43 of ~250 flags |
 | Connection | 80% | Pool, TCP_NODELAY, keepalive, Unix sockets, interface/port binding |
-| Overall | ~44% | ~88% for basic HTTP/HTTPS use cases |
+| Overall | ~46% | ~88% for basic HTTP/HTTPS use cases |
 
 ---
 
@@ -67,6 +67,8 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 - **2026-03-08:** Share interface uses swap-based approach: shared state is swapped into local Easy fields before transfer, then swapped back after. No lock held across async await points — only brief locks for the swap. This naturally serializes access per-transfer.
 - **2026-03-08:** Poll/socket/timer/fdset Multi APIs deferred to FFI phase — these are C event-loop integration points that don't map naturally to tokio's async model. The Rust Multi API already provides native async via `perform()`.
 - **2026-03-08:** `PipeliningMode` enum has `Nothing` and `Multiplex` variants. HTTP/1.1 pipelining was deprecated in libcurl and is not supported — only HTTP/2 multiplexing is offered.
+- **2026-03-08:** `curl_slist` is implemented as a C-compatible linked list with manual memory management (Vec + mem::forget for string data, Box for nodes). This matches libcurl's API exactly.
+- **2026-03-08:** `curl_multi_perform` uses `perform_blocking` internally, creating a tokio runtime per call. This matches the blocking C API model. For async-native C consumers, poll/socket callbacks would be needed (deferred).
 
 ---
 
@@ -281,36 +283,15 @@ Implemented connection limiting, message queue, share interface, and pipelining 
 
 ---
 
-### Phase 6: FFI Expansion
+### Phase 6: FFI Expansion — COMPLETED (2026-03-08)
 
-**Goal:** Make liburlx-ffi a realistic drop-in for libcurl consumers.
-
-**CURLcode expansion:**
-- Map all 92 libcurl error codes (currently 9)
-
-**CURLoption expansion (target: top 100 most-used options):**
-- All TLS options from Phase 2
-- All DNS/connection options from Phase 3
-- Cookie file I/O — `CURLOPT_COOKIEFILE`, `CURLOPT_COOKIEJAR`
-- Upload — `CURLOPT_UPLOAD`, `CURLOPT_INFILESIZE`
-- Auth — `CURLOPT_HTTPAUTH`, `CURLOPT_PROXYAUTH`
-- Rate limiting — `CURLOPT_MAX_SEND_SPEED_LARGE`, `CURLOPT_MAX_RECV_SPEED_LARGE`
-- Callbacks — `CURLOPT_READFUNCTION`, `CURLOPT_PROGRESSFUNCTION`, `CURLOPT_DEBUGFUNCTION`
-- Handle options — `CURLOPT_PRIVATE`, `CURLOPT_SHARE`
-
-**CURLINFO expansion:**
-- All timing fields (namelookup, connect, appconnect, starttransfer, pretransfer, redirect)
-- Speed fields (download, upload)
-- Size fields (upload, download, header)
-- TLS info (SSL_VERIFYRESULT, CERTINFO)
-- Connection info (LOCAL_IP, LOCAL_PORT, PRIMARY_IP, PRIMARY_PORT)
-
-**Additional FFI functions:**
-- `curl_multi_*` — init, add_handle, remove_handle, perform, poll, info_read, cleanup
-- `curl_easy_duphandle` — handle cloning
-- `curl_mime_*` — structured multipart API
-- `curl_url_*` — URL parsing API
-- `curl_slist_*` — linked list for headers
+Expanded liburlx-ffi from ~8% to ~18% libcurl coverage:
+- CURLcode: 12 → 25 error codes (proxy, FTP, HTTP error, write/read, SSL cert, auth, abort)
+- CURLoption: 18 → 37 options (TLS verify/cert/key/CA/pin/version, auth, cookies, encoding, range, TCP, Unix socket, interface, resolve, upload)
+- CURLINFO: 6 → 12 codes (namelookup, connect, appconnect, starttransfer, speed, header size)
+- New functions: `curl_easy_duphandle`, `curl_easy_reset`, `curl_slist_append`/`curl_slist_free_all`, `curl_multi_init`/`cleanup`/`add_handle`/`remove_handle`/`perform`, `curl_version`
+- CURLMcode enum for multi error codes
+- Deferred: `curl_mime_*`, `curl_url_*`, read/progress/debug callbacks, CURLOPT_PRIVATE/SHARE
 
 ---
 
