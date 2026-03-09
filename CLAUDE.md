@@ -14,18 +14,18 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 8 — HTTP Completeness + HTTP/3
-**Last completed:** Phase 7 (CLI Completeness) — 2026-03-08
-**Total tests:** 1550+
-**In progress:** Planning Phase 8
+**Phase:** 9 — Advanced Transfer Features + Cookie Persistence
+**Last completed:** Phase 8 (HTTP Completeness) — 2026-03-08
+**Total tests:** 1580+
+**In progress:** Planning Phase 9
 **Blockers:** None
-**Next up:** Expect: 100-continue, HTTP/2 server push, HTTP/3 via quinn
+**Next up:** Rate limiting, cookie persistence, retry logic in library
 
 ### Completeness Summary
 
 | Feature Area | Parity | Notes |
 |---|---|---|
-| HTTP/1.1 | 85% | Solid; no Expect: 100-continue |
+| HTTP/1.1 | 95% | Expect: 100-continue, HTTP/1.0 mode; no trailer headers |
 | HTTP/2 | 60% | Works; no server push |
 | HTTP/3 | 0% | Not implemented |
 | TLS | 80% | rustls with insecure mode, custom CA, client certs, pinning, version selection |
@@ -37,9 +37,9 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 | SSH/SFTP/SCP | 0% | Not implemented |
 | Multi API | 55% | Connection limiting, message queue, share interface, pipelining config; no poll/socket/timer callbacks |
 | FFI (libcurl C ABI) | ~18% | 37 options, 12 info codes, 25 error codes, multi API, slist, duphandle |
-| CLI | ~19% | ~58 of ~250 flags |
+| CLI | ~20% | ~62 of ~250 flags |
 | Connection | 80% | Pool, TCP_NODELAY, keepalive, Unix sockets, interface/port binding |
-| Overall | ~48% | ~89% for basic HTTP/HTTPS use cases |
+| Overall | ~50% | ~90% for basic HTTP/HTTPS use cases |
 
 ---
 
@@ -69,6 +69,9 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 - **2026-03-08:** `PipeliningMode` enum has `Nothing` and `Multiplex` variants. HTTP/1.1 pipelining was deprecated in libcurl and is not supported — only HTTP/2 multiplexing is offered.
 - **2026-03-08:** `curl_slist` is implemented as a C-compatible linked list with manual memory management (Vec + mem::forget for string data, Box for nodes). This matches libcurl's API exactly.
 - **2026-03-08:** `curl_multi_perform` uses `perform_blocking` internally, creating a tokio runtime per call. This matches the blocking C API model. For async-native C consumers, poll/socket callbacks would be needed (deferred).
+- **2026-03-08:** HTTP/3 via quinn deferred from Phase 8. Adding QUIC transport is a major effort requiring: new dependency, QUIC connection management, Alt-Svc-based discovery, 0-RTT, connection migration. Better as a dedicated phase after the Phase 10 review.
+- **2026-03-08:** `HttpVersion` enum uses `None` (auto) as default rather than `Http11` to preserve existing ALPN-based HTTP/2 negotiation behavior. `Http2` variant is equivalent to `None` for HTTPS since ALPN already prefers H2.
+- **2026-03-08:** Expect: 100-continue timeout defaults to sending body on timeout (matching curl behavior). Body is NOT sent only when server actively responds with an error status before the timeout.
 
 ---
 
@@ -303,31 +306,20 @@ Added 15 new CLI flags: `-b/--cookie`, `--data-binary`, `--data-urlencode`, `--r
 
 ---
 
-### Phase 8: HTTP Completeness + HTTP/3
+### Phase 8: HTTP Completeness — COMPLETED (2026-03-08)
 
-**Goal:** Full HTTP protocol feature parity.
+Implemented HTTP version selection, Expect: 100-continue, and response header parsing:
+- `HttpVersion` enum (`None`/`Http10`/`Http11`/`Http2`) for `CURLOPT_HTTP_VERSION`
+- HTTP/1.0 mode: sends `HTTP/1.0` request line, `Connection: close`, no keep-alive
+- HTTP/1.1 mode: forces HTTP/1.1, skips HTTP/2 ALPN
+- Expect: 100-continue: sends `Expect` header, waits for `100 Continue`, handles server rejection, timeout fallback
+- 1xx response skipping with buffered prefix handling
+- Alt-Svc header parsing (RFC 7838): protocol_id, host, port, max_age, clear directive, multiple entries
+- Retry-After header parsing (seconds format)
+- CLI flags: `--http1.0`, `--http1.1`, `--http2`, `--expect100-timeout`
+- 28 new unit tests
 
-**HTTP/1.1:**
-- Expect: 100-continue protocol — `CURLOPT_EXPECT_100_TIMEOUT_MS`
-- Trailer headers (chunked encoding trailers)
-- HTTP/1.0 explicit mode — `CURLOPT_HTTP_VERSION`
-
-**HTTP/2:**
-- Server push — `CURLMOPT_PUSHFUNCTION`, `CURLMOPT_PUSHDATA`
-- Stream priority/weight — `CURLOPT_STREAM_WEIGHT`
-- SETTINGS frame customization
-- Window size configuration
-
-**HTTP/3:**
-- QUIC transport via quinn crate (feature-gated `http3`)
-- QUIC connection migration
-- Alt-Svc header parsing and caching — `CURLOPT_ALTSVC`
-- 0-RTT early data
-
-**Other:**
-- Alt-Svc persistence — `CURLOPT_ALTSVC_CTRL`
-- HSTS preload list support
-- Retry-After header handling
+**Deferred:** HTTP/3 via quinn (massive effort — needs own phase), HTTP/2 server push, stream priority, trailer headers, Alt-Svc caching/persistence, HSTS preload list.
 
 ---
 
