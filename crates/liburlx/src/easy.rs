@@ -151,6 +151,12 @@ pub struct Easy {
     http2_stream_weight: Option<u16>,
     /// HTTP/2 PING frame interval for keep-alive.
     http2_ping_interval: Option<Duration>,
+    /// Custom request target (curl `--request-target`).
+    custom_request_target: Option<String>,
+    /// TFTP block size (curl `--tftp-blksize`).
+    tftp_blksize: Option<u16>,
+    /// Disable TFTP options negotiation (curl `--tftp-no-options`).
+    tftp_no_options: bool,
 }
 
 impl std::fmt::Debug for Easy {
@@ -237,6 +243,9 @@ impl std::fmt::Debug for Easy {
             .field("http2_enable_push", &self.http2_enable_push)
             .field("http2_stream_weight", &self.http2_stream_weight)
             .field("http2_ping_interval", &self.http2_ping_interval)
+            .field("custom_request_target", &self.custom_request_target)
+            .field("tftp_blksize", &self.tftp_blksize)
+            .field("tftp_no_options", &self.tftp_no_options)
             .finish()
     }
 }
@@ -322,6 +331,9 @@ impl Clone for Easy {
             http2_enable_push: self.http2_enable_push,
             http2_stream_weight: self.http2_stream_weight,
             http2_ping_interval: self.http2_ping_interval,
+            custom_request_target: self.custom_request_target.clone(),
+            tftp_blksize: self.tftp_blksize,
+            tftp_no_options: self.tftp_no_options,
         }
     }
 }
@@ -409,6 +421,9 @@ impl Easy {
             http2_enable_push: None,
             http2_stream_weight: None,
             http2_ping_interval: None,
+            custom_request_target: None,
+            tftp_blksize: None,
+            tftp_no_options: false,
         }
     }
 
@@ -1369,6 +1384,28 @@ impl Easy {
         self.http2_ping_interval = Some(interval);
     }
 
+    /// Set a custom request target for the HTTP request line.
+    ///
+    /// Overrides the default request target (path + query from the URL).
+    /// For example, `"*"` can be used for server-wide OPTIONS requests.
+    pub fn custom_request_target(&mut self, target: &str) {
+        self.custom_request_target = Some(target.to_string());
+    }
+
+    /// Set the TFTP block size for transfers.
+    ///
+    /// Valid values are 8-65464 (RFC 2348). Defaults to 512.
+    pub const fn tftp_blksize(&mut self, blksize: u16) {
+        self.tftp_blksize = Some(blksize);
+    }
+
+    /// Disable TFTP option negotiation.
+    ///
+    /// When enabled, no OACK options are sent, using vanilla RFC 1350 behavior.
+    pub const fn tftp_no_options(&mut self, disable: bool) {
+        self.tftp_no_options = disable;
+    }
+
     /// Build a DNS resolver from the current configuration.
     ///
     /// Uses hickory-dns when available and custom DNS servers or `DoH` URL
@@ -1577,6 +1614,9 @@ impl Easy {
             #[cfg(feature = "http2")]
             &h2_config,
             &dns_resolver,
+            self.custom_request_target.as_deref(),
+            self.tftp_blksize,
+            self.tftp_no_options,
         );
 
         // Apply total transfer timeout if set.
@@ -1681,6 +1721,9 @@ async fn perform_transfer(
     proxy_tls_config: Option<&TlsConfig>,
     #[cfg(feature = "http2")] h2_config: &crate::protocol::http::h2::Http2Config,
     dns_resolver: &crate::dns::DnsResolver,
+    custom_request_target: Option<&str>,
+    tftp_blksize: Option<u16>,
+    tftp_no_options: bool,
 ) -> Result<Response, Error> {
     let transfer_start = Instant::now();
     let original_url = url.clone();
@@ -1746,6 +1789,9 @@ async fn perform_transfer(
             #[cfg(feature = "http2")]
             h2_config,
             dns_resolver,
+            custom_request_target,
+            tftp_blksize,
+            tftp_no_options,
         ))
         .await?;
 
@@ -1766,7 +1812,7 @@ async fn perform_transfer(
                                 }
                             }
 
-                            let uri = current_url.request_target();
+                            let uri = resolve_request_target(custom_request_target, &current_url);
                             let cnonce = crate::auth::digest::generate_cnonce();
                             let auth_header = challenge.respond(
                                 &auth.username,
@@ -1812,6 +1858,9 @@ async fn perform_transfer(
                                 #[cfg(feature = "http2")]
                                 h2_config,
                                 dns_resolver,
+                                custom_request_target,
+                                tftp_blksize,
+                                tftp_no_options,
                             ))
                             .await?;
                         }
@@ -1954,10 +2003,16 @@ async fn do_single_request(
     alt_svc_cache: &crate::protocol::http::altsvc::AltSvcCache,
     #[cfg(feature = "http2")] h2_config: &crate::protocol::http::h2::Http2Config,
     dns_resolver: &crate::dns::DnsResolver,
+    custom_request_target: Option<&str>,
+    tftp_blksize: Option<u16>,
+    tftp_no_options: bool,
 ) -> Result<Response, Error> {
     // Handle non-HTTP schemes directly
     match url.scheme() {
         "file" => return crate::protocol::file::read_file(url),
+        "tftp" => {
+            return crate::protocol::tftp::download(url, tftp_blksize, tftp_no_options).await;
+        }
         #[cfg(feature = "ssh")]
         "sftp" | "scp" => {
             return if method == "PUT" {
@@ -2008,7 +2063,7 @@ async fn do_single_request(
                 }
             }
 
-            let request_target = url.request_target();
+            let request_target = resolve_request_target(custom_request_target, url);
             let use_http10 = http_version == HttpVersion::Http10;
             let result = crate::protocol::http::h1::request(
                 &mut stream,
@@ -2092,7 +2147,7 @@ async fn do_single_request(
         let time_namelookup = time_connect;
         let time_pretransfer = request_start.elapsed();
 
-        let request_target = url.request_target();
+        let request_target = resolve_request_target(custom_request_target, url);
         let use_http10 = http_version == HttpVersion::Http10;
         let mut stream = PooledStream::Unix(uds_stream);
         let (resp, _can_reuse) = crate::protocol::http::h1::request(
@@ -2252,7 +2307,7 @@ async fn do_single_request(
                             }
                         }
                     }
-                    let request_target = url.request_target();
+                    let request_target = resolve_request_target(custom_request_target, url);
                     let time_pretransfer = request_start.elapsed();
                     let resp = crate::protocol::http::h3::request(
                         addr,
@@ -2322,7 +2377,7 @@ async fn do_single_request(
                     let (mut tls_stream, _alpn) = tls.connect_generic(tunnel_stream, &host).await?;
                     let time_appconnect = request_start.elapsed();
 
-                    let request_target = url.request_target();
+                    let request_target = resolve_request_target(custom_request_target, url);
                     let use_http10 = http_version == HttpVersion::Http10;
                     let time_pretransfer = request_start.elapsed();
 
@@ -2379,7 +2434,7 @@ async fn do_single_request(
                 let (tls_stream, alpn) = tls.connect(tls_stream_inner, &host).await?;
                 let time_appconnect = request_start.elapsed();
 
-                let request_target = url.request_target();
+                let request_target = resolve_request_target(custom_request_target, url);
 
                 // Use HTTP/2 if ALPN negotiated it, unless user forced HTTP/1.x
                 let allow_h2 = !matches!(http_version, HttpVersion::Http10 | HttpVersion::Http11);
@@ -2457,8 +2512,11 @@ async fn do_single_request(
             }
         }
         "http" => {
-            // For HTTP through proxy (non-SOCKS), use absolute URL as request target
-            let request_target = if proxy.is_some() && !is_socks_proxy {
+            // Custom request target overrides; otherwise, for HTTP proxy use absolute URL
+            #[allow(clippy::option_if_let_else)]
+            let request_target = if let Some(target) = custom_request_target {
+                target.to_string()
+            } else if proxy.is_some() && !is_socks_proxy {
                 url.as_str().to_string()
             } else {
                 url.request_target()
@@ -2819,6 +2877,11 @@ fn noproxy_from_env() -> Option<String> {
 }
 
 /// Check if a host should bypass the proxy based on the noproxy list.
+/// Get the request target, using the custom target if set, otherwise from the URL.
+fn resolve_request_target(custom: Option<&str>, url: &Url) -> String {
+    custom.map_or_else(|| url.request_target(), str::to_string)
+}
+
 fn should_bypass_proxy(url: &Url, noproxy: Option<&str>) -> bool {
     let Some(noproxy) = noproxy else {
         return false;
@@ -4264,5 +4327,43 @@ mod tests {
         assert!(easy.http2_ping_interval.is_none());
         easy.http2_ping_interval(Duration::from_secs(30));
         assert_eq!(easy.http2_ping_interval, Some(Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn easy_custom_request_target() {
+        let mut easy = Easy::new();
+        assert!(easy.custom_request_target.is_none());
+        easy.custom_request_target("*");
+        assert_eq!(easy.custom_request_target.as_deref(), Some("*"));
+    }
+
+    #[test]
+    fn easy_tftp_blksize() {
+        let mut easy = Easy::new();
+        assert!(easy.tftp_blksize.is_none());
+        easy.tftp_blksize(1024);
+        assert_eq!(easy.tftp_blksize, Some(1024));
+    }
+
+    #[test]
+    fn easy_tftp_no_options() {
+        let mut easy = Easy::new();
+        assert!(!easy.tftp_no_options);
+        easy.tftp_no_options(true);
+        assert!(easy.tftp_no_options);
+    }
+
+    #[test]
+    fn resolve_request_target_custom() {
+        let url = Url::parse("http://example.com/path?q=1").unwrap();
+        let result = super::resolve_request_target(Some("/custom"), &url);
+        assert_eq!(result, "/custom");
+    }
+
+    #[test]
+    fn resolve_request_target_default() {
+        let url = Url::parse("http://example.com/path?q=1").unwrap();
+        let result = super::resolve_request_target(None, &url);
+        assert_eq!(result, "/path?q=1");
     }
 }

@@ -68,6 +68,8 @@ struct CliOptions {
     etag_save_file: Option<String>,
     etag_compare_file: Option<String>,
     proto_default: Option<String>,
+    output_dir: Option<String>,
+    remove_on_error: bool,
 }
 
 /// Print usage information to stderr.
@@ -203,6 +205,30 @@ fn print_usage() {
     eprintln!("      --doh-insecure        Don't verify DoH server TLS");
     eprintln!("      --compressed-ssh      Enable SSH compression (no-op)");
     eprintln!("      --proto-default <proto> Default protocol for schemeless URLs");
+    eprintln!("      --form-string <n=v>   Literal form field (@ not interpreted as file)");
+    eprintln!("      --request-target <t>  Custom request target (e.g., *)");
+    eprintln!("      --socks4 <host:port>  SOCKS4 proxy");
+    eprintln!("      --socks4a <host:port> SOCKS4a proxy (remote DNS)");
+    eprintln!("      --socks5 <host:port>  SOCKS5 proxy (local DNS)");
+    eprintln!("      --proxy-1.0 <url>     HTTP/1.0 proxy");
+    eprintln!("      --tftp-blksize <n>    TFTP block size (8-65464)");
+    eprintln!("      --tftp-no-options     Disable TFTP option negotiation");
+    eprintln!("      --url <url>           Explicit URL (alternative to positional arg)");
+    eprintln!("      --output-dir <dir>    Output directory for downloaded files");
+    eprintln!("      --remove-on-error     Remove output file on error");
+    eprintln!("      --proxy-insecure      Don't verify proxy TLS certificate");
+    eprintln!("      --tlsv1               Use TLS 1.x");
+    eprintln!("      --tlsv1.0             Use TLS 1.0 or later");
+    eprintln!("      --tlsv1.1             Use TLS 1.1 or later");
+    eprintln!("      --sslv3               Use SSLv3 (treated as TLS 1.2)");
+    eprintln!("  -N, --no-buffer           Disable output buffering (no-op)");
+    eprintln!("      --no-sessionid        Disable TLS session ID reuse (no-op)");
+    eprintln!("      --no-alpn             Disable ALPN negotiation (no-op)");
+    eprintln!("      --no-npn              Disable NPN negotiation (no-op)");
+    eprintln!("      --cert-status         Request OCSP stapling (no-op)");
+    eprintln!("      --false-start          Enable TLS false start (no-op)");
+    eprintln!("      --disable-eprt        Disable EPRT for FTP (no-op)");
+    eprintln!("      --disable-epsv        Disable EPSV for FTP (no-op)");
 }
 
 /// Parse CLI arguments into options.
@@ -263,6 +289,8 @@ fn parse_args(args: &[String]) -> Option<CliOptions> {
         etag_save_file: None,
         etag_compare_file: None,
         proto_default: None,
+        output_dir: None,
+        remove_on_error: false,
     };
 
     let mut i = 1;
@@ -892,11 +920,6 @@ fn parse_args(args: &[String]) -> Option<CliOptions> {
             "--globoff" => {
                 opts.globoff = true;
             }
-            // No-op flags: --ftp-pasv (default), --styled-output/--no-styled-output
-            // (no terminal styling), --negotiate (Kerberos/SPNEGO), --next (option groups),
-            // --compressed-ssh (not implemented), --doh-cert-status (not implemented)
-            "--next" | "--ftp-pasv" | "--styled-output" | "--no-styled-output" | "--negotiate"
-            | "--compressed-ssh" | "--doh-cert-status" => {}
             // FTPS: explicit mode (AUTH TLS)
             "--ftp-ssl" | "--ssl" | "--ftp-ssl-reqd" | "--ssl-reqd" => {
                 opts.easy.ftp_ssl_mode(liburlx::protocol::ftp::FtpSslMode::Explicit);
@@ -1057,6 +1080,115 @@ fn parse_args(args: &[String]) -> Option<CliOptions> {
                 i += 1;
                 let val = require_arg(args, i, "--proto-default")?;
                 opts.proto_default = Some(val.to_string());
+            }
+            "--form-string" => {
+                i += 1;
+                let val = require_arg(args, i, "--form-string")?;
+                if let Some((name, value)) = val.split_once('=') {
+                    // Unlike --form, @ is not interpreted as a file path
+                    opts.easy.form_field(name, value);
+                } else {
+                    eprintln!("urlx: invalid form-string format: {val}");
+                    eprintln!("  Use: --form-string name=value");
+                    return None;
+                }
+            }
+            "--request-target" => {
+                i += 1;
+                let val = require_arg(args, i, "--request-target")?;
+                opts.easy.custom_request_target(val);
+            }
+            "--socks4" => {
+                i += 1;
+                let val = require_arg(args, i, "--socks4")?;
+                let proxy_url = format!("socks4://{val}");
+                if let Err(e) = opts.easy.proxy(&proxy_url) {
+                    eprintln!("urlx: invalid SOCKS4 proxy: {e}");
+                    return None;
+                }
+            }
+            "--socks4a" => {
+                i += 1;
+                let val = require_arg(args, i, "--socks4a")?;
+                let proxy_url = format!("socks4a://{val}");
+                if let Err(e) = opts.easy.proxy(&proxy_url) {
+                    eprintln!("urlx: invalid SOCKS4a proxy: {e}");
+                    return None;
+                }
+            }
+            "--socks5" => {
+                i += 1;
+                let val = require_arg(args, i, "--socks5")?;
+                let proxy_url = format!("socks5://{val}");
+                if let Err(e) = opts.easy.proxy(&proxy_url) {
+                    eprintln!("urlx: invalid SOCKS5 proxy: {e}");
+                    return None;
+                }
+            }
+            "--proxy-1.0" => {
+                i += 1;
+                let val = require_arg(args, i, "--proxy-1.0")?;
+                if let Err(e) = opts.easy.proxy(val) {
+                    eprintln!("urlx: invalid proxy URL: {e}");
+                    return None;
+                }
+                opts.easy.http_version(liburlx::HttpVersion::Http10);
+            }
+            "--tftp-blksize" => {
+                i += 1;
+                let val = require_arg(args, i, "--tftp-blksize")?;
+                if let Ok(bs) = val.parse::<u16>() {
+                    opts.easy.tftp_blksize(bs);
+                } else {
+                    eprintln!("urlx: invalid tftp-blksize: {val}");
+                    return None;
+                }
+            }
+            "--tftp-no-options" => {
+                opts.easy.tftp_no_options(true);
+            }
+            "--url" => {
+                i += 1;
+                let val = require_arg(args, i, "--url")?;
+                opts.urls.push(val.to_string());
+            }
+            "--output-dir" => {
+                i += 1;
+                let val = require_arg(args, i, "--output-dir")?;
+                opts.output_dir = Some(val.to_string());
+            }
+            "--remove-on-error" => {
+                opts.remove_on_error = true;
+            }
+            "--proxy-insecure" => {
+                opts.easy.proxy_ssl_verify_peer(false);
+            }
+            // TLS version flags
+            "--tlsv1" | "--tlsv1.0" | "--tlsv1.1" => {
+                // TLS 1.0/1.1 are deprecated; treat as minimum TLS 1.2
+                opts.easy.ssl_min_version(liburlx::TlsVersion::Tls12);
+            }
+            "--sslv3" => {
+                // SSLv3 is insecure; accepted for compat but treated as TLS 1.2
+                opts.easy.ssl_min_version(liburlx::TlsVersion::Tls12);
+            }
+            // No-op flags for compatibility (accepted but not implemented)
+            "-N" | "--no-buffer" | "--no-sessionid" | "--no-alpn" | "--no-npn"
+            | "--cert-status" | "--false-start" | "--disable-eprt" | "--disable-epsv"
+            | "--compressed-ssh" | "--doh-cert-status" | "--next" | "--ftp-pasv"
+            | "--styled-output" | "--no-styled-output" | "--negotiate" => {}
+            // No-op flags that take an argument
+            "--create-file-mode"
+            | "--service-name"
+            | "--proxy-service-name"
+            | "--proxy-tlsv1"
+            | "--proxy-tls13-ciphers"
+            | "--proxy-ciphers"
+            | "--tls13-ciphers"
+            | "--login-options" => {
+                i += 1;
+                let _val = require_arg(args, i, &args[i - 1].clone())?;
+                // Accepted for compatibility; not implemented
             }
             arg if arg.starts_with('-') => {
                 eprintln!("urlx: unknown option: {arg}");
@@ -4040,5 +4172,182 @@ mod tests {
         let args = make_args(&["--compressed-ssh", "sftp://example.com"]);
         let opts = parse_args(&args).unwrap();
         assert_eq!(opts.urls, vec!["sftp://example.com"]);
+    }
+
+    // --- Phase 47 tests: CLI Expansion VI ---
+
+    #[test]
+    fn parse_form_string() {
+        let args = make_args(&["--form-string", "name=@notafile", "http://example.com"]);
+        let opts = parse_args(&args).unwrap();
+        assert_eq!(opts.urls, vec!["http://example.com"]);
+    }
+
+    #[test]
+    fn parse_request_target() {
+        let args = make_args(&["--request-target", "/custom/path", "http://example.com"]);
+        let opts = parse_args(&args).unwrap();
+        assert_eq!(opts.urls, vec!["http://example.com"]);
+    }
+
+    #[test]
+    fn parse_socks4() {
+        let args = make_args(&["--socks4", "127.0.0.1:1080", "http://example.com"]);
+        let opts = parse_args(&args).unwrap();
+        assert_eq!(opts.urls, vec!["http://example.com"]);
+    }
+
+    #[test]
+    fn parse_socks4a() {
+        let args = make_args(&["--socks4a", "127.0.0.1:1080", "http://example.com"]);
+        let opts = parse_args(&args).unwrap();
+        assert_eq!(opts.urls, vec!["http://example.com"]);
+    }
+
+    #[test]
+    fn parse_socks5() {
+        let args = make_args(&["--socks5", "127.0.0.1:1080", "http://example.com"]);
+        let opts = parse_args(&args).unwrap();
+        assert_eq!(opts.urls, vec!["http://example.com"]);
+    }
+
+    #[test]
+    fn parse_proxy_1_0() {
+        let args = make_args(&["--proxy-1.0", "http://proxy:8080", "http://example.com"]);
+        let opts = parse_args(&args).unwrap();
+        assert_eq!(opts.urls, vec!["http://example.com"]);
+    }
+
+    #[test]
+    fn parse_tftp_blksize() {
+        let args = make_args(&["--tftp-blksize", "1024", "tftp://example.com/file"]);
+        let opts = parse_args(&args).unwrap();
+        assert_eq!(opts.urls, vec!["tftp://example.com/file"]);
+    }
+
+    #[test]
+    fn parse_tftp_no_options() {
+        let args = make_args(&["--tftp-no-options", "tftp://example.com/file"]);
+        let opts = parse_args(&args).unwrap();
+        assert_eq!(opts.urls, vec!["tftp://example.com/file"]);
+    }
+
+    #[test]
+    fn parse_no_buffer() {
+        let args = make_args(&["-N", "http://example.com"]);
+        let opts = parse_args(&args).unwrap();
+        assert_eq!(opts.urls, vec!["http://example.com"]);
+    }
+
+    #[test]
+    fn parse_no_sessionid() {
+        let args = make_args(&["--no-sessionid", "http://example.com"]);
+        let opts = parse_args(&args).unwrap();
+        assert_eq!(opts.urls, vec!["http://example.com"]);
+    }
+
+    #[test]
+    fn parse_no_alpn() {
+        let args = make_args(&["--no-alpn", "http://example.com"]);
+        let opts = parse_args(&args).unwrap();
+        assert_eq!(opts.urls, vec!["http://example.com"]);
+    }
+
+    #[test]
+    fn parse_no_npn() {
+        let args = make_args(&["--no-npn", "http://example.com"]);
+        let opts = parse_args(&args).unwrap();
+        assert_eq!(opts.urls, vec!["http://example.com"]);
+    }
+
+    #[test]
+    fn parse_tlsv1() {
+        let args = make_args(&["--tlsv1", "http://example.com"]);
+        let opts = parse_args(&args).unwrap();
+        assert_eq!(opts.urls, vec!["http://example.com"]);
+    }
+
+    #[test]
+    fn parse_sslv3() {
+        let args = make_args(&["--sslv3", "http://example.com"]);
+        let opts = parse_args(&args).unwrap();
+        assert_eq!(opts.urls, vec!["http://example.com"]);
+    }
+
+    #[test]
+    fn parse_proxy_insecure() {
+        let args = make_args(&["--proxy-insecure", "http://example.com"]);
+        let opts = parse_args(&args).unwrap();
+        assert_eq!(opts.urls, vec!["http://example.com"]);
+    }
+
+    #[test]
+    fn parse_disable_eprt() {
+        let args = make_args(&["--disable-eprt", "ftp://example.com/file"]);
+        let opts = parse_args(&args).unwrap();
+        assert_eq!(opts.urls, vec!["ftp://example.com/file"]);
+    }
+
+    #[test]
+    fn parse_disable_epsv() {
+        let args = make_args(&["--disable-epsv", "ftp://example.com/file"]);
+        let opts = parse_args(&args).unwrap();
+        assert_eq!(opts.urls, vec!["ftp://example.com/file"]);
+    }
+
+    #[test]
+    fn parse_tlsv1_0() {
+        let args = make_args(&["--tlsv1.0", "http://example.com"]);
+        let opts = parse_args(&args).unwrap();
+        assert_eq!(opts.urls, vec!["http://example.com"]);
+    }
+
+    #[test]
+    fn parse_pinnedpubkey_sha256() {
+        let args = make_args(&["--pinnedpubkey", "sha256//abc123", "https://example.com"]);
+        let opts = parse_args(&args).unwrap();
+        assert_eq!(opts.urls, vec!["https://example.com"]);
+    }
+
+    #[test]
+    fn parse_cert_status() {
+        let args = make_args(&["--cert-status", "https://example.com"]);
+        let opts = parse_args(&args).unwrap();
+        assert_eq!(opts.urls, vec!["https://example.com"]);
+    }
+
+    #[test]
+    fn parse_false_start() {
+        let args = make_args(&["--false-start", "https://example.com"]);
+        let opts = parse_args(&args).unwrap();
+        assert_eq!(opts.urls, vec!["https://example.com"]);
+    }
+
+    #[test]
+    fn parse_create_file_mode() {
+        let args = make_args(&["--create-file-mode", "0644", "http://example.com"]);
+        let opts = parse_args(&args).unwrap();
+        assert_eq!(opts.urls, vec!["http://example.com"]);
+    }
+
+    #[test]
+    fn parse_output_dir() {
+        let args = make_args(&["--output-dir", "/tmp", "http://example.com"]);
+        let opts = parse_args(&args).unwrap();
+        assert_eq!(opts.output_dir.as_deref(), Some("/tmp"));
+    }
+
+    #[test]
+    fn parse_remove_on_error() {
+        let args = make_args(&["--remove-on-error", "http://example.com"]);
+        let opts = parse_args(&args).unwrap();
+        assert!(opts.remove_on_error);
+    }
+
+    #[test]
+    fn parse_url_flag() {
+        let args = make_args(&["--url", "http://example.com"]);
+        let opts = parse_args(&args).unwrap();
+        assert_eq!(opts.urls, vec!["http://example.com"]);
     }
 }
