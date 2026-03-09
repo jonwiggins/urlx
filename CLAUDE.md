@@ -14,12 +14,12 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 47 — Planning
-**Last completed:** Phase 46 (FFI Expansion III) — 2026-03-09
-**Total tests:** 2,227
-**In progress:** Planning Phase 47
+**Phase:** 48 — Planning
+**Last completed:** Phase 47 (CLI Expansion VI) — 2026-03-09
+**Total tests:** 2,243
+**In progress:** Planning Phase 48
 **Blockers:** None
-**Next up:** Phase 47 — CLI Expansion VI
+**Next up:** Phase 48 — SSH Known Hosts & Security Hardening
 
 ### Completeness Summary (updated Phase 40 review)
 
@@ -38,15 +38,18 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 | WebSocket | 85% | RFC 6455, CloseCode, Message, WebSocketStream, fragmentation; no permessage-deflate |
 | Multi API | 75% | Connection limiting, share, pipelining, FFI event loop stubs |
 | FFI (libcurl C ABI) | ~60% | 116 CURLOPT, 43 CURLINFO, 32 CURLcode, 56 functions, cbindgen header |
-| CLI | ~48% | ~120 of ~250 flags |
+| CLI | ~55% | ~150 of ~250 flags |
 | Connection | 80% | Pool, TCP_NODELAY, keepalive, Unix sockets, interface/port binding |
 | Transfer control | 80% | Rate limiting enforced (max recv/send speed, low speed timeout) |
-| Overall | ~62% | ~92% for basic HTTP/HTTPS use cases |
+| Overall | ~64% | ~92% for basic HTTP/HTTPS use cases |
 
 ---
 
 ## Decision Log
 
+- **2026-03-09:** `custom_request_target` is passed through `perform_transfer` → `do_single_request` as `Option<&str>` parameter (not a method) since these are free functions, not methods. A helper `resolve_request_target()` free function handles the fallback to `url.request_target()`.
+- **2026-03-09:** TFTP block size negotiation uses RFC 2348 OACK mechanism. The `build_rrq()` function appends `blksize\0{value}\0` option when requested. OACK response (opcode 6) is parsed to update effective block size, then ACK'd with block 0. When `tftp_no_options` is set, no OACK options are sent (vanilla RFC 1350).
+- **2026-03-09:** `--proxy-1.0` sets both the proxy URL and forces HTTP/1.0 version. This matches curl behavior where `--proxy-1.0` means "use HTTP/1.0 for proxy communication."
 - **2026-03-08:** Workspace lint inheritance is all-or-nothing in Cargo. `unsafe_code = "deny"` is enforced via `#![deny(unsafe_code)]` in source files (liburlx, urlx-cli) rather than workspace lints, since liburlx-ffi needs to allow it and can't partially override workspace lints.
 - **2026-03-08:** `rustfmt.toml` uses only stable options (`edition`, `max_width`, `use_small_heuristics`). `imports_granularity` and `group_imports` are nightly-only and omitted.
 - **2026-03-08:** cargo-deny v0.19 uses a simplified config format — `vulnerability`/`unmaintained`/`unlicensed`/`copyleft` keys were removed.
@@ -398,17 +401,9 @@ Added 6 FFI functions (curl_global_init/cleanup, curl_version_info with CurlVers
 
 ---
 
-### Phase 47: CLI Expansion VI
+### Phase 47: CLI Expansion VI (completed 2026-03-09)
 
-**Goal:** Additional CLI flags toward 150+.
-
-- `--form-string` (literal form data, no @ interpretation)
-- `--proto-default` (default protocol for schemeless URLs)
-- `--request-target` (custom request target)
-- `--socks4`/`--socks4a`/`--socks5` (SOCKS proxy variants)
-- `--proxy-1.0` (HTTP/1.0 proxy)
-- `--tftp-blksize`/`--tftp-no-options` (TFTP options)
-- Remaining output formatting flags
+Added 30+ CLI flags reaching ~150 total. New flags: `--form-string`, `--request-target`, `--socks4`/`--socks4a`/`--socks5`, `--proxy-1.0`, `--tftp-blksize`/`--tftp-no-options`, `--url`, `--output-dir`, `--remove-on-error`, `--proxy-insecure`, `--tlsv1`/`--tlsv1.0`/`--tlsv1.1`/`--sslv3`, `-N`/`--no-buffer`, `--no-sessionid`, `--no-alpn`, `--no-npn`, `--cert-status`, `--false-start`, `--disable-eprt`/`--disable-epsv`, `--create-file-mode`, plus 8 no-op argument-taking flags. Wired `custom_request_target` into all HTTP request paths. Added TFTP block size negotiation (RFC 2348) with OACK handling. Connected TFTP protocol to Easy transfer dispatch.
 
 ---
 
