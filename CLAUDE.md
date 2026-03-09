@@ -14,12 +14,12 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 29 — Multi API Hardening + Response Builder Tests
-**Last completed:** Phase 28 (fail_on_error integration, timeouts, HSTS upgrade) — 2026-03-08
-**Total tests:** 1124
-**In progress:** Planning Phase 29
+**Phase:** 30 — Error Variant Coverage + Connection Pool Stress + CLI Edge Cases
+**Last completed:** Phase 29 (Multi API edge cases, Response builder, form upload integration) — 2026-03-08
+**Total tests:** 1161
+**In progress:** Planning Phase 30
 **Blockers:** None
-**Next up:** Multi API edge cases, Response construction tests, form upload integration
+**Next up:** Error variant exhaustive tests, connection pool stress scenarios, CLI argument edge cases
 
 ---
 
@@ -602,29 +602,42 @@ chains, toggle). 9 timeout scenario tests (connection timing, both timeouts,
 persistence). 14 HSTS upgrade tests (cache behavior, Easy config, header variants).
 Fixed proptest_url.rs port normalization bug. 1124 total tests.
 
-### Phase 29: Multi API Hardening + Response Builder Tests
+### Phase 29: Multi API Hardening + Response Builder Tests — COMPLETED (2026-03-08)
 
-**Scope:** Strengthen Multi API edge case coverage, test Response construction
-and manipulation, and add multipart form upload integration tests.
+7 Multi API edge case tests (fail_on_error mixed, timeouts, reuse, mixed methods/bodies,
+custom headers, redirects). 25 Response builder tests (construction, with_info, headers,
+body_str, is_redirect, content_type, size_download, TransferInfo, clone). 6 form upload
+integration tests (multipart, methods, special chars, handle reuse). 1161 total tests.
 
-**Step 29.1: Multi API edge cases**
-- Multi with fail_on_error handles
-- Multi with timeout handles
-- Multi reuse after perform
-- Multi with mixed methods and bodies
+### Phase 30: Error Variant Coverage + Connection Pool Stress + CLI Edge Cases
 
-**Step 29.2: Response builder/manipulation**
-- Response::new construction variants
-- Response with_info transfer info attachment
-- Response header case-insensitive lookup
-- Response body_str with non-UTF-8 data
+**Scope:** Exhaustive testing of error types, connection pool under stress,
+and CLI argument parsing edge cases to close remaining coverage gaps.
 
-**Step 29.3: Multipart form upload integration**
-- Form field sent correctly to server
-- File upload with correct content type
-- Mixed fields and files
+**Step 30.1: Error variant exhaustive tests** (`error_variant_coverage.rs`)
+- Every Error variant constructible and displayable
+- Error source chains (Connect→io::Error, Tls→Box<dyn Error>)
+- Error Send+Sync bounds verification
+- Error Debug formatting for all variants
+- UrlxError vs nested error type distinctions
 
-**Exit criteria:** 1160+ tests.
+**Step 30.2: Connection pool stress** (`pool_stress.rs`)
+- Pool with many concurrent connections
+- Pool key isolation (different hosts don't share)
+- Pool connection eviction under pressure
+- Pool behavior after connection errors
+- Pool with mixed HTTP/HTTPS (Tcp vs Tls variants)
+
+**Step 30.3: CLI argument edge cases** (`cli_edge_cases.rs`)
+- Unknown flags rejected
+- Conflicting options (e.g. -I with -d)
+- Multiple -H headers accumulate
+- -o with - means stdout
+- Empty URL rejected
+- Multiple URLs with --next semantics
+- Write-out variable edge cases (%{unknown}, empty format)
+
+**Exit criteria:** 1200+ tests.
 
 ---
 
