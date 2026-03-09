@@ -64,6 +64,10 @@ struct CliOptions {
     rate: Option<String>,
     use_ntlm: bool,
     globoff: bool,
+    alt_svc_file: Option<String>,
+    etag_save_file: Option<String>,
+    etag_compare_file: Option<String>,
+    proto_default: Option<String>,
 }
 
 /// Print usage information to stderr.
@@ -187,6 +191,18 @@ fn print_usage() {
     eprintln!("      --mail-auth <addr>    SMTP AUTH identity (MAIL AUTH)");
     eprintln!("      --ftp-create-dirs     Create remote directories during upload");
     eprintln!("      --ftp-method <method> FTP method (multicwd, singlecwd, nocwd)");
+    eprintln!("      --connect-to <h:p:h:p> Connect to host:port instead of URL");
+    eprintln!("      --alt-svc <file>      Alt-Svc cache file");
+    eprintln!("      --etag-save <file>    Save ETag to file");
+    eprintln!("      --etag-compare <file> Compare ETag from file (If-None-Match)");
+    eprintln!("      --haproxy-protocol    Send HAProxy PROXY protocol v1 header");
+    eprintln!("      --abstract-unix-socket <path> Connect via abstract Unix socket");
+    eprintln!("      --proxy-cacert <file> CA cert for proxy TLS verification");
+    eprintln!("      --proxy-cert <file>   Client cert for proxy TLS");
+    eprintln!("      --proxy-key <file>    Private key for proxy TLS");
+    eprintln!("      --doh-insecure        Don't verify DoH server TLS");
+    eprintln!("      --compressed-ssh      Enable SSH compression (no-op)");
+    eprintln!("      --proto-default <proto> Default protocol for schemeless URLs");
 }
 
 /// Parse CLI arguments into options.
@@ -243,6 +259,10 @@ fn parse_args(args: &[String]) -> Option<CliOptions> {
         rate: None,
         use_ntlm: false,
         globoff: false,
+        alt_svc_file: None,
+        etag_save_file: None,
+        etag_compare_file: None,
+        proto_default: None,
     };
 
     let mut i = 1;
@@ -873,9 +893,10 @@ fn parse_args(args: &[String]) -> Option<CliOptions> {
                 opts.globoff = true;
             }
             // No-op flags: --ftp-pasv (default), --styled-output/--no-styled-output
-            // (no terminal styling), --negotiate (Kerberos/SPNEGO not fully implemented),
-            // --next (URL option groups — URLs already collected separately)
-            "--next" | "--ftp-pasv" | "--styled-output" | "--no-styled-output" | "--negotiate" => {}
+            // (no terminal styling), --negotiate (Kerberos/SPNEGO), --next (option groups),
+            // --compressed-ssh (not implemented), --doh-cert-status (not implemented)
+            "--next" | "--ftp-pasv" | "--styled-output" | "--no-styled-output" | "--negotiate"
+            | "--compressed-ssh" | "--doh-cert-status" => {}
             // FTPS: explicit mode (AUTH TLS)
             "--ftp-ssl" | "--ssl" | "--ftp-ssl-reqd" | "--ssl-reqd" => {
                 opts.easy.ftp_ssl_mode(liburlx::protocol::ftp::FtpSslMode::Explicit);
@@ -976,6 +997,66 @@ fn parse_args(args: &[String]) -> Option<CliOptions> {
                         return None;
                     }
                 }
+            }
+            "--connect-to" => {
+                i += 1;
+                let val = require_arg(args, i, "--connect-to")?;
+                opts.easy.connect_to(val);
+            }
+            "--alt-svc" => {
+                i += 1;
+                let val = require_arg(args, i, "--alt-svc")?;
+                opts.alt_svc_file = Some(val.to_string());
+            }
+            "--etag-save" => {
+                i += 1;
+                let val = require_arg(args, i, "--etag-save")?;
+                opts.etag_save_file = Some(val.to_string());
+            }
+            "--etag-compare" => {
+                i += 1;
+                let val = require_arg(args, i, "--etag-compare")?;
+                opts.etag_compare_file = Some(val.to_string());
+            }
+            "--haproxy-protocol" => {
+                opts.easy.haproxy_protocol(true);
+            }
+            "--abstract-unix-socket" => {
+                i += 1;
+                let val = require_arg(args, i, "--abstract-unix-socket")?;
+                opts.easy.abstract_unix_socket(val);
+            }
+            "--proxy-cacert" => {
+                i += 1;
+                let val = require_arg(args, i, "--proxy-cacert")?;
+                opts.easy.proxy_tls_config(liburlx::TlsConfig {
+                    ca_cert: Some(val.into()),
+                    ..Default::default()
+                });
+            }
+            "--proxy-cert" => {
+                i += 1;
+                let val = require_arg(args, i, "--proxy-cert")?;
+                opts.easy.proxy_tls_config(liburlx::TlsConfig {
+                    client_cert: Some(val.into()),
+                    ..Default::default()
+                });
+            }
+            "--proxy-key" => {
+                i += 1;
+                let val = require_arg(args, i, "--proxy-key")?;
+                opts.easy.proxy_tls_config(liburlx::TlsConfig {
+                    client_key: Some(val.into()),
+                    ..Default::default()
+                });
+            }
+            "--doh-insecure" => {
+                opts.easy.doh_insecure(true);
+            }
+            "--proto-default" => {
+                i += 1;
+                let val = require_arg(args, i, "--proto-default")?;
+                opts.proto_default = Some(val.to_string());
             }
             arg if arg.starts_with('-') => {
                 eprintln!("urlx: unknown option: {arg}");
@@ -1397,6 +1478,17 @@ fn run(args: &[String]) -> ExitCode {
             append_url_queries(url, &opts.url_queries)
         };
 
+        // --proto-default: add default scheme if URL has none
+        let url = if let Some(ref default_proto) = opts.proto_default {
+            if url.contains("://") {
+                url
+            } else {
+                format!("{default_proto}://{url}")
+            }
+        } else {
+            url
+        };
+
         // --proto: validate URL scheme against allowed protocols
         if let Some(ref proto_list) = opts.proto {
             if !is_protocol_allowed(&url, proto_list) {
@@ -1497,6 +1589,17 @@ fn run(args: &[String]) -> ExitCode {
         Ok(response) => {
             if opts.show_progress && !opts.silent {
                 eprintln!();
+            }
+
+            // --etag-save: save ETag from response header
+            if let Some(ref path) = opts.etag_save_file {
+                if let Some(etag) = response.header("etag") {
+                    if let Err(e) = std::fs::write(path, etag) {
+                        if !opts.silent || opts.show_error {
+                            eprintln!("urlx: error saving ETag to '{path}': {e}");
+                        }
+                    }
+                }
             }
 
             // --fail: exit 22 on HTTP error status codes
@@ -1611,6 +1714,16 @@ fn run(args: &[String]) -> ExitCode {
 
 /// Perform a transfer with optional retry logic.
 fn perform_with_retry(opts: &mut CliOptions) -> Result<liburlx::Response, liburlx::Error> {
+    // --etag-compare: send If-None-Match header from saved ETag
+    if let Some(ref path) = opts.etag_compare_file {
+        if let Ok(etag) = std::fs::read_to_string(path) {
+            let etag = etag.trim().to_string();
+            if !etag.is_empty() {
+                opts.easy.header("If-None-Match", &etag);
+            }
+        }
+    }
+
     let max_retries = opts.retry_count;
     let delay = std::time::Duration::from_secs(opts.retry_delay_secs);
     let max_time = if opts.retry_max_time_secs > 0 {
@@ -3847,5 +3960,85 @@ mod tests {
         let args = make_args(&["http://example.com/[1-3]"]);
         let opts = parse_args(&args).unwrap();
         assert_eq!(opts.urls, vec!["http://example.com/[1-3]"]);
+    }
+
+    // --- Phase 42 tests: CLI Expansion V ---
+
+    #[test]
+    fn parse_connect_to() {
+        let args = make_args(&["--connect-to", "a.com:80:b.com:8080", "http://a.com"]);
+        let opts = parse_args(&args).unwrap();
+        assert_eq!(opts.urls, vec!["http://a.com"]);
+    }
+
+    #[test]
+    fn parse_alt_svc() {
+        let args = make_args(&["--alt-svc", "/tmp/altsvc.txt", "http://example.com"]);
+        let opts = parse_args(&args).unwrap();
+        assert_eq!(opts.alt_svc_file.as_deref(), Some("/tmp/altsvc.txt"));
+    }
+
+    #[test]
+    fn parse_etag_save() {
+        let args = make_args(&["--etag-save", "/tmp/etag.txt", "http://example.com"]);
+        let opts = parse_args(&args).unwrap();
+        assert_eq!(opts.etag_save_file.as_deref(), Some("/tmp/etag.txt"));
+    }
+
+    #[test]
+    fn parse_etag_compare() {
+        let args = make_args(&["--etag-compare", "/tmp/etag.txt", "http://example.com"]);
+        let opts = parse_args(&args).unwrap();
+        assert_eq!(opts.etag_compare_file.as_deref(), Some("/tmp/etag.txt"));
+    }
+
+    #[test]
+    fn parse_haproxy_protocol() {
+        let args = make_args(&["--haproxy-protocol", "http://example.com"]);
+        let opts = parse_args(&args).unwrap();
+        assert_eq!(opts.urls, vec!["http://example.com"]);
+    }
+
+    #[test]
+    fn parse_abstract_unix_socket() {
+        let args = make_args(&["--abstract-unix-socket", "/my/sock", "http://example.com"]);
+        let opts = parse_args(&args).unwrap();
+        assert_eq!(opts.urls, vec!["http://example.com"]);
+    }
+
+    #[test]
+    fn parse_proxy_tls_flags() {
+        let args = make_args(&[
+            "--proxy-cacert",
+            "/path/ca.pem",
+            "--proxy-cert",
+            "/path/cert.pem",
+            "--proxy-key",
+            "/path/key.pem",
+            "http://example.com",
+        ]);
+        let opts = parse_args(&args).unwrap();
+        assert_eq!(opts.urls, vec!["http://example.com"]);
+    }
+
+    #[test]
+    fn parse_doh_insecure() {
+        let args = make_args(&["--doh-insecure", "http://example.com"]);
+        let opts = parse_args(&args).unwrap();
+        assert_eq!(opts.urls, vec!["http://example.com"]);
+    }
+
+    #[test]
+    fn parse_proto_default() {
+        let args = make_args(&["--proto-default", "https", "example.com"]);
+        let opts = parse_args(&args).unwrap();
+        assert_eq!(opts.proto_default.as_deref(), Some("https"));
+    }
+
+    #[test]
+    fn parse_compressed_ssh_noop() {
+        let args = make_args(&["--compressed-ssh", "sftp://example.com"]);
+        let opts = parse_args(&args).unwrap();
+        assert_eq!(opts.urls, vec!["sftp://example.com"]);
     }
 }
