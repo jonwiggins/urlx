@@ -14,12 +14,12 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 22 — Planning
-**Last completed:** Phase 21 (Transfer Engine Rate Limiting) — 2026-03-09
-**Total tests:** 1,788
-**In progress:** Planning Phase 22
+**Phase:** 23 — Planning
+**Last completed:** Phase 22 (FFI Callbacks & MIME API) — 2026-03-09
+**Total tests:** 1,819
+**In progress:** Planning Phase 23
 **Blockers:** None
-**Next up:** Phase 22 — FFI Callbacks & MIME API
+**Next up:** Phase 23 — URL API & FFI Expansion
 
 ### Completeness Summary (updated Phase 20 review)
 
@@ -36,7 +36,7 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 | FTP | 70% | Session API, upload, resume, dir ops, FEAT; no FTPS or active mode |
 | SSH/SFTP/SCP | 0% | Not implemented |
 | Multi API | 55% | Connection limiting, message queue, share interface, pipelining config; no poll/socket/timer callbacks |
-| FFI (libcurl C ABI) | ~32% | 70 options, 16 info codes, 25 error codes, 16 functions |
+| FFI (libcurl C ABI) | ~38% | 79 options, 17 info codes, 25 error codes, 26 functions |
 | CLI | ~34% | ~84 of ~250 flags |
 | Connection | 80% | Pool, TCP_NODELAY, keepalive, Unix sockets, interface/port binding |
 | Transfer control | 80% | Rate limiting enforced in transfer engine (max recv/send speed, low speed timeout) |
@@ -77,6 +77,10 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 - **2026-03-08:** Netscape cookie file format uses leading dot prefix for all domains (matching curl behavior). `#HttpOnly_` prefix handled before general `#` comment check to avoid false skipping. Session cookies written with `expiration=0`.
 - **2026-03-08:** Rate limiting (max_recv_speed, max_send_speed) and minimum speed enforcement (low_speed_limit, low_speed_time) added as Easy API setters. CLI `--limit-rate` supports K/M/G suffixes using 1024-based multipliers (matching curl behavior).
 - **2026-03-09:** Rate limiting wired into transfer engine via `SpeedLimits` struct and `RateLimiter`. Token-bucket approach: tracks bytes transferred vs elapsed time, sleeps to enforce max speed. Low speed enforcement checks average throughput and aborts with `Error::SpeedLimit` after exceeding `low_speed_time`. Throttled reads/writes use 16KB chunks (`THROTTLE_CHUNK_SIZE`). Large futures from added parameters addressed with `Box::pin` on `perform_transfer` and `#[allow(clippy::large_futures)]` on `do_single_request`.
+- **2026-03-09:** FFI MIME API uses standalone `MimePartHandle` structs that are finalized into the parent `MimeHandle`'s `MultipartForm` via `finalize_mime_part()`. This matches libcurl's workflow: `curl_mime_addpart` → set name/data/filename → `CURLOPT_MIMEPOST`. Parts own their data until finalized.
+- **2026-03-09:** `CURLOPT_PROGRESSFUNCTION` and `CURLOPT_XFERINFOFUNCTION` share the same data pointer (`CURLOPT_PROGRESSDATA` = 10057). The xferinfo callback takes precedence over the progress callback (matching libcurl behavior). Both are only invoked when `CURLOPT_NOPROGRESS` is set to 0.
+- **2026-03-09:** `CURLINFO_PRIVATE` is handled before the response check in `curl_easy_getinfo` since it doesn't require a completed transfer — it's stored directly on the `EasyHandle` struct, not on the response.
+- **2026-03-09:** `curl_share_setopt` lock/unlock function callbacks (options 3/4) are accepted but ignored. The Rust `Share` type uses `Arc<Mutex>` internally, making external locking unnecessary.
 
 ---
 
@@ -246,9 +250,11 @@ Built from scratch over 20 phases. All features below are implemented and tested
 - **Transfer control:** Rate limiting enforced in transfer engine via `SpeedLimits` and `RateLimiter`. Max recv/send speed throttling (token bucket, 16KB chunks). Low speed enforcement aborts with `Error::SpeedLimit` after timeout.
 - **Response:** Status, headers, body, trailers, effective_url, TransferInfo (6 timing fields + speed/size metrics).
 
-**FFI Layer (liburlx-ffi) — 70 CURLOPT, 16 CURLINFO, 25 CURLcode, 16 functions:**
-- Functions: curl_easy_init/cleanup/duphandle/reset/setopt/perform/getinfo/strerror, curl_slist_append/free_all, curl_multi_init/cleanup/add_handle/remove_handle/perform, curl_version.
-- Callbacks: WRITEFUNCTION, READFUNCTION (with CURL_READFUNC_ABORT), HEADERFUNCTION, DEBUGFUNCTION.
+**FFI Layer (liburlx-ffi) — 79 CURLOPT, 17 CURLINFO, 25 CURLcode, 26 functions:**
+- Functions: curl_easy_init/cleanup/duphandle/reset/setopt/perform/getinfo/strerror, curl_slist_append/free_all, curl_multi_init/cleanup/add_handle/remove_handle/perform, curl_version, curl_mime_init/addpart/name/data/filename/type/free, curl_share_init/cleanup/setopt/strerror.
+- Callbacks: WRITEFUNCTION, READFUNCTION (with CURL_READFUNC_ABORT), HEADERFUNCTION, DEBUGFUNCTION, PROGRESSFUNCTION, XFERINFOFUNCTION, SEEKFUNCTION.
+- Options: CURLOPT_PRIVATE, CURLOPT_SHARE, CURLOPT_MIMEPOST, CURLOPT_NOPROGRESS.
+- Enums: CURLSHcode (6 variants), CURLSHoption (4 variants).
 - Memory: Box<[u8]>-based slist string allocation (exact-size, no capacity mismatch). catch_unwind on all FFI boundaries.
 
 **CLI (urlx) — ~84 flags:**
@@ -265,7 +271,7 @@ Built from scratch over 20 phases. All features below are implemented and tested
 - Features: .curlrc-style config file parser, protocol restriction, max filesize enforcement (exit 63), libcurl C code generation, retry logic (408/429/5xx).
 
 **Testing — 1,788 tests (0 failures):**
-- Unit: 442 (liburlx) + 81 (FFI) + 134 (CLI) = 657
+- Unit: 455 (liburlx) + 112 (FFI) + 134 (CLI) = 701
 - Integration: 1,048 (hyper-based test servers)
 - Property-based: 60 (proptest — URL, cookie, FTP, HTTP, HSTS, multipart, protocols, WebSocket)
 - Doc tests: 3
@@ -274,7 +280,7 @@ Built from scratch over 20 phases. All features below are implemented and tested
 
 **Guardrails:** Zero TODO/FIXME/HACK. Zero `unwrap()` in production code. `#![deny(unsafe_code)]` in liburlx and urlx-cli. GitHub Actions CI (fmt, clippy, test on 3 OS, doc, cargo-deny, MSRV 1.83, commit lint). Pre-commit hooks (fmt, clippy, test, deny, doc, conventional commit).
 
-**Known gaps (as of Phase 21):** Trace file writing not fully wired. HTTP/3 QUIC transport not implemented. SSH/SFTP/SCP not implemented. FTPS not implemented. Poll/socket/timer Multi APIs not implemented. Missing FFI: curl_mime_*, curl_url_*, CURLOPT_PRIVATE, progress callbacks from C.
+**Known gaps (as of Phase 22):** Trace file writing not fully wired. HTTP/3 QUIC transport not implemented. SSH/SFTP/SCP not implemented. FTPS not implemented. Poll/socket/timer Multi APIs not implemented. Missing FFI: curl_url_*, CURLOPT_HTTPPOST (deprecated).
 
 ---
 
@@ -284,15 +290,9 @@ Wired rate limiting into the transfer engine. Added `SpeedLimits` struct, `RateL
 
 ---
 
-### Phase 22: FFI Callbacks & MIME API
+### Phase 22: FFI Callbacks & MIME API (completed 2026-03-09)
 
-**Goal:** Complete FFI callback support and add MIME API.
-
-- CURLOPT_PROGRESSFUNCTION / CURLOPT_XFERINFOFUNCTION
-- CURLOPT_SEEKFUNCTION
-- `curl_mime_init` / `curl_mime_addpart` / `curl_mime_name` / `curl_mime_data` / `curl_mime_free`
-- CURLOPT_MIMEPOST
-- CURLOPT_PRIVATE / CURLOPT_SHARE
+Added 10 FFI functions (curl_mime_init/addpart/name/data/filename/type/free, curl_share_init/cleanup/setopt/strerror), 9 new CURLOPT options (PROGRESSFUNCTION, XFERINFOFUNCTION, SEEKFUNCTION, NOPROGRESS, PRIVATE, SHARE, MIMEPOST, + data pointers), CURLINFO_PRIVATE, CURLSHcode/CURLSHoption enums. 31 new FFI tests. Total: 1,819 tests.
 
 ---
 
