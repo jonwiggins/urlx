@@ -14,19 +14,19 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 43 — Planning
-**Last completed:** Phase 42 (CLI Expansion V) — 2026-03-09
-**Total tests:** 2,180
-**In progress:** Planning Phase 43
+**Phase:** 44 — Planning
+**Last completed:** Phase 43 (HTTP/2 Config & PING Keep-Alive) — 2026-03-09
+**Total tests:** 2,191
+**In progress:** Planning Phase 44
 **Blockers:** None
-**Next up:** Phase 43 — HTTP/2 Stream Priority & Advanced Features
+**Next up:** Phase 44 — FFI Callbacks & MIME API
 
 ### Completeness Summary (updated Phase 40 review)
 
 | Feature Area | Parity | Notes |
 |---|---|---|
 | HTTP/1.1 | 97% | Expect, HTTP/1.0, trailer headers; no chunked upload |
-| HTTP/2 | 75% | Works with server push; no stream priority/dependency |
+| HTTP/2 | 80% | Server push, Builder config, flow control tuning, PING keep-alive; no stream priority enforcement |
 | HTTP/3 | 55% | QUIC via quinn, Alt-Svc upgrade, 0-RTT; no connection pooling or server push |
 | TLS | 85% | rustls, insecure mode, CA/client certs, pinning, version selection, cipher list, session cache |
 | Authentication | 60% | Basic, Bearer, Digest, AWS SigV4, NTLM skeleton, SASL options |
@@ -101,6 +101,9 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 - **2026-03-09:** Multi API event loop FFI functions use pragmatic stubs: tokio owns socket polling, so `curl_multi_fdset` returns max_fd=-1, `curl_multi_wait/poll` provide simple `thread::sleep`, `curl_multi_socket_action` delegates to `curl_multi_perform` on `CURL_SOCKET_TIMEOUT` (-1). Socket/timer callbacks are accepted and stored but not actively invoked. `curl_multi_info_read` returns `CURLMsg` pointers from a Vec-based message queue populated during `curl_multi_perform`.
 - **2026-03-09:** `CURLMsg` returned by `curl_multi_info_read` uses a rotate-to-back strategy: the consumed message is removed from the front and pushed to the back, with a pointer to the last element returned. This keeps the pointer valid until the next call (matching libcurl's lifetime guarantee).
 - **2026-03-09:** `CURLMOPT_MAXCONNECTS` (6) and `CURLMOPT_MAX_TOTAL_CONNECTIONS` (13) both map to `Multi::max_total_connections()`. In libcurl they have subtly different semantics (cache size vs active limit), but for our implementation the distinction is irrelevant since tokio manages connection lifecycle.
+- **2026-03-09:** HTTP/2 configuration uses `h2::client::Builder` instead of the free `h2::client::handshake()` function. This enables flow control window tuning (`initial_window_size`, `initial_connection_window_size`), max frame size, max header list size, and server push toggle via SETTINGS frame. Required adding `bytes` as a direct dependency for the `http2` feature (was already transitive via h2).
+- **2026-03-09:** HTTP/2 stream priority weight (`stream_weight`) is stored on Easy for API compatibility with `CURLOPT_STREAM_WEIGHT` but not enforced at the h2 level. HTTP/2 priority was deprecated in RFC 9113 and the h2 crate doesn't expose priority APIs. Most servers ignore it.
+- **2026-03-09:** HTTP/2 PING keep-alive spawns a separate tokio task that calls `PingPong::ping()` at the configured interval. The task is aborted when the response is fully received. `Connection::ping_pong()` takes the PingPong handle before the connection is moved into its driver task.
 - **2026-03-09:** HTTP/2 server push uses `response_fut.push_promises()` which clones h2 internal state, allowing independent collection in a background task without blocking the main response await. Spawned as a `tokio::spawn` task that runs concurrently with response body reading.
 - **2026-03-09:** HTTP/3 via quinn/h3/h3-quinn uses `bytes` crate as a direct dependency (feature-gated behind `http3`) because h3's `recv_data()` returns `impl Buf` which requires the `Buf` trait in scope. The `bytes` crate is already a transitive dependency via h3/quinn.
 - **2026-03-09:** HTTP/3 dispatch in easy.rs bypasses TCP connection and TLS — it uses the resolved DNS address directly for QUIC (UDP). The QUIC endpoint binds to 0.0.0.0:0 (OS-assigned port). Connection errors map to `Error::Connect` to match the existing error taxonomy.
@@ -365,15 +368,9 @@ Added 14 CLI flags: `--connect-to` (host:port mapping stored on Easy), `--alt-sv
 
 ---
 
-### Phase 43: HTTP/2 Stream Priority & Advanced Features
+### Phase 43: HTTP/2 Config & PING Keep-Alive (completed 2026-03-09)
 
-**Goal:** HTTP/2 stream priority/dependency and window management.
-
-- Stream priority weights
-- Stream dependencies (exclusive/non-exclusive)
-- Flow control window tuning
-- Server push handling improvements
-- PING frame keep-alive
+Added `Http2Config` struct with 7 fields: `window_size`, `connection_window_size`, `max_frame_size`, `max_header_list_size`, `enable_push`, `stream_weight`, `ping_interval`. Replaced `h2::client::handshake()` with `h2::client::Builder` to apply flow control and SETTINGS configuration. Added PING keep-alive via `Connection::ping_pong()` with configurable interval. Added 7 Easy setter methods and 11 unit tests. Added `bytes` as direct dependency for `http2` feature.
 
 ---
 
