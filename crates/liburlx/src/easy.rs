@@ -81,6 +81,8 @@ pub struct Easy {
     max_send_speed: Option<u64>,
     low_speed_limit: Option<u32>,
     low_speed_time: Option<Duration>,
+    fresh_connect: bool,
+    forbid_reuse: bool,
 }
 
 impl std::fmt::Debug for Easy {
@@ -125,6 +127,8 @@ impl std::fmt::Debug for Easy {
             .field("max_send_speed", &self.max_send_speed)
             .field("low_speed_limit", &self.low_speed_limit)
             .field("low_speed_time", &self.low_speed_time)
+            .field("fresh_connect", &self.fresh_connect)
+            .field("forbid_reuse", &self.forbid_reuse)
             .finish()
     }
 }
@@ -171,6 +175,8 @@ impl Clone for Easy {
             max_send_speed: self.max_send_speed,
             low_speed_limit: self.low_speed_limit,
             low_speed_time: self.low_speed_time,
+            fresh_connect: self.fresh_connect,
+            forbid_reuse: self.forbid_reuse,
         }
     }
 }
@@ -219,6 +225,8 @@ impl Easy {
             max_send_speed: None,
             low_speed_limit: None,
             low_speed_time: None,
+            fresh_connect: false,
+            forbid_reuse: false,
         }
     }
 
@@ -700,6 +708,26 @@ impl Easy {
     /// Equivalent to `CURLOPT_LOW_SPEED_TIME`.
     pub fn low_speed_time(&mut self, duration: Duration) {
         self.low_speed_time = Some(duration);
+    }
+
+    /// Force a fresh connection, ignoring the connection pool.
+    ///
+    /// When enabled, the transfer always uses a new connection rather
+    /// than reusing a pooled connection.
+    ///
+    /// Equivalent to `CURLOPT_FRESH_CONNECT`.
+    pub fn fresh_connect(&mut self, enable: bool) {
+        self.fresh_connect = enable;
+    }
+
+    /// Forbid connection reuse after the transfer completes.
+    ///
+    /// When enabled, the connection is closed after the transfer
+    /// rather than being returned to the connection pool for reuse.
+    ///
+    /// Equivalent to `CURLOPT_FORBID_REUSE`.
+    pub fn forbid_reuse(&mut self, enable: bool) {
+        self.forbid_reuse = enable;
     }
 
     /// Perform the transfer and return the response (blocking).
@@ -2454,5 +2482,31 @@ mod tests {
         assert_eq!(cloned.max_send_speed, Some(2048));
         assert_eq!(cloned.low_speed_limit, Some(100));
         assert_eq!(cloned.low_speed_time, Some(Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn easy_fresh_connect() {
+        let mut easy = Easy::new();
+        assert!(!easy.fresh_connect);
+        easy.fresh_connect(true);
+        assert!(easy.fresh_connect);
+    }
+
+    #[test]
+    fn easy_forbid_reuse() {
+        let mut easy = Easy::new();
+        assert!(!easy.forbid_reuse);
+        easy.forbid_reuse(true);
+        assert!(easy.forbid_reuse);
+    }
+
+    #[test]
+    fn easy_connection_control_clone() {
+        let mut easy = Easy::new();
+        easy.fresh_connect(true);
+        easy.forbid_reuse(true);
+        let cloned = easy.clone();
+        assert!(cloned.fresh_connect);
+        assert!(cloned.forbid_reuse);
     }
 }

@@ -75,6 +75,9 @@ pub enum CURLoption {
 
     // Long options (CURLOPTTYPE_LONG = 0)
     CURLOPT_TIMEOUT = 13,
+    CURLOPT_LOW_SPEED_LIMIT = 19,
+    CURLOPT_LOW_SPEED_TIME = 20,
+    CURLOPT_SSLVERSION = 32,
     CURLOPT_VERBOSE = 41,
     CURLOPT_NOBODY = 44,
     CURLOPT_FAILONERROR = 45,
@@ -85,14 +88,21 @@ pub enum CURLoption {
     CURLOPT_POSTFIELDSIZE = 60,
     CURLOPT_SSL_VERIFYPEER = 64,
     CURLOPT_MAXREDIRS = 68,
+    CURLOPT_FRESH_CONNECT = 74,
+    CURLOPT_FORBID_REUSE = 75,
     CURLOPT_CONNECTTIMEOUT = 78,
     CURLOPT_HTTPGET = 80,
     CURLOPT_SSL_VERIFYHOST = 81,
     CURLOPT_HTTPAUTH = 107,
     CURLOPT_TCP_NODELAY = 121,
     CURLOPT_LOCALPORT = 139,
+    CURLOPT_TIMEOUT_MS = 155,
+    CURLOPT_CONNECTTIMEOUT_MS = 156,
     CURLOPT_TCP_KEEPALIVE = 213,
-    CURLOPT_SSLVERSION = 32,
+
+    // Off_t options (CURLOPTTYPE_OFF_T = 30000)
+    CURLOPT_MAX_SEND_SPEED_LARGE = 30145,
+    CURLOPT_MAX_RECV_SPEED_LARGE = 30146,
 
     // Function options (CURLOPTTYPE_FUNCTIONPOINT = 20000)
     CURLOPT_WRITEFUNCTION = 20011,
@@ -111,9 +121,12 @@ pub enum CURLINFO {
     CURLINFO_TOTAL_TIME = 0x0030_0003,
     CURLINFO_NAMELOOKUP_TIME = 0x0030_0004,
     CURLINFO_CONNECT_TIME = 0x0030_0005,
+    CURLINFO_SIZE_UPLOAD = 0x0030_0007,
     CURLINFO_SIZE_DOWNLOAD = 0x0030_0008,
     CURLINFO_SPEED_DOWNLOAD = 0x0030_0009,
+    CURLINFO_SPEED_UPLOAD = 0x0030_000A,
     CURLINFO_HEADER_SIZE = 0x0020_000B,
+    CURLINFO_PRETRANSFER_TIME = 0x0030_000E,
     CURLINFO_STARTTRANSFER_TIME = 0x0030_0011,
     CURLINFO_CONTENT_TYPE = 0x0010_0012,
     CURLINFO_REDIRECT_COUNT = 0x0020_0014,
@@ -733,6 +746,73 @@ pub unsafe extern "C" fn curl_easy_setopt(
             CURLcode::CURLE_OK
         }
 
+        // CURLOPT_LOW_SPEED_LIMIT = 19
+        19 => {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            h.easy.low_speed_limit(value as u32);
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_LOW_SPEED_TIME = 20
+        20 => {
+            #[allow(clippy::cast_sign_loss)]
+            let secs = value as u64;
+            h.easy.low_speed_time(std::time::Duration::from_secs(secs));
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_FRESH_CONNECT = 74
+        74 => {
+            h.easy.fresh_connect(value as c_long != 0);
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_FORBID_REUSE = 75
+        75 => {
+            h.easy.forbid_reuse(value as c_long != 0);
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_TIMEOUT_MS = 155
+        155 => {
+            #[allow(clippy::cast_sign_loss)]
+            let ms = value as u64;
+            if ms > 0 {
+                h.easy.timeout(std::time::Duration::from_millis(ms));
+            }
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_CONNECTTIMEOUT_MS = 156
+        156 => {
+            #[allow(clippy::cast_sign_loss)]
+            let ms = value as u64;
+            if ms > 0 {
+                h.easy.connect_timeout(std::time::Duration::from_millis(ms));
+            }
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_MAX_SEND_SPEED_LARGE = 30145
+        30145 => {
+            #[allow(clippy::cast_sign_loss)]
+            let speed = value as u64;
+            if speed > 0 {
+                h.easy.max_send_speed(speed);
+            }
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_MAX_RECV_SPEED_LARGE = 30146
+        30146 => {
+            #[allow(clippy::cast_sign_loss)]
+            let speed = value as u64;
+            if speed > 0 {
+                h.easy.max_recv_speed(speed);
+            }
+            CURLcode::CURLE_OK
+        }
+
         _ => CURLcode::CURLE_UNKNOWN_OPTION,
     }
 }
@@ -951,6 +1031,33 @@ pub unsafe extern "C" fn curl_easy_getinfo(
             // SAFETY: Caller guarantees out points to f64
             let out = unsafe { &mut *out.cast::<f64>() };
             *out = response.transfer_info().time_appconnect.as_secs_f64();
+            CURLcode::CURLE_OK
+        }
+
+        // CURLINFO_SIZE_UPLOAD = 0x300007
+        0x30_0007 => {
+            // SAFETY: Caller guarantees out points to f64
+            let out = unsafe { &mut *out.cast::<f64>() };
+            #[allow(clippy::cast_precision_loss)]
+            {
+                *out = response.transfer_info().size_upload as f64;
+            }
+            CURLcode::CURLE_OK
+        }
+
+        // CURLINFO_SPEED_UPLOAD = 0x30000A
+        0x30_000A => {
+            // SAFETY: Caller guarantees out points to f64
+            let out = unsafe { &mut *out.cast::<f64>() };
+            *out = response.transfer_info().speed_upload;
+            CURLcode::CURLE_OK
+        }
+
+        // CURLINFO_PRETRANSFER_TIME = 0x30000E
+        0x30_000E => {
+            // SAFETY: Caller guarantees out points to f64
+            let out = unsafe { &mut *out.cast::<f64>() };
+            *out = response.transfer_info().time_pretransfer.as_secs_f64();
             CURLcode::CURLE_OK
         }
 
@@ -1668,5 +1775,77 @@ mod tests {
             curl_slist_free_all(list);
             curl_easy_cleanup(handle);
         }
+    }
+
+    #[test]
+    fn easy_setopt_timeout_ms() {
+        let handle = curl_easy_init();
+        // CURLOPT_TIMEOUT_MS = 155
+        let code = unsafe { curl_easy_setopt(handle, 155, 5000_usize as *const c_void) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_connecttimeout_ms() {
+        let handle = curl_easy_init();
+        // CURLOPT_CONNECTTIMEOUT_MS = 156
+        let code = unsafe { curl_easy_setopt(handle, 156, 3000_usize as *const c_void) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_fresh_connect() {
+        let handle = curl_easy_init();
+        // CURLOPT_FRESH_CONNECT = 74
+        let code = unsafe { curl_easy_setopt(handle, 74, 1_usize as *const c_void) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_forbid_reuse() {
+        let handle = curl_easy_init();
+        // CURLOPT_FORBID_REUSE = 75
+        let code = unsafe { curl_easy_setopt(handle, 75, 1_usize as *const c_void) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_low_speed_limit() {
+        let handle = curl_easy_init();
+        // CURLOPT_LOW_SPEED_LIMIT = 19
+        let code = unsafe { curl_easy_setopt(handle, 19, 1000_usize as *const c_void) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_low_speed_time() {
+        let handle = curl_easy_init();
+        // CURLOPT_LOW_SPEED_TIME = 20
+        let code = unsafe { curl_easy_setopt(handle, 20, 30_usize as *const c_void) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_max_send_speed() {
+        let handle = curl_easy_init();
+        // CURLOPT_MAX_SEND_SPEED_LARGE = 30145
+        let code = unsafe { curl_easy_setopt(handle, 30145, 1024_usize as *const c_void) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_max_recv_speed() {
+        let handle = curl_easy_init();
+        // CURLOPT_MAX_RECV_SPEED_LARGE = 30146
+        let code = unsafe { curl_easy_setopt(handle, 30146, 2048_usize as *const c_void) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
     }
 }
