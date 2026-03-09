@@ -14,12 +14,12 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 31 — Protocol Codec Property Tests + Transfer State Machine
-**Last completed:** Phase 30 (multipart encoding, error interop, Easy method coverage) — 2026-03-08
-**Total tests:** 1222
-**In progress:** Planning Phase 31
+**Phase:** 32 — Header Wire Format + Multi API Stress + URL Conformance
+**Last completed:** Phase 31 (redirect chain, decompression integration, keep-alive behavior) — 2026-03-08
+**Total tests:** 1249
+**In progress:** Planning Phase 32
 **Blockers:** None
-**Next up:** Protocol codec property tests, transfer state machine edge cases
+**Next up:** HTTP header wire format tests, Multi API concurrency stress, URL conformance
 
 ---
 
@@ -617,30 +617,39 @@ formats, source chain, thread safety, debug, edge cases). 16 Easy method coverag
 (method_is_default, verbose, max_redirects, timeout, perform_async, clone settings,
 method override). 1222 total tests.
 
-### Phase 31: Protocol Codec Property Tests + Transfer State Machine
+### Phase 31: Redirect Chain + Decompression Integration + Keep-Alive — COMPLETED (2026-03-08)
 
-**Scope:** Property-based tests for protocol codecs beyond URL parser,
-and integration tests for transfer state machine edge cases.
+12 redirect chain tests (single/multi-hop, 303/307/308 method semantics, max redirects,
+effective URL, redirect counter, all codes, without Location). 7 decompression integration
+tests (gzip through Easy, identity, Accept-Encoding header, large/empty compressed). 8
+keep-alive behavior tests (connection reuse, error survival, 204/HEAD, large body,
+alternating hosts). 1249 total tests.
 
-**Step 31.1: HTTP codec property tests** (`proptest_http.rs`)
-- Status code roundtrip (any valid code 100-599)
-- Content-Length body size consistency
-- Header name/value preservation
-- Chunked encoding roundtrip
+### Phase 32: Header Wire Format + Multi API Stress + URL Conformance
 
-**Step 31.2: Cookie property tests** (`proptest_cookie.rs`)
-- Cookie name=value roundtrip
-- Domain matching transitivity
-- Path matching prefix property
-- Max-Age expiry ordering
+**Scope:** Test HTTP header handling through the wire, Multi API under
+concurrent load, and URL parsing conformance edge cases.
 
-**Step 31.3: Transfer edge cases** (`transfer_edge_cases.rs`)
-- Empty response body handling
-- Connection drop mid-transfer
-- Multiple Set-Cookie headers aggregation
-- Redirect with body (should read and discard)
+**Step 32.1: HTTP header wire format** (`header_wire_format.rs`)
+- Custom headers sent correctly to server
+- Multiple headers with same name
+- Header value with special characters (colons, commas)
+- User-Agent override
+- Content-Type sent with POST body
 
-**Exit criteria:** 1270+ tests.
+**Step 32.2: Multi API concurrency stress** (`multi_concurrency.rs`)
+- 20+ concurrent requests
+- Mixed success/failure results
+- All results returned in order
+- Concurrent requests to different servers
+
+**Step 32.3: URL parsing conformance** (`url_conformance.rs`)
+- International domain names
+- Percent-encoded paths
+- Unusual but valid URLs
+- Edge cases from RFC 3986
+
+**Exit criteria:** 1300+ tests.
 
 ---
 
