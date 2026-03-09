@@ -12,9 +12,14 @@ use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// A simple cookie jar that stores and retrieves cookies.
+///
+/// Cookies are indexed by domain for O(1) domain lookup on each request.
+/// The domain index maps lowercase domains to indices in the cookie Vec.
 #[derive(Debug, Clone, Default)]
 pub struct CookieJar {
     cookies: Vec<Cookie>,
+    /// Index from domain to cookie indices for fast lookup.
+    domain_index: HashMap<String, Vec<usize>>,
 }
 
 /// A single HTTP cookie.
@@ -33,8 +38,9 @@ struct Cookie {
 impl CookieJar {
     /// Create a new empty cookie jar.
     #[must_use]
-    pub const fn new() -> Self {
-        Self { cookies: Vec::new() }
+    #[allow(clippy::missing_const_for_fn)] // HashMap::new() is not const
+    pub fn new() -> Self {
+        Self { cookies: Vec::new(), domain_index: HashMap::new() }
     }
 
     /// Parse and store cookies from `Set-Cookie` headers.
@@ -72,29 +78,48 @@ impl CookieJar {
     #[must_use]
     pub fn cookie_header(&self, host: &str, path: &str, is_secure: bool) -> Option<String> {
         let now = SystemTime::now();
-        let matching: Vec<&Cookie> = self
-            .cookies
+        let host_lower = host.to_ascii_lowercase();
+
+        // Collect candidate domains: exact match + parent domains
+        let mut candidate_indices: Vec<usize> = Vec::new();
+
+        // Check exact domain match
+        if let Some(indices) = self.domain_index.get(&host_lower) {
+            candidate_indices.extend(indices);
+        }
+
+        // Check parent domains (e.g., for host "www.example.com", check "example.com")
+        let mut dot_pos = 0;
+        while let Some(pos) = host_lower[dot_pos..].find('.') {
+            let parent = &host_lower[dot_pos + pos + 1..];
+            if !parent.is_empty() && parent.contains('.') {
+                if let Some(indices) = self.domain_index.get(parent) {
+                    candidate_indices.extend(indices);
+                }
+            }
+            dot_pos += pos + 1;
+        }
+
+        // Filter candidates by expiry, secure, domain match, and path
+        let matching: Vec<&Cookie> = candidate_indices
             .iter()
-            .filter(|c| {
-                // Check expiration
+            .filter_map(|&idx| {
+                let c = &self.cookies[idx];
                 if let Some(expires) = c.expires {
                     if now > expires {
-                        return false;
+                        return None;
                     }
                 }
-
-                // Check secure flag
                 if c.secure && !is_secure {
-                    return false;
+                    return None;
                 }
-
-                // Check domain match
                 if !domain_matches(host, &c.domain) {
-                    return false;
+                    return None;
                 }
-
-                // Check path match
-                path_matches(path, &c.path)
+                if !path_matches(path, &c.path) {
+                    return None;
+                }
+                Some(c)
             })
             .collect();
 
@@ -127,6 +152,7 @@ impl CookieJar {
     pub fn remove_expired(&mut self) {
         let now = SystemTime::now();
         self.cookies.retain(|c| c.expires.map_or(true, |exp| now <= exp));
+        self.rebuild_index();
     }
 
     /// Load cookies from a Netscape-format cookie file.
@@ -198,6 +224,7 @@ impl CookieJar {
 
             self.cookies.push(Cookie { name, value, domain, path, expires, secure, http_only });
         }
+        self.rebuild_index();
         Ok(())
     }
 
@@ -314,6 +341,17 @@ impl CookieJar {
         self.cookies.retain(|c| !(c.name == name && c.domain == domain && c.path == path));
 
         self.cookies.push(Cookie { name, value, domain, path, expires, secure, http_only });
+
+        // Rebuild the index (retain may have invalidated indices)
+        self.rebuild_index();
+    }
+
+    /// Rebuild the domain index from scratch.
+    fn rebuild_index(&mut self) {
+        self.domain_index.clear();
+        for (idx, cookie) in self.cookies.iter().enumerate() {
+            self.domain_index.entry(cookie.domain.clone()).or_default().push(idx);
+        }
     }
 }
 
@@ -683,5 +721,54 @@ mod tests {
         // SECURE flag should be set
         assert_eq!(jar.cookie_header("example.com", "/api", false), None);
         assert_eq!(jar.cookie_header("example.com", "/api", true), Some("k=v".to_string()));
+    }
+
+    #[test]
+    fn domain_index_basic() {
+        let mut jar = CookieJar::new();
+        jar.parse_set_cookie("a=1", "foo.com", "/");
+        jar.parse_set_cookie("b=2", "bar.com", "/");
+        jar.parse_set_cookie("c=3", "foo.com", "/");
+        // Index should have 2 domains
+        assert_eq!(jar.domain_index.len(), 2);
+        assert_eq!(jar.domain_index["foo.com"].len(), 2);
+        assert_eq!(jar.domain_index["bar.com"].len(), 1);
+    }
+
+    #[test]
+    fn domain_index_subdomain_lookup() {
+        let mut jar = CookieJar::new();
+        jar.parse_set_cookie("k=v; Domain=example.com", "www.example.com", "/");
+        // Cookie is stored under "example.com"
+        assert_eq!(jar.domain_index.len(), 1);
+        // Subdomain lookup should find it
+        assert_eq!(jar.cookie_header("sub.example.com", "/", false), Some("k=v".to_string()));
+        // Non-matching domain should not find it
+        assert_eq!(jar.cookie_header("other.com", "/", false), None);
+    }
+
+    #[test]
+    fn domain_index_after_replacement() {
+        let mut jar = CookieJar::new();
+        jar.parse_set_cookie("k=old", "example.com", "/");
+        jar.parse_set_cookie("k=new", "example.com", "/");
+        // Should have only 1 cookie (replaced)
+        assert_eq!(jar.len(), 1);
+        assert_eq!(jar.domain_index["example.com"].len(), 1);
+        assert_eq!(jar.cookie_header("example.com", "/", false), Some("k=new".to_string()));
+    }
+
+    #[test]
+    fn domain_index_many_domains() {
+        let mut jar = CookieJar::new();
+        for i in 0..100 {
+            jar.store_cookies(&[&format!("k{i}=v{i}")], &format!("host{i}.com"), "/");
+        }
+        assert_eq!(jar.len(), 100);
+        assert_eq!(jar.domain_index.len(), 100);
+        // Lookup specific domain
+        assert_eq!(jar.cookie_header("host50.com", "/", false), Some("k50=v50".to_string()));
+        // No match
+        assert_eq!(jar.cookie_header("unknown.com", "/", false), None);
     }
 }
