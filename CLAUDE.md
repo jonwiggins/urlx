@@ -14,12 +14,12 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 44 — Planning
-**Last completed:** Phase 43 (HTTP/2 Config & PING Keep-Alive) — 2026-03-09
-**Total tests:** 2,191
-**In progress:** Planning Phase 44
+**Phase:** 45 — Planning
+**Last completed:** Phase 44 (Async DNS Resolver) — 2026-03-09
+**Total tests:** 2,198
+**In progress:** Planning Phase 45
 **Blockers:** None
-**Next up:** Phase 44 — FFI Callbacks & MIME API
+**Next up:** Phase 45 — Cookie Public Suffix List
 
 ### Completeness Summary (updated Phase 40 review)
 
@@ -32,7 +32,7 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 | Authentication | 60% | Basic, Bearer, Digest, AWS SigV4, NTLM skeleton, SASL options |
 | Cookie engine | 92% | Netscape file format, domain-indexed jar; no public suffix list |
 | Proxy | 90% | HTTP + SOCKS + HTTPS tunnel (TLS-in-TLS), proxy auth; no PAC |
-| DNS | 75% | Cache, Happy Eyeballs, shuffle, custom servers, DoH URL; no async resolver |
+| DNS | 85% | Cache, Happy Eyeballs, shuffle, custom servers, DoH, DoT, async hickory-dns resolver |
 | FTP | 87% | Full session API, FTPS (explicit/implicit), active mode, FtpMethod; no MLST |
 | SSH/SFTP/SCP | 60% | SFTP/SCP download/upload, password + pubkey auth; no known_hosts |
 | WebSocket | 85% | RFC 6455, CloseCode, Message, WebSocketStream, fragmentation; no permessage-deflate |
@@ -113,6 +113,8 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 - **2026-03-09:** 0-RTT via quinn's `Connecting::into_0rtt()` — currently falls back to full handshake every time since no session cache exists between requests. Adding a QUIC session cache is deferred; when implemented, 0-RTT will activate automatically on resumed connections. Only idempotent requests are safe for 0-RTT replay, but since `into_0rtt` handles this at the TLS level, no additional filtering is needed.
 - **2026-03-09:** `curl_getdate` FFI function implements inline HTTP date parsing supporting three formats: RFC 2822 ("Sun, 06 Nov 1994 08:49:37 GMT"), RFC 850 ("Sunday, 06-Nov-94 08:49:37 GMT"), and asctime ("Sun Nov  6 08:49:37 1994"). Inline Unix timestamp computation avoids adding a `chrono` dependency for a single use case. Two-digit years ≥70 map to 1900s, <70 to 2000s (matching curl).
 - **2026-03-09:** `curl_escape`/`curl_unescape` use RFC 3986 unreserved characters (A-Z, a-z, 0-9, `-._~`) for percent-encoding. `curl_unescape` decodes `+` as space (matching curl's behavior for form-encoded data). `curl_easy_escape`/`curl_easy_unescape` delegate to the same implementation.
+- **2026-03-09:** `DnsResolver::Hickory` variant uses `Box<HickoryResolver>` to avoid large enum variant clippy error — `HickoryResolver` contains `TokioResolver` which is ~1272 bytes, while `System` carries no data. Boxing eliminates the size disparity.
+- **2026-03-09:** hickory-resolver 0.25 API uses `TokioResolver::builder_tokio()?.build()` for system config and `TokioResolver::builder_with_config(config, provider).build()` for custom config. The `system-config` feature is required for `builder_tokio()`. `TokioConnectionProvider` lives in `hickory_resolver::name_server`, and `Protocol` in `hickory_resolver::proto::xfer`.
 - **2026-03-09:** `curl_formadd` returns `CURL_FORMADD_DISABLED` (7) as a stub — the deprecated multipart API is replaced by the MIME API (`curl_mime_*`). `curl_formfree` is a no-op. This matches libcurl's behavior when built without form API support.
 
 ---
@@ -374,15 +376,9 @@ Added `Http2Config` struct with 7 fields: `window_size`, `connection_window_size
 
 ---
 
-### Phase 44: Async DNS Resolver
+### Phase 44: Async DNS Resolver (completed 2026-03-09)
 
-**Goal:** Non-blocking DNS resolution via hickory-dns.
-
-- Feature-gated `hickory-dns` integration
-- Async resolution in transfer engine
-- DNS-over-HTTPS (DoH) actual implementation
-- DNS-over-TLS (DoT) support
-- Configurable resolver selection
+Added `DnsResolver` enum (System/Hickory variants) and `HickoryResolver` struct with `from_system()`, `from_servers()`, `from_doh()` constructors. Wired resolver into Easy transfer engine via `build_dns_resolver()` which selects hickory-dns backend when `dns_servers` or `doh_url` is configured. Feature-gated behind `hickory-dns` feature flag. Added 7 unit tests. Boxing `HickoryResolver` in enum to avoid large variant size difference.
 
 ---
 
