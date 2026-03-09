@@ -122,17 +122,27 @@ pub async fn request(
 
     endpoint.set_default_client_config(client_config);
 
-    // Connect to the server
-    let connection = endpoint
+    // Connect to the server — try 0-RTT first, fall back to full handshake
+    let connecting = endpoint
         .connect(addr, server_name)
-        .map_err(|e| Error::Http(format!("QUIC connect error: {e}")))?
-        .await
-        .map_err(|e| {
-            Error::Connect(std::io::Error::new(
-                std::io::ErrorKind::ConnectionRefused,
-                e.to_string(),
-            ))
-        })?;
+        .map_err(|e| Error::Http(format!("QUIC connect error: {e}")))?;
+
+    let connection = match connecting.into_0rtt() {
+        Ok((conn, _zero_rtt_accepted)) => {
+            // 0-RTT connection established (session resumption available)
+            // _zero_rtt_accepted is a future that resolves when server confirms 0-RTT
+            conn
+        }
+        Err(connecting) => {
+            // No 0-RTT data available, perform full handshake
+            connecting.await.map_err(|e| {
+                Error::Connect(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionRefused,
+                    e.to_string(),
+                ))
+            })?
+        }
+    };
 
     // Create h3 connection over QUIC
     let quinn_conn = h3_quinn::Connection::new(connection);

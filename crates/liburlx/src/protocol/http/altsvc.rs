@@ -559,4 +559,70 @@ mod tests {
         let cloned = cache.clone();
         assert_eq!(cloned.len(), 1);
     }
+
+    // --- Alt-Svc h3 upgrade tests ---
+
+    #[test]
+    fn cache_h3_upgrade_from_header() {
+        // Simulate receiving an Alt-Svc header and checking for h3 upgrade
+        let entries = parse_alt_svc(r#"h3=":443"; ma=86400"#);
+        assert_eq!(entries.len(), 1);
+
+        let mut cache = AltSvcCache::new();
+        cache.store("https://example.com:443", &entries);
+
+        // Should find h3 for subsequent requests
+        let h3 = cache.get_protocol("https://example.com:443", "h3");
+        assert!(h3.is_some());
+        assert_eq!(h3.unwrap().port, 443);
+    }
+
+    #[test]
+    fn cache_h3_upgrade_different_port() {
+        // Server advertises h3 on a different port
+        let entries = parse_alt_svc(r#"h3=":8443"; ma=86400"#);
+        let mut cache = AltSvcCache::new();
+        cache.store("https://example.com:443", &entries);
+
+        let h3 = cache.get_protocol("https://example.com:443", "h3");
+        assert!(h3.is_some());
+        assert_eq!(h3.unwrap().port, 8443);
+    }
+
+    #[test]
+    fn cache_h3_upgrade_not_available_for_http() {
+        // HTTP (not HTTPS) — h3 should not be cached for HTTP origins
+        let entries = parse_alt_svc(r#"h3=":443"; ma=86400"#);
+        let mut cache = AltSvcCache::new();
+        cache.store("http://example.com:80", &entries);
+
+        // Query for the HTTPS origin should not find it
+        assert!(cache.get_protocol("https://example.com:443", "h3").is_none());
+    }
+
+    #[test]
+    fn cache_clear_disables_h3_upgrade() {
+        let entries = parse_alt_svc(r#"h3=":443"; ma=86400"#);
+        let mut cache = AltSvcCache::new();
+        cache.store("https://example.com:443", &entries);
+        assert!(cache.get_protocol("https://example.com:443", "h3").is_some());
+
+        // Server sends Alt-Svc: clear
+        let clear_entries = parse_alt_svc("clear");
+        assert!(clear_entries.is_empty());
+        cache.clear_origin("https://example.com:443");
+        assert!(cache.get_protocol("https://example.com:443", "h3").is_none());
+    }
+
+    #[test]
+    fn cache_h3_upgrade_with_h2_fallback() {
+        // Server advertises both h3 and h2
+        let entries = parse_alt_svc(r#"h3=":443"; ma=86400, h2=":443"; ma=86400"#);
+        let mut cache = AltSvcCache::new();
+        cache.store("https://example.com:443", &entries);
+
+        // h3 should be preferred
+        assert!(cache.get_protocol("https://example.com:443", "h3").is_some());
+        assert!(cache.get_protocol("https://example.com:443", "h2").is_some());
+    }
 }

@@ -1451,6 +1451,7 @@ async fn perform_transfer(
             ftp_ssl_mode,
             ssh_key_path,
             proxy_tls_config,
+            alt_svc_cache,
         ))
         .await?;
 
@@ -1513,6 +1514,7 @@ async fn perform_transfer(
                                 ftp_ssl_mode,
                                 ssh_key_path,
                                 proxy_tls_config,
+                                alt_svc_cache,
                             ))
                             .await?;
                         }
@@ -1651,6 +1653,8 @@ async fn do_single_request(
     ftp_ssl_mode: crate::protocol::ftp::FtpSslMode,
     #[cfg_attr(not(feature = "ssh"), allow(unused_variables))] ssh_key_path: Option<&str>,
     proxy_tls_config: Option<&TlsConfig>,
+    #[cfg_attr(not(feature = "http3"), allow(unused_variables))]
+    alt_svc_cache: &crate::protocol::http::altsvc::AltSvcCache,
 ) -> Result<Response, Error> {
     // Handle non-HTTP schemes directly
     match url.scheme() {
@@ -1923,38 +1927,65 @@ async fn do_single_request(
     let response = match url.scheme() {
         "https" => {
             // HTTP/3 over QUIC — bypasses TCP/TLS, uses UDP transport
+            // Triggered by explicit --http3 flag OR Alt-Svc cache indicating h3 support
             #[cfg(feature = "http3")]
-            if http_version == HttpVersion::Http3 {
-                if verbose {
-                    #[allow(clippy::print_stderr)]
-                    {
-                        eprintln!("* Using HTTP/3");
+            {
+                let use_h3 = if http_version == HttpVersion::Http3 {
+                    true
+                } else if http_version == HttpVersion::None || http_version == HttpVersion::Http2 {
+                    // Check Alt-Svc cache for h3 support
+                    let alt_port = url.port_or_default().unwrap_or(443);
+                    let origin = format!("https://{}:{}", host, alt_port);
+                    alt_svc_cache.get_protocol(&origin, "h3").is_some()
+                } else {
+                    false
+                };
+
+                if use_h3 {
+                    // Determine target address — Alt-Svc may specify a different port
+                    let alt_port = url.port_or_default().unwrap_or(443);
+                    let origin = format!("https://{}:{}", host, alt_port);
+                    let h3_port =
+                        alt_svc_cache.get_protocol(&origin, "h3").map_or(alt_port, |svc| svc.port);
+
+                    // Use the resolved address with possibly different port
+                    let mut addr = addrs[0];
+                    addr.set_port(h3_port);
+
+                    if verbose {
+                        #[allow(clippy::print_stderr)]
+                        {
+                            if http_version == HttpVersion::Http3 {
+                                eprintln!("* Using HTTP/3");
+                            } else {
+                                eprintln!("* Using HTTP/3 (Alt-Svc upgrade)");
+                            }
+                        }
                     }
+                    let request_target = url.request_target();
+                    let time_pretransfer = request_start.elapsed();
+                    let resp = crate::protocol::http::h3::request(
+                        addr,
+                        &host,
+                        method,
+                        &request_target,
+                        &effective_headers,
+                        body,
+                        url.as_str(),
+                        speed_limits,
+                        tls_config.verify_peer,
+                    )
+                    .await?;
+                    let time_starttransfer = request_start.elapsed();
+                    let mut resp = maybe_decompress(resp, accept_encoding)?;
+                    let mut info = resp.transfer_info().clone();
+                    info.time_namelookup = time_namelookup;
+                    info.time_connect = time_connect;
+                    info.time_pretransfer = time_pretransfer;
+                    info.time_starttransfer = time_starttransfer;
+                    resp.set_transfer_info(info);
+                    return Ok(resp);
                 }
-                let addr = addrs[0];
-                let request_target = url.request_target();
-                let time_pretransfer = request_start.elapsed();
-                let resp = crate::protocol::http::h3::request(
-                    addr,
-                    &host,
-                    method,
-                    &request_target,
-                    &effective_headers,
-                    body,
-                    url.as_str(),
-                    speed_limits,
-                    tls_config.verify_peer,
-                )
-                .await?;
-                let time_starttransfer = request_start.elapsed();
-                let mut resp = maybe_decompress(resp, accept_encoding)?;
-                let mut info = resp.transfer_info().clone();
-                info.time_namelookup = time_namelookup;
-                info.time_connect = time_connect;
-                info.time_pretransfer = time_pretransfer;
-                info.time_starttransfer = time_starttransfer;
-                resp.set_transfer_info(info);
-                return Ok(resp);
             }
 
             #[cfg(feature = "rustls")]
