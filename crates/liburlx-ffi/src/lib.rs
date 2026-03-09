@@ -223,10 +223,11 @@ pub unsafe extern "C" fn curl_slist_append(
     let owned = s.to_bytes().to_vec();
     let mut buf = owned;
     buf.push(0); // null terminator
+                 // Convert to boxed slice for exact-length allocation (len == capacity guaranteed)
+    let boxed = buf.into_boxed_slice();
+    let data_ptr = Box::into_raw(boxed).cast::<c_char>();
 
-    let node =
-        Box::new(curl_slist { data: buf.as_mut_ptr().cast::<c_char>(), next: ptr::null_mut() });
-    std::mem::forget(buf); // data is now owned by the node
+    let node = Box::new(curl_slist { data: data_ptr, next: ptr::null_mut() });
 
     let node_ptr = Box::into_raw(node);
 
@@ -262,10 +263,11 @@ pub unsafe extern "C" fn curl_slist_free_all(list: *mut curl_slist) {
 
         // Free the string data
         if !node.data.is_null() {
-            // SAFETY: data was allocated via Vec + mem::forget
+            // SAFETY: data was allocated via Box::into_raw on a boxed slice
             let s = unsafe { CStr::from_ptr(node.data) };
             let len = s.to_bytes_with_nul().len();
-            let _ = unsafe { Vec::from_raw_parts(node.data.cast::<u8>(), len, len) };
+            let raw_slice = unsafe { std::slice::from_raw_parts_mut(node.data.cast::<u8>(), len) };
+            let _ = unsafe { Box::from_raw(raw_slice) };
         }
 
         current = next;

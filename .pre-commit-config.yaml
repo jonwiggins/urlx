@@ -39,6 +39,7 @@ repos:
 
       - id: conventional-commit
         name: conventional commit
-        entry: sh -c 'echo "$1" | grep -qE "^(feat|fix|refactor|test|docs|chore|ci|perf|build|style|revert)(\(.+\))?(!)?: .+"'
+        entry: >-
+          sh -c 'head -1 "$1" | grep -qE "^(feat|fix|refactor|test|docs|chore|ci|perf|build|style|revert)(\(.+\))?(!)?: .+"' --
         language: system
         stages: [commit-msg]
