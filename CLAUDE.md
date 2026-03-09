@@ -14,12 +14,12 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 25 — Milestone: 1000 Tests + Final API Audit
-**Last completed:** Phase 24 (Multi concurrent stress, WebSocket codec edge cases) — 2026-03-08
-**Total tests:** 969
-**In progress:** Planning Phase 25
+**Phase:** 26 — Integration Test Infrastructure + End-to-End Scenarios
+**Last completed:** Phase 25 (1000+ tests milestone, API audit) — 2026-03-08
+**Total tests:** 1013
+**In progress:** Planning Phase 26
 **Blockers:** None
-**Next up:** Push past 1000 tests, audit remaining untested API surface
+**Next up:** Shared test server infrastructure, end-to-end scenario tests
 
 ---
 
@@ -572,36 +572,43 @@ purge_expired). 8 progress callback tests (invocation, download data, abort sign
 large bodies). 27 WebSocket codec tests (frame types, as_text, encoding, length
 fields, masking, key generation, RFC 6455 accept key). 969 total tests.
 
-### Phase 25: Milestone — 1000 Tests + Final API Audit
+### Phase 25: Milestone — 1000 Tests + Final API Audit — COMPLETED (2026-03-08)
 
-**Scope:** Push past 1000 tests by exercising remaining untested API
-surface: H1 parser edge cases, URL builder methods, DICT/TFTP protocol
-codecs, and Easy handle configuration completeness.
+26 H1 parser edge case tests (status codes, Content-Length, chunked encoding, HEAD,
+Set-Cookie joining, malformed responses). 18 Easy config completeness tests
+(max_redirects, verbose, hsts, resolve, form_field, range, resume_from,
+fail_on_error, method_is_default, clone). 1013 total tests passing.
 
-**Step 25.1: H1 parser property tests**
-- Test parse_response with various Content-Length values
-- Test chunked body with trailing whitespace
-- Test header size limits
-- Test status line parsing edge cases
+### Phase 26: Integration Test Infrastructure + End-to-End Scenarios
 
-**Step 25.2: URL builder edge cases**
-- Test scheme normalization
-- Test host normalization
-- Test path normalization with dot segments
-- Test query/fragment roundtripping
+**Scope:** Create a shared test server module to reduce boilerplate across
+integration tests, then add end-to-end scenario tests that exercise
+multi-step workflows (redirect chains with cookies, auth + retry,
+conditional requests, connection reuse patterns).
 
-**Step 25.3: DICT/TFTP protocol tests**
-- Test DICT response parsing
-- Test TFTP packet encoding
-- Test protocol-specific error handling
+**Step 26.1: Shared TestServer module**
+- Extract the TestServer pattern (currently duplicated in ~8 test files) into
+  a shared test helper crate or module
+- Support configurable handlers, custom response headers, request recording
 
-**Step 25.4: Easy handle configuration completeness**
-- Test verbose output toggle
-- Test accept_encoding with various states
-- Test method_is_default semantics
-- Test form_field/form_file interactions
+**Step 26.2: Multi-step workflow tests**
+- Redirect chain with cookie propagation (3xx → cookie set → follow → cookie sent)
+- Auth challenge flow (401 → retry with credentials → 200)
+- Conditional GET (If-None-Match → 304 Not Modified)
+- Connection reuse verification across sequential requests
 
-**Exit criteria:** 1000+ tests. All public API surface exercised.
+**Step 26.3: Error recovery scenarios**
+- Server drops connection mid-transfer → error reported correctly
+- Timeout during slow response → proper timeout error
+- Invalid Content-Length (shorter than actual body)
+- Chunked encoding with premature close
+
+**Step 26.4: CLI end-to-end tests**
+- Multi-URL download with progress
+- Cookie jar file persistence across invocations
+- Write-out format with timing variables
+
+**Exit criteria:** 1050+ tests. Shared test infrastructure eliminates duplication.
 
 ---
 
