@@ -171,7 +171,11 @@ fn create_canonical_request(
 
     canonical_headers.sort_by(|a, b| a.0.cmp(&b.0));
 
-    let headers_str: String = canonical_headers.iter().map(|(k, v)| format!("{k}:{v}\n")).collect();
+    let headers_str: String = canonical_headers.iter().fold(String::new(), |mut acc, (k, v)| {
+        use std::fmt::Write as _;
+        let _ = writeln!(acc, "{k}:{v}");
+        acc
+    });
 
     let signed_headers: String =
         canonical_headers.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>().join(";");

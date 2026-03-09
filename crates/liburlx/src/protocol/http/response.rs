@@ -4,14 +4,36 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 /// Transfer timing and metadata information.
+///
+/// Timing fields follow curl's conventions:
+/// - `time_namelookup`: DNS resolution completed
+/// - `time_connect`: TCP connection established
+/// - `time_appconnect`: TLS handshake completed (HTTPS only)
+/// - `time_pretransfer`: Ready to send request
+/// - `time_starttransfer`: First response byte received
+/// - `time_total`: Entire transfer completed
 #[derive(Debug, Clone, Default)]
 pub struct TransferInfo {
+    /// Time from start until DNS name resolution completed.
+    pub time_namelookup: Duration,
     /// Time from start until TCP connection was established.
     pub time_connect: Duration,
+    /// Time from start until TLS/SSL handshake completed (HTTPS only).
+    pub time_appconnect: Duration,
+    /// Time from start until the request is ready to be sent.
+    pub time_pretransfer: Duration,
+    /// Time from start until the first response byte was received.
+    pub time_starttransfer: Duration,
     /// Total time for the entire transfer.
     pub time_total: Duration,
     /// Number of redirects followed.
     pub num_redirects: u32,
+    /// Average download speed in bytes per second.
+    pub speed_download: f64,
+    /// Average upload speed in bytes per second.
+    pub speed_upload: f64,
+    /// Total bytes uploaded.
+    pub size_upload: u64,
 }
 
 /// An HTTP response with status, headers, and body.

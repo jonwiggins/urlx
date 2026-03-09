@@ -631,9 +631,20 @@ fn format_write_out(fmt: &str, response: &liburlx::Response) -> String {
     result = result.replace("%{url_effective}", response.effective_url());
     result = result.replace("%{content_type}", response.content_type().unwrap_or(""));
     result = result.replace("%{size_download}", &response.size_download().to_string());
-    result = result.replace("%{time_total}", &format!("{:.6}", info.time_total.as_secs_f64()));
+    result =
+        result.replace("%{time_namelookup}", &format!("{:.6}", info.time_namelookup.as_secs_f64()));
     result = result.replace("%{time_connect}", &format!("{:.6}", info.time_connect.as_secs_f64()));
+    result =
+        result.replace("%{time_appconnect}", &format!("{:.6}", info.time_appconnect.as_secs_f64()));
+    result = result
+        .replace("%{time_pretransfer}", &format!("{:.6}", info.time_pretransfer.as_secs_f64()));
+    result = result
+        .replace("%{time_starttransfer}", &format!("{:.6}", info.time_starttransfer.as_secs_f64()));
+    result = result.replace("%{time_total}", &format!("{:.6}", info.time_total.as_secs_f64()));
     result = result.replace("%{num_redirects}", &info.num_redirects.to_string());
+    result = result.replace("%{speed_download}", &format!("{:.3}", info.speed_download));
+    result = result.replace("%{speed_upload}", &format!("{:.3}", info.speed_upload));
+    result = result.replace("%{size_upload}", &info.size_upload.to_string());
 
     // Handle escape sequences
     result = result.replace("\\n", "\n");
@@ -1074,6 +1085,24 @@ mod tests {
         );
         let result = format_write_out("%{content_type}", &response);
         assert_eq!(result, "");
+    }
+
+    #[test]
+    fn format_write_out_timing_variables() {
+        let response = liburlx::Response::new(
+            200,
+            std::collections::HashMap::new(),
+            Vec::new(),
+            String::new(),
+        );
+        let result = format_write_out(
+            "%{time_namelookup} %{time_appconnect} %{time_pretransfer} %{time_starttransfer} %{speed_download} %{speed_upload} %{size_upload}",
+            &response,
+        );
+        // All default to zero
+        assert!(result.contains("0.000000"));
+        assert!(result.contains("0.000"));
+        assert!(result.contains('0'));
     }
 
     #[test]

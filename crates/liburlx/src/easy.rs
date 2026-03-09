@@ -13,7 +13,7 @@ use crate::hsts::HstsCache;
 use crate::pool::{ConnectionPool, PooledStream};
 use crate::progress::{call_progress, ProgressCallback, ProgressInfo};
 use crate::protocol::http::multipart::MultipartForm;
-use crate::protocol::http::response::{Response, TransferInfo};
+use crate::protocol::http::response::Response;
 use crate::tls::TlsConfig;
 use crate::url::Url;
 
@@ -46,6 +46,8 @@ pub struct Easy {
     tls_config: TlsConfig,
     aws_sigv4: Option<crate::auth::aws_sigv4::AwsSigV4Config>,
     aws_credentials: Option<(String, String)>,
+    tcp_nodelay: bool,
+    tcp_keepalive: Option<Duration>,
     pool: ConnectionPool,
 }
 
@@ -75,6 +77,8 @@ impl std::fmt::Debug for Easy {
             .field("tls_config", &self.tls_config)
             .field("aws_sigv4", &self.aws_sigv4)
             .field("aws_credentials", &self.aws_credentials.as_ref().map(|_| "<credentials>"))
+            .field("tcp_nodelay", &self.tcp_nodelay)
+            .field("tcp_keepalive", &self.tcp_keepalive)
             .field("pool", &"<ConnectionPool>")
             .finish()
     }
@@ -106,6 +110,8 @@ impl Clone for Easy {
             tls_config: self.tls_config.clone(),
             aws_sigv4: self.aws_sigv4.clone(),
             aws_credentials: self.aws_credentials.clone(),
+            tcp_nodelay: self.tcp_nodelay,
+            tcp_keepalive: self.tcp_keepalive,
             pool: ConnectionPool::new(),
         }
     }
@@ -139,6 +145,8 @@ impl Easy {
             tls_config: TlsConfig::default(),
             aws_sigv4: None,
             aws_credentials: None,
+            tcp_nodelay: true,
+            tcp_keepalive: None,
             pool: ConnectionPool::new(),
         }
     }
@@ -455,6 +463,23 @@ impl Easy {
         self.tls_config.pinned_public_key = Some(pin.to_string());
     }
 
+    /// Enable or disable `TCP_NODELAY` (Nagle's algorithm).
+    ///
+    /// When enabled (the default), small packets are sent immediately without
+    /// waiting to coalesce. Equivalent to `CURLOPT_TCP_NODELAY`.
+    pub fn tcp_nodelay(&mut self, enable: bool) {
+        self.tcp_nodelay = enable;
+    }
+
+    /// Enable TCP keepalive with the given idle interval.
+    ///
+    /// When set, TCP keepalive probes are sent after the connection has been
+    /// idle for the specified duration. Equivalent to `CURLOPT_TCP_KEEPALIVE`
+    /// and `CURLOPT_TCP_KEEPIDLE`.
+    pub fn tcp_keepalive(&mut self, idle: Duration) {
+        self.tcp_keepalive = Some(idle);
+    }
+
     /// Perform the transfer and return the response (blocking).
     ///
     /// Creates a new tokio runtime internally. Do not call from within
@@ -572,6 +597,8 @@ impl Easy {
             &self.resolve_overrides,
             self.auth_credentials.as_ref(),
             &self.tls_config,
+            self.tcp_nodelay,
+            self.tcp_keepalive,
             &mut self.pool,
         );
 
@@ -615,7 +642,7 @@ impl Default for Easy {
 }
 
 /// Internal async transfer implementation.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines, clippy::fn_params_excessive_bools)]
 async fn perform_transfer(
     url: &Url,
     method: Option<&str>,
@@ -633,6 +660,8 @@ async fn perform_transfer(
     resolve_overrides: &[(String, String)],
     auth_credentials: Option<&AuthCredentials>,
     tls_config: &TlsConfig,
+    tcp_nodelay: bool,
+    tcp_keepalive: Option<Duration>,
     pool: &mut ConnectionPool,
 ) -> Result<Response, Error> {
     let transfer_start = Instant::now();
@@ -640,7 +669,6 @@ async fn perform_transfer(
     let mut current_method = method.unwrap_or("GET").to_string();
     let mut current_body = body.map(<[u8]>::to_vec);
     let mut redirects_followed: u32 = 0;
-    let mut last_connect_time;
 
     loop {
         // Determine effective proxy for this URL
@@ -660,7 +688,6 @@ async fn perform_transfer(
             }
         }
 
-        let connect_start = Instant::now();
         let mut response = do_single_request(
             &current_url,
             &current_method,
@@ -672,10 +699,11 @@ async fn perform_transfer(
             effective_proxy,
             resolve_overrides,
             tls_config,
+            tcp_nodelay,
+            tcp_keepalive,
             pool,
         )
         .await?;
-        last_connect_time = connect_start.elapsed();
 
         // Handle Digest auth: if 401 with WWW-Authenticate: Digest, retry with credentials
         if response.status() == 401 {
@@ -719,6 +747,8 @@ async fn perform_transfer(
                                 effective_proxy,
                                 resolve_overrides,
                                 tls_config,
+                                tcp_nodelay,
+                                tcp_keepalive,
                                 pool,
                             )
                             .await?;
@@ -786,11 +816,22 @@ async fn perform_transfer(
             }
         }
 
-        response.set_transfer_info(TransferInfo {
-            time_connect: last_connect_time,
-            time_total: transfer_start.elapsed(),
-            num_redirects: redirects_followed,
-        });
+        let time_total = transfer_start.elapsed();
+        #[allow(clippy::cast_precision_loss)]
+        let download_size = response.size_download() as f64;
+        let upload_size = current_body.as_ref().map_or(0, Vec::len) as u64;
+        let total_secs = time_total.as_secs_f64();
+        let speed_download = if total_secs > 0.0 { download_size / total_secs } else { 0.0 };
+        #[allow(clippy::cast_precision_loss)]
+        let speed_upload = if total_secs > 0.0 { upload_size as f64 / total_secs } else { 0.0 };
+
+        let mut info = response.transfer_info().clone();
+        info.time_total = time_total;
+        info.num_redirects = redirects_followed;
+        info.speed_download = speed_download;
+        info.speed_upload = speed_upload;
+        info.size_upload = upload_size;
+        response.set_transfer_info(info);
         return Ok(response);
     }
 }
@@ -808,6 +849,8 @@ async fn do_single_request(
     proxy: Option<&Url>,
     resolve_overrides: &[(String, String)],
     tls_config: &TlsConfig,
+    tcp_nodelay: bool,
+    tcp_keepalive: Option<Duration>,
     pool: &mut ConnectionPool,
 ) -> Result<Response, Error> {
     // Handle non-HTTP schemes directly
@@ -896,6 +939,7 @@ async fn do_single_request(
         .map_or_else(|| connect_host.clone(), |(_, addr)| addr.clone());
 
     // Connect via TCP (with optional connect timeout)
+    let request_start = Instant::now();
     let addr = format!("{resolved_host}:{connect_port}");
     let connect_fut = tokio::net::TcpStream::connect(&addr);
     let tcp_stream = if let Some(timeout_dur) = connect_timeout {
@@ -906,6 +950,18 @@ async fn do_single_request(
     } else {
         connect_fut.await.map_err(Error::Connect)?
     };
+    // DNS + TCP connect time (TcpStream::connect does both)
+    let time_connect = request_start.elapsed();
+    // For TcpStream::connect, DNS and TCP happen together
+    let time_namelookup = time_connect;
+
+    // Apply TCP socket options
+    tcp_stream.set_nodelay(tcp_nodelay).map_err(Error::Connect)?;
+    if let Some(keepalive_idle) = tcp_keepalive {
+        let sock = socket2::SockRef::from(&tcp_stream);
+        let keepalive = socket2::TcpKeepalive::new().with_time(keepalive_idle);
+        sock.set_tcp_keepalive(&keepalive).map_err(Error::Connect)?;
+    }
 
     // Handle SOCKS proxy tunneling
     let is_socks_proxy = proxy.is_some_and(|p| {
@@ -950,6 +1006,7 @@ async fn do_single_request(
 
                 let tls = crate::tls::TlsConnector::new(tls_config)?;
                 let (tls_stream, alpn) = tls.connect(tls_stream_inner, &host).await?;
+                let time_appconnect = request_start.elapsed();
 
                 let request_target = url.request_target();
 
@@ -961,6 +1018,7 @@ async fn do_single_request(
                             eprintln!("* Using HTTP/2");
                         }
                     }
+                    let time_pretransfer = request_start.elapsed();
                     let resp = crate::protocol::http::h2::request(
                         tls_stream,
                         method,
@@ -971,10 +1029,20 @@ async fn do_single_request(
                         url.as_str(),
                     )
                     .await?;
-                    return maybe_decompress(resp, accept_encoding);
+                    let time_starttransfer = request_start.elapsed();
+                    let mut resp = maybe_decompress(resp, accept_encoding)?;
+                    let mut info = resp.transfer_info().clone();
+                    info.time_namelookup = time_namelookup;
+                    info.time_connect = time_connect;
+                    info.time_appconnect = time_appconnect;
+                    info.time_pretransfer = time_pretransfer;
+                    info.time_starttransfer = time_starttransfer;
+                    resp.set_transfer_info(info);
+                    return Ok(resp);
                 }
 
                 // HTTP/1.1 over TLS
+                let time_pretransfer = request_start.elapsed();
                 let mut stream = PooledStream::Tls(tls_stream);
                 let (resp, can_reuse) = crate::protocol::http::h1::request(
                     &mut stream,
@@ -987,11 +1055,20 @@ async fn do_single_request(
                     use_pool,
                 )
                 .await?;
+                let time_starttransfer = request_start.elapsed();
 
                 if can_reuse && use_pool {
                     pool.put(&host, port, is_tls, stream);
                 }
 
+                let mut resp = resp;
+                let mut info = resp.transfer_info().clone();
+                info.time_namelookup = time_namelookup;
+                info.time_connect = time_connect;
+                info.time_appconnect = time_appconnect;
+                info.time_pretransfer = time_pretransfer;
+                info.time_starttransfer = time_starttransfer;
+                resp.set_transfer_info(info);
                 resp
             }
             #[cfg(not(feature = "rustls"))]
@@ -1007,6 +1084,7 @@ async fn do_single_request(
                 url.request_target()
             };
 
+            let time_pretransfer = request_start.elapsed();
             let mut stream = PooledStream::Tcp(tcp_stream);
             let (resp, can_reuse) = crate::protocol::http::h1::request(
                 &mut stream,
@@ -1019,11 +1097,19 @@ async fn do_single_request(
                 use_pool,
             )
             .await?;
+            let time_starttransfer = request_start.elapsed();
 
             if can_reuse && use_pool {
                 pool.put(&host, port, is_tls, stream);
             }
 
+            let mut resp = resp;
+            let mut info = resp.transfer_info().clone();
+            info.time_namelookup = time_namelookup;
+            info.time_connect = time_connect;
+            info.time_pretransfer = time_pretransfer;
+            info.time_starttransfer = time_starttransfer;
+            resp.set_transfer_info(info);
             resp
         }
         scheme => return Err(Error::Http(format!("unsupported scheme: {scheme}"))),
@@ -1479,5 +1565,31 @@ mod tests {
         let cloned = easy.clone();
         // Clone succeeds with its own pool and preserves URL
         assert!(cloned.url.is_some());
+    }
+
+    #[test]
+    fn easy_tcp_nodelay_default_true() {
+        let easy = Easy::new();
+        assert!(easy.tcp_nodelay);
+    }
+
+    #[test]
+    fn easy_tcp_nodelay_disable() {
+        let mut easy = Easy::new();
+        easy.tcp_nodelay(false);
+        assert!(!easy.tcp_nodelay);
+    }
+
+    #[test]
+    fn easy_tcp_keepalive_default_none() {
+        let easy = Easy::new();
+        assert!(easy.tcp_keepalive.is_none());
+    }
+
+    #[test]
+    fn easy_tcp_keepalive_set() {
+        let mut easy = Easy::new();
+        easy.tcp_keepalive(Duration::from_secs(60));
+        assert_eq!(easy.tcp_keepalive, Some(Duration::from_secs(60)));
     }
 }

@@ -13,6 +13,7 @@
 
 pub mod auth;
 pub mod cookie;
+pub mod dns;
 pub mod easy;
 pub mod error;
 pub mod hsts;
@@ -26,6 +27,7 @@ pub mod url;
 
 pub use auth::{AuthCredentials, AuthMethod};
 pub use cookie::CookieJar;
+pub use dns::DnsCache;
 pub use easy::Easy;
 pub use error::Error;
 pub use hsts::HstsCache;
