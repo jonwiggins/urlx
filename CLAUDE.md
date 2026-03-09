@@ -14,12 +14,12 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 39 — Planning
-**Last completed:** Phase 38 (CLI Expansion IV) — 2026-03-09
-**Total tests:** 2,090
-**In progress:** Planning Phase 39
+**Phase:** 40 — Planning
+**Last completed:** Phase 39 (Differential Testing) — 2026-03-09
+**Total tests:** 2,131
+**In progress:** Planning Phase 40
 **Blockers:** None
-**Next up:** Phase 39 — Differential Testing
+**Next up:** Phase 40 — 1.0 Release Preparation (mandatory review)
 
 ### Completeness Summary (updated Phase 30 review)
 
@@ -404,28 +404,23 @@ Added 12 CLI flags: `--ciphers` (TLS cipher selection via `ssl_cipher_list()`), 
 
 ---
 
-### Phase 39: Differential Testing
+### Phase 39: Differential Testing (2026-03-09)
 
-**Goal:** Systematic testing against curl behavior.
-
-- Port curl test cases from tests/data/ format
-- Side-by-side output comparison tool
-- Edge case coverage for redirects, encoding, auth
-- Error code mapping verification
-- Timing/performance comparison benchmarks
+Systematic testing against curl behavior. 30 differential tests covering: error codes (DNS, connection refused, timeout), redirect behavior (307/308 preserve POST, 301 with/without post301, max-redirs, relative URL), header handling (case insensitive, last value wins, custom headers), HTTP methods (PUT, PATCH, DELETE, OPTIONS), transfer info (`effective_url`, timing, `size_download`), URL parsing (ports, userinfo, empty path), cookies (jar sends cookies), content-type/body (empty POST body, GET no content-length), `fail_on_error` (4xx, 5xx, 200 success), auth (Basic header verification with inline base64, Bearer token). 11 error code mapping tests covering URL parse errors, valid patterns, query/fragment, percent encoding, error display, variant distinctness, timeout/http/transfer formatting. MSRV bumped to 1.85.0 (getrandom 0.4 requires edition2024). 46 clippy lint fixes from MSRV upgrade (is_none_or, const fn, &raw mut).
 
 ---
 
-### Phase 40: 1.0 Release Preparation
+### Phase 40: Completeness Review IV (mandatory review)
 
-**Goal:** Fourth mandatory review. Final 1.0 readiness assessment.
+**Goal:** Fourth mandatory review. Compact phases 31-39 into Phase 0. Audit codebase, update completeness table, plan phases 41-50.
 
-- API stability freeze
-- Comprehensive changelog
-- Documentation review
-- Security audit
-- Performance baseline
-- Plan 1.0 release or phases 41-50
+- Compact Phase 0: merge phases 31-39 summaries into cumulative summary
+- Remove individual phase 31-39 entries
+- Count current tests, Easy methods, FFI functions/options/info codes
+- Update completeness table with accurate parity percentages
+- Update known gaps list
+- Assess 1.0 readiness
+- Plan phases 41-50
 
 ---
 
