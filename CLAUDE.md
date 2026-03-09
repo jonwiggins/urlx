@@ -14,12 +14,12 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 32 — Header Wire Format + Multi API Stress + URL Conformance
-**Last completed:** Phase 31 (redirect chain, decompression integration, keep-alive behavior) — 2026-03-08
-**Total tests:** 1249
-**In progress:** Planning Phase 32
+**Phase:** 33 — Cookie Wire Integration + File Protocol + Progress Callback
+**Last completed:** Phase 32 (header wire format, Multi concurrency, URL conformance) — 2026-03-08
+**Total tests:** 1311
+**In progress:** Planning Phase 33
 **Blockers:** None
-**Next up:** HTTP header wire format tests, Multi API concurrency stress, URL conformance
+**Next up:** Cookie wire integration, file protocol edge cases, progress callback behavior
 
 ---
 
@@ -625,31 +625,37 @@ tests (gzip through Easy, identity, Accept-Encoding header, large/empty compress
 keep-alive behavior tests (connection reuse, error survival, 204/HEAD, large body,
 alternating hosts). 1249 total tests.
 
-### Phase 32: Header Wire Format + Multi API Stress + URL Conformance
+### Phase 32: Header Wire Format + Multi Concurrency + URL Conformance — COMPLETED (2026-03-08)
 
-**Scope:** Test HTTP header handling through the wire, Multi API under
-concurrent load, and URL parsing conformance edge cases.
+12 header wire format tests (custom headers, User-Agent, Content-Type, auth, Host, Accept,
+colons, Content-Length). 10 Multi concurrency tests (20 concurrent, ordering, mixed codes,
+body sizes, multi-server, empty, len tracking). 40 URL conformance tests (schemes, hosts,
+IPv4/IPv6, paths, queries, fragments, credentials, roundtrip, methods, real-world URLs).
+1311 total tests.
 
-**Step 32.1: HTTP header wire format** (`header_wire_format.rs`)
-- Custom headers sent correctly to server
-- Multiple headers with same name
-- Header value with special characters (colons, commas)
-- User-Agent override
-- Content-Type sent with POST body
+### Phase 33: Cookie Wire Integration + File Protocol + Progress Callback
 
-**Step 32.2: Multi API concurrency stress** (`multi_concurrency.rs`)
-- 20+ concurrent requests
-- Mixed success/failure results
-- All results returned in order
-- Concurrent requests to different servers
+**Scope:** End-to-end cookie flow through the wire, file protocol edge
+cases, and progress callback integration.
 
-**Step 32.3: URL parsing conformance** (`url_conformance.rs`)
-- International domain names
-- Percent-encoded paths
-- Unusual but valid URLs
-- Edge cases from RFC 3986
+**Step 33.1: Cookie wire integration** (`cookie_wire_integration.rs`)
+- Server sends Set-Cookie, client returns Cookie on next request
+- Cookie not sent to wrong domain
+- Cookie path scoping through wire
+- Multiple Set-Cookie headers accumulated
 
-**Exit criteria:** 1300+ tests.
+**Step 33.2: File protocol edge cases** (`file_protocol_edge.rs`)
+- Read existing file
+- Non-existent file returns error
+- Directory returns error
+- Empty file
+
+**Step 33.3: Progress callback integration** (`progress_integration.rs`)
+- Callback invoked during transfer
+- Download size reported
+- Abort via callback
+
+**Exit criteria:** 1360+ tests.
 
 ---
 
