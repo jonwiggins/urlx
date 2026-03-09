@@ -420,6 +420,15 @@ impl Easy {
         self.tls_config.max_tls_version = Some(version);
     }
 
+    /// Set the SHA-256 hash of the expected server public key for pinning.
+    ///
+    /// Format: `sha256//<base64-encoded-hash>`.
+    /// The connection will be rejected if the server's public key doesn't match.
+    /// Equivalent to curl's `--pinnedpubkey`.
+    pub fn ssl_pinned_public_key(&mut self, pin: &str) {
+        self.tls_config.pinned_public_key = Some(pin.to_string());
+    }
+
     /// Perform the transfer and return the response (blocking).
     ///
     /// Creates a new tokio runtime internally. Do not call from within

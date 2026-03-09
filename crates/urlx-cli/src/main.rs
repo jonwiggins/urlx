@@ -315,6 +315,11 @@ fn parse_args(args: &[String]) -> Option<CliOptions> {
                     }
                 }
             }
+            "--pinnedpubkey" => {
+                i += 1;
+                let val = require_arg(args, i, "--pinnedpubkey")?;
+                opts.easy.ssl_pinned_public_key(val);
+            }
             arg if arg.starts_with('-') => {
                 eprintln!("urlx: unknown option: {arg}");
                 return None;
