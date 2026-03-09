@@ -14,12 +14,12 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 3 — DNS + Connection Infrastructure
-**Last completed:** Phase 2 (TLS hardening + authentication) — 2026-03-08
-**Total tests:** 1400+
-**In progress:** Phase 3 — DNS cache, TCP options, timing instrumentation done; Happy Eyeballs, Unix sockets, DoH remaining
+**Phase:** 4 — FTP Completeness + SSH/SFTP/SCP
+**Last completed:** Phase 3 (DNS + connection infrastructure) — 2026-03-08
+**Total tests:** 1460+
+**In progress:** Planning Phase 4
 **Blockers:** None
-**Next up:** Happy Eyeballs (RFC 6555), Unix domain sockets, DNS-over-HTTPS
+**Next up:** FTP upload, FTPS, directory operations, SSH/SFTP
 
 ### Completeness Summary
 
@@ -32,13 +32,14 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 | Authentication | 50% | Basic, Bearer, Digest (MD5/SHA-256), AWS SigV4 |
 | Cookie engine | 75% | In-memory only, no persistence |
 | Proxy | 80% | HTTP + SOCKS + proxy auth; no HTTPS proxy or PAC |
-| DNS | 25% | Manual overrides + in-memory cache with TTL |
+| DNS | 60% | Cache with TTL, Happy Eyeballs (RFC 6555), DNS shuffle; no async resolver or DoH |
 | FTP | 30% | Download only; no upload or FTPS |
 | SSH/SFTP/SCP | 0% | Not implemented |
 | Multi API | 30% | Simple concurrency; no event-driven model |
 | FFI (libcurl C ABI) | ~8% | 19/300+ options, 6/50+ info codes |
-| CLI | ~12% | ~35 of ~250 flags |
-| Overall | ~38% | ~85% for basic HTTP/HTTPS use cases |
+| CLI | ~13% | ~41 of ~250 flags |
+| Connection | 80% | Pool, TCP_NODELAY, keepalive, Unix sockets, interface/port binding |
+| Overall | ~40% | ~88% for basic HTTP/HTTPS use cases |
 
 ---
 
@@ -57,7 +58,10 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 - **2026-03-08:** Cipher suite selection deferred from Phase 2 — rustls defaults are secure and appropriate. The `CryptoProvider` API exists for future use if needed.
 - **2026-03-08:** Migrated from `rustls-pemfile` (RUSTSEC-2025-0134, unmaintained) to `rustls-pki-types` `PemObject` trait for PEM parsing. The `rustls-pki-types` API is the maintained replacement.
 - **2026-03-08:** TCP_NODELAY defaults to `true` (matching curl behavior). TCP keepalive uses `socket2` crate (already in dependency tree via tokio) for cross-platform `SO_KEEPALIVE` + `TCP_KEEPIDLE`.
-- **2026-03-08:** TransferInfo timing instrumentation captures `time_namelookup` = `time_connect` since `TcpStream::connect` does DNS+TCP together. Separate DNS timing requires pre-resolving with a standalone DNS resolver.
+- **2026-03-08:** TransferInfo timing now separates `time_namelookup` from `time_connect` — DNS resolution via `tokio::net::lookup_host` is explicit, with caching. Previous approach had them equal since `TcpStream::connect` does both.
+- **2026-03-08:** Happy Eyeballs uses 250ms delay (RFC 6555 recommendation) before starting IPv4 after IPv6. Uses `tokio::select!` for racing. Falls back to sequential if only one address family available.
+- **2026-03-08:** DNS shuffle uses inline xorshift32 PRNG seeded from nanosecond timestamp. Avoids adding a `rand` dependency for a simple shuffle operation.
+- **2026-03-08:** Local interface/port binding uses `socket2::Socket` for pre-bind + non-blocking connect, with platform-specific `EINPROGRESS` handling (code 36 on macOS, 115 on Linux, 10036 on Windows).
 
 ---
 
@@ -242,28 +246,11 @@ TLS configuration and authentication mechanisms:
 
 ---
 
-### Phase 3: DNS + Connection Infrastructure
+### Phase 3: DNS + Connection Infrastructure — COMPLETED (2026-03-08)
 
-**Goal:** Intelligent DNS resolution and robust connection setup.
+DNS caching (TTL-based, 60s default), Happy Eyeballs (RFC 6555, 250ms IPv6 head start), DNS shuffle, TCP_NODELAY (default on), TCP keepalive (socket2), Unix domain sockets, local interface/port binding (socket2), TransferInfo timing fields (namelookup, connect, appconnect, pretransfer, starttransfer, speed_download/upload, size_upload), CLI --write-out variables, --unix-socket, --interface, --local-port, --dns-shuffle flags. Migrated PEM parsing from unmaintained rustls-pemfile to rustls-pki-types.
 
-**Completed:**
-- DNS cache module (`dns.rs`) with TTL-based expiry (default 60s), case-insensitive lookup, purge
-- `TCP_NODELAY` socket option (enabled by default, matching curl) via `Easy::tcp_nodelay()`
-- TCP keepalive configuration via socket2 — `Easy::tcp_keepalive()`
-- TransferInfo expanded with all timing fields: `time_namelookup`, `time_connect`, `time_appconnect`, `time_pretransfer`, `time_starttransfer`, `speed_download`, `speed_upload`, `size_upload`
-- Per-phase timing instrumentation in `do_single_request` (DNS, TCP, TLS, request, response)
-- CLI `--write-out` variables for all new timing fields
-- Migrated PEM parsing from unmaintained `rustls-pemfile` to `rustls-pki-types`
-
-**Remaining:**
-- Happy Eyeballs (RFC 6555) — race IPv4/IPv6 connections
-- Unix domain socket connections — `CURLOPT_UNIX_SOCKET_PATH`
-- Abstract Unix sockets — `CURLOPT_ABSTRACT_UNIX_SOCKET`
-- Local interface/port binding — `CURLOPT_INTERFACE`, `CURLOPT_LOCALPORT`
-- Async DNS resolver via hickory-dns (feature-gated)
-- DNS-over-HTTPS (DoH) — `CURLOPT_DOH_URL`
-- DNS shuffle (randomize resolver results)
-- Wire DNS cache into the transfer pipeline (currently standalone)
+**Deferred to later phases:** Async DNS resolver (hickory-dns), DNS-over-HTTPS, abstract Unix sockets.
 
 ---
 
