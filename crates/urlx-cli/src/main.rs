@@ -28,7 +28,13 @@ struct CliOptions {
     dump_header: Option<String>,
     use_digest: bool,
     use_aws_sigv4: bool,
+    use_bearer: bool,
     user_credentials: Option<(String, String)>,
+    retry_count: u32,
+    retry_delay_secs: u64,
+    retry_max_time_secs: u64,
+    parallel: bool,
+    parallel_max: usize,
 }
 
 /// Print usage information to stderr.
@@ -74,6 +80,21 @@ fn print_usage() {
     eprintln!("      --local-port <port>   Bind to local port for outgoing connections");
     eprintln!("      --dns-shuffle         Randomize DNS resolution order");
     eprintln!("  -T, --upload-file <file>  Upload file (PUT)");
+    eprintln!("  -b, --cookie <data>       Send cookies (e.g., 'name=value; name2=value2')");
+    eprintln!("      --data-binary <data>  POST binary data (use @filename)");
+    eprintln!("      --data-urlencode <d>  POST URL-encoded data");
+    eprintln!("      --resolve <h:p:a>     Resolve host:port to address");
+    eprintln!("      --http2               Request HTTP/2");
+    eprintln!("      --retry <num>         Retry on transient errors");
+    eprintln!("      --retry-delay <s>     Wait between retries (seconds)");
+    eprintln!("      --retry-max-time <s>  Maximum total retry time (seconds)");
+    eprintln!("  -Z, --parallel            Perform transfers in parallel");
+    eprintln!("      --parallel-max <n>    Maximum parallel transfers (default: 50)");
+    eprintln!("      --socks5-hostname <h> SOCKS5 proxy (resolve via proxy)");
+    eprintln!("      --tcp-nodelay         Use TCP_NODELAY");
+    eprintln!("      --tcp-keepalive <s>   TCP keepalive idle time (seconds)");
+    eprintln!("      --hsts                Enable HSTS (HTTP Strict Transport Security)");
+    eprintln!("      --bearer <token>      Bearer token authentication");
 }
 
 /// Parse CLI arguments into options.
@@ -94,7 +115,13 @@ fn parse_args(args: &[String]) -> Option<CliOptions> {
         dump_header: None,
         use_digest: false,
         use_aws_sigv4: false,
+        use_bearer: false,
         user_credentials: None,
+        retry_count: 0,
+        retry_delay_secs: 0,
+        retry_max_time_secs: 0,
+        parallel: false,
+        parallel_max: 50,
     };
 
     let mut i = 1;
@@ -374,6 +401,131 @@ fn parse_args(args: &[String]) -> Option<CliOptions> {
                     }
                 }
             }
+            "-b" | "--cookie" => {
+                i += 1;
+                let val = require_arg(args, i, "-b")?;
+                // Enable cookie engine and set initial cookies via header
+                opts.easy.cookie_jar(true);
+                opts.easy.header("Cookie", val);
+            }
+            "--data-binary" => {
+                i += 1;
+                let val = require_arg(args, i, "--data-binary")?;
+                if let Some(path) = val.strip_prefix('@') {
+                    match std::fs::read(path) {
+                        Ok(data) => opts.easy.body(&data),
+                        Err(e) => {
+                            eprintln!("urlx: error reading {path}: {e}");
+                            return None;
+                        }
+                    }
+                } else {
+                    opts.easy.body(val.as_bytes());
+                }
+                if opts.easy.method_is_default() {
+                    opts.easy.method("POST");
+                }
+            }
+            "--data-urlencode" => {
+                i += 1;
+                let val = require_arg(args, i, "--data-urlencode")?;
+                let encoded = urlencoded(val);
+                opts.easy.body(encoded.as_bytes());
+                if opts.easy.method_is_default() {
+                    opts.easy.method("POST");
+                }
+                opts.easy.header("Content-Type", "application/x-www-form-urlencoded");
+            }
+            "--resolve" => {
+                i += 1;
+                let val = require_arg(args, i, "--resolve")?;
+                // Format: host:port:address
+                let parts: Vec<&str> = val.splitn(3, ':').collect();
+                if parts.len() == 3 {
+                    opts.easy.resolve(parts[0], parts[2]);
+                } else {
+                    eprintln!("urlx: invalid --resolve format: {val}");
+                    eprintln!("  Use: --resolve host:port:address");
+                    return None;
+                }
+            }
+            "--http2" => {
+                // HTTP/2 is auto-negotiated via ALPN; this flag is accepted for compat
+            }
+            "--retry" => {
+                i += 1;
+                let val = require_arg(args, i, "--retry")?;
+                if let Ok(n) = val.parse::<u32>() {
+                    opts.retry_count = n;
+                } else {
+                    eprintln!("urlx: invalid retry count: {val}");
+                    return None;
+                }
+            }
+            "--retry-delay" => {
+                i += 1;
+                let val = require_arg(args, i, "--retry-delay")?;
+                if let Ok(s) = val.parse::<u64>() {
+                    opts.retry_delay_secs = s;
+                } else {
+                    eprintln!("urlx: invalid retry-delay value: {val}");
+                    return None;
+                }
+            }
+            "--retry-max-time" => {
+                i += 1;
+                let val = require_arg(args, i, "--retry-max-time")?;
+                if let Ok(s) = val.parse::<u64>() {
+                    opts.retry_max_time_secs = s;
+                } else {
+                    eprintln!("urlx: invalid retry-max-time value: {val}");
+                    return None;
+                }
+            }
+            "-Z" | "--parallel" => {
+                opts.parallel = true;
+            }
+            "--parallel-max" => {
+                i += 1;
+                let val = require_arg(args, i, "--parallel-max")?;
+                if let Ok(n) = val.parse::<usize>() {
+                    opts.parallel_max = n;
+                } else {
+                    eprintln!("urlx: invalid parallel-max value: {val}");
+                    return None;
+                }
+            }
+            "--socks5-hostname" => {
+                i += 1;
+                let val = require_arg(args, i, "--socks5-hostname")?;
+                let proxy_url = format!("socks5h://{val}");
+                if let Err(e) = opts.easy.proxy(&proxy_url) {
+                    eprintln!("urlx: invalid SOCKS5 proxy: {e}");
+                    return None;
+                }
+            }
+            "--tcp-nodelay" => {
+                opts.easy.tcp_nodelay(true);
+            }
+            "--tcp-keepalive" => {
+                i += 1;
+                let val = require_arg(args, i, "--tcp-keepalive")?;
+                if let Ok(secs) = val.parse::<u64>() {
+                    opts.easy.tcp_keepalive(std::time::Duration::from_secs(secs));
+                } else {
+                    eprintln!("urlx: invalid tcp-keepalive value: {val}");
+                    return None;
+                }
+            }
+            "--hsts" => {
+                opts.easy.hsts(true);
+            }
+            "--bearer" => {
+                i += 1;
+                let val = require_arg(args, i, "--bearer")?;
+                opts.easy.bearer_token(val);
+                opts.use_bearer = true;
+            }
             arg if arg.starts_with('-') => {
                 eprintln!("urlx: unknown option: {arg}");
                 return None;
@@ -398,6 +550,40 @@ fn parse_args(args: &[String]) -> Option<CliOptions> {
 
     Some(opts)
 }
+
+/// URL-encode a string value for `--data-urlencode`.
+///
+/// If the value contains `=`, only the part after the first `=` is encoded
+/// (the name is passed through as-is). Otherwise the entire value is encoded.
+fn urlencoded(input: &str) -> String {
+    if let Some((name, value)) = input.split_once('=') {
+        let encoded = percent_encode(value);
+        format!("{name}={encoded}")
+    } else {
+        percent_encode(input)
+    }
+}
+
+/// Percent-encode a string per RFC 3986 (unreserved characters are not encoded).
+fn percent_encode(input: &str) -> String {
+    let mut result = String::with_capacity(input.len());
+    for byte in input.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                result.push(byte as char);
+            }
+            _ => {
+                result.push('%');
+                result.push(char::from(HEX_CHARS[(byte >> 4) as usize]));
+                result.push(char::from(HEX_CHARS[(byte & 0x0F) as usize]));
+            }
+        }
+    }
+    result
+}
+
+/// Hex lookup table for percent encoding.
+const HEX_CHARS: [u8; 16] = *b"0123456789ABCDEF";
 
 /// Helper to require an argument value for an option flag.
 fn require_arg<'a>(args: &'a [String], i: usize, flag: &str) -> Option<&'a str> {
@@ -430,6 +616,8 @@ fn run(args: &[String]) -> ExitCode {
             opts.silent,
             opts.show_error,
             opts.fail_on_error,
+            opts.parallel,
+            opts.parallel_max,
         );
     }
 
@@ -461,7 +649,9 @@ fn run(args: &[String]) -> ExitCode {
         }));
     }
 
-    match opts.easy.perform() {
+    let result = perform_with_retry(&mut opts);
+
+    match result {
         Ok(response) => {
             if opts.show_progress && !opts.silent {
                 eprintln!();
@@ -508,6 +698,70 @@ fn run(args: &[String]) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Perform a transfer with optional retry logic.
+fn perform_with_retry(opts: &mut CliOptions) -> Result<liburlx::Response, liburlx::Error> {
+    let max_retries = opts.retry_count;
+    let delay = std::time::Duration::from_secs(opts.retry_delay_secs);
+    let max_time = if opts.retry_max_time_secs > 0 {
+        Some(std::time::Duration::from_secs(opts.retry_max_time_secs))
+    } else {
+        None
+    };
+    let start = std::time::Instant::now();
+
+    let mut last_err = None;
+    for attempt in 0..=max_retries {
+        if attempt > 0 {
+            // Check max time budget
+            if let Some(max) = max_time {
+                if start.elapsed() >= max {
+                    break;
+                }
+            }
+            if !delay.is_zero() {
+                std::thread::sleep(delay);
+            }
+            if !opts.silent {
+                eprintln!(
+                    "Warning: Transient problem: {} — retrying after {} seconds. Retry {} of {}.",
+                    last_err.as_ref().map_or("unknown error", |_| "transfer error"),
+                    delay.as_secs(),
+                    attempt,
+                    max_retries,
+                );
+            }
+        }
+
+        match opts.easy.perform() {
+            Ok(response) => {
+                // Retry on 408, 429, 500, 502, 503, 504 if retries remain
+                if is_retryable_status(response.status()) && attempt < max_retries {
+                    last_err = Some(liburlx::Error::Http(format!(
+                        "HTTP {} {}",
+                        response.status(),
+                        http_status_text(response.status()),
+                    )));
+                    continue;
+                }
+                return Ok(response);
+            }
+            Err(e) => {
+                last_err = Some(e);
+                if attempt == max_retries {
+                    break;
+                }
+            }
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| liburlx::Error::Http("retry exhausted".to_string())))
+}
+
+/// Check if an HTTP status code is retryable (transient error).
+const fn is_retryable_status(code: u16) -> bool {
+    matches!(code, 408 | 429 | 500 | 502 | 503 | 504)
 }
 
 /// Format response headers as HTTP status line + headers.
@@ -598,7 +852,7 @@ fn output_response(
 }
 
 /// Run multiple URLs concurrently using the Multi API.
-#[allow(clippy::fn_params_excessive_bools)]
+#[allow(clippy::fn_params_excessive_bools, clippy::too_many_arguments)]
 fn run_multi(
     template: &liburlx::Easy,
     urls: &[String],
@@ -607,8 +861,13 @@ fn run_multi(
     silent: bool,
     show_error: bool,
     fail_on_error: bool,
+    parallel: bool,
+    parallel_max: usize,
 ) -> ExitCode {
     let mut multi = liburlx::Multi::new();
+    if parallel {
+        multi.max_total_connections(parallel_max);
+    }
 
     for url in urls {
         let mut easy = template.clone();
@@ -1236,5 +1495,283 @@ mod tests {
             "https://x.com".to_string(),
         ];
         assert!(parse_args(&args).is_none());
+    }
+
+    #[test]
+    fn parse_args_cookie() {
+        let args = vec![
+            "urlx".to_string(),
+            "-b".to_string(),
+            "name=value".to_string(),
+            "http://x.com".to_string(),
+        ];
+        let opts = parse_args(&args);
+        assert!(opts.is_some());
+    }
+
+    #[test]
+    fn parse_args_cookie_long() {
+        let args = vec![
+            "urlx".to_string(),
+            "--cookie".to_string(),
+            "a=1; b=2".to_string(),
+            "http://x.com".to_string(),
+        ];
+        let opts = parse_args(&args);
+        assert!(opts.is_some());
+    }
+
+    #[test]
+    fn parse_args_data_binary() {
+        let args = vec![
+            "urlx".to_string(),
+            "--data-binary".to_string(),
+            "raw bytes here".to_string(),
+            "http://x.com".to_string(),
+        ];
+        let opts = parse_args(&args);
+        assert!(opts.is_some());
+    }
+
+    #[test]
+    fn parse_args_data_urlencode() {
+        let args = vec![
+            "urlx".to_string(),
+            "--data-urlencode".to_string(),
+            "key=hello world".to_string(),
+            "http://x.com".to_string(),
+        ];
+        let opts = parse_args(&args);
+        assert!(opts.is_some());
+    }
+
+    #[test]
+    fn parse_args_resolve() {
+        let args = vec![
+            "urlx".to_string(),
+            "--resolve".to_string(),
+            "example.com:443:127.0.0.1".to_string(),
+            "http://x.com".to_string(),
+        ];
+        let opts = parse_args(&args);
+        assert!(opts.is_some());
+    }
+
+    #[test]
+    fn parse_args_resolve_invalid() {
+        let args = vec![
+            "urlx".to_string(),
+            "--resolve".to_string(),
+            "bad-format".to_string(),
+            "http://x.com".to_string(),
+        ];
+        assert!(parse_args(&args).is_none());
+    }
+
+    #[test]
+    fn parse_args_http2() {
+        let args = vec!["urlx".to_string(), "--http2".to_string(), "http://x.com".to_string()];
+        let opts = parse_args(&args);
+        assert!(opts.is_some());
+    }
+
+    #[test]
+    fn parse_args_retry() {
+        let args = vec![
+            "urlx".to_string(),
+            "--retry".to_string(),
+            "3".to_string(),
+            "http://x.com".to_string(),
+        ];
+        let opts = parse_args(&args).unwrap();
+        assert_eq!(opts.retry_count, 3);
+    }
+
+    #[test]
+    fn parse_args_retry_invalid() {
+        let args = vec![
+            "urlx".to_string(),
+            "--retry".to_string(),
+            "abc".to_string(),
+            "http://x.com".to_string(),
+        ];
+        assert!(parse_args(&args).is_none());
+    }
+
+    #[test]
+    fn parse_args_retry_delay() {
+        let args = vec![
+            "urlx".to_string(),
+            "--retry-delay".to_string(),
+            "5".to_string(),
+            "http://x.com".to_string(),
+        ];
+        let opts = parse_args(&args).unwrap();
+        assert_eq!(opts.retry_delay_secs, 5);
+    }
+
+    #[test]
+    fn parse_args_retry_max_time() {
+        let args = vec![
+            "urlx".to_string(),
+            "--retry-max-time".to_string(),
+            "60".to_string(),
+            "http://x.com".to_string(),
+        ];
+        let opts = parse_args(&args).unwrap();
+        assert_eq!(opts.retry_max_time_secs, 60);
+    }
+
+    #[test]
+    fn parse_args_parallel() {
+        let args = vec!["urlx".to_string(), "-Z".to_string(), "http://x.com".to_string()];
+        let opts = parse_args(&args).unwrap();
+        assert!(opts.parallel);
+        assert_eq!(opts.parallel_max, 50); // default
+    }
+
+    #[test]
+    fn parse_args_parallel_long() {
+        let args = vec!["urlx".to_string(), "--parallel".to_string(), "http://x.com".to_string()];
+        let opts = parse_args(&args).unwrap();
+        assert!(opts.parallel);
+    }
+
+    #[test]
+    fn parse_args_parallel_max() {
+        let args = vec![
+            "urlx".to_string(),
+            "--parallel-max".to_string(),
+            "10".to_string(),
+            "http://x.com".to_string(),
+        ];
+        let opts = parse_args(&args).unwrap();
+        assert_eq!(opts.parallel_max, 10);
+    }
+
+    #[test]
+    fn parse_args_parallel_max_invalid() {
+        let args = vec![
+            "urlx".to_string(),
+            "--parallel-max".to_string(),
+            "abc".to_string(),
+            "http://x.com".to_string(),
+        ];
+        assert!(parse_args(&args).is_none());
+    }
+
+    #[test]
+    fn parse_args_socks5_hostname() {
+        let args = vec![
+            "urlx".to_string(),
+            "--socks5-hostname".to_string(),
+            "127.0.0.1:1080".to_string(),
+            "http://x.com".to_string(),
+        ];
+        let opts = parse_args(&args);
+        assert!(opts.is_some());
+    }
+
+    #[test]
+    fn parse_args_tcp_nodelay() {
+        let args =
+            vec!["urlx".to_string(), "--tcp-nodelay".to_string(), "http://x.com".to_string()];
+        let opts = parse_args(&args);
+        assert!(opts.is_some());
+    }
+
+    #[test]
+    fn parse_args_tcp_keepalive() {
+        let args = vec![
+            "urlx".to_string(),
+            "--tcp-keepalive".to_string(),
+            "60".to_string(),
+            "http://x.com".to_string(),
+        ];
+        let opts = parse_args(&args);
+        assert!(opts.is_some());
+    }
+
+    #[test]
+    fn parse_args_tcp_keepalive_invalid() {
+        let args = vec![
+            "urlx".to_string(),
+            "--tcp-keepalive".to_string(),
+            "abc".to_string(),
+            "http://x.com".to_string(),
+        ];
+        assert!(parse_args(&args).is_none());
+    }
+
+    #[test]
+    fn parse_args_hsts() {
+        let args = vec!["urlx".to_string(), "--hsts".to_string(), "http://x.com".to_string()];
+        let opts = parse_args(&args);
+        assert!(opts.is_some());
+    }
+
+    #[test]
+    fn parse_args_bearer() {
+        let args = vec![
+            "urlx".to_string(),
+            "--bearer".to_string(),
+            "mytoken123".to_string(),
+            "http://x.com".to_string(),
+        ];
+        let opts = parse_args(&args).unwrap();
+        assert!(opts.use_bearer);
+    }
+
+    #[test]
+    fn parse_args_bearer_missing_arg() {
+        let args = vec!["urlx".to_string(), "--bearer".to_string()];
+        assert!(parse_args(&args).is_none());
+    }
+
+    #[test]
+    fn urlencoded_basic() {
+        assert_eq!(urlencoded("hello world"), "hello%20world");
+    }
+
+    #[test]
+    fn urlencoded_with_name() {
+        assert_eq!(urlencoded("key=hello world"), "key=hello%20world");
+    }
+
+    #[test]
+    fn urlencoded_special_chars() {
+        // Input has '=' so it splits: name="a&b", value="c" → "a&b=c"
+        assert_eq!(urlencoded("a&b=c"), "a&b=c");
+        // Without '=', the whole string is encoded
+        assert_eq!(urlencoded("a&b"), "a%26b");
+    }
+
+    #[test]
+    fn urlencoded_unreserved_chars() {
+        assert_eq!(urlencoded("abc-_.~123"), "abc-_.~123");
+    }
+
+    #[test]
+    fn percent_encode_empty() {
+        assert_eq!(percent_encode(""), "");
+    }
+
+    #[test]
+    fn percent_encode_space() {
+        assert_eq!(percent_encode(" "), "%20");
+    }
+
+    #[test]
+    fn is_retryable_status_true() {
+        for code in [408, 429, 500, 502, 503, 504] {
+            assert!(is_retryable_status(code), "status {code} should be retryable");
+        }
+    }
+
+    #[test]
+    fn is_retryable_status_false() {
+        for code in [200, 301, 400, 401, 403, 404] {
+            assert!(!is_retryable_status(code), "status {code} should not be retryable");
+        }
     }
 }
