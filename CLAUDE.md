@@ -14,12 +14,12 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 36 — Planning
-**Last completed:** Phase 35 (WebSocket Enhancements) — 2026-03-09
-**Total tests:** 2,064
-**In progress:** Planning Phase 36
+**Phase:** 37 — Planning
+**Last completed:** Phase 36 (HTTP/3 Maturity) — 2026-03-09
+**Total tests:** 2,069
+**In progress:** Planning Phase 37
 **Blockers:** None
-**Next up:** Phase 36 — HTTP/3 Maturity
+**Next up:** Phase 37 — Platform & Build
 
 ### Completeness Summary (updated Phase 30 review)
 
@@ -27,7 +27,7 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 |---|---|---|
 | HTTP/1.1 | 97% | Expect, HTTP/1.0, trailer headers; no chunked upload |
 | HTTP/2 | 75% | Works with server push collection; no stream priority/dependency |
-| HTTP/3 | 40% | QUIC transport via quinn, h3 request/response, rate limiting; no 0-RTT or Alt-Svc upgrade |
+| HTTP/3 | 55% | QUIC transport via quinn, h3 request/response, rate limiting, Alt-Svc upgrade, 0-RTT; no connection pooling or server push |
 | TLS | 85% | rustls with insecure mode, custom CA, client certs, pinning, version selection, cipher list, session cache |
 | Authentication | 60% | Basic, Bearer, Digest (MD5/SHA-256), AWS SigV4, NTLM skeleton |
 | Cookie engine | 92% | Netscape file format read/write, domain-indexed jar; no public suffix list |
@@ -106,6 +106,8 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 - **2026-03-09:** HTTP/3 dispatch in easy.rs bypasses TCP connection and TLS — it uses the resolved DNS address directly for QUIC (UDP). The QUIC endpoint binds to 0.0.0.0:0 (OS-assigned port). Connection errors map to `Error::Connect` to match the existing error taxonomy.
 - **2026-03-09:** HTTPS proxy tunnel uses TLS-in-TLS: first TLS-wrap TCP to the proxy (via `new_no_alpn`), then HTTP CONNECT through the TLS stream, then TLS-wrap the tunnel to the target. The result is `TlsStream<TlsStream<TcpStream>>` which doesn't fit `PooledStream::Tls(TlsStream<TcpStream>)`, so the HTTPS proxy path uses a separate early-return block with `h1::request` directly on the generic stream.
 - **2026-03-09:** WebSocket key generation uses `AtomicU64` counter mixed with nanosecond timestamp to ensure uniqueness even when called within the same nanosecond. Previous approach used only timestamp, causing identical keys on fast CI machines.
+- **2026-03-09:** Alt-Svc HTTP/3 upgrade triggers only for `HttpVersion::None` (auto) or `HttpVersion::Http2` — explicit `Http10`/`Http11` requests are never upgraded. The origin key uses `format!("https://{}:{}", host, port)` matching how Alt-Svc entries are stored during response processing.
+- **2026-03-09:** 0-RTT via quinn's `Connecting::into_0rtt()` — currently falls back to full handshake every time since no session cache exists between requests. Adding a QUIC session cache is deferred; when implemented, 0-RTT will activate automatically on resumed connections. Only idempotent requests are safe for 0-RTT replay, but since `into_0rtt` handles this at the TLS level, no additional filtering is needed.
 - **2026-03-09:** `curl_getdate` FFI function implements inline HTTP date parsing supporting three formats: RFC 2822 ("Sun, 06 Nov 1994 08:49:37 GMT"), RFC 850 ("Sunday, 06-Nov-94 08:49:37 GMT"), and asctime ("Sun Nov  6 08:49:37 1994"). Inline Unix timestamp computation avoids adding a `chrono` dependency for a single use case. Two-digit years ≥70 map to 1900s, <70 to 2000s (matching curl).
 - **2026-03-09:** `curl_escape`/`curl_unescape` use RFC 3986 unreserved characters (A-Z, a-z, 0-9, `-._~`) for percent-encoding. `curl_unescape` decodes `+` as space (matching curl's behavior for form-encoded data). `curl_easy_escape`/`curl_easy_unescape` delegate to the same implementation.
 - **2026-03-09:** `curl_formadd` returns `CURL_FORMADD_DISABLED` (7) as a stub — the deprecated multipart API is replaced by the MIME API (`curl_mime_*`). `curl_formfree` is a no-op. This matches libcurl's behavior when built without form API support.
@@ -273,7 +275,7 @@ Built from scratch over 29 phases. All features below are implemented and tested
 - **DNS:** Cache with configurable TTL, shuffle (inline xorshift32), custom server addresses, DoH URL config. No async resolver.
 - **FTP:** Session-based API — STOR, APPE, REST, FEAT, MKD/RMD/DELE, RNFR/RNTO, SITE, PWD/CWD, SIZE, MLSD, TYPE A/I. Explicit FTPS (AUTH TLS + PBSZ 0 + PROT P, RFC 4217), implicit FTPS (port 990, direct TLS). Active mode (PORT for IPv4, EPRT for IPv4/IPv6). `FtpStream` enum (Plain/Tls) with `AsyncRead`/`AsyncWrite` delegation. `ftps://` URL scheme with default port 990. `TlsConnector::new_no_alpn()` for non-HTTP TLS.
 - **SSH/SFTP/SCP:** Via russh + russh-sftp (pure-Rust, async). `SshSession` with password and public key auth. SFTP download/upload/list via `SftpSession`. SCP download/upload via exec channel with SCP protocol parsing. Auto-discovery of `~/.ssh/id_{ed25519,rsa,ecdsa}` keys. Feature-gated behind `ssh` (optional). `sftp://` and `scp://` URL schemes with default port 22. `Error::Ssh` variant.
-- **HTTP/3:** Via quinn 0.11 + h3 0.0.8 + h3-quinn 0.0.10 for QUIC transport (feature-gated `http3`). QUIC client config with ALPN "h3", insecure cert verifier for -k mode. Rate-limited body send/recv. Wired into easy.rs dispatch for `HttpVersion::Http3`. No 0-RTT or Alt-Svc upgrade.
+- **HTTP/3:** Via quinn 0.11 + h3 0.0.8 + h3-quinn 0.0.10 for QUIC transport (feature-gated `http3`). QUIC client config with ALPN "h3", insecure cert verifier for -k mode. Rate-limited body send/recv. Wired into easy.rs dispatch for `HttpVersion::Http3`. Alt-Svc-based automatic HTTP/3 upgrade with port override. 0-RTT connection via `into_0rtt()` with full handshake fallback. No connection pooling or server push.
 - **Other protocols:** WebSocket (RFC 6455), SMTP, IMAP, POP3, MQTT 3.1.1, DICT, TFTP, FILE.
 - **Multi API:** JoinSet-based concurrency, connection limiting (semaphore), message queue, Share interface (DNS cache + cookie jar), PipeliningMode (Nothing/Multiplex). FFI event loop: wait/poll/wakeup, fdset, socket_action, timeout, info_read, setopt, strerror.
 - **Alt-Svc:** Header parsing (RFC 7838), TTL-based cache, automatic processing in transfers.
@@ -307,7 +309,7 @@ Built from scratch over 29 phases. All features below are implemented and tested
 - Features: .curlrc-style config file parser, protocol restriction, max filesize enforcement (exit 63), libcurl C code generation, retry logic (408/429/5xx), netrc credential lookup, Content-Disposition filename extraction, URL query parameter appending.
 - Misc: --globoff (no-op, no URL globbing).
 
-**Testing — 2,064 tests (0 failures):**
+**Testing — 2,069 tests (0 failures):**
 - Unit + integration tests across all crates
 - Integration: 1,048 (hyper-based test servers)
 - Property-based: 60 (proptest — URL, cookie, FTP, HTTP, HSTS, multipart, protocols, WebSocket)
@@ -317,7 +319,7 @@ Built from scratch over 29 phases. All features below are implemented and tested
 
 **Guardrails:** Zero TODO/FIXME/HACK. Zero `unwrap()` in production code. `#![deny(unsafe_code)]` in liburlx and urlx-cli. GitHub Actions CI (fmt, clippy, test on 3 OS, doc, cargo-deny, MSRV 1.83, commit lint). Pre-commit hooks (fmt, clippy, test, deny, doc, conventional commit).
 
-**Known gaps (as of Phase 34):** HTTP/3 missing 0-RTT and Alt-Svc-based upgrade from HTTP/2. HTTP/2 missing stream priority/dependency. SSH known_hosts verification not implemented. Socket/timer callbacks stored but not actively invoked (tokio manages I/O). Missing FFI: CURLOPT_HTTPPOST (deprecated). URL globbing not yet implemented. No async DNS resolver (hickory-dns). No cookie public suffix list. NTLM auth is skeleton only. No PAC proxy auto-config. `--rate` stored but not enforced. `--path-as-is` stored but URL crate still normalizes paths.
+**Known gaps (as of Phase 36):** HTTP/3 missing connection pooling and server push. HTTP/2 missing stream priority/dependency. SSH known_hosts verification not implemented. Socket/timer callbacks stored but not actively invoked (tokio manages I/O). Missing FFI: CURLOPT_HTTPPOST (deprecated). URL globbing not yet implemented. No async DNS resolver (hickory-dns). No cookie public suffix list. NTLM auth is skeleton only. No PAC proxy auto-config. `--rate` stored but not enforced. `--path-as-is` stored but URL crate still normalizes paths.
 
 ---
 
@@ -383,15 +385,9 @@ Added `CloseCode` enum (11 RFC 6455 Section 7.4.1 status codes), `close_with_cod
 
 ---
 
-### Phase 36: HTTP/3 Maturity
+### Phase 36: HTTP/3 Maturity (2026-03-09)
 
-**Goal:** Complete HTTP/3 support.
-
-- Alt-Svc-based HTTP/3 upgrade from HTTP/2
-- 0-RTT early data
-- Connection migration
-- QUIC connection pooling
-- HTTP/3 server push
+Alt-Svc-based automatic HTTP/3 upgrade: wired Alt-Svc cache into `do_single_request` so cached h3 entries trigger QUIC dispatch when `HttpVersion` is `None` or `Http2`. Alt-Svc port override (h3 on different port than origin). 0-RTT QUIC connection via quinn's `into_0rtt()` with fallback to full handshake when no session data available. Verbose output distinguishes `--http3` from "Alt-Svc upgrade". 5 new tests.
 
 ---
 
