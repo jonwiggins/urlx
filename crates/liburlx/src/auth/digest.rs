@@ -153,15 +153,15 @@ impl DigestChallenge {
 }
 
 /// Generate a random client nonce (cnonce) as a hex string.
+///
+/// Uses a cryptographically secure random number generator to prevent
+/// nonce prediction attacks in Digest authentication.
 #[must_use]
 pub fn generate_cnonce() -> String {
-    // Use a simple approach: mix of timestamp and a counter
-    // For better randomness in production, use a CSPRNG, but this
-    // is sufficient for Digest auth cnonce generation.
-    use std::time::SystemTime;
-    let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default();
-    let seed = now.as_nanos();
-    format!("{seed:016x}")
+    use rand::Rng as _;
+    let mut rng = rand::rng();
+    let bytes: [u8; 16] = rng.random();
+    hex::encode(bytes)
 }
 
 /// Split comma-separated parameters, respecting quoted strings.

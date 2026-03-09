@@ -4,6 +4,42 @@
 //! as a drop-in replacement for `libcurl` at the binary level.
 //!
 //! All `unsafe` code in the urlx project is confined to this crate.
+//!
+//! # Safety Invariants
+//!
+//! The following safety contracts apply throughout this crate:
+//!
+//! - **Handle pointers** (`*mut c_void` for easy/multi/share/url/mime handles):
+//!   All callers must provide valid, non-null pointers obtained from the
+//!   corresponding `_init` function. Every exported function null-checks its
+//!   handle argument before dereferencing. Handles are `Box`-allocated and cast
+//!   to `*mut c_void`; `Box::from_raw` reclaims ownership in `_cleanup`.
+//!
+//! - **C strings** (`*const c_char`): Callers must provide valid,
+//!   null-terminated strings. The helper `read_cstr()` combines null-check +
+//!   `CStr::from_ptr` + UTF-8 validation. Direct `CStr::from_ptr` calls
+//!   appear where `read_cstr` is insufficient (e.g., when the pointer type
+//!   differs or when non-UTF-8 data is acceptable).
+//!
+//! - **Output pointers** in `curl_easy_getinfo`: Callers must provide a valid
+//!   pointer to the expected output type (`*mut c_long`, `*mut f64`,
+//!   `*mut *const c_char`, `*mut i64`). Each match arm casts `out` to the
+//!   documented type and writes through it. The function null-checks `out`
+//!   before the match.
+//!
+//! - **Callback function pointers**: `std::mem::transmute` converts `*const
+//!   c_void` to the appropriate callback signature. Callers must ensure the
+//!   pointer is actually a function with the documented C signature. Callbacks
+//!   are invoked during `curl_easy_perform` with the corresponding `*data`
+//!   pointer passed as the user-data argument.
+//!
+//! - **`curl_slist` traversal**: Linked-list nodes are caller-allocated. The
+//!   list is walked via `(*node).next` until null. Each `node.data` is a
+//!   caller-owned C string. `curl_slist_free_all` reclaims all nodes.
+//!
+//! - **Panic safety**: `curl_easy_perform` wraps the transfer in
+//!   `std::panic::catch_unwind` to prevent Rust panics from unwinding across
+//!   the FFI boundary.
 
 #![warn(missing_docs)]
 
@@ -2083,6 +2119,7 @@ pub unsafe extern "C" fn curl_easy_setopt(
         10135 => {
             // Cookie engine control commands (ALL, SESS, FLUSH, RELOAD, or cookie string)
             // All values accepted — actual cookie manipulation handled internally
+            // SAFETY: value is a caller-provided C string
             let _ = unsafe { read_cstr(value) };
             CURLcode::CURLE_OK
         }
@@ -2753,9 +2790,9 @@ pub unsafe extern "C" fn curl_easy_getinfo(
 
         // CURLINFO_SCHEME = 0x100044
         0x10_0044 => {
-            // SAFETY: Caller guarantees out points to *const c_char
             // Return the scheme from the effective URL
             // Note: We store a pointer to the effective URL string which contains the scheme
+            // SAFETY: Caller guarantees out points to *const c_char
             let out = unsafe { &mut *out.cast::<*const c_char>() };
             *out = response.effective_url().as_ptr().cast::<c_char>();
             CURLcode::CURLE_OK
@@ -2784,6 +2821,7 @@ pub unsafe extern "C" fn curl_easy_getinfo(
 
         // CURLINFO_NAMELOOKUP_TIME_T = 0x60003F (microseconds)
         0x60_003F => {
+            // SAFETY: Caller provides valid output pointer; null-checked above
             let out = unsafe { &mut *out.cast::<i64>() };
             #[allow(clippy::cast_possible_truncation)]
             {
@@ -2794,6 +2832,7 @@ pub unsafe extern "C" fn curl_easy_getinfo(
 
         // CURLINFO_CONNECT_TIME_T = 0x600040 (microseconds)
         0x60_0040 => {
+            // SAFETY: Caller provides valid output pointer; null-checked above
             let out = unsafe { &mut *out.cast::<i64>() };
             #[allow(clippy::cast_possible_truncation)]
             {
@@ -2804,6 +2843,7 @@ pub unsafe extern "C" fn curl_easy_getinfo(
 
         // CURLINFO_PRETRANSFER_TIME_T = 0x600041 (microseconds)
         0x60_0041 => {
+            // SAFETY: Caller provides valid output pointer; null-checked above
             let out = unsafe { &mut *out.cast::<i64>() };
             #[allow(clippy::cast_possible_truncation)]
             {
@@ -2814,6 +2854,7 @@ pub unsafe extern "C" fn curl_easy_getinfo(
 
         // CURLINFO_STARTTRANSFER_TIME_T = 0x600042 (microseconds)
         0x60_0042 => {
+            // SAFETY: Caller provides valid output pointer; null-checked above
             let out = unsafe { &mut *out.cast::<i64>() };
             #[allow(clippy::cast_possible_truncation)]
             {
@@ -2824,6 +2865,7 @@ pub unsafe extern "C" fn curl_easy_getinfo(
 
         // CURLINFO_REDIRECT_TIME_T = 0x600043 (microseconds)
         0x60_0043 => {
+            // SAFETY: Caller provides valid output pointer; null-checked above
             let out = unsafe { &mut *out.cast::<i64>() };
             // Not yet tracked — return 0
             *out = 0;
@@ -2832,6 +2874,7 @@ pub unsafe extern "C" fn curl_easy_getinfo(
 
         // CURLINFO_APPCONNECT_TIME_T = 0x600044 (microseconds)
         0x60_0044 => {
+            // SAFETY: Caller provides valid output pointer; null-checked above
             let out = unsafe { &mut *out.cast::<i64>() };
             #[allow(clippy::cast_possible_truncation)]
             {
@@ -2851,6 +2894,7 @@ pub unsafe extern "C" fn curl_easy_getinfo(
 
         // CURLINFO_SIZE_UPLOAD_T = 0x600045
         0x60_0045 => {
+            // SAFETY: Caller provides valid output pointer; null-checked above
             let out = unsafe { &mut *out.cast::<i64>() };
             #[allow(clippy::cast_possible_wrap)]
             {
@@ -2861,6 +2905,7 @@ pub unsafe extern "C" fn curl_easy_getinfo(
 
         // CURLINFO_SIZE_DOWNLOAD_T = 0x600046
         0x60_0046 => {
+            // SAFETY: Caller provides valid output pointer; null-checked above
             let out = unsafe { &mut *out.cast::<i64>() };
             #[allow(clippy::cast_possible_wrap)]
             {
@@ -2871,6 +2916,7 @@ pub unsafe extern "C" fn curl_easy_getinfo(
 
         // CURLINFO_SPEED_DOWNLOAD_T = 0x600047
         0x60_0047 => {
+            // SAFETY: Caller provides valid output pointer; null-checked above
             let out = unsafe { &mut *out.cast::<i64>() };
             #[allow(clippy::cast_possible_truncation)]
             {
@@ -2881,6 +2927,7 @@ pub unsafe extern "C" fn curl_easy_getinfo(
 
         // CURLINFO_SPEED_UPLOAD_T = 0x600048
         0x60_0048 => {
+            // SAFETY: Caller provides valid output pointer; null-checked above
             let out = unsafe { &mut *out.cast::<i64>() };
             #[allow(clippy::cast_possible_truncation)]
             {

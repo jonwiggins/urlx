@@ -37,6 +37,7 @@ h2 = { version = "0.4", optional = true }
 md-5 = "0.10"
 sha2 = "0.10"
 hex = "0.4"
+rand = "0.9"
 socket2 = { version = "0.6", features = ["all"] }
 url = "2"
 bytes = { version = "1", optional = true }

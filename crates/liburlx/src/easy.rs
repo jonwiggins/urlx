@@ -459,7 +459,18 @@ impl Easy {
     }
 
     /// Add a custom request header.
+    ///
+    /// Header names and values must not contain CR (`\r`) or LF (`\n`)
+    /// characters. Such headers are silently rejected to prevent
+    /// header injection attacks.
     pub fn header(&mut self, name: &str, value: &str) {
+        if name.contains('\r')
+            || name.contains('\n')
+            || value.contains('\r')
+            || value.contains('\n')
+        {
+            return;
+        }
         self.headers.push((name.to_string(), value.to_string()));
     }
 
@@ -1187,7 +1198,15 @@ impl Easy {
     /// Add a header to send only to the proxy, not the target server.
     ///
     /// Equivalent to curl's `--proxy-header` or `CURLOPT_PROXYHEADER`.
+    /// Headers containing CR or LF characters are silently rejected.
     pub fn proxy_header(&mut self, name: &str, value: &str) {
+        if name.contains('\r')
+            || name.contains('\n')
+            || value.contains('\r')
+            || value.contains('\n')
+        {
+            return;
+        }
         self.proxy_headers.push((name.to_string(), value.to_string()));
     }
 
@@ -4475,5 +4494,41 @@ mod tests {
         let url = Url::parse("http://example.com/path?q=1").unwrap();
         let result = super::resolve_request_target(None, &url);
         assert_eq!(result, "/path?q=1");
+    }
+
+    #[test]
+    fn header_rejects_crlf_in_name() {
+        let mut easy = Easy::new();
+        easy.header("X-Foo\r\nX-Injected", "value");
+        assert!(easy.headers.is_empty());
+    }
+
+    #[test]
+    fn header_rejects_lf_in_name() {
+        let mut easy = Easy::new();
+        easy.header("X-Foo\nX-Injected", "value");
+        assert!(easy.headers.is_empty());
+    }
+
+    #[test]
+    fn header_rejects_cr_in_value() {
+        let mut easy = Easy::new();
+        easy.header("X-Foo", "bar\r\nbaz");
+        assert!(easy.headers.is_empty());
+    }
+
+    #[test]
+    fn header_accepts_clean_values() {
+        let mut easy = Easy::new();
+        easy.header("X-Foo", "bar");
+        assert_eq!(easy.headers.len(), 1);
+        assert_eq!(easy.headers[0], ("X-Foo".to_string(), "bar".to_string()));
+    }
+
+    #[test]
+    fn proxy_header_rejects_crlf() {
+        let mut easy = Easy::new();
+        easy.proxy_header("X-Foo\r\n", "value");
+        assert!(easy.proxy_headers.is_empty());
     }
 }
