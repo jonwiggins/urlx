@@ -25,6 +25,7 @@ fn transfer_info_custom_values() {
         time_connect: Duration::from_millis(50),
         time_total: Duration::from_millis(200),
         num_redirects: 3,
+        ..TransferInfo::default()
     };
     assert_eq!(info.time_connect.as_millis(), 50);
     assert_eq!(info.time_total.as_millis(), 200);
@@ -37,6 +38,7 @@ fn transfer_info_clone() {
         time_connect: Duration::from_secs(1),
         time_total: Duration::from_secs(2),
         num_redirects: 5,
+        ..TransferInfo::default()
     };
     let cloned = info.clone();
     assert_eq!(info.time_connect, cloned.time_connect);
@@ -61,6 +63,7 @@ fn response_with_info_preserves_timing() {
         time_connect: Duration::from_millis(100),
         time_total: Duration::from_millis(500),
         num_redirects: 2,
+        ..TransferInfo::default()
     };
     let resp = Response::with_info(
         200,
@@ -83,6 +86,7 @@ fn response_set_transfer_info() {
         time_connect: Duration::from_millis(25),
         time_total: Duration::from_millis(100),
         num_redirects: 1,
+        ..TransferInfo::default()
     });
     assert_eq!(resp.transfer_info().time_total.as_millis(), 100);
     assert_eq!(resp.transfer_info().num_redirects, 1);

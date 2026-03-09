@@ -3,7 +3,7 @@
 //! Tests all public methods on `Response` and `TransferInfo`
 //! to ensure complete coverage of the response data model.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, unused_results)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::float_cmp, unused_results)]
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -21,6 +21,7 @@ fn with_info_preserves_all_fields() {
         time_connect: Duration::from_millis(10),
         time_total: Duration::from_millis(50),
         num_redirects: 3,
+        ..TransferInfo::default()
     };
 
     let resp = Response::with_info(
@@ -73,6 +74,7 @@ fn set_transfer_info_updates_values() {
         time_connect: Duration::from_millis(100),
         time_total: Duration::from_millis(500),
         num_redirects: 5,
+        ..TransferInfo::default()
     };
     resp.set_transfer_info(info);
 
@@ -87,6 +89,7 @@ fn set_transfer_info_overrides_previous() {
         time_connect: Duration::from_millis(10),
         time_total: Duration::from_millis(20),
         num_redirects: 1,
+        ..TransferInfo::default()
     };
     let mut resp = Response::with_info(200, HashMap::new(), Vec::new(), String::new(), info1);
     assert_eq!(resp.transfer_info().num_redirects, 1);
@@ -95,6 +98,7 @@ fn set_transfer_info_overrides_previous() {
         time_connect: Duration::from_millis(99),
         time_total: Duration::from_millis(99),
         num_redirects: 9,
+        ..TransferInfo::default()
     };
     resp.set_transfer_info(info2);
     assert_eq!(resp.transfer_info().num_redirects, 9);
@@ -211,9 +215,63 @@ fn size_download_matches_body_len() {
 #[test]
 fn transfer_info_default_all_zero() {
     let info = TransferInfo::default();
+    assert_eq!(info.time_namelookup, Duration::ZERO);
     assert_eq!(info.time_connect, Duration::ZERO);
+    assert_eq!(info.time_appconnect, Duration::ZERO);
+    assert_eq!(info.time_pretransfer, Duration::ZERO);
+    assert_eq!(info.time_starttransfer, Duration::ZERO);
     assert_eq!(info.time_total, Duration::ZERO);
     assert_eq!(info.num_redirects, 0);
+    assert_eq!(info.speed_download, 0.0);
+    assert_eq!(info.speed_upload, 0.0);
+    assert_eq!(info.size_upload, 0);
+}
+
+#[test]
+fn transfer_info_all_timing_fields() {
+    let info = TransferInfo {
+        time_namelookup: Duration::from_millis(5),
+        time_connect: Duration::from_millis(10),
+        time_appconnect: Duration::from_millis(20),
+        time_pretransfer: Duration::from_millis(21),
+        time_starttransfer: Duration::from_millis(50),
+        time_total: Duration::from_millis(100),
+        num_redirects: 1,
+        speed_download: 1024.0,
+        speed_upload: 512.0,
+        size_upload: 2048,
+    };
+
+    assert_eq!(info.time_namelookup, Duration::from_millis(5));
+    assert_eq!(info.time_connect, Duration::from_millis(10));
+    assert_eq!(info.time_appconnect, Duration::from_millis(20));
+    assert_eq!(info.time_pretransfer, Duration::from_millis(21));
+    assert_eq!(info.time_starttransfer, Duration::from_millis(50));
+    assert_eq!(info.time_total, Duration::from_millis(100));
+    assert_eq!(info.num_redirects, 1);
+    assert_eq!(info.speed_download, 1024.0);
+    assert_eq!(info.speed_upload, 512.0);
+    assert_eq!(info.size_upload, 2048);
+}
+
+#[test]
+fn transfer_info_timing_order_invariant() {
+    // Timing fields should satisfy: namelookup <= connect <= appconnect <= pretransfer <= starttransfer <= total
+    let info = TransferInfo {
+        time_namelookup: Duration::from_millis(5),
+        time_connect: Duration::from_millis(10),
+        time_appconnect: Duration::from_millis(20),
+        time_pretransfer: Duration::from_millis(25),
+        time_starttransfer: Duration::from_millis(50),
+        time_total: Duration::from_millis(100),
+        ..TransferInfo::default()
+    };
+
+    assert!(info.time_namelookup <= info.time_connect);
+    assert!(info.time_connect <= info.time_appconnect);
+    assert!(info.time_appconnect <= info.time_pretransfer);
+    assert!(info.time_pretransfer <= info.time_starttransfer);
+    assert!(info.time_starttransfer <= info.time_total);
 }
 
 #[test]
@@ -222,8 +280,35 @@ fn transfer_info_debug_output() {
         time_connect: Duration::from_millis(5),
         time_total: Duration::from_millis(10),
         num_redirects: 2,
+        ..TransferInfo::default()
     };
     let debug = format!("{info:?}");
     assert!(debug.contains("TransferInfo"));
-    assert!(debug.contains('2'));
+    assert!(debug.contains("time_namelookup"));
+    assert!(debug.contains("time_appconnect"));
+    assert!(debug.contains("speed_download"));
+}
+
+#[test]
+fn transfer_info_clone_preserves_all_fields() {
+    let info = TransferInfo {
+        time_namelookup: Duration::from_millis(1),
+        time_connect: Duration::from_millis(2),
+        time_appconnect: Duration::from_millis(3),
+        time_pretransfer: Duration::from_millis(4),
+        time_starttransfer: Duration::from_millis(5),
+        time_total: Duration::from_millis(6),
+        num_redirects: 7,
+        speed_download: 8.0,
+        speed_upload: 9.0,
+        size_upload: 10,
+    };
+    let cloned = info.clone();
+    assert_eq!(cloned.time_namelookup, info.time_namelookup);
+    assert_eq!(cloned.time_appconnect, info.time_appconnect);
+    assert_eq!(cloned.time_pretransfer, info.time_pretransfer);
+    assert_eq!(cloned.time_starttransfer, info.time_starttransfer);
+    assert_eq!(cloned.speed_download, info.speed_download);
+    assert_eq!(cloned.speed_upload, info.speed_upload);
+    assert_eq!(cloned.size_upload, info.size_upload);
 }

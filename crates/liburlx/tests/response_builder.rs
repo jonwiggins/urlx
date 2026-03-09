@@ -47,6 +47,7 @@ fn response_with_info() {
         time_connect: Duration::from_millis(50),
         time_total: Duration::from_millis(100),
         num_redirects: 2,
+        ..TransferInfo::default()
     };
 
     let resp = Response::with_info(200, HashMap::new(), Vec::new(), String::new(), info);
@@ -66,6 +67,7 @@ fn set_transfer_info() {
         time_connect: Duration::from_millis(25),
         time_total: Duration::from_millis(75),
         num_redirects: 1,
+        ..TransferInfo::default()
     };
     resp.set_transfer_info(info);
 
@@ -188,6 +190,7 @@ fn transfer_info_clone() {
         time_connect: Duration::from_millis(10),
         time_total: Duration::from_millis(20),
         num_redirects: 3,
+        ..TransferInfo::default()
     };
     let cloned = info.clone();
     // Use both to prove they are independent copies
