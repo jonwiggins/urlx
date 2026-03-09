@@ -14,7 +14,7 @@ default = ["http", "http2", "rustls", "decompression"]
 
 # Protocols
 http = []
-http2 = ["dep:h2"]
+http2 = ["dep:h2", "dep:bytes"]
 http3 = ["dep:quinn", "dep:h3", "dep:h3-quinn", "dep:bytes"]
 
 # TLS backends

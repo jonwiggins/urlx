@@ -137,6 +137,20 @@ pub struct Easy {
     abstract_unix_socket: Option<String>,
     /// Don't verify `DoH` server TLS certificate.
     doh_insecure: bool,
+    /// HTTP/2 initial stream window size in bytes.
+    http2_window_size: Option<u32>,
+    /// HTTP/2 initial connection window size in bytes.
+    http2_connection_window_size: Option<u32>,
+    /// HTTP/2 maximum frame size in bytes.
+    http2_max_frame_size: Option<u32>,
+    /// HTTP/2 maximum header list size in bytes.
+    http2_max_header_list_size: Option<u32>,
+    /// HTTP/2 server push enabled.
+    http2_enable_push: Option<bool>,
+    /// HTTP/2 stream priority weight (1-256).
+    http2_stream_weight: Option<u16>,
+    /// HTTP/2 PING frame interval for keep-alive.
+    http2_ping_interval: Option<Duration>,
 }
 
 impl std::fmt::Debug for Easy {
@@ -216,6 +230,13 @@ impl std::fmt::Debug for Easy {
             .field("haproxy_protocol", &self.haproxy_protocol)
             .field("abstract_unix_socket", &self.abstract_unix_socket)
             .field("doh_insecure", &self.doh_insecure)
+            .field("http2_window_size", &self.http2_window_size)
+            .field("http2_connection_window_size", &self.http2_connection_window_size)
+            .field("http2_max_frame_size", &self.http2_max_frame_size)
+            .field("http2_max_header_list_size", &self.http2_max_header_list_size)
+            .field("http2_enable_push", &self.http2_enable_push)
+            .field("http2_stream_weight", &self.http2_stream_weight)
+            .field("http2_ping_interval", &self.http2_ping_interval)
             .finish()
     }
 }
@@ -294,6 +315,13 @@ impl Clone for Easy {
             haproxy_protocol: self.haproxy_protocol,
             abstract_unix_socket: self.abstract_unix_socket.clone(),
             doh_insecure: self.doh_insecure,
+            http2_window_size: self.http2_window_size,
+            http2_connection_window_size: self.http2_connection_window_size,
+            http2_max_frame_size: self.http2_max_frame_size,
+            http2_max_header_list_size: self.http2_max_header_list_size,
+            http2_enable_push: self.http2_enable_push,
+            http2_stream_weight: self.http2_stream_weight,
+            http2_ping_interval: self.http2_ping_interval,
         }
     }
 }
@@ -374,6 +402,13 @@ impl Easy {
             haproxy_protocol: false,
             abstract_unix_socket: None,
             doh_insecure: false,
+            http2_window_size: None,
+            http2_connection_window_size: None,
+            http2_max_frame_size: None,
+            http2_max_header_list_size: None,
+            http2_enable_push: None,
+            http2_stream_weight: None,
+            http2_ping_interval: None,
         }
     }
 
@@ -1276,6 +1311,64 @@ impl Easy {
         self.doh_insecure = enable;
     }
 
+    /// Set the HTTP/2 initial stream window size in bytes.
+    ///
+    /// Controls how much data a single stream can receive before the
+    /// sender must wait for a `WINDOW_UPDATE` frame. Default is 65,535
+    /// bytes (HTTP/2 spec default). Must be between 1 and 2^31-1.
+    pub const fn http2_window_size(&mut self, size: u32) {
+        self.http2_window_size = Some(size);
+    }
+
+    /// Set the HTTP/2 initial connection window size in bytes.
+    ///
+    /// Controls total data across all streams before the sender must
+    /// wait for a connection-level `WINDOW_UPDATE`. Default is 65,535 bytes.
+    pub const fn http2_connection_window_size(&mut self, size: u32) {
+        self.http2_connection_window_size = Some(size);
+    }
+
+    /// Set the HTTP/2 maximum frame size in bytes.
+    ///
+    /// The maximum size of a single HTTP/2 frame payload. Must be between
+    /// 16,384 and 16,777,215 (2^24-1). Default is 16,384.
+    pub const fn http2_max_frame_size(&mut self, size: u32) {
+        self.http2_max_frame_size = Some(size);
+    }
+
+    /// Set the HTTP/2 maximum header list size in bytes.
+    ///
+    /// The maximum size of the decoded header list for incoming responses.
+    pub const fn http2_max_header_list_size(&mut self, size: u32) {
+        self.http2_max_header_list_size = Some(size);
+    }
+
+    /// Enable or disable HTTP/2 server push.
+    ///
+    /// When set to `false`, tells the server not to send `PUSH_PROMISE`
+    /// frames via the `SETTINGS_ENABLE_PUSH` setting.
+    pub const fn http2_enable_push(&mut self, enable: bool) {
+        self.http2_enable_push = Some(enable);
+    }
+
+    /// Set the HTTP/2 stream priority weight (1-256).
+    ///
+    /// Higher weight streams get proportionally more bandwidth relative
+    /// to sibling streams. Note: HTTP/2 priority was deprecated in
+    /// RFC 9113 and many servers ignore it.
+    /// Equivalent to `CURLOPT_STREAM_WEIGHT`.
+    pub const fn http2_stream_weight(&mut self, weight: u16) {
+        self.http2_stream_weight = Some(weight);
+    }
+
+    /// Set the HTTP/2 PING frame interval for connection keep-alive.
+    ///
+    /// When set, periodically sends HTTP/2 PING frames to keep the
+    /// connection alive and detect dead connections.
+    pub const fn http2_ping_interval(&mut self, interval: Duration) {
+        self.http2_ping_interval = Some(interval);
+    }
+
     /// Perform the transfer and return the response (blocking).
     ///
     /// Creates a new tokio runtime internally. Do not call from within
@@ -1404,6 +1497,17 @@ impl Easy {
             low_speed_time: self.low_speed_time,
         };
 
+        #[cfg(feature = "http2")]
+        let h2_config = crate::protocol::http::h2::Http2Config {
+            window_size: self.http2_window_size,
+            connection_window_size: self.http2_connection_window_size,
+            max_frame_size: self.http2_max_frame_size,
+            max_header_list_size: self.http2_max_header_list_size,
+            enable_push: self.http2_enable_push,
+            stream_weight: self.http2_stream_weight,
+            ping_interval: self.http2_ping_interval,
+        };
+
         let fut = perform_transfer(
             &url,
             Some(effective_method.as_str()),
@@ -1443,6 +1547,8 @@ impl Easy {
             self.ftp_ssl_mode,
             self.ssh_key_path.as_deref(),
             self.proxy_tls_config.as_ref(),
+            #[cfg(feature = "http2")]
+            &h2_config,
         );
 
         // Apply total transfer timeout if set.
@@ -1545,6 +1651,7 @@ async fn perform_transfer(
     ftp_ssl_mode: crate::protocol::ftp::FtpSslMode,
     ssh_key_path: Option<&str>,
     proxy_tls_config: Option<&TlsConfig>,
+    #[cfg(feature = "http2")] h2_config: &crate::protocol::http::h2::Http2Config,
 ) -> Result<Response, Error> {
     let transfer_start = Instant::now();
     let original_url = url.clone();
@@ -1607,6 +1714,8 @@ async fn perform_transfer(
             ssh_key_path,
             proxy_tls_config,
             alt_svc_cache,
+            #[cfg(feature = "http2")]
+            h2_config,
         ))
         .await?;
 
@@ -1670,6 +1779,8 @@ async fn perform_transfer(
                                 ssh_key_path,
                                 proxy_tls_config,
                                 alt_svc_cache,
+                                #[cfg(feature = "http2")]
+                                h2_config,
                             ))
                             .await?;
                         }
@@ -1810,6 +1921,7 @@ async fn do_single_request(
     proxy_tls_config: Option<&TlsConfig>,
     #[cfg_attr(not(feature = "http3"), allow(unused_variables))]
     alt_svc_cache: &crate::protocol::http::altsvc::AltSvcCache,
+    #[cfg(feature = "http2")] h2_config: &crate::protocol::http::h2::Http2Config,
 ) -> Result<Response, Error> {
     // Handle non-HTTP schemes directly
     match url.scheme() {
@@ -2266,6 +2378,7 @@ async fn do_single_request(
                         body,
                         url.as_str(),
                         speed_limits,
+                        h2_config,
                     )
                     .await?;
                     let time_starttransfer = request_start.elapsed();
@@ -4072,5 +4185,61 @@ mod tests {
         assert!(!easy.doh_insecure);
         easy.doh_insecure(true);
         assert!(easy.doh_insecure);
+    }
+
+    #[test]
+    fn easy_http2_window_size() {
+        let mut easy = Easy::new();
+        assert!(easy.http2_window_size.is_none());
+        easy.http2_window_size(1_048_576);
+        assert_eq!(easy.http2_window_size, Some(1_048_576));
+    }
+
+    #[test]
+    fn easy_http2_connection_window_size() {
+        let mut easy = Easy::new();
+        assert!(easy.http2_connection_window_size.is_none());
+        easy.http2_connection_window_size(2_097_152);
+        assert_eq!(easy.http2_connection_window_size, Some(2_097_152));
+    }
+
+    #[test]
+    fn easy_http2_max_frame_size() {
+        let mut easy = Easy::new();
+        assert!(easy.http2_max_frame_size.is_none());
+        easy.http2_max_frame_size(32_768);
+        assert_eq!(easy.http2_max_frame_size, Some(32_768));
+    }
+
+    #[test]
+    fn easy_http2_max_header_list_size() {
+        let mut easy = Easy::new();
+        assert!(easy.http2_max_header_list_size.is_none());
+        easy.http2_max_header_list_size(8192);
+        assert_eq!(easy.http2_max_header_list_size, Some(8192));
+    }
+
+    #[test]
+    fn easy_http2_enable_push() {
+        let mut easy = Easy::new();
+        assert!(easy.http2_enable_push.is_none());
+        easy.http2_enable_push(false);
+        assert_eq!(easy.http2_enable_push, Some(false));
+    }
+
+    #[test]
+    fn easy_http2_stream_weight() {
+        let mut easy = Easy::new();
+        assert!(easy.http2_stream_weight.is_none());
+        easy.http2_stream_weight(128);
+        assert_eq!(easy.http2_stream_weight, Some(128));
+    }
+
+    #[test]
+    fn easy_http2_ping_interval() {
+        let mut easy = Easy::new();
+        assert!(easy.http2_ping_interval.is_none());
+        easy.http2_ping_interval(Duration::from_secs(30));
+        assert_eq!(easy.http2_ping_interval, Some(Duration::from_secs(30)));
     }
 }
