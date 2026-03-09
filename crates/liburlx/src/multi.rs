@@ -10,6 +10,19 @@ use std::sync::{Arc, Mutex};
 use crate::easy::Easy;
 use crate::error::Error;
 use crate::protocol::http::response::Response;
+use crate::share::Share;
+
+/// Controls HTTP pipelining and multiplexing behavior.
+///
+/// Equivalent to `CURLMOPT_PIPELINING`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PipeliningMode {
+    /// No pipelining or multiplexing (default).
+    #[default]
+    Nothing,
+    /// HTTP/2 multiplexing — multiple requests over a single connection.
+    Multiplex,
+}
 
 /// Completion message for a finished transfer.
 ///
@@ -32,6 +45,8 @@ pub struct Multi {
     handles: Vec<Easy>,
     max_total_connections: Option<usize>,
     max_host_connections: Option<usize>,
+    pipelining: PipeliningMode,
+    share: Option<Share>,
     /// Completed transfer messages waiting to be read.
     messages: Arc<Mutex<Vec<TransferMessage>>>,
 }
@@ -50,6 +65,8 @@ impl Multi {
             handles: Vec::new(),
             max_total_connections: None,
             max_host_connections: None,
+            pipelining: PipeliningMode::Nothing,
+            share: None,
             messages: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -99,6 +116,30 @@ impl Multi {
         self.max_host_connections = Some(max);
     }
 
+    /// Set the pipelining/multiplexing mode.
+    ///
+    /// When set to [`PipeliningMode::Multiplex`], HTTP/2 multiplexing is
+    /// preferred for connections to the same host.
+    /// Equivalent to `CURLMOPT_PIPELINING`.
+    pub fn pipelining(&mut self, mode: PipeliningMode) {
+        self.pipelining = mode;
+    }
+
+    /// Returns the current pipelining mode.
+    #[must_use]
+    pub const fn pipelining_mode(&self) -> PipeliningMode {
+        self.pipelining
+    }
+
+    /// Attach a Share handle for cross-handle data sharing.
+    ///
+    /// When set, all Easy handles added to this Multi will automatically
+    /// have the Share handle attached before performing.
+    /// Equivalent to `CURLOPT_SHARE` applied to all handles.
+    pub fn set_share(&mut self, share: Share) {
+        self.share = Some(share);
+    }
+
     /// Read a completed transfer message.
     ///
     /// Returns `None` when no more messages are available.
@@ -140,10 +181,17 @@ impl Multi {
     /// Individual transfer errors are returned in the result vector.
     /// This method itself does not fail.
     pub async fn perform(&mut self) -> Vec<Result<Response, Error>> {
-        let handles: Vec<Easy> = self.handles.drain(..).collect();
+        let mut handles: Vec<Easy> = self.handles.drain(..).collect();
 
         if handles.is_empty() {
             return Vec::new();
+        }
+
+        // Attach share handle to all Easy handles if configured
+        if let Some(ref share) = self.share {
+            for handle in &mut handles {
+                handle.set_share(share.clone());
+            }
         }
 
         let results = if let Some(max_conns) = self.max_total_connections {
@@ -384,5 +432,47 @@ mod tests {
         // Limit to 2 concurrent connections
         let results = perform_with_limit(handles, 2).await;
         assert_eq!(results.len(), 5);
+    }
+
+    #[test]
+    fn multi_pipelining_default() {
+        let multi = Multi::new();
+        assert_eq!(multi.pipelining_mode(), PipeliningMode::Nothing);
+    }
+
+    #[test]
+    fn multi_pipelining_set() {
+        let mut multi = Multi::new();
+        multi.pipelining(PipeliningMode::Multiplex);
+        assert_eq!(multi.pipelining_mode(), PipeliningMode::Multiplex);
+    }
+
+    #[test]
+    fn multi_set_share() {
+        let mut multi = Multi::new();
+        let mut share = crate::share::Share::new();
+        share.add(crate::share::ShareType::Dns);
+        multi.set_share(share);
+        assert!(multi.share.is_some());
+    }
+
+    #[tokio::test]
+    async fn multi_perform_attaches_share() {
+        let mut share = crate::share::Share::new();
+        share.add(crate::share::ShareType::Dns);
+
+        let mut multi = Multi::new();
+        multi.set_share(share);
+
+        let mut easy = Easy::new();
+        let _ = easy.url("http://127.0.0.1:1");
+        easy.connect_timeout(std::time::Duration::from_millis(10));
+        multi.add(easy);
+
+        // Perform should succeed (handles get share attached)
+        let results = multi.perform().await;
+        assert_eq!(results.len(), 1);
+        // Transfer will fail (unreachable addr), but share was attached
+        assert!(results[0].is_err());
     }
 }

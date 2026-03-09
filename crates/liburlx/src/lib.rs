@@ -22,6 +22,7 @@ pub(crate) mod pool;
 pub mod progress;
 pub mod protocol;
 pub mod proxy;
+pub mod share;
 pub mod tls;
 pub mod url;
 
@@ -31,10 +32,11 @@ pub use dns::DnsCache;
 pub use easy::Easy;
 pub use error::Error;
 pub use hsts::HstsCache;
-pub use multi::Multi;
+pub use multi::{Multi, PipeliningMode};
 pub use progress::{make_progress_callback, ProgressCallback, ProgressInfo};
 pub use protocol::http::multipart::MultipartForm;
 pub use protocol::http::response::{Response, TransferInfo};
+pub use share::{Share, ShareType};
 pub use tls::{TlsConfig, TlsVersion};
 pub use url::Url;
 

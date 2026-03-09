@@ -55,6 +55,7 @@ pub struct Easy {
     dns_shuffle: bool,
     dns_cache: DnsCache,
     pool: ConnectionPool,
+    share: Option<crate::share::Share>,
 }
 
 impl std::fmt::Debug for Easy {
@@ -91,6 +92,7 @@ impl std::fmt::Debug for Easy {
             .field("dns_shuffle", &self.dns_shuffle)
             .field("dns_cache", &self.dns_cache)
             .field("pool", &"<ConnectionPool>")
+            .field("share", &self.share)
             .finish()
     }
 }
@@ -129,6 +131,7 @@ impl Clone for Easy {
             dns_shuffle: self.dns_shuffle,
             dns_cache: DnsCache::new(),
             pool: ConnectionPool::new(),
+            share: self.share.clone(),
         }
     }
 }
@@ -169,6 +172,7 @@ impl Easy {
             dns_shuffle: false,
             dns_cache: DnsCache::new(),
             pool: ConnectionPool::new(),
+            share: None,
         }
     }
 
@@ -536,6 +540,17 @@ impl Easy {
         self.unix_socket = Some(path.to_string());
     }
 
+    /// Attach a Share handle for cross-handle data sharing.
+    ///
+    /// When a Share handle is attached, the Easy handle uses the shared
+    /// DNS cache and/or cookie jar instead of its own private instances.
+    /// This allows multiple Easy handles to benefit from shared caching.
+    ///
+    /// Equivalent to `CURLOPT_SHARE`.
+    pub fn set_share(&mut self, share: crate::share::Share) {
+        self.share = Some(share);
+    }
+
     /// Perform the transfer and return the response (blocking).
     ///
     /// Creates a new tokio runtime internally. Do not call from within
@@ -636,6 +651,27 @@ impl Easy {
         let resolved_noproxy = self.noproxy.as_deref().or(env_noproxy.as_deref());
         let effective_noproxy = resolved_noproxy;
 
+        // Swap in shared state if a Share handle is attached.
+        // We briefly lock to swap, then release — no lock held across await.
+        if let Some(ref share) = self.share {
+            if let Some(dns_arc) = share.dns_cache() {
+                if let Ok(mut shared) = dns_arc.lock() {
+                    std::mem::swap(&mut self.dns_cache, &mut *shared);
+                }
+            }
+            if let Some(cookie_arc) = share.cookie_jar() {
+                if let Ok(mut shared) = cookie_arc.lock() {
+                    // Ensure cookie jar is enabled if shared
+                    if self.cookie_jar.is_none() {
+                        self.cookie_jar = Some(CookieJar::new());
+                    }
+                    if let Some(ref mut local_jar) = self.cookie_jar {
+                        std::mem::swap(local_jar, &mut *shared);
+                    }
+                }
+            }
+        }
+
         let fut = perform_transfer(
             &url,
             Some(effective_method.as_str()),
@@ -668,7 +704,25 @@ impl Easy {
             tokio::time::timeout(timeout, fut).await.map_err(|_| Error::Timeout(timeout))?
         } else {
             fut.await
-        }?;
+        };
+
+        // Swap shared state back after transfer completes (even on error).
+        if let Some(ref share) = self.share {
+            if let Some(dns_arc) = share.dns_cache() {
+                if let Ok(mut shared) = dns_arc.lock() {
+                    std::mem::swap(&mut self.dns_cache, &mut *shared);
+                }
+            }
+            if let Some(cookie_arc) = share.cookie_jar() {
+                if let Ok(mut shared) = cookie_arc.lock() {
+                    if let Some(ref mut local_jar) = self.cookie_jar {
+                        std::mem::swap(local_jar, &mut *shared);
+                    }
+                }
+            }
+        }
+
+        let response = response?;
 
         // Check fail_on_error: HTTP status >= 400 becomes an error
         if self.fail_on_error && response.status() >= 400 {
@@ -1999,6 +2053,21 @@ mod tests {
         easy.url("http://example.com").unwrap();
         let cloned = easy.clone();
         assert!(cloned.dns_cache.is_empty());
+    }
+
+    #[test]
+    fn easy_set_share() {
+        let mut share = crate::share::Share::new();
+        share.add(crate::share::ShareType::Dns);
+        share.add(crate::share::ShareType::Cookies);
+
+        let mut easy = Easy::new();
+        easy.set_share(share.clone());
+        assert!(easy.share.is_some());
+
+        // Clone should inherit share
+        let cloned = easy.clone();
+        assert!(cloned.share.is_some());
     }
 
     #[tokio::test]
