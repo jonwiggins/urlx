@@ -14,12 +14,12 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 25 — Planning
-**Last completed:** Phase 24 (CLI Expansion II) — 2026-03-09
-**Total tests:** 1,881
-**In progress:** Planning Phase 25
+**Phase:** 26 — Planning
+**Last completed:** Phase 25 (FTPS & Active Mode FTP) — 2026-03-09
+**Total tests:** 1,906
+**In progress:** Planning Phase 26
 **Blockers:** None
-**Next up:** Phase 25 — FTPS & Active Mode FTP
+**Next up:** Phase 26 — SSH/SFTP/SCP
 
 ### Completeness Summary (updated Phase 20 review)
 
@@ -33,11 +33,11 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 | Cookie engine | 90% | Netscape file format read/write, in-memory jar; no public suffix list |
 | Proxy | 85% | HTTP + SOCKS + proxy Basic/Digest/NTLM auth, proxy TLS config; no HTTPS proxy tunnel or PAC |
 | DNS | 75% | Cache with configurable TTL, Happy Eyeballs, DNS shuffle, DNS server config, DoH URL config; no async resolver |
-| FTP | 70% | Session API, upload, resume, dir ops, FEAT; no FTPS or active mode |
+| FTP | 85% | Session API, upload, resume, dir ops, FEAT, explicit/implicit FTPS (AUTH TLS, PBSZ, PROT P), active mode (PORT/EPRT) |
 | SSH/SFTP/SCP | 0% | Not implemented |
 | Multi API | 55% | Connection limiting, message queue, share interface, pipelining config; no poll/socket/timer callbacks |
 | FFI (libcurl C ABI) | ~42% | 87 options, 20 info codes, 25 error codes, 32 functions |
-| CLI | ~39% | ~98 of ~250 flags |
+| CLI | ~40% | ~99 of ~250 flags |
 | Connection | 80% | Pool, TCP_NODELAY, keepalive, Unix sockets, interface/port binding |
 | Transfer control | 80% | Rate limiting enforced in transfer engine (max recv/send speed, low speed timeout) |
 | Overall | ~56% | ~92% for basic HTTP/HTTPS use cases |
@@ -86,6 +86,11 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 - **2026-03-09:** `.netrc` credential loading is deferred from argument parsing to the `run()` function, where the URL is known. This allows extracting the hostname for lookup. `--netrc-optional` silently ignores missing files; `--netrc` fails if the file doesn't exist.
 - **2026-03-09:** `--remote-time` uses the `filetime` crate for cross-platform file mtime setting. HTTP date parsing is inline (RFC 7231 format only) to avoid adding a date-parsing dependency for a single use case.
 - **2026-03-09:** `--post301/--post302/--post303` flags map to `post301`/`post302`/`post303` bool fields on Easy. The redirect logic in `perform_transfer` checks these before converting POST→GET on 301/302/303 redirects. This matches curl's `CURLOPT_POSTREDIR` bitmask approach.
+- **2026-03-09:** `FtpStream` enum follows the same pattern as `PooledStream` (Plain/Tls variants with `#[cfg(feature = "rustls")]` on the Tls variant, `#[allow(clippy::large_enum_variant)]`). `AsyncRead`/`AsyncWrite` delegation via `Pin::new(s).poll_*`.
+- **2026-03-09:** `TlsConnector::new_no_alpn()` added via internal `build(tls_config, use_http_alpn)` refactor. FTP/SMTP/IMAP don't use HTTP ALPN protocols; sending them could cause some servers to reject the connection. No public API change to existing `new()`.
+- **2026-03-09:** Explicit FTPS uses AUTH TLS → PBSZ 0 → PROT P sequence before login (RFC 4217). `auth_tls()` consumes self because it needs to reassemble the split reader/writer, extract TcpStream, TLS-wrap it, and re-split. PBSZ/PROT happen on the (now TLS) control connection after upgrade.
+- **2026-03-09:** Active mode FTP uses `tokio::net::TcpListener::bind(local_ip, 0)` for OS-assigned ports. PORT command formats IPv4 octets; EPRT supports both IPv4/IPv6. `--ftp-port "-"` uses the control connection's local address (stored during connect).
+- **2026-03-09:** `ftps://` URL scheme defaults to port 990 (implicit FTPS). The `url` crate doesn't know about `ftps`, so `port_or_default()` has a fallback match. In `do_single_request`, `ftps://` always maps to `FtpSslMode::Implicit`.
 
 ---
 
@@ -248,7 +253,7 @@ Built from scratch over 20 phases. All features below are implemented and tested
 - **Proxy:** HTTP forward, HTTP CONNECT tunnel (with Digest/NTLM 407 challenge-response), SOCKS4/4a/5 with auth, noproxy bypass, proxy TLS config.
 - **Connection:** Pool with stale retry, TCP_NODELAY (default on), TCP keepalive (socket2), Unix domain sockets, interface/port binding, Happy Eyeballs (250ms, configurable).
 - **DNS:** Cache with configurable TTL, shuffle (inline xorshift32), custom server addresses, DoH URL config. No async resolver.
-- **FTP:** Session-based API — STOR, APPE, REST, FEAT, MKD/RMD/DELE, RNFR/RNTO, SITE, PWD/CWD, SIZE, MLSD, TYPE A/I. No FTPS or active mode.
+- **FTP:** Session-based API — STOR, APPE, REST, FEAT, MKD/RMD/DELE, RNFR/RNTO, SITE, PWD/CWD, SIZE, MLSD, TYPE A/I. Explicit FTPS (AUTH TLS + PBSZ 0 + PROT P, RFC 4217), implicit FTPS (port 990, direct TLS). Active mode (PORT for IPv4, EPRT for IPv4/IPv6). `FtpStream` enum (Plain/Tls) with `AsyncRead`/`AsyncWrite` delegation. `ftps://` URL scheme with default port 990. `TlsConnector::new_no_alpn()` for non-HTTP TLS.
 - **Other protocols:** WebSocket (RFC 6455), SMTP, IMAP, POP3, MQTT 3.1.1, DICT, TFTP, FILE.
 - **Multi API:** JoinSet-based concurrency, connection limiting (semaphore), message queue, Share interface (DNS cache + cookie jar), PipeliningMode (Nothing/Multiplex). No poll/socket/timer callbacks.
 - **Alt-Svc:** Header parsing (RFC 7838), TTL-based cache, automatic processing in transfers.
@@ -263,7 +268,7 @@ Built from scratch over 20 phases. All features below are implemented and tested
 - URL API: Mutable UrlHandle with component-level get/set (scheme, user, password, host, port, path, query, fragment).
 - Memory: Box<[u8]>-based slist string allocation (exact-size, no capacity mismatch). catch_unwind on all FFI boundaries.
 
-**CLI (urlx) — ~98 flags:**
+**CLI (urlx) — ~99 flags:**
 - HTTP: -X, -H, -d, --data-raw, --data-binary, --data-urlencode, -L, --max-redirs, -I, -A, -e, -G, -F, -r, -C, --compressed, --http1.0, --http1.1, --http2, --expect100-timeout, --post301, --post302, --post303.
 - Output: -o, -O, -D, -i, -w, --create-dirs, -v, -s, -S, -f, -#, -R/--remote-time.
 - Auth: -u, --digest, --bearer, --aws-sigv4, -b, -c, --netrc, --netrc-file, --netrc-optional.
@@ -274,11 +279,11 @@ Built from scratch over 20 phases. All features below are implemented and tested
 - DNS: --dns-shuffle, --dns-servers, --doh-url, --happy-eyeballs-timeout-ms.
 - Concurrency: -Z, --parallel-max.
 - Debug/Config: --trace, --trace-ascii, --trace-time, -K/--config, --libcurl, --proto, --proto-redir, --max-filesize, --hsts, --next.
-- FTP: --ftp-pasv, --ftp-ssl, --ssl, --ftp-ssl-reqd, --ssl-reqd.
+- FTP: --ftp-pasv, --ftp-ssl, --ssl, --ftp-ssl-reqd, --ssl-reqd, --ftp-port.
 - Features: .curlrc-style config file parser, protocol restriction, max filesize enforcement (exit 63), libcurl C code generation, retry logic (408/429/5xx), netrc credential lookup.
 
-**Testing — 1,881 tests (0 failures):**
-- Unit: 462 (liburlx) + 133 (FFI) + 158 (CLI) = 753
+**Testing — 1,906 tests (0 failures):**
+- Unit: 487 (liburlx) + 133 (FFI) + 158 (CLI) = 778
 - Integration: 1,048 (hyper-based test servers)
 - Property-based: 60 (proptest — URL, cookie, FTP, HTTP, HSTS, multipart, protocols, WebSocket)
 - Doc tests: 3
@@ -287,7 +292,7 @@ Built from scratch over 20 phases. All features below are implemented and tested
 
 **Guardrails:** Zero TODO/FIXME/HACK. Zero `unwrap()` in production code. `#![deny(unsafe_code)]` in liburlx and urlx-cli. GitHub Actions CI (fmt, clippy, test on 3 OS, doc, cargo-deny, MSRV 1.83, commit lint). Pre-commit hooks (fmt, clippy, test, deny, doc, conventional commit).
 
-**Known gaps (as of Phase 24):** Trace file writing not fully wired. HTTP/3 QUIC transport not implemented. SSH/SFTP/SCP not implemented. FTPS not implemented. Poll/socket/timer Multi APIs not implemented. Missing FFI: CURLOPT_HTTPPOST (deprecated). URL globbing (--glob) not yet implemented.
+**Known gaps (as of Phase 25):** Trace file writing not fully wired. HTTP/3 QUIC transport not implemented. SSH/SFTP/SCP not implemented. Poll/socket/timer Multi APIs not implemented. Missing FFI: CURLOPT_HTTPPOST (deprecated). URL globbing (--glob) not yet implemented.
 
 ---
 
@@ -315,15 +320,9 @@ Added 14 new CLI flags (~98 total): `--netrc`, `--netrc-file`, `--netrc-optional
 
 ---
 
-### Phase 25: FTPS & Active Mode FTP
+### Phase 25: FTPS & Active Mode FTP (completed 2026-03-09)
 
-**Goal:** Complete FTP protocol support.
-
-- AUTH TLS (FTPS explicit)
-- Implicit FTPS (port 990)
-- Active mode (PORT/EPRT)
-- FTP directory listing parsing
-- `--ftp-ssl-reqd`, `--ftp-ssl`, `--ftp-port` CLI flags
+Added FTPS support (explicit via AUTH TLS + PBSZ/PROT P, implicit via direct TLS on port 990) and active mode (PORT/EPRT). `FtpStream` enum wraps TcpStream or TlsStream with AsyncRead/AsyncWrite delegation (cfg-gated behind `rustls` feature). `FtpSession` updated: hostname, local_addr, use_tls_data, active_port, tls_connector fields. `TlsConnector::new_no_alpn()` added for non-HTTP protocols. `ftps://` URL scheme with default port 990. `format_port_command()`/`format_eprt_command()` for active mode. CLI: `--ftp-ssl`/`--ftp-ssl-reqd` now functional (explicit FTPS), `--ftp-port` added. Easy API: `ftp_ssl_mode()` and `ftp_active_port()` setters. 25 new tests. Total: 1,906 tests.
 
 ---
 
