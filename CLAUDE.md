@@ -14,12 +14,12 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 14 — Streaming Upload & Callback API
-**Last completed:** Phase 13 (Proxy Enhancements) — 2026-03-08
-**Total tests:** 1,680+
-**In progress:** Planning Phase 14
+**Phase:** 15 — DNS Hardening & DoH
+**Last completed:** Phase 14 (Streaming Upload & Callback API) — 2026-03-08
+**Total tests:** 1,693+
+**In progress:** Planning Phase 15
 **Blockers:** None
-**Next up:** CURLOPT_READFUNCTION, streaming upload, debug callback
+**Next up:** CURLOPT_DNS_SERVERS, CURLOPT_DOH_URL, async resolver
 
 ### Completeness Summary (updated Phase 10 review)
 
@@ -36,7 +36,7 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 | FTP | 70% | Session API, upload, resume, dir ops, FEAT; no FTPS or active mode |
 | SSH/SFTP/SCP | 0% | Not implemented |
 | Multi API | 55% | Connection limiting, message queue, share interface, pipelining config; no poll/socket/timer callbacks |
-| FFI (libcurl C ABI) | ~24% | 58 options, 16 info codes, 25 error codes, multi API, slist, duphandle |
+| FFI (libcurl C ABI) | ~26% | 63 options, 16 info codes, 25 error codes, multi API, slist, duphandle |
 | CLI | ~25% | ~74 of ~250 flags |
 | Connection | 80% | Pool, TCP_NODELAY, keepalive, Unix sockets, interface/port binding |
 | Transfer control | 40% | Rate limiting, speed enforcement API; not wired into transfer engine yet |
@@ -365,14 +365,9 @@ Added NTLM auth skeleton (Type 1/2/3 message exchange) in `auth/ntlm.rs`. Added 
 
 ---
 
-### Phase 14: Streaming Upload & Callback API
+### Phase 14: Streaming Upload & Callback API — COMPLETED (2026-03-08)
 
-**Goal:** Dynamic request/response handling.
-
-- CURLOPT_READFUNCTION + CURLOPT_READDATA (streaming upload)
-- CURLOPT_INFILESIZE_LARGE
-- CURLOPT_TRAILERFUNCTION (chunked trailer headers)
-- CURLOPT_DEBUGFUNCTION (wire protocol logging)
+Added CURLOPT_READFUNCTION/CURLOPT_READDATA for streaming upload data collection via callback (with CURL_READFUNC_ABORT support). Added CURLOPT_DEBUGFUNCTION/CURLOPT_DEBUGDATA for wire-level debug information (CURLINFO_HEADER_IN, CURLINFO_DATA_IN). Added CURLOPT_INFILESIZE_LARGE for expected upload size. Added Easy::infilesize() and Easy::upload_file() convenience methods. Read callback invocation in curl_easy_perform collects upload data when no postfields are set. Debug callback receives response headers and body data after transfer. Deferred: CURLOPT_TRAILERFUNCTION (chunked trailer headers — deferred to Phase 17 HTTP edge cases). 13 new tests.
 
 ---
 
