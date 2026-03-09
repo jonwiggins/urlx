@@ -14,20 +14,20 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 28 — Planning
-**Last completed:** Phase 27 (Multi API Event Loop Integration) — 2026-03-09
-**Total tests:** 1,941
-**In progress:** Planning Phase 28
+**Phase:** 29 — Planning
+**Last completed:** Phase 28 (HTTP/2 Enhancements & HTTP/3 Transport) — 2026-03-09
+**Total tests:** 1,945
+**In progress:** Planning Phase 29
 **Blockers:** None
-**Next up:** Phase 28 — HTTP/2 Enhancements & HTTP/3 Transport
+**Next up:** Phase 29 — Performance & Optimization
 
 ### Completeness Summary (updated Phase 20 review)
 
 | Feature Area | Parity | Notes |
 |---|---|---|
 | HTTP/1.1 | 97% | Expect, HTTP/1.0, trailer headers; no chunked upload |
-| HTTP/2 | 60% | Works; no server push |
-| HTTP/3 | 5% | HttpVersion::Http3 variant + Alt-Svc cache; no QUIC transport |
+| HTTP/2 | 75% | Works with server push collection; no stream priority/dependency |
+| HTTP/3 | 40% | QUIC transport via quinn, h3 request/response, rate limiting; no 0-RTT or Alt-Svc upgrade |
 | TLS | 85% | rustls with insecure mode, custom CA, client certs, pinning, version selection, cipher list, session cache |
 | Authentication | 60% | Basic, Bearer, Digest (MD5/SHA-256), AWS SigV4, NTLM skeleton |
 | Cookie engine | 90% | Netscape file format read/write, in-memory jar; no public suffix list |
@@ -37,7 +37,7 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 | SSH/SFTP/SCP | 60% | SFTP download/upload/list, SCP download/upload, password + pubkey auth; no known_hosts, agent forwarding |
 | Multi API | 75% | Connection limiting, message queue, share interface, pipelining config, wait/poll/wakeup, fdset, socket_action, timeout, info_read, setopt, strerror |
 | FFI (libcurl C ABI) | ~46% | 87 options, 20 info codes, 25 error codes, 41 functions |
-| CLI | ~40% | ~99 of ~250 flags |
+| CLI | ~40% | ~100 of ~250 flags |
 | Connection | 80% | Pool, TCP_NODELAY, keepalive, Unix sockets, interface/port binding |
 | Transfer control | 80% | Rate limiting enforced in transfer engine (max recv/send speed, low speed timeout) |
 | Overall | ~56% | ~92% for basic HTTP/HTTPS use cases |
@@ -100,6 +100,9 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 - **2026-03-09:** Multi API event loop FFI functions use pragmatic stubs: tokio owns socket polling, so `curl_multi_fdset` returns max_fd=-1, `curl_multi_wait/poll` provide simple `thread::sleep`, `curl_multi_socket_action` delegates to `curl_multi_perform` on `CURL_SOCKET_TIMEOUT` (-1). Socket/timer callbacks are accepted and stored but not actively invoked. `curl_multi_info_read` returns `CURLMsg` pointers from a Vec-based message queue populated during `curl_multi_perform`.
 - **2026-03-09:** `CURLMsg` returned by `curl_multi_info_read` uses a rotate-to-back strategy: the consumed message is removed from the front and pushed to the back, with a pointer to the last element returned. This keeps the pointer valid until the next call (matching libcurl's lifetime guarantee).
 - **2026-03-09:** `CURLMOPT_MAXCONNECTS` (6) and `CURLMOPT_MAX_TOTAL_CONNECTIONS` (13) both map to `Multi::max_total_connections()`. In libcurl they have subtly different semantics (cache size vs active limit), but for our implementation the distinction is irrelevant since tokio manages connection lifecycle.
+- **2026-03-09:** HTTP/2 server push uses `response_fut.push_promises()` which clones h2 internal state, allowing independent collection in a background task without blocking the main response await. Spawned as a `tokio::spawn` task that runs concurrently with response body reading.
+- **2026-03-09:** HTTP/3 via quinn/h3/h3-quinn uses `bytes` crate as a direct dependency (feature-gated behind `http3`) because h3's `recv_data()` returns `impl Buf` which requires the `Buf` trait in scope. The `bytes` crate is already a transitive dependency via h3/quinn.
+- **2026-03-09:** HTTP/3 dispatch in easy.rs bypasses TCP connection and TLS — it uses the resolved DNS address directly for QUIC (UDP). The QUIC endpoint binds to 0.0.0.0:0 (OS-assigned port). Connection errors map to `Error::Connect` to match the existing error taxonomy.
 
 ---
 
@@ -254,7 +257,7 @@ Built from scratch over 20 phases. All features below are implemented and tested
 
 **Core Library (liburlx) — 73 Easy methods, 14 Multi methods:**
 - **HTTP/1.x:** Full request/response codec (all methods), chunked transfer encoding with trailer header parsing, Content-Encoding decompression (gzip, deflate, brotli, zstd), redirects (301/302/303/307/308), Expect: 100-continue, HTTP/1.0 mode, header deduplication (last wins), ignore-content-length (read to EOF), auth stripping on cross-origin redirects (unrestricted_auth option).
-- **HTTP/2:** Via h2 crate with ALPN negotiation. `HttpVersion` enum (None/Http10/Http11/Http2/Http3). No server push.
+- **HTTP/2:** Via h2 crate with ALPN negotiation. `HttpVersion` enum (None/Http10/Http11/Http2/Http3). Server push collection via `push_promises()` stream — `PushedResponse` struct with URL, status, headers, body.
 - **TLS:** rustls + tokio-rustls. `TlsConfig` with verify_peer/host, CA cert, client cert/key, version selection (TLS 1.2/1.3), certificate pinning (SHA-256 SPKI), cipher list, session cache. Inline DER parser for SPKI extraction.
 - **Authentication:** Basic, Bearer, Digest (MD5/SHA-256 with qop=auth), AWS SigV4 (inline HMAC-SHA256), NTLM skeleton (SHA-256-based, sufficient for proxy auth testing).
 - **Cookie engine:** RFC 6265 parsing, domain/path matching, Netscape file format persistence (read/write), HttpOnly, Secure, SameSite (stored). No public suffix list.
@@ -264,6 +267,7 @@ Built from scratch over 20 phases. All features below are implemented and tested
 - **DNS:** Cache with configurable TTL, shuffle (inline xorshift32), custom server addresses, DoH URL config. No async resolver.
 - **FTP:** Session-based API — STOR, APPE, REST, FEAT, MKD/RMD/DELE, RNFR/RNTO, SITE, PWD/CWD, SIZE, MLSD, TYPE A/I. Explicit FTPS (AUTH TLS + PBSZ 0 + PROT P, RFC 4217), implicit FTPS (port 990, direct TLS). Active mode (PORT for IPv4, EPRT for IPv4/IPv6). `FtpStream` enum (Plain/Tls) with `AsyncRead`/`AsyncWrite` delegation. `ftps://` URL scheme with default port 990. `TlsConnector::new_no_alpn()` for non-HTTP TLS.
 - **SSH/SFTP/SCP:** Via russh + russh-sftp (pure-Rust, async). `SshSession` with password and public key auth. SFTP download/upload/list via `SftpSession`. SCP download/upload via exec channel with SCP protocol parsing. Auto-discovery of `~/.ssh/id_{ed25519,rsa,ecdsa}` keys. Feature-gated behind `ssh` (optional). `sftp://` and `scp://` URL schemes with default port 22. `Error::Ssh` variant.
+- **HTTP/3:** Via quinn 0.11 + h3 0.0.8 + h3-quinn 0.0.10 for QUIC transport (feature-gated `http3`). QUIC client config with ALPN "h3", insecure cert verifier for -k mode. Rate-limited body send/recv. Wired into easy.rs dispatch for `HttpVersion::Http3`. No 0-RTT or Alt-Svc upgrade.
 - **Other protocols:** WebSocket (RFC 6455), SMTP, IMAP, POP3, MQTT 3.1.1, DICT, TFTP, FILE.
 - **Multi API:** JoinSet-based concurrency, connection limiting (semaphore), message queue, Share interface (DNS cache + cookie jar), PipeliningMode (Nothing/Multiplex). FFI event loop: wait/poll/wakeup, fdset, socket_action, timeout, info_read, setopt, strerror.
 - **Alt-Svc:** Header parsing (RFC 7838), TTL-based cache, automatic processing in transfers.
@@ -279,8 +283,8 @@ Built from scratch over 20 phases. All features below are implemented and tested
 - URL API: Mutable UrlHandle with component-level get/set (scheme, user, password, host, port, path, query, fragment).
 - Memory: Box<[u8]>-based slist string allocation (exact-size, no capacity mismatch). catch_unwind on all FFI boundaries.
 
-**CLI (urlx) — ~99 flags:**
-- HTTP: -X, -H, -d, --data-raw, --data-binary, --data-urlencode, -L, --max-redirs, -I, -A, -e, -G, -F, -r, -C, --compressed, --http1.0, --http1.1, --http2, --expect100-timeout, --post301, --post302, --post303.
+**CLI (urlx) — ~100 flags:**
+- HTTP: -X, -H, -d, --data-raw, --data-binary, --data-urlencode, -L, --max-redirs, -I, -A, -e, -G, -F, -r, -C, --compressed, --http1.0, --http1.1, --http2, --http3, --expect100-timeout, --post301, --post302, --post303.
 - Output: -o, -O, -D, -i, -w, --create-dirs, -v, -s, -S, -f, -#, -R/--remote-time.
 - Auth: -u, --digest, --bearer, --aws-sigv4, -b, -c, --netrc, --netrc-file, --netrc-optional.
 - TLS/SSH: -k, --cacert, --cert, --key (TLS client key + SSH identity), --tlsv1.2, --tlsv1.3, --tls-max, --pinnedpubkey.
@@ -293,8 +297,8 @@ Built from scratch over 20 phases. All features below are implemented and tested
 - FTP: --ftp-pasv, --ftp-ssl, --ssl, --ftp-ssl-reqd, --ssl-reqd, --ftp-port.
 - Features: .curlrc-style config file parser, protocol restriction, max filesize enforcement (exit 63), libcurl C code generation, retry logic (408/429/5xx), netrc credential lookup.
 
-**Testing — 1,941 tests (0 failures):**
-- Unit: 504 (liburlx) + 160 (FFI) + 159 (CLI) = 823
+**Testing — 1,945 tests (0 failures):**
+- Unit: 507 (liburlx) + 160 (FFI) + 160 (CLI) = 827
 - Integration: 1,048 (hyper-based test servers)
 - Property-based: 60 (proptest — URL, cookie, FTP, HTTP, HSTS, multipart, protocols, WebSocket)
 - Doc tests: 3
@@ -303,7 +307,7 @@ Built from scratch over 20 phases. All features below are implemented and tested
 
 **Guardrails:** Zero TODO/FIXME/HACK. Zero `unwrap()` in production code. `#![deny(unsafe_code)]` in liburlx and urlx-cli. GitHub Actions CI (fmt, clippy, test on 3 OS, doc, cargo-deny, MSRV 1.83, commit lint). Pre-commit hooks (fmt, clippy, test, deny, doc, conventional commit).
 
-**Known gaps (as of Phase 27):** Trace file writing not fully wired. HTTP/3 QUIC transport not implemented. SSH known_hosts verification not implemented. Socket/timer callbacks stored but not actively invoked (tokio manages I/O). Missing FFI: CURLOPT_HTTPPOST (deprecated). URL globbing (--glob) not yet implemented.
+**Known gaps (as of Phase 28):** Trace file writing not fully wired. HTTP/3 missing 0-RTT and Alt-Svc-based upgrade from HTTP/2. HTTP/2 missing stream priority/dependency. SSH known_hosts verification not implemented. Socket/timer callbacks stored but not actively invoked (tokio manages I/O). Missing FFI: CURLOPT_HTTPPOST (deprecated). URL globbing (--glob) not yet implemented.
 
 ---
 
@@ -349,15 +353,9 @@ Added 9 FFI functions: `curl_multi_info_read`, `curl_multi_setopt` (8 CURLMoptio
 
 ---
 
-### Phase 28: HTTP/2 Enhancements & HTTP/3 Transport
+### Phase 28: HTTP/2 Enhancements & HTTP/3 Transport (completed 2026-03-09)
 
-**Goal:** Advanced HTTP/2 features and begin QUIC transport.
-
-- HTTP/2 server push handling
-- Stream priority / dependency
-- quinn-based QUIC transport (feature-gated `http3`)
-- Alt-Svc-based HTTP/3 upgrade from HTTP/2
-- 0-RTT early data
+HTTP/2 server push: rewrote h2.rs to collect `PUSH_PROMISE` frames via `push_promises()` stream, spawns background task to collect pushed responses (URL, status, headers, body), attaches to main Response. `PushedResponse` struct added to response.rs, exported from lib.rs. HTTP/3: new h3.rs module with quinn 0.11 + h3 0.0.8 + h3-quinn 0.0.10 for QUIC transport. `make_quic_client_config()` with ALPN "h3", `InsecureServerVerifier` for -k mode, `request()` function with rate-limited body send/recv. Feature-gated behind `http3` (adds `bytes` dep). Wired into easy.rs dispatch for `HttpVersion::Http3`. CLI: `--http3` flag. 4 new tests. Total: 1,945 tests.
 
 ---
 
