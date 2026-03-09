@@ -31,6 +31,7 @@ pub use multi::Multi;
 pub use progress::{make_progress_callback, ProgressCallback, ProgressInfo};
 pub use protocol::http::multipart::MultipartForm;
 pub use protocol::http::response::{Response, TransferInfo};
+pub use tls::TlsConfig;
 pub use url::Url;
 
 /// Convenience result type for liburlx operations.

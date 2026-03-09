@@ -60,6 +60,10 @@ fn print_usage() {
     eprintln!("  -r, --range <range>       Byte range (e.g., 0-499, 500-, -500)");
     eprintln!("  -C, --continue-at <off>   Resume download from byte offset");
     eprintln!("  -#, --progress-bar        Display transfer progress bar");
+    eprintln!("  -k, --insecure            Allow insecure TLS connections");
+    eprintln!("      --cacert <file>       CA certificate bundle (PEM format)");
+    eprintln!("      --cert <file>         Client certificate (PEM format)");
+    eprintln!("      --key <file>          Client private key (PEM format)");
 }
 
 /// Parse CLI arguments into options.
@@ -256,6 +260,25 @@ fn parse_args(args: &[String]) -> Option<CliOptions> {
             }
             "-#" | "--progress-bar" => {
                 opts.show_progress = true;
+            }
+            "-k" | "--insecure" => {
+                opts.easy.ssl_verify_peer(false);
+                opts.easy.ssl_verify_host(false);
+            }
+            "--cacert" => {
+                i += 1;
+                let val = require_arg(args, i, "--cacert")?;
+                opts.easy.ssl_ca_cert(std::path::Path::new(val));
+            }
+            "--cert" => {
+                i += 1;
+                let val = require_arg(args, i, "--cert")?;
+                opts.easy.ssl_client_cert(std::path::Path::new(val));
+            }
+            "--key" => {
+                i += 1;
+                let val = require_arg(args, i, "--key")?;
+                opts.easy.ssl_client_key(std::path::Path::new(val));
             }
             arg if arg.starts_with('-') => {
                 eprintln!("urlx: unknown option: {arg}");
@@ -999,5 +1022,51 @@ mod tests {
         let args = vec!["urlx".to_string()];
         let code = run(&args);
         assert_ne!(code, ExitCode::SUCCESS);
+    }
+
+    #[test]
+    fn parse_args_insecure() {
+        let args = vec!["urlx".to_string(), "-k".to_string(), "https://x.com".to_string()];
+        let opts = parse_args(&args);
+        assert!(opts.is_some());
+    }
+
+    #[test]
+    fn parse_args_insecure_long() {
+        let args = vec!["urlx".to_string(), "--insecure".to_string(), "https://x.com".to_string()];
+        let opts = parse_args(&args);
+        assert!(opts.is_some());
+    }
+
+    #[test]
+    fn parse_args_cacert() {
+        let args = vec![
+            "urlx".to_string(),
+            "--cacert".to_string(),
+            "/tmp/ca.pem".to_string(),
+            "https://x.com".to_string(),
+        ];
+        let opts = parse_args(&args);
+        assert!(opts.is_some());
+    }
+
+    #[test]
+    fn parse_args_cert_and_key() {
+        let args = vec![
+            "urlx".to_string(),
+            "--cert".to_string(),
+            "/tmp/cert.pem".to_string(),
+            "--key".to_string(),
+            "/tmp/key.pem".to_string(),
+            "https://x.com".to_string(),
+        ];
+        let opts = parse_args(&args);
+        assert!(opts.is_some());
+    }
+
+    #[test]
+    fn parse_args_cacert_missing_arg() {
+        let args = vec!["urlx".to_string(), "--cacert".to_string()];
+        assert!(parse_args(&args).is_none());
     }
 }

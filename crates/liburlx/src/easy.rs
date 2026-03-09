@@ -3,9 +3,8 @@
 //! The `Easy` handle is the primary way to perform URL transfers.
 //! It provides a blocking API that wraps the async internals.
 
-use std::time::{Duration, Instant};
-
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use crate::cookie::CookieJar;
 use crate::error::Error;
@@ -14,6 +13,7 @@ use crate::pool::{ConnectionPool, PooledStream};
 use crate::progress::{call_progress, ProgressCallback, ProgressInfo};
 use crate::protocol::http::multipart::MultipartForm;
 use crate::protocol::http::response::{Response, TransferInfo};
+use crate::tls::TlsConfig;
 use crate::url::Url;
 
 /// A handle for performing a single URL transfer.
@@ -41,6 +41,7 @@ pub struct Easy {
     resolve_overrides: Vec<(String, String)>,
     progress_callback: Option<ProgressCallback>,
     fail_on_error: bool,
+    tls_config: TlsConfig,
     pool: ConnectionPool,
 }
 
@@ -66,6 +67,7 @@ impl std::fmt::Debug for Easy {
             .field("resolve_overrides", &self.resolve_overrides)
             .field("progress_callback", &self.progress_callback.as_ref().map(|_| "<callback>"))
             .field("fail_on_error", &self.fail_on_error)
+            .field("tls_config", &self.tls_config)
             .field("pool", &"<ConnectionPool>")
             .finish()
     }
@@ -93,6 +95,7 @@ impl Clone for Easy {
             resolve_overrides: self.resolve_overrides.clone(),
             progress_callback: self.progress_callback.clone(),
             fail_on_error: self.fail_on_error,
+            tls_config: self.tls_config.clone(),
             pool: ConnectionPool::new(),
         }
     }
@@ -122,6 +125,7 @@ impl Easy {
             resolve_overrides: Vec::new(),
             progress_callback: None,
             fail_on_error: false,
+            tls_config: TlsConfig::default(),
             pool: ConnectionPool::new(),
         }
     }
@@ -325,6 +329,52 @@ impl Easy {
         self.fail_on_error = enable;
     }
 
+    /// Enable or disable TLS certificate verification.
+    ///
+    /// When set to `false`, the connection proceeds even if the server's
+    /// certificate is invalid, self-signed, or expired.
+    /// Equivalent to curl's `-k` / `--insecure` flag or `CURLOPT_SSL_VERIFYPEER`.
+    ///
+    /// **WARNING: Disabling verification makes the connection insecure.**
+    pub fn ssl_verify_peer(&mut self, enable: bool) {
+        self.tls_config.verify_peer = enable;
+    }
+
+    /// Enable or disable TLS hostname verification.
+    ///
+    /// When set to `false`, accepts certificates that don't match the
+    /// server's hostname. Equivalent to `CURLOPT_SSL_VERIFYHOST`.
+    ///
+    /// **WARNING: Disabling verification makes the connection insecure.**
+    pub fn ssl_verify_host(&mut self, enable: bool) {
+        self.tls_config.verify_host = enable;
+    }
+
+    /// Set the path to a custom CA certificate bundle in PEM format.
+    ///
+    /// When set, only certificates signed by CAs in this bundle are trusted,
+    /// replacing the system default root certificates.
+    /// Equivalent to curl's `--cacert` flag or `CURLOPT_CAINFO`.
+    pub fn ssl_ca_cert(&mut self, path: &Path) {
+        self.tls_config.ca_cert = Some(path.to_path_buf());
+    }
+
+    /// Set the path to a client certificate in PEM format.
+    ///
+    /// Used for mutual TLS (mTLS) authentication.
+    /// Equivalent to curl's `--cert` flag or `CURLOPT_SSLCERT`.
+    pub fn ssl_client_cert(&mut self, path: &Path) {
+        self.tls_config.client_cert = Some(path.to_path_buf());
+    }
+
+    /// Set the path to a client private key in PEM format.
+    ///
+    /// Must correspond to the certificate specified with [`ssl_client_cert`](Self::ssl_client_cert).
+    /// Equivalent to curl's `--key` flag or `CURLOPT_SSLKEY`.
+    pub fn ssl_client_key(&mut self, path: &Path) {
+        self.tls_config.client_key = Some(path.to_path_buf());
+    }
+
     /// Perform the transfer and return the response (blocking).
     ///
     /// Creates a new tokio runtime internally. Do not call from within
@@ -418,6 +468,7 @@ impl Easy {
             &mut self.cookie_jar,
             &mut self.hsts_cache,
             &self.resolve_overrides,
+            &self.tls_config,
             &mut self.pool,
         );
 
@@ -477,6 +528,7 @@ async fn perform_transfer(
     cookie_jar: &mut Option<CookieJar>,
     hsts_cache: &mut Option<HstsCache>,
     resolve_overrides: &[(String, String)],
+    tls_config: &TlsConfig,
     pool: &mut ConnectionPool,
 ) -> Result<Response, Error> {
     let transfer_start = Instant::now();
@@ -515,6 +567,7 @@ async fn perform_transfer(
             connect_timeout,
             effective_proxy,
             resolve_overrides,
+            tls_config,
             pool,
         )
         .await?;
@@ -600,6 +653,7 @@ async fn do_single_request(
     connect_timeout: Option<Duration>,
     proxy: Option<&Url>,
     resolve_overrides: &[(String, String)],
+    tls_config: &TlsConfig,
     pool: &mut ConnectionPool,
 ) -> Result<Response, Error> {
     // Handle non-HTTP schemes directly
@@ -740,7 +794,7 @@ async fn do_single_request(
                     tcp_stream
                 };
 
-                let tls = crate::tls::TlsConnector::new()?;
+                let tls = crate::tls::TlsConnector::new(tls_config)?;
                 let (tls_stream, alpn) = tls.connect(tls_stream_inner, &host).await?;
 
                 let request_target = url.request_target();

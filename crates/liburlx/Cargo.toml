@@ -17,7 +17,7 @@ http = []
 http2 = ["dep:h2"]
 
 # TLS backends
-rustls = ["dep:rustls", "dep:webpki-roots", "dep:tokio-rustls"]
+rustls = ["dep:rustls", "dep:webpki-roots", "dep:tokio-rustls", "dep:rustls-pemfile"]
 
 # Content-Encoding decompression
 decompression = ["dep:flate2", "dep:brotli", "dep:zstd"]
@@ -33,6 +33,7 @@ httparse = "1"
 rustls = { version = "0.23", optional = true, default-features = false, features = ["std", "tls12", "ring"] }
 webpki-roots = { version = "1", optional = true }
 tokio-rustls = { version = "0.26", optional = true, default-features = false, features = ["ring", "tls12"] }
+rustls-pemfile = { version = "2", optional = true }
 flate2 = { version = "1", optional = true }
 brotli = { version = "7", optional = true }
 zstd = { version = "0.13", optional = true, default-features = false }
@@ -46,6 +47,10 @@ flate2 = "1"
 tempfile = "3"
 proptest = "1"
 criterion = { version = "0.5", features = ["html_reports"] }
+rcgen = "0.13"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
+rustls-pemfile = "2"
 
 [[bench]]
 name = "throughput"
