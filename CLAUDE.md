@@ -14,12 +14,12 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 29 — Multi API Hardening + Response Builder Tests
-**Last completed:** Phase 28 (fail_on_error integration, timeouts, HSTS upgrade) — 2026-03-08
+**Phase:** 2 — TLS Hardening + Authentication
+**Last completed:** Phase 1 (initial implementation) — 2026-03-08
 **Total tests:** 1124
-**In progress:** Planning Phase 29
+**In progress:** Planning Phase 2
 **Blockers:** None
-**Next up:** Multi API edge cases, Response construction tests, form upload integration
+**Next up:** TLS configuration API, client certificates, SSL verification options, Digest/NTLM auth
 
 ---
 
@@ -175,12 +175,6 @@ urlx/
     ├── latency.rs             # Connection setup latency
     └── concurrency.rs         # Multi-transfer performance
 ```
-
----
-
-## Phase 0: Repository Setup & Guardrails — COMPLETED (2026-03-08)
-
-Workspace initialized with three crates (liburlx, liburlx-ffi, urlx-cli). Guardrails configured: rustfmt, clippy with strict lints, cargo-deny, pre-commit hooks, GitHub Actions CI with commit linting, multi-OS testing, MSRV check. All gates pass.
 
 ---
 
@@ -348,283 +342,143 @@ These are compiled and run by a build script or test harness to verify ABI compa
 
 ## Implementation Phases
 
-### Phase 1: HTTP GET Works — COMPLETED (2026-03-08)
-
-URL parser wrapping `url` crate with curl-compatible scheme defaulting. HTTP/1.1 GET
-request/response codec using `httparse`. TLS via `rustls` + `tokio-rustls`. Blocking
-`Easy` API wrapping async internals. CLI prints response body. 40 unit tests. Both
-HTTP and HTTPS GET transfers work end-to-end against real servers.
-
-### Phase 2a: HTTP Methods, Headers, Redirects, CLI — COMPLETED (2026-03-08)
-
-Added POST/PUT/DELETE/HEAD/PATCH methods, custom headers, request body, redirect following
-(301/302/303/307/308), verbose output, CLI flags (-X, -H, -d, -L, -I, -o, -v).
-16 integration tests with hyper-based test server. 67 total tests passing.
-
-### Phase 2b: Chunked Transfer Encoding + Decompression — COMPLETED (2026-03-08)
-
-Chunked Transfer-Encoding decoding in HTTP/1.1 parser. Content-Encoding decompression
-(gzip, deflate, brotli, zstd) behind `decompression` feature flag. `accept_encoding()`
-API method and `--compressed` CLI flag. 86 tests passing.
-
-### Phase 2c: Timeouts + Authentication — COMPLETED (2026-03-08)
-
-Connect timeout, total transfer timeout, Basic and Bearer authentication.
-CLI flags: --connect-timeout, -m/--max-time, -u/--user. 94 tests passing.
-
-### Phase 2d: Transfer Info + Write-Out — COMPLETED (2026-03-08)
-
-TransferInfo with timing/redirect counts. CLI --write-out/-w with %{variable}
-format. 96 tests passing.
-
-### Phase 3a: HTTP/2 Support — COMPLETED (2026-03-08)
-
-HTTP/2 via h2 crate with ALPN negotiation. Automatic protocol selection based on
-TLS handshake. Feature-gated behind `http2` flag. 96 tests passing.
-
-### Phase 3b: HTTP Proxy Support — COMPLETED (2026-03-08)
-
-HTTP forward proxy for plain HTTP URLs. HTTP CONNECT tunneling for HTTPS
-through proxy. Noproxy bypass with domain suffix matching and wildcard.
-Environment variable support (http_proxy, https_proxy, no_proxy). CLI
-flags: -x/--proxy, --noproxy. 113 tests passing.
-
-### Phase 3c: Concurrent Transfers (Multi API) — COMPLETED (2026-03-08)
-
-Multi handle with JoinSet-based concurrent execution. Preserves result
-ordering. Blocking `perform_blocking()` wrapper. CLI multi-URL support.
-123 tests passing.
-
-### Phase 4a: Connection Pooling + Cookie Engine — COMPLETED (2026-03-08)
-
-Cookie engine with RFC 6265 Set-Cookie parsing, domain/path matching,
-Max-Age expiry, and automatic cookie injection/storage. Connection
-pooling via PooledStream enum with streaming h1 response reading
-(Content-Length and chunked). Stale connection retry. 154 tests passing.
-
-### Phase 4b: FILE Protocol + Multipart Uploads + Range Requests — COMPLETED (2026-03-08)
-
-FILE protocol handler with percent-decoding. Multipart form-data encoder
-with text fields and file uploads (MultipartForm API). Range request support
-with resume_from(). CLI flags: -F/--form, -r/--range, -C/--continue-at.
-185 tests passing.
-
-### Phase 4c: HSTS + DNS Resolution + WebSocket Foundation — COMPLETED (2026-03-08)
-
-HSTS cache with Strict-Transport-Security parsing, auto HTTP→HTTPS upgrade,
-includeSubDomains support. DNS resolve overrides (Easy::resolve). WebSocket
-frame codec with RFC 6455 masking, SHA-1 accept key, text/binary/ping/pong/close
-frames. 208 tests passing.
-
-### Phase 5a: FTP Protocol Handler — COMPLETED (2026-03-08)
-
-FTP control connection codec with multi-line response parsing. Login
-(USER/PASS), PASV passive mode, RETR download, LIST directory listing.
-URL credentials extraction. 215 tests passing.
-
-### Phase 5b: SOCKS Proxy + Progress Callbacks — COMPLETED (2026-03-08)
-
-SOCKS4/SOCKS5 proxy handshake with username/password auth, SOCKS4a hostname
-support. Integrated into Easy handle (socks5://, socks4://, socks5h://, socks4a://
-proxy URLs). Progress callback API (ProgressInfo, ProgressCallback). CLI -#/--progress-bar
-flag with visual progress bar. 162 tests passing.
-
-### Phase 6a: SMTP/IMAP/POP3 — COMPLETED (2026-03-08)
-
-SMTP client with EHLO/HELO, AUTH PLAIN, MAIL FROM/RCPT TO/DATA. IMAP4rev1
-client with LOGIN, SELECT, UID FETCH, mailbox listing. POP3 client with
-USER/PASS, LIST, RETR, dot-stuffing. 27 unit tests across the three protocols.
-
-### Phase 6b: MQTT + DICT + TFTP — COMPLETED (2026-03-08)
-
-MQTT 3.1.1 client with CONNECT, PUBLISH, SUBSCRIBE. DICT client (RFC 2229)
-with DEFINE/MATCH. TFTP client (RFC 1350) for UDP file downloads. 26 unit tests
-across the three protocols. 213 total tests passing.
-
-### Phase 7a: FFI Compatibility Layer — COMPLETED (2026-03-08)
-
-C ABI compatibility layer with curl_easy_init/cleanup, curl_easy_setopt (16 options),
-curl_easy_perform with write/header callbacks and catch_unwind panic safety,
-curl_easy_getinfo (6 info codes), curl_easy_strerror, curl_version. CURLcode/CURLoption/CURLINFO
-enums. 22 FFI unit tests. All unsafe blocks have SAFETY comments.
-
-### Phase 7b: CLI Completeness + Integration Tests — COMPLETED (2026-03-08)
-
-CLI expanded with 10 new flags: -s/--silent, -S/--show-error, -f/--fail (exit 22),
--i/--include, -D/--dump-header, -A/--user-agent, --data-raw, --max-redirs,
--d @filename support. Refactored argument parsing into parse_args/run split with
-15 CLI unit tests. Built hyper-based integration test server with 24 end-to-end
-tests covering GET/POST/PUT/DELETE/HEAD, headers, status codes, redirects,
-timeouts, auth, encoding, ranges, multi-transfers. 336 total tests passing.
-
-### Phase 8: Curl Test Suite Porting + Polish — COMPLETED (2026-03-08)
-
-C header generation via cbindgen with libcurl-compatible urlx.h (CURLcode,
-CURLoption, CURLINFO enums, curl_easy_* functions, CURL typedef). 14 curl
-behavioral compatibility tests covering redirect semantics (301/302/303/307/308),
-cookie engine, relative URLs, effective URL tracking, auth, HEAD. Documentation
-builds cleanly with no warnings. 350 total tests passing.
-
-### Phase 9: Hardening + Production Readiness — COMPLETED (2026-03-08)
-
-16 URL parser edge case tests (percent-encoding, credentials, schemes, dot
-segments, host headers, long paths). 16 HTTP edge case integration tests
-(204/304 responses, binary data, long/many headers, status codes, PATCH/OPTIONS,
-query strings, timeouts). 382 total tests passing.
-
-### Phase 10: Feature Completeness + Optimization — COMPLETED (2026-03-08)
-
-5 gzip decompression integration tests (compressed response, identity, Accept-Encoding
-header verification). 5 cookie engine integration tests (set/send, path matching,
-multiple cookies, overwrite). File protocol tests already existed from Phase 4b.
-392 total tests passing.
-
-### Phase 11: Extended Protocol Testing + Polish — COMPLETED (2026-03-08)
-
-HSTS integration tests (3 tests). Comprehensive README with project overview,
-feature list, usage examples for library/CLI/C API. 395 total tests passing.
-
-### Phase 12: Property-Based Testing + Benchmarks — COMPLETED (2026-03-08)
-
-26 property-based tests via proptest (URL parser, cookie engine, HSTS cache).
-Criterion benchmarks for URL parsing, cookie jar, and HSTS cache throughput.
-421 total tests passing. Benchmarks runnable via `cargo bench -p liburlx`.
-
-### Phase 13: Robustness Testing + Error Path Hardening — COMPLETED (2026-03-08)
-
-64 new tests: HTTP error paths (14), URL malformed inputs (32), cookie stress
-tests (18). Covers server drops, large bodies, unusual status codes, control
-characters, extreme URL lengths, IPv6, port bounds, 1000-cookie jars, deeply
-nested domains, path segment boundaries. 485 total tests passing.
-
-### Phase 14: HTTP/1.1 Parser Hardening + Multipart Stress Tests — COMPLETED (2026-03-08)
-
-28 H1 parser edge case tests (chunked encoding variants, Content-Length edge
-cases, HEAD handling, Set-Cookie preservation, redirect detection, malformed
-responses). 19 multipart stress tests (100 fields, 100KB values/files, special
-chars, binary data, content type detection). 532 total tests passing.
-
-### Phase 15: `fail_on_error` Feature + H1 Property Tests — COMPLETED (2026-03-08)
-
-`fail_on_error` field/method on Easy handle (curl -f behavior): HTTP status >= 400
-returns Error. 8 integration tests (404, 200, 500, redirects, boundaries, toggle).
-10 H1 property tests (status codes, Content-Length, headers, HEAD, URLs, redirects,
-body_str, size_download). 549 total tests passing.
-
-### Phase 16: Fuzz Testing + Protocol Integration Tests — COMPLETED (2026-03-08)
-
-4 cargo-fuzz harnesses (URL, HTTP, cookie, HSTS parsers) — all compile and run
-on nightly. 18 WebSocket frame stress tests (roundtrips, size edges, masking,
-multi-frame streams). 27 FTP protocol edge case tests (PASV/EPSV parsing,
-response reading, command formatting). Fixed RFC 6455 WebSocket accept key
-GUID bug. 594 total tests passing.
-
-### Phase 17: Protocol Property Tests + CLI Hardening — COMPLETED (2026-03-08)
-
-16 property-based tests (7 WebSocket, 4 FTP, 5 multipart). 22 new CLI
-argument parsing tests covering all flags, invalid inputs, combinations,
-write-out variables. 634 total tests passing.
-
-### Phase 18: Response/Error/Multi Stress Tests — COMPLETED (2026-03-08)
-
-22 response tests (field preservation, body operations, headers, redirects,
-content type, size_download, large bodies). 20 error coverage tests (all
-variants, display, debug, source chain, Send+Sync). 6 Multi API stress
-tests (concurrent transfers, mixed results, body sizes). 677 total tests.
-
-### Phase 19: Easy API Coverage + URL Normalization — COMPLETED (2026-03-08)
-
-30 Easy API tests (clone independence, multiple performs, option toggles,
-method/body interactions, auth, proxy, form, range, resolve). 33 URL
-normalization tests (scheme/host casing, default scheme, path/port/query/
-fragment handling, credentials, host_and_port, request target). 740 tests.
-
-### Phase 20: Protocol Codec Hardening — COMPLETED (2026-03-08)
-
-15 SMTP tests (response reading, multiline EHLO, status categories, send_command).
-6 IMAP tests (ImapResponse OK/NO/BAD, case-insensitive, data, debug).
-21 POP3 tests (response reading, multiline, dot-stuffing, send_command, struct).
-11 MQTT tests (PacketType values, equality, debug, clone). 793 total tests.
-
-### Phase 21: FFI Expansion + Transfer Info Hardening — COMPLETED (2026-03-08)
-
-33 FFI/response tests (TransferInfo, Response status ranges, redirect detection,
-error mapping, header lookup). 16 transfer info accuracy tests (timing, redirect
-counting, effective URL, size_download). 12 protocol property tests (SMTP, POP3,
-IMAP, MQTT). 10 pool lifecycle tests (reuse, isolation, error survival). 843 tests.
-
-### Phase 22: HTTP Conformance + Cookie Persistence + Multipart — COMPLETED (2026-03-08)
-
-22 HTTP conformance tests (HEAD, 204/304, headers, binary/large body, methods,
-redirects 307/303). 6 cookie persistence tests (store/send, replacement, path
-scoping, disabled jar). 25 multipart tests (encoding, content-type detection,
-boundary, file data, binary). 890 total tests.
-
-### Phase 23: HSTS + Progress + Proxy — COMPLETED (2026-03-08)
-
-20 HSTS cache tests (store/upgrade, includeSubDomains, max-age=0, case-insensitive,
-purge_expired). 8 progress callback tests (invocation, download data, abort signaling).
-14 proxy behavior tests (URL validation, noproxy, credentials, resolve). 932 tests.
-
-### Phase 24: Multi Concurrent + WebSocket Codec — COMPLETED (2026-03-08)
-
-10 Multi API tests (empty, single, 3/10 concurrent, mixed codes, drain, methods,
-large bodies). 27 WebSocket codec tests (frame types, as_text, encoding, length
-fields, masking, key generation, RFC 6455 accept key). 969 total tests.
-
-### Phase 25: Milestone — 1000 Tests + Final API Audit — COMPLETED (2026-03-08)
-
-26 H1 parser edge case tests (status codes, Content-Length, chunked encoding, HEAD,
-Set-Cookie joining, malformed responses). 18 Easy config completeness tests
-(max_redirects, verbose, hsts, resolve, form_field, range, resume_from,
-fail_on_error, method_is_default, clone). 1013 total tests passing.
-
-### Phase 26: Integration Test Infrastructure + E2E Scenarios — COMPLETED (2026-03-08)
-
-Shared TestServer module (common/mod.rs) with graceful shutdown. 16 E2E workflow
-tests (redirect+cookies, multi-hop redirects, auth, 303/307 semantics, cookie
-accumulation, Multi concurrent, HEAD, custom headers, fail_on_error+redirect,
-large body integrity, bearer token). 15 error recovery tests (4xx/5xx codes,
-binary/JSON content, connection refused, no URL, fail_on_error). 1044 total tests.
-
-### Phase 27: Test Deduplication + Coverage Gaps — COMPLETED (2026-03-08)
-
-Migrated 18 test files to shared common::TestServer, removing ~610 lines of
-duplication. 20 CookieJar API tests (construction, store_cookies, cookie_header,
-secure filtering, replacement, remove_expired, clone). 23 URL edge case tests
-(IPv6, fragments, queries, credentials, paths, ports, host methods, roundtrip).
-1087 total tests.
-
-### Phase 28: Fail-on-Error + Timeouts + HSTS Upgrade — COMPLETED (2026-03-08)
-
-15 fail_on_error integration tests (399/400 boundary, 4xx/5xx codes, redirect
-chains, toggle). 9 timeout scenario tests (connection timing, both timeouts,
-persistence). 14 HSTS upgrade tests (cache behavior, Easy config, header variants).
-Fixed proptest_url.rs port normalization bug. 1124 total tests.
-
-### Phase 29: Multi API Hardening + Response Builder Tests
-
-**Scope:** Strengthen Multi API edge case coverage, test Response construction
-and manipulation, and add multipart form upload integration tests.
-
-**Step 29.1: Multi API edge cases**
-- Multi with fail_on_error handles
-- Multi with timeout handles
-- Multi reuse after perform
-- Multi with mixed methods and bodies
-
-**Step 29.2: Response builder/manipulation**
-- Response::new construction variants
-- Response with_info transfer info attachment
-- Response header case-insensitive lookup
-- Response body_str with non-UTF-8 data
-
-**Step 29.3: Multipart form upload integration**
-- Form field sent correctly to server
-- File upload with correct content type
-- Mixed fields and files
-
-**Exit criteria:** 1160+ tests.
+### Phase 1: Initial Implementation — COMPLETED (2026-03-08)
+
+Repository setup, guardrails (rustfmt, clippy, cargo-deny, CI), and core implementation of HTTP/1.1, HTTP/2, FTP, FILE, WebSocket, MQTT, SMTP, IMAP, POP3, TFTP, DICT protocols. Includes Easy/Multi APIs, connection pooling, cookie engine, HSTS, SOCKS4/5 proxy, HTTP proxy, chunked encoding, gzip/br/zstd decompression, Basic/Bearer auth, progress callbacks, multipart uploads, range requests, DNS resolve overrides, fail_on_error. FFI layer with 17 CURLOPT options and 6 CURLINFO codes. CLI with 24 flags. 1124 tests, property-based tests, fuzz harnesses, and benchmarks. All guardrails pass.
+
+### Phase 2: TLS Hardening + Authentication
+
+**Goal:** Make TLS fully configurable and add missing authentication mechanisms so urlx can be used in enterprise environments.
+
+- **TLS configuration API:** `ssl_verify_peer(bool)`, `ssl_verify_host(bool)`, `cacert(path)`, `capath(path)`, `client_cert(path)`, `client_key(path)`, `tls_version_min(TlsVersion)`, `ciphers(string)`, `tls13_ciphers(string)`
+- **Certificate pinning:** `pinned_pubkey(hash)` for HPKP-style pinning
+- **OCSP stapling:** Support via rustls
+- **-k/--insecure CLI flag:** Skip peer certificate verification
+- **Digest authentication:** RFC 7616 implementation (MD5, SHA-256)
+- **NTLM authentication:** Basic NTLM challenge/response
+- **Negotiate/Kerberos:** SPNEGO via system GSSAPI (feature-gated)
+- **CURLOPT_HTTPAUTH:** Auth type selection bitmask in Easy API and FFI
+- **CLI flags:** `--cert`, `--key`, `--cacert`, `--capath`, `--ciphers`, `--tlsv1.0/1.1/1.2/1.3`, `--digest`, `--ntlm`, `--negotiate`
+- **FFI options:** CURLOPT_SSLCERT, CURLOPT_SSLKEY, CURLOPT_CAINFO, CURLOPT_SSL_VERIFYPEER, CURLOPT_SSL_VERIFYHOST, CURLOPT_SSLVERSION, CURLOPT_HTTPAUTH, CURLOPT_USERPWD
+
+### Phase 3: HTTP Completeness + Upload Streams
+
+**Goal:** Complete HTTP protocol coverage including version negotiation, conditional requests, Expect-100, chunked request bodies, and streaming uploads.
+
+- **HTTP version forcing:** `http_version(HttpVersion)` — support HTTP/1.0, HTTP/1.1, HTTP/2-only, HTTP/2-with-fallback
+- **Expect 100-continue:** Send `Expect: 100-continue` header, wait for 100 response before sending body
+- **Chunked request body encoding:** Streaming request bodies with Transfer-Encoding: chunked
+- **Conditional requests:** `time_condition(TimeCond)`, `time_value(SystemTime)` for If-Modified-Since / If-Unmodified-Since; ETag support via If-Match / If-None-Match
+- **Streaming uploads:** `upload(bool)`, `read_function(callback)`, `in_filesize(u64)` for PUT/POST streaming from file or callback
+- **Referer header:** `-e/--referer` CLI flag, `referer(url)` Easy API method
+- **Max filesize:** `max_filesize(u64)` to abort transfers exceeding a size limit
+- **HTTP trailers:** Support reading HTTP trailers in chunked responses
+- **CLI flags:** `--http1.0`, `--http1.1`, `--http2`, `--post301`, `--post302`, `--post303`, `--location-trusted`, `-e/--referer`, `--max-filesize`, `-T/--upload-file`, `-G/--get`
+- **FFI options:** CURLOPT_HTTP_VERSION, CURLOPT_UPLOAD, CURLOPT_INFILESIZE, CURLOPT_READFUNCTION, CURLOPT_READDATA, CURLOPT_TIMECONDITION, CURLOPT_TIMEVALUE, CURLOPT_EXPECT_100_TIMEOUT_MS, CURLOPT_REFERER
+
+### Phase 4: Retry, Rate Limiting + Networking Controls
+
+**Goal:** Add retry logic, bandwidth throttling, and low-level networking options that enterprise and scripting users depend on.
+
+- **Retry logic:** `--retry <n>`, `--retry-delay <secs>`, `--retry-max-time <secs>`, `--retry-all-errors` with exponential backoff; Easy API: `retry(RetryConfig)`
+- **Rate limiting:** `--limit-rate <speed>` bandwidth throttling via token-bucket; Easy API: `max_recv_speed(u64)`, `max_send_speed(u64)`
+- **Speed limits:** `--speed-limit <bps>` + `--speed-time <secs>` to abort slow transfers; Easy API: `low_speed_limit(u64)`, `low_speed_time(Duration)`
+- **Interface binding:** `--interface <name>` to bind outbound connections to a local interface
+- **Local port:** `--local-port <range>` for outbound port selection
+- **TCP options:** `tcp_keepalive(bool)`, `tcp_keepidle(Duration)`, `tcp_keepintvl(Duration)`, `tcp_nodelay(bool)`
+- **Unix sockets:** `--unix-socket <path>`, `--abstract-unix-socket <path>`; Easy API: `unix_socket_path(path)`
+- **IP version selection:** `--ipv4` / `--ipv6` to force IPv4 or IPv6; Easy API: `ip_resolve(IpResolve)`
+- **Connect-to:** `--connect-to <host:port:addr:port>` for connection remapping
+- **FFI options:** CURLOPT_LOW_SPEED_LIMIT, CURLOPT_LOW_SPEED_TIME, CURLOPT_MAX_RECV_SPEED_LARGE, CURLOPT_MAX_SEND_SPEED_LARGE, CURLOPT_INTERFACE, CURLOPT_LOCALPORT, CURLOPT_TCP_KEEPALIVE, CURLOPT_TCP_NODELAY, CURLOPT_UNIX_SOCKET_PATH, CURLOPT_IPRESOLVE, CURLOPT_CONNECT_TO
+
+### Phase 5: CLI Parity + Configuration Files
+
+**Goal:** Bring CLI flag count from 24 to 100+ and add config file support so urlx can serve as a real drop-in for the `curl` binary.
+
+- **Config file loading:** `-K/--config <file>`, `.curlrc` auto-loading; parse curl config file format (one flag per line, comments with #)
+- **Netrc support:** `--netrc`, `--netrc-file <path>`, `--netrc-optional`; parse standard .netrc format for automatic credentials
+- **Output control:** `-O/--remote-name` (save with server filename), `--remote-header-name` (Content-Disposition), `--create-dirs`, `-o` with `#` expansion for multi-URL, `-J/--remote-header-name`
+- **Data variants:** `--data-urlencode`, `--data-binary`, `--form-string`, `--data-ascii`
+- **Protocol whitelist:** `--proto <list>`, `--proto-redir <list>` to restrict allowed protocols
+- **Parallel control:** `--parallel`, `--parallel-max <n>`, `--parallel-immediate`
+- **Cookie CLI:** `-b/--cookie <data|file>`, `-c/--cookie-jar <file>`
+- **Resolve CLI:** `--resolve <host:port:addr>` (wiring existing Easy API to CLI)
+- **Misc flags:** `--compressed` improvements, `--raw`, `--path-as-is`, `--request-target`, `--oauth2-bearer`, `--no-alpn`, `--no-sessionid`, `--trace`, `--trace-ascii`, `--stderr`
+- **Exit codes:** Match curl's exit code behavior for all error scenarios
+
+### Phase 6: FFI API Expansion + Multi C API
+
+**Goal:** Expand FFI coverage from ~17 CURLOPT to 80+ and expose the Multi API through C ABI so liburlx-ffi is a credible libcurl replacement.
+
+- **CURLOPT expansion:** Map all options added in Phases 2-5 to FFI integer constants; target 80+ CURLOPT codes
+- **CURLINFO expansion:** Add all timing info codes (CURLINFO_NAMELOOKUP_TIME, CURLINFO_CONNECT_TIME, CURLINFO_APPCONNECT_TIME, CURLINFO_PRETRANSFER_TIME, CURLINFO_STARTTRANSFER_TIME, CURLINFO_REDIRECT_TIME), size codes (CURLINFO_HEADER_SIZE, CURLINFO_REQUEST_SIZE, CURLINFO_SPEED_DOWNLOAD, CURLINFO_SPEED_UPLOAD), connection info (CURLINFO_PRIMARY_IP, CURLINFO_PRIMARY_PORT, CURLINFO_LOCAL_IP, CURLINFO_LOCAL_PORT, CURLINFO_NUM_CONNECTS), SSL info (CURLINFO_SSL_VERIFYRESULT, CURLINFO_CERTINFO), protocol info (CURLINFO_PROTOCOL, CURLINFO_EFFECTIVE_METHOD, CURLINFO_COOKIELIST, CURLINFO_FTP_ENTRY_PATH, CURLINFO_REDIRECT_URL, CURLINFO_CONDITION_UNMET). Target 35+ CURLINFO codes
+- **curl_multi_* FFI:** `curl_multi_init`, `curl_multi_cleanup`, `curl_multi_add_handle`, `curl_multi_remove_handle`, `curl_multi_perform`, `curl_multi_wait`, `curl_multi_wakeup`, `curl_multi_timeout`, `curl_multi_fdset`, `curl_multi_info_read`, `curl_multi_setopt`
+- **curl_share_* FFI:** `curl_share_init`, `curl_share_cleanup`, `curl_share_setopt` for cookie/DNS/SSL session sharing between handles
+- **curl_url_* FFI:** URL builder/parser API (`curl_url`, `curl_url_set`, `curl_url_get`, `curl_url_cleanup`, `curl_url_dup`)
+- **curl_mime_* FFI:** Structured MIME/multipart builder (`curl_mime_init`, `curl_mime_addpart`, `curl_mime_name`, `curl_mime_data`, `curl_mime_filedata`, `curl_mime_type`, `curl_mime_free`)
+- **curl_slist_* FFI:** Linked list API (`curl_slist_append`, `curl_slist_free_all`)
+- **Global functions:** `curl_global_init`, `curl_global_cleanup`, `curl_version_info` (with feature bitmask and protocol list)
+- **C test programs:** One test per major API surface (easy, multi, share, url, mime, slist)
+
+### Phase 7: Missing Protocols + Protocol Hardening
+
+**Goal:** Implement remaining protocols and harden existing ones so all of curl's protocol surface is covered.
+
+- **HTTP/3:** QUIC transport via `quinn` crate, H3 codec, ALPN for h3, `--http3` CLI flag, feature-gated behind `http3`
+- **SCP/SFTP:** SSH-based file transfer via `ssh2` crate, feature-gated behind `sftp`
+- **Telnet:** Interactive bidirectional protocol handler
+- **RTSP:** Real-Time Streaming Protocol (DESCRIBE, SETUP, PLAY, TEARDOWN)
+- **LDAP/LDAPS:** Directory protocol via `ldap3` crate, feature-gated behind `ldap`
+- **SMB/SMBS:** Windows file sharing protocol via `pavao` or custom, feature-gated
+- **Gopher:** Simple text protocol handler
+- **Protocol hardening:** Wire existing protocol implementations (SMTP, IMAP, POP3, MQTT, DICT, TFTP, FTP, WebSocket, FILE) into the transfer state machine so they work end-to-end through the Easy/Multi API, not just as standalone codec modules. Add integration tests with real mock servers for each
+- **FTPS/IMAPS/SMTPS/POP3S:** TLS upgrade (STARTTLS) for each protocol that supports it
+- **FTP active mode:** PORT command for active FTP connections
+- **FTP directory creation:** `--ftp-create-dirs` support
+- **WebSocket over TLS:** wss:// support with proper TLS handshake
+- **OAuth2 for mail protocols:** SMTP/IMAP/POP3 with XOAUTH2 authentication
+
+### Phase 8: DNS + Connection Infrastructure
+
+**Goal:** Advanced DNS resolution, connection pooling configuration, and Happy Eyeballs for robust networking.
+
+- **Async DNS resolver:** Integrate `hickory-dns` behind `dns-over-https` feature flag
+- **Custom DNS servers:** `--dns-servers <list>` CLI flag, `dns_servers(list)` Easy API
+- **DNS cache control:** `dns_cache_timeout(Duration)` to configure TTL, DNS cache flushing
+- **Happy Eyeballs (RFC 8305):** Concurrent IPv4/IPv6 connection racing with configurable delay
+- **Connection pool configuration:** Expose pool size, idle timeout, max connections per host
+- **HTTP/2 multiplexing controls:** Stream priorities, SETTINGS frame configuration, concurrent stream limits
+- **Connection filter chain:** Formalize the filter pipeline (DNS → TCP → TLS → Proxy → Protocol) with composable filter traits
+- **Platform-native TLS backends:** SecureTransport (macOS), Schannel (Windows) behind `native-tls` feature flag
+- **SSL session caching:** Reuse TLS sessions across connections to the same host
+
+### Phase 9: Curl Test Suite Porting + Differential Testing
+
+**Goal:** Systematically port curl's test suite to validate behavioral compatibility and catch divergences.
+
+- **Python HTTP test porting:** Port curl's ~280 pytest-based HTTP tests from `tests/http/test_*.py` to Rust integration tests
+- **XML test data runner:** Build a test runner that parses curl's XML test format (tests/data/test1 through test1918), spins up mock servers, and verifies urlx matches curl's expected wire protocol
+- **Differential test framework:** `cargo test --features differential-testing` runs operations against both urlx and the real curl binary, comparing status codes, headers, and response bodies
+- **Mapping file:** Maintain `tests/curl_test_compat/MAPPING.md` tracking which curl test ID maps to which urlx test
+- **HTTP test target:** Port ~893 HTTP-only XML tests (636 GET + 109 POST + 49 PUT + 99 redirect)
+- **C unit test porting:** Selectively port curl's 59 C unit tests that test internal functions relevant to FFI compatibility
+- **Coverage gate:** Achieve 80%+ code coverage measured by cargo-tarpaulin
+
+### Phase 10: Codebase Review — Drop-in Readiness Audit
+
+**Goal:** Comprehensive review of the entire codebase against curl/libcurl to identify remaining gaps, inconsistencies, and quality issues. This is a mandatory review phase — no new features, only analysis and planning.
+
+- **CLI flag audit:** Compare every curl CLI flag against urlx-cli; document which are implemented, which are missing, and prioritize remaining gaps
+- **CURLOPT audit:** Compare every CURLOPT_* constant in curl's `include/curl/curl.h` against liburlx-ffi; document coverage percentage and missing options
+- **CURLINFO audit:** Same for CURLINFO_* codes
+- **Protocol integration audit:** For each protocol module, verify it works end-to-end through Easy::perform(), not just as an isolated codec. Document which protocols are fully wired vs. codec-only
+- **Error code audit:** Compare CURLcode values and ensure every error path in urlx maps to the correct curl error code
+- **Behavioral diff testing:** Run the differential test suite and catalog all behavioral differences between urlx and curl
+- **Performance baseline:** Run benchmarks and compare throughput/latency against curl for common operations (HTTP GET, POST, file upload, parallel transfers)
+- **Security review:** Audit all unsafe code in liburlx-ffi, review TLS configuration defaults, check for OWASP-style vulnerabilities
+- **Output:** Updated CLAUDE.md with findings and a prioritized Phase 11-20 roadmap based on what the audit reveals
+
+> **Mandatory review cadence:** Every 10th phase (Phase 10, Phase 20, Phase 30, ...) must be a full codebase review following this same template. No new features are implemented during review phases. The review produces an updated roadmap for the next 9 phases based on current gaps.
 
 ---
 
@@ -890,15 +744,19 @@ When working on this project:
    - **2026-03-10:** Chose `rustls` over `native-tls` as default TLS backend. Rationale: pure Rust, no OpenSSL dependency, audited, used by Cloudflare in production. Platform-native backends (Schannel, SecureTransport) available behind `native-tls` feature flag.
    ```
 
+### Review Phases
+
+9. **Every 10th phase is a mandatory codebase review.** Phases 10, 20, 30, etc. are dedicated to auditing the entire codebase against curl/libcurl. No new features are implemented during review phases. The review compares CLI flags, CURLOPT/CURLINFO coverage, protocol integration, error codes, behavioral differences, and performance. The output is an updated CLAUDE.md with a prioritized roadmap for the next 9 phases.
+
 ### Behavioral Correctness
 
-9. **When stuck on behavior, check curl.** Clone curl's repo and examine the relevant source file. curl's behavior is the specification. When curl's behavior seems wrong, document it and match it anyway (with a comment noting the curl compat quirk and a link to the relevant curl source).
+10. **When stuck on behavior, check curl.** Clone curl's repo and examine the relevant source file. curl's behavior is the specification. When curl's behavior seems wrong, document it and match it anyway (with a comment noting the curl compat quirk and a link to the relevant curl source).
 
-10. **Keep the scope tight.** Implement the minimum for the current phase. Do not speculatively add protocols or features ahead of schedule.
+11. **Keep the scope tight.** Implement the minimum for the current phase. Do not speculatively add protocols or features ahead of schedule.
 
 ### Protocol Implementation Checklist
 
-11. **When implementing a protocol handler,** follow this order:
+12. **When implementing a protocol handler,** follow this order:
     a. Write integration tests with a mock server
     b. Define the protocol-specific error variants
     c. Implement the happy path
@@ -910,7 +768,7 @@ When working on this project:
 
 ### FFI Safety
 
-12. **For the FFI layer,** every `#[no_mangle] pub extern "C" fn` must have:
+13. **For the FFI layer,** every `#[no_mangle] pub extern "C" fn` must have:
     - A `// SAFETY:` comment on every `unsafe` block
     - Null pointer checks on all pointer arguments
     - Proper error code returns (never panic across FFI boundary)
