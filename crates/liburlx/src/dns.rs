@@ -42,6 +42,19 @@ impl DnsCache {
         Self { entries: HashMap::new(), ttl }
     }
 
+    /// Set the TTL for new entries added to the cache.
+    ///
+    /// Does not affect already-cached entries.
+    pub fn set_ttl(&mut self, ttl: Duration) {
+        self.ttl = ttl;
+    }
+
+    /// Returns the current TTL for new entries.
+    #[must_use]
+    pub const fn ttl(&self) -> Duration {
+        self.ttl
+    }
+
     /// Look up a cached DNS entry for the given host and port.
     ///
     /// Returns `None` if no entry exists or the entry has expired.
@@ -203,5 +216,33 @@ mod tests {
     fn default_is_new() {
         let cache = DnsCache::default();
         assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn ttl_returns_default() {
+        let cache = DnsCache::new();
+        assert_eq!(cache.ttl(), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn set_ttl_changes_ttl() {
+        let mut cache = DnsCache::new();
+        cache.set_ttl(Duration::from_secs(300));
+        assert_eq!(cache.ttl(), Duration::from_secs(300));
+    }
+
+    #[test]
+    fn set_ttl_affects_new_entries() {
+        let mut cache = DnsCache::new();
+        cache.set_ttl(Duration::ZERO);
+        cache.put("example.com", 80, vec![addr_v4([1, 2, 3, 4], 80)]);
+        // New entry uses zero TTL, so it's immediately expired
+        assert!(cache.get("example.com", 80).is_none());
+    }
+
+    #[test]
+    fn with_ttl_returns_custom_ttl() {
+        let cache = DnsCache::with_ttl(Duration::from_secs(120));
+        assert_eq!(cache.ttl(), Duration::from_secs(120));
     }
 }

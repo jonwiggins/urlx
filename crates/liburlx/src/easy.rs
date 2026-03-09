@@ -86,6 +86,10 @@ pub struct Easy {
     proxy_credentials: Option<ProxyAuthCredentials>,
     proxy_tls_config: Option<TlsConfig>,
     infilesize: Option<u64>,
+    happy_eyeballs_timeout: Option<Duration>,
+    dns_cache_timeout: Option<Duration>,
+    dns_servers: Option<Vec<std::net::SocketAddr>>,
+    doh_url: Option<String>,
 }
 
 impl std::fmt::Debug for Easy {
@@ -138,6 +142,10 @@ impl std::fmt::Debug for Easy {
             )
             .field("proxy_tls_config", &self.proxy_tls_config)
             .field("infilesize", &self.infilesize)
+            .field("happy_eyeballs_timeout", &self.happy_eyeballs_timeout)
+            .field("dns_cache_timeout", &self.dns_cache_timeout)
+            .field("dns_servers", &self.dns_servers)
+            .field("doh_url", &self.doh_url)
             .finish()
     }
 }
@@ -189,6 +197,10 @@ impl Clone for Easy {
             proxy_credentials: self.proxy_credentials.clone(),
             proxy_tls_config: self.proxy_tls_config.clone(),
             infilesize: self.infilesize,
+            happy_eyeballs_timeout: self.happy_eyeballs_timeout,
+            dns_cache_timeout: self.dns_cache_timeout,
+            dns_servers: self.dns_servers.clone(),
+            doh_url: self.doh_url.clone(),
         }
     }
 }
@@ -242,6 +254,10 @@ impl Easy {
             proxy_credentials: None,
             proxy_tls_config: None,
             infilesize: None,
+            happy_eyeballs_timeout: None,
+            dns_cache_timeout: None,
+            dns_servers: None,
+            doh_url: None,
         }
     }
 
@@ -767,6 +783,72 @@ impl Easy {
         self.dns_shuffle = enable;
     }
 
+    /// Set the DNS cache timeout.
+    ///
+    /// Controls how long resolved DNS entries are cached before expiring.
+    /// The default is 60 seconds (matching curl). Setting to zero disables
+    /// DNS caching (every request triggers a new lookup).
+    /// Equivalent to `CURLOPT_DNS_CACHE_TIMEOUT`.
+    pub fn dns_cache_timeout(&mut self, duration: Duration) {
+        self.dns_cache_timeout = Some(duration);
+        self.dns_cache.set_ttl(duration);
+    }
+
+    /// Set the Happy Eyeballs timeout.
+    ///
+    /// Controls the delay before starting a parallel IPv4 connection when
+    /// attempting an IPv6 connection (RFC 6555). The default is 250ms.
+    /// A shorter timeout prefers IPv4 more aggressively; a longer timeout
+    /// gives IPv6 more time to succeed.
+    /// Equivalent to `CURLOPT_HAPPY_EYEBALLS_TIMEOUT_MS`.
+    pub fn happy_eyeballs_timeout(&mut self, duration: Duration) {
+        self.happy_eyeballs_timeout = Some(duration);
+    }
+
+    /// Set custom DNS server addresses.
+    ///
+    /// Accepts a comma-separated list of IP:port addresses (e.g., `"8.8.8.8:53,8.8.4.4:53"`).
+    /// Port defaults to 53 if not specified.
+    /// Equivalent to `CURLOPT_DNS_SERVERS`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Http`] if the server list cannot be parsed.
+    pub fn dns_servers(&mut self, servers: &str) -> Result<(), Error> {
+        let mut addrs = Vec::new();
+        for s in servers.split(',') {
+            let s = s.trim();
+            if s.is_empty() {
+                continue;
+            }
+            let addr: std::net::SocketAddr = if s.contains(':') {
+                s.parse()
+                    .map_err(|e| Error::Http(format!("invalid DNS server address '{s}': {e}")))?
+            } else {
+                let ip: std::net::IpAddr = s
+                    .parse()
+                    .map_err(|e| Error::Http(format!("invalid DNS server IP '{s}': {e}")))?;
+                std::net::SocketAddr::new(ip, 53)
+            };
+            addrs.push(addr);
+        }
+        if addrs.is_empty() {
+            return Err(Error::Http("empty DNS server list".to_string()));
+        }
+        self.dns_servers = Some(addrs);
+        Ok(())
+    }
+
+    /// Set the DNS-over-HTTPS URL.
+    ///
+    /// When set, DNS queries are sent as HTTPS requests to this URL
+    /// instead of using the system resolver. The URL should be a `DoH`
+    /// endpoint (e.g., `"https://dns.google/dns-query"`).
+    /// Equivalent to `CURLOPT_DOH_URL`.
+    pub fn doh_url(&mut self, url: &str) {
+        self.doh_url = Some(url.to_string());
+    }
+
     /// Connect via a Unix domain socket instead of TCP.
     ///
     /// When set, all connections go through the specified Unix socket path.
@@ -1018,6 +1100,7 @@ impl Easy {
             &mut self.pool,
             self.http_version,
             self.expect_100_timeout,
+            self.happy_eyeballs_timeout,
         );
 
         // Apply total transfer timeout if set
@@ -1107,6 +1190,7 @@ async fn perform_transfer(
     pool: &mut ConnectionPool,
     http_version: HttpVersion,
     expect_100_timeout: Option<Duration>,
+    happy_eyeballs_timeout: Option<Duration>,
 ) -> Result<Response, Error> {
     let transfer_start = Instant::now();
     let mut current_url = url.clone();
@@ -1154,6 +1238,7 @@ async fn perform_transfer(
             pool,
             http_version,
             expect_100_timeout,
+            happy_eyeballs_timeout,
         )
         .await?;
 
@@ -1210,6 +1295,7 @@ async fn perform_transfer(
                                 pool,
                                 http_version,
                                 expect_100_timeout,
+                                happy_eyeballs_timeout,
                             )
                             .await?;
                         }
@@ -1320,6 +1406,7 @@ async fn do_single_request(
     pool: &mut ConnectionPool,
     http_version: HttpVersion,
     expect_100_timeout: Option<Duration>,
+    happy_eyeballs_timeout: Option<Duration>,
 ) -> Result<Response, Error> {
     // Handle non-HTTP schemes directly
     match url.scheme() {
@@ -1525,10 +1612,16 @@ async fn do_single_request(
         }
     }
 
-    // Happy Eyeballs (RFC 6555): prefer IPv6, fall back to IPv4 after 250ms
-    let tcp_stream =
-        happy_eyeballs_connect(&addrs, connect_timeout, request_start, interface, local_port)
-            .await?;
+    // Happy Eyeballs (RFC 6555): prefer IPv6, fall back to IPv4
+    let tcp_stream = happy_eyeballs_connect(
+        &addrs,
+        connect_timeout,
+        request_start,
+        interface,
+        local_port,
+        happy_eyeballs_timeout,
+    )
+    .await?;
     let time_connect = request_start.elapsed();
 
     // Apply TCP socket options
@@ -2116,11 +2209,13 @@ async fn happy_eyeballs_connect(
     start: Instant,
     interface: Option<&str>,
     local_port: Option<u16>,
+    eyeballs_timeout: Option<Duration>,
 ) -> Result<tokio::net::TcpStream, Error> {
     use std::net::SocketAddr;
 
     // Happy Eyeballs delay before starting the other address family
-    const EYEBALLS_DELAY: Duration = Duration::from_millis(250);
+    // Default: 250ms (RFC 6555 recommendation)
+    let eyeballs_delay = eyeballs_timeout.unwrap_or(Duration::from_millis(250));
 
     // Separate into IPv6 and IPv4
     let v6: Vec<SocketAddr> = addrs.iter().copied().filter(SocketAddr::is_ipv6).collect();
@@ -2131,7 +2226,7 @@ async fn happy_eyeballs_connect(
         return try_connect_addrs(addrs, connect_timeout, interface, local_port).await;
     }
 
-    // Both families present: race with 250ms head start for IPv6
+    // Both families present: race with head start for IPv6
     let remaining_timeout = connect_timeout.map(|t| {
         let elapsed = start.elapsed();
         t.saturating_sub(elapsed)
@@ -2139,10 +2234,10 @@ async fn happy_eyeballs_connect(
 
     let v6_fut = try_connect_addrs(&v6, remaining_timeout, interface, local_port);
     let v4_delayed = async {
-        tokio::time::sleep(EYEBALLS_DELAY).await;
+        tokio::time::sleep(eyeballs_delay).await;
         try_connect_addrs(
             &v4,
-            remaining_timeout.map(|t| t.saturating_sub(EYEBALLS_DELAY)),
+            remaining_timeout.map(|t| t.saturating_sub(eyeballs_delay)),
             interface,
             local_port,
         )
@@ -2586,13 +2681,13 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
-        let result = happy_eyeballs_connect(&[addr], None, Instant::now(), None, None).await;
+        let result = happy_eyeballs_connect(&[addr], None, Instant::now(), None, None, None).await;
         assert!(result.is_ok());
     }
 
     #[tokio::test]
     async fn happy_eyeballs_no_addrs() {
-        let result = happy_eyeballs_connect(&[], None, Instant::now(), None, None).await;
+        let result = happy_eyeballs_connect(&[], None, Instant::now(), None, None, None).await;
         assert!(result.is_err());
     }
 
@@ -2962,5 +3057,94 @@ mod tests {
         easy.infilesize(8192);
         let cloned = easy.clone();
         assert_eq!(cloned.infilesize, Some(8192));
+    }
+
+    #[test]
+    fn easy_dns_cache_timeout() {
+        let mut easy = Easy::new();
+        assert!(easy.dns_cache_timeout.is_none());
+        easy.dns_cache_timeout(Duration::from_secs(120));
+        assert_eq!(easy.dns_cache_timeout, Some(Duration::from_secs(120)));
+        // Verify the cache TTL was updated
+        assert_eq!(easy.dns_cache.ttl(), Duration::from_secs(120));
+    }
+
+    #[test]
+    fn easy_dns_cache_timeout_zero_disables() {
+        let mut easy = Easy::new();
+        easy.dns_cache_timeout(Duration::ZERO);
+        assert_eq!(easy.dns_cache.ttl(), Duration::ZERO);
+    }
+
+    #[test]
+    fn easy_happy_eyeballs_timeout() {
+        let mut easy = Easy::new();
+        assert!(easy.happy_eyeballs_timeout.is_none());
+        easy.happy_eyeballs_timeout(Duration::from_millis(100));
+        assert_eq!(easy.happy_eyeballs_timeout, Some(Duration::from_millis(100)));
+    }
+
+    #[test]
+    fn easy_happy_eyeballs_timeout_cloned() {
+        let mut easy = Easy::new();
+        easy.happy_eyeballs_timeout(Duration::from_millis(500));
+        let cloned = easy.clone();
+        assert_eq!(cloned.happy_eyeballs_timeout, Some(Duration::from_millis(500)));
+    }
+
+    #[test]
+    fn easy_dns_servers_valid() {
+        let mut easy = Easy::new();
+        easy.dns_servers("8.8.8.8,8.8.4.4").unwrap();
+        let servers = easy.dns_servers.as_ref().unwrap();
+        assert_eq!(servers.len(), 2);
+        assert_eq!(servers[0].ip().to_string(), "8.8.8.8");
+        assert_eq!(servers[0].port(), 53);
+        assert_eq!(servers[1].ip().to_string(), "8.8.4.4");
+    }
+
+    #[test]
+    fn easy_dns_servers_with_port() {
+        let mut easy = Easy::new();
+        easy.dns_servers("1.1.1.1:5353").unwrap();
+        let servers = easy.dns_servers.as_ref().unwrap();
+        assert_eq!(servers[0].port(), 5353);
+    }
+
+    #[test]
+    fn easy_dns_servers_empty_fails() {
+        let mut easy = Easy::new();
+        assert!(easy.dns_servers("").is_err());
+    }
+
+    #[test]
+    fn easy_dns_servers_invalid_ip_fails() {
+        let mut easy = Easy::new();
+        assert!(easy.dns_servers("not-an-ip").is_err());
+    }
+
+    #[test]
+    fn easy_dns_servers_cloned() {
+        let mut easy = Easy::new();
+        easy.dns_servers("8.8.8.8").unwrap();
+        let cloned = easy.clone();
+        assert!(cloned.dns_servers.is_some());
+        assert_eq!(cloned.dns_servers.as_ref().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn easy_doh_url() {
+        let mut easy = Easy::new();
+        assert!(easy.doh_url.is_none());
+        easy.doh_url("https://dns.google/dns-query");
+        assert_eq!(easy.doh_url.as_deref(), Some("https://dns.google/dns-query"));
+    }
+
+    #[test]
+    fn easy_doh_url_cloned() {
+        let mut easy = Easy::new();
+        easy.doh_url("https://dns.cloudflare.com/dns-query");
+        let cloned = easy.clone();
+        assert_eq!(cloned.doh_url.as_deref(), Some("https://dns.cloudflare.com/dns-query"));
     }
 }

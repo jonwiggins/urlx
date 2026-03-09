@@ -80,6 +80,8 @@ pub enum CURLoption {
     CURLOPT_PROXY_SSLKEY = 10255,
     CURLOPT_READDATA = 10009,
     CURLOPT_DEBUGDATA = 10095,
+    CURLOPT_DNS_SERVERS = 10211,
+    CURLOPT_DOH_URL = 10279,
 
     // Long options (CURLOPTTYPE_LONG = 0)
     CURLOPT_TIMEOUT = 13,
@@ -108,6 +110,8 @@ pub enum CURLoption {
     CURLOPT_LOCALPORT = 139,
     CURLOPT_TIMEOUT_MS = 155,
     CURLOPT_CONNECTTIMEOUT_MS = 156,
+    CURLOPT_DNS_CACHE_TIMEOUT = 92,
+    CURLOPT_HAPPY_EYEBALLS_TIMEOUT_MS = 271,
     CURLOPT_TCP_KEEPALIVE = 213,
     CURLOPT_SSL_SESSIONID_CACHE = 150,
 
@@ -958,6 +962,44 @@ pub unsafe extern "C" fn curl_easy_setopt(
             let size = value as u64;
             h.infilesize = Some(size);
             h.easy.infilesize(size);
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_DNS_CACHE_TIMEOUT = 92
+        92 => {
+            #[allow(clippy::cast_sign_loss)]
+            let secs = value as u64;
+            h.easy.dns_cache_timeout(std::time::Duration::from_secs(secs));
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_HAPPY_EYEBALLS_TIMEOUT_MS = 271
+        271 => {
+            #[allow(clippy::cast_sign_loss)]
+            let ms = value as u64;
+            h.easy.happy_eyeballs_timeout(std::time::Duration::from_millis(ms));
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_DNS_SERVERS = 10211
+        10211 => {
+            // SAFETY: value must be a null-terminated C string
+            if let Some(s) = unsafe { read_cstr(value) } {
+                match h.easy.dns_servers(s) {
+                    Ok(()) => CURLcode::CURLE_OK,
+                    Err(_) => CURLcode::CURLE_BAD_FUNCTION_ARGUMENT,
+                }
+            } else {
+                CURLcode::CURLE_OK
+            }
+        }
+
+        // CURLOPT_DOH_URL = 10279
+        10279 => {
+            // SAFETY: value must be a null-terminated C string
+            if let Some(s) = unsafe { read_cstr(value) } {
+                h.easy.doh_url(s);
+            }
             CURLcode::CURLE_OK
         }
 
@@ -2293,6 +2335,53 @@ mod tests {
         assert!(h.debug_callback.is_none());
         assert!(h.infilesize.is_none());
 
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_dns_cache_timeout() {
+        let handle = curl_easy_init();
+        // CURLOPT_DNS_CACHE_TIMEOUT = 92
+        let code = unsafe { curl_easy_setopt(handle, 92, 120_usize as *const c_void) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_happy_eyeballs_timeout() {
+        let handle = curl_easy_init();
+        // CURLOPT_HAPPY_EYEBALLS_TIMEOUT_MS = 271
+        let code = unsafe { curl_easy_setopt(handle, 271, 100_usize as *const c_void) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_dns_servers() {
+        let handle = curl_easy_init();
+        // CURLOPT_DNS_SERVERS = 10211
+        let servers = c"8.8.8.8,8.8.4.4";
+        let code = unsafe { curl_easy_setopt(handle, 10211, servers.as_ptr().cast::<c_void>()) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_dns_servers_invalid() {
+        let handle = curl_easy_init();
+        let servers = c"not-valid";
+        let code = unsafe { curl_easy_setopt(handle, 10211, servers.as_ptr().cast::<c_void>()) };
+        assert_eq!(code, CURLcode::CURLE_BAD_FUNCTION_ARGUMENT);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_doh_url() {
+        let handle = curl_easy_init();
+        // CURLOPT_DOH_URL = 10279
+        let url = c"https://dns.google/dns-query";
+        let code = unsafe { curl_easy_setopt(handle, 10279, url.as_ptr().cast::<c_void>()) };
+        assert_eq!(code, CURLcode::CURLE_OK);
         unsafe { curl_easy_cleanup(handle) };
     }
 }

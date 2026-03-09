@@ -91,6 +91,9 @@ fn print_usage() {
     eprintln!("      --interface <name>    Use network interface/address for outgoing connections");
     eprintln!("      --local-port <port>   Bind to local port for outgoing connections");
     eprintln!("      --dns-shuffle         Randomize DNS resolution order");
+    eprintln!("      --dns-servers <addrs> Use custom DNS servers (comma-separated IP:port)");
+    eprintln!("      --doh-url <url>       DNS-over-HTTPS URL");
+    eprintln!("      --happy-eyeballs-timeout-ms <ms>  Happy Eyeballs timeout (milliseconds)");
     eprintln!("  -T, --upload-file <file>  Upload file (PUT)");
     eprintln!("  -b, --cookie <data>       Send cookies (e.g., 'name=value; name2=value2')");
     eprintln!("  -e, --referer <url>       Set Referer header");
@@ -435,6 +438,29 @@ fn parse_args(args: &[String]) -> Option<CliOptions> {
             }
             "--dns-shuffle" => {
                 opts.easy.dns_shuffle(true);
+            }
+            "--dns-servers" => {
+                i += 1;
+                let val = require_arg(args, i, "--dns-servers")?;
+                if let Err(e) = opts.easy.dns_servers(val) {
+                    eprintln!("urlx: invalid DNS servers: {e}");
+                    return None;
+                }
+            }
+            "--doh-url" => {
+                i += 1;
+                let val = require_arg(args, i, "--doh-url")?;
+                opts.easy.doh_url(val);
+            }
+            "--happy-eyeballs-timeout-ms" => {
+                i += 1;
+                let val = require_arg(args, i, "--happy-eyeballs-timeout-ms")?;
+                if let Ok(ms) = val.parse::<u64>() {
+                    opts.easy.happy_eyeballs_timeout(std::time::Duration::from_millis(ms));
+                } else {
+                    eprintln!("urlx: invalid happy-eyeballs-timeout-ms: {val}");
+                    return None;
+                }
             }
             "-T" | "--upload-file" => {
                 i += 1;
@@ -2194,5 +2220,52 @@ mod tests {
     #[test]
     fn remote_name_from_url_path_segments() {
         assert_eq!(remote_name_from_url("http://example.com/path/to/file.txt"), "file.txt");
+    }
+
+    #[test]
+    fn parse_args_dns_servers() {
+        let args = vec![
+            "urlx".into(),
+            "--dns-servers".into(),
+            "8.8.8.8,8.8.4.4".into(),
+            "http://example.com".into(),
+        ];
+        let opts = parse_args(&args).unwrap();
+        assert_eq!(opts.urls, vec!["http://example.com"]);
+    }
+
+    #[test]
+    fn parse_args_doh_url() {
+        let args = vec![
+            "urlx".into(),
+            "--doh-url".into(),
+            "https://dns.google/dns-query".into(),
+            "http://example.com".into(),
+        ];
+        let opts = parse_args(&args).unwrap();
+        assert_eq!(opts.urls, vec!["http://example.com"]);
+    }
+
+    #[test]
+    fn parse_args_happy_eyeballs_timeout() {
+        let args = vec![
+            "urlx".into(),
+            "--happy-eyeballs-timeout-ms".into(),
+            "100".into(),
+            "http://example.com".into(),
+        ];
+        let opts = parse_args(&args).unwrap();
+        assert_eq!(opts.urls, vec!["http://example.com"]);
+    }
+
+    #[test]
+    fn parse_args_happy_eyeballs_timeout_invalid() {
+        let args = vec![
+            "urlx".into(),
+            "--happy-eyeballs-timeout-ms".into(),
+            "abc".into(),
+            "http://example.com".into(),
+        ];
+        assert!(parse_args(&args).is_none());
     }
 }
