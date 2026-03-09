@@ -129,6 +129,14 @@ pub struct Easy {
     sasl_authzid: Option<String>,
     /// Send SASL initial response in first message.
     sasl_ir: bool,
+    /// Connect-to host:port mapping (`from_host:from_port:to_host:to_port`).
+    connect_to: Vec<String>,
+    /// Send `HAProxy` PROXY protocol v1 header.
+    haproxy_protocol: bool,
+    /// Linux abstract Unix domain socket path.
+    abstract_unix_socket: Option<String>,
+    /// Don't verify `DoH` server TLS certificate.
+    doh_insecure: bool,
 }
 
 impl std::fmt::Debug for Easy {
@@ -204,6 +212,10 @@ impl std::fmt::Debug for Easy {
             .field("ftp_method", &self.ftp_method)
             .field("sasl_authzid", &self.sasl_authzid)
             .field("sasl_ir", &self.sasl_ir)
+            .field("connect_to", &self.connect_to)
+            .field("haproxy_protocol", &self.haproxy_protocol)
+            .field("abstract_unix_socket", &self.abstract_unix_socket)
+            .field("doh_insecure", &self.doh_insecure)
             .finish()
     }
 }
@@ -278,6 +290,10 @@ impl Clone for Easy {
             ftp_method: self.ftp_method,
             sasl_authzid: self.sasl_authzid.clone(),
             sasl_ir: self.sasl_ir,
+            connect_to: self.connect_to.clone(),
+            haproxy_protocol: self.haproxy_protocol,
+            abstract_unix_socket: self.abstract_unix_socket.clone(),
+            doh_insecure: self.doh_insecure,
         }
     }
 }
@@ -354,6 +370,10 @@ impl Easy {
             ftp_method: FtpMethod::default(),
             sasl_authzid: None,
             sasl_ir: false,
+            connect_to: Vec::new(),
+            haproxy_protocol: false,
+            abstract_unix_socket: None,
+            doh_insecure: false,
         }
     }
 
@@ -1223,6 +1243,37 @@ impl Easy {
     /// Equivalent to `CURLOPT_SASL_IR` / curl's `--sasl-ir`.
     pub const fn sasl_ir(&mut self, enable: bool) {
         self.sasl_ir = enable;
+    }
+
+    /// Add a `--connect-to` mapping: `from_host:from_port:to_host:to_port`.
+    ///
+    /// Redirects connections meant for `from_host:from_port` to `to_host:to_port`.
+    /// Equivalent to `CURLOPT_CONNECT_TO` / curl's `--connect-to`.
+    pub fn connect_to(&mut self, mapping: &str) {
+        self.connect_to.push(mapping.to_string());
+    }
+
+    /// Enable `HAProxy` PROXY protocol v1 header.
+    ///
+    /// Sends a PROXY protocol header at the start of the connection.
+    /// Equivalent to `CURLOPT_HAPROXYPROTOCOL` / curl's `--haproxy-protocol`.
+    pub const fn haproxy_protocol(&mut self, enable: bool) {
+        self.haproxy_protocol = enable;
+    }
+
+    /// Set abstract Unix domain socket path (Linux-only).
+    ///
+    /// Similar to `--unix-socket` but uses Linux abstract socket namespace.
+    /// Equivalent to `CURLOPT_ABSTRACT_UNIX_SOCKET` / curl's `--abstract-unix-socket`.
+    pub fn abstract_unix_socket(&mut self, path: &str) {
+        self.abstract_unix_socket = Some(path.to_string());
+    }
+
+    /// Don't verify the `DoH` (DNS-over-HTTPS) server's TLS certificate.
+    ///
+    /// Equivalent to curl's `--doh-insecure`.
+    pub const fn doh_insecure(&mut self, enable: bool) {
+        self.doh_insecure = enable;
     }
 
     /// Perform the transfer and return the response (blocking).
@@ -3989,5 +4040,37 @@ mod tests {
         assert!(!easy.sasl_ir);
         easy.sasl_ir(true);
         assert!(easy.sasl_ir);
+    }
+
+    #[test]
+    fn easy_connect_to() {
+        let mut easy = Easy::new();
+        easy.connect_to("a.com:80:b.com:8080");
+        assert_eq!(easy.connect_to.len(), 1);
+        assert_eq!(easy.connect_to[0], "a.com:80:b.com:8080");
+    }
+
+    #[test]
+    fn easy_haproxy_protocol() {
+        let mut easy = Easy::new();
+        assert!(!easy.haproxy_protocol);
+        easy.haproxy_protocol(true);
+        assert!(easy.haproxy_protocol);
+    }
+
+    #[test]
+    fn easy_abstract_unix_socket() {
+        let mut easy = Easy::new();
+        assert!(easy.abstract_unix_socket.is_none());
+        easy.abstract_unix_socket("/my/abstract/sock");
+        assert_eq!(easy.abstract_unix_socket.as_deref(), Some("/my/abstract/sock"));
+    }
+
+    #[test]
+    fn easy_doh_insecure() {
+        let mut easy = Easy::new();
+        assert!(!easy.doh_insecure);
+        easy.doh_insecure(true);
+        assert!(easy.doh_insecure);
     }
 }
