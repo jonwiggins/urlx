@@ -15,6 +15,7 @@ use crate::pool::{ConnectionPool, PooledStream};
 use crate::progress::{call_progress, ProgressCallback, ProgressInfo};
 use crate::protocol::http::multipart::MultipartForm;
 use crate::protocol::http::response::Response;
+use crate::throttle::SpeedLimits;
 use crate::tls::TlsConfig;
 use crate::url::Url;
 
@@ -1104,6 +1105,13 @@ impl Easy {
             }
         }
 
+        let speed_limits = SpeedLimits {
+            max_recv_speed: self.max_recv_speed,
+            max_send_speed: self.max_send_speed,
+            low_speed_limit: self.low_speed_limit,
+            low_speed_time: self.low_speed_time,
+        };
+
         let fut = perform_transfer(
             &url,
             Some(effective_method.as_str()),
@@ -1136,9 +1144,12 @@ impl Easy {
             self.unrestricted_auth,
             self.ignore_content_length,
             &mut self.alt_svc_cache,
+            &speed_limits,
         );
 
-        // Apply total transfer timeout if set
+        // Apply total transfer timeout if set.
+        // Box::pin to avoid large future on stack.
+        let fut = Box::pin(fut);
         let response = if let Some(timeout) = self.timeout {
             tokio::time::timeout(timeout, fut).await.map_err(|_| Error::Timeout(timeout))?
         } else {
@@ -1229,6 +1240,7 @@ async fn perform_transfer(
     unrestricted_auth: bool,
     ignore_content_length: bool,
     alt_svc_cache: &mut crate::protocol::http::altsvc::AltSvcCache,
+    speed_limits: &SpeedLimits,
 ) -> Result<Response, Error> {
     let transfer_start = Instant::now();
     let original_url = url.clone();
@@ -1262,7 +1274,7 @@ async fn perform_transfer(
             }
         }
 
-        let mut response = do_single_request(
+        let mut response = Box::pin(do_single_request(
             &current_url,
             &current_method,
             &request_headers,
@@ -1286,7 +1298,8 @@ async fn perform_transfer(
             expect_100_timeout,
             happy_eyeballs_timeout,
             ignore_content_length,
-        )
+            speed_limits,
+        ))
         .await?;
 
         // Handle Digest auth: if 401 with WWW-Authenticate: Digest, retry with credentials
@@ -1320,7 +1333,7 @@ async fn perform_transfer(
                             let mut auth_headers = request_headers.clone();
                             auth_headers.push(("Authorization".to_string(), auth_header));
 
-                            response = do_single_request(
+                            response = Box::pin(do_single_request(
                                 &current_url,
                                 &current_method,
                                 &auth_headers,
@@ -1344,7 +1357,8 @@ async fn perform_transfer(
                                 expect_100_timeout,
                                 happy_eyeballs_timeout,
                                 ignore_content_length,
-                            )
+                                speed_limits,
+                            ))
                             .await?;
                         }
                     }
@@ -1446,7 +1460,12 @@ async fn perform_transfer(
 }
 
 /// Perform a single HTTP request (no redirect handling).
-#[allow(clippy::too_many_arguments, clippy::too_many_lines, clippy::fn_params_excessive_bools)]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::fn_params_excessive_bools,
+    clippy::large_futures
+)]
 async fn do_single_request(
     url: &Url,
     method: &str,
@@ -1471,6 +1490,7 @@ async fn do_single_request(
     expect_100_timeout: Option<Duration>,
     happy_eyeballs_timeout: Option<Duration>,
     ignore_content_length: bool,
+    speed_limits: &SpeedLimits,
 ) -> Result<Response, Error> {
     // Handle non-HTTP schemes directly
     match url.scheme() {
@@ -1524,6 +1544,7 @@ async fn do_single_request(
                 use_http10,
                 expect_100_timeout,
                 ignore_content_length,
+                speed_limits,
             )
             .await;
 
@@ -1608,6 +1629,7 @@ async fn do_single_request(
             use_http10,
             expect_100_timeout,
             ignore_content_length,
+            speed_limits,
         )
         .await?;
         let time_starttransfer = request_start.elapsed();
@@ -1772,6 +1794,7 @@ async fn do_single_request(
                         &effective_headers,
                         body,
                         url.as_str(),
+                        speed_limits,
                     )
                     .await?;
                     let time_starttransfer = request_start.elapsed();
@@ -1802,6 +1825,7 @@ async fn do_single_request(
                     use_http10,
                     expect_100_timeout,
                     ignore_content_length,
+                    speed_limits,
                 )
                 .await?;
                 let time_starttransfer = request_start.elapsed();
@@ -1848,6 +1872,7 @@ async fn do_single_request(
                 use_http10,
                 expect_100_timeout,
                 ignore_content_length,
+                speed_limits,
             )
             .await?;
             let time_starttransfer = request_start.elapsed();

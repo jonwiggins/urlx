@@ -41,6 +41,18 @@ pub enum Error {
         /// A human-readable error message.
         message: String,
     },
+
+    /// Transfer speed dropped below the minimum threshold for too long.
+    /// Maps to `CURLE_OPERATION_TIMEDOUT` (28) at the FFI boundary.
+    #[error("transfer speed {speed} B/s below limit {limit} B/s for {duration:?}")]
+    SpeedLimit {
+        /// The measured speed in bytes/sec.
+        speed: u64,
+        /// The configured minimum speed in bytes/sec.
+        limit: u64,
+        /// How long the speed has been below the limit.
+        duration: Duration,
+    },
 }
 
 #[cfg(test)]
@@ -71,6 +83,12 @@ mod tests {
         let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "file not found");
         let err = Error::Io(io_err);
         assert!(err.to_string().contains("file not found"));
+    }
+
+    #[test]
+    fn error_display_speed_limit() {
+        let err = Error::SpeedLimit { speed: 50, limit: 100, duration: Duration::from_secs(10) };
+        assert_eq!(err.to_string(), "transfer speed 50 B/s below limit 100 B/s for 10s");
     }
 
     #[test]

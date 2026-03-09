@@ -1591,7 +1591,9 @@ fn error_to_curlcode(err: &liburlx::Error) -> CURLcode {
                 CURLcode::CURLE_RECV_ERROR
             }
         }
-        liburlx::Error::Timeout(_) => CURLcode::CURLE_OPERATION_TIMEDOUT,
+        liburlx::Error::Timeout(_) | liburlx::Error::SpeedLimit { .. } => {
+            CURLcode::CURLE_OPERATION_TIMEDOUT
+        }
         _ => CURLcode::CURLE_RECV_ERROR,
     }
 }

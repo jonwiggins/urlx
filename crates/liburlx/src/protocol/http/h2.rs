@@ -9,6 +9,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::error::Error;
 use crate::protocol::http::response::Response;
+use crate::throttle::{RateLimiter, SpeedLimits, THROTTLE_CHUNK_SIZE};
 
 /// Send an HTTP/2 request and read the response.
 ///
@@ -17,6 +18,7 @@ use crate::protocol::http::response::Response;
 /// # Errors
 ///
 /// Returns errors for I/O failures or protocol errors.
+#[allow(clippy::too_many_arguments)]
 pub async fn request<S>(
     stream: S,
     method: &str,
@@ -25,6 +27,7 @@ pub async fn request<S>(
     custom_headers: &[(String, String)],
     body: Option<&[u8]>,
     url: &str,
+    speed_limits: &SpeedLimits,
 ) -> Result<Response, Error>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -78,11 +81,28 @@ where
         .send_request(req, !has_body)
         .map_err(|e| Error::Http(format!("h2 send failed: {e}")))?;
 
-    // Send body if present
+    // Send body if present, with optional rate limiting
     if let Some(body_data) = body {
-        send_stream
-            .send_data(body_data.to_vec().into(), true)
-            .map_err(|e| Error::Http(format!("h2 body send failed: {e}")))?;
+        let mut send_limiter = RateLimiter::for_send(speed_limits);
+        if send_limiter.is_active() {
+            // Throttled: send in chunks
+            let mut offset = 0;
+            while offset < body_data.len() {
+                let end = (offset + THROTTLE_CHUNK_SIZE).min(body_data.len());
+                let is_last = end == body_data.len();
+                let chunk = body_data[offset..end].to_vec();
+                let chunk_len = chunk.len();
+                send_stream
+                    .send_data(chunk.into(), is_last)
+                    .map_err(|e| Error::Http(format!("h2 body send failed: {e}")))?;
+                send_limiter.record(chunk_len).await?;
+                offset = end;
+            }
+        } else {
+            send_stream
+                .send_data(body_data.to_vec().into(), true)
+                .map_err(|e| Error::Http(format!("h2 body send failed: {e}")))?;
+        }
     }
 
     // Receive response
@@ -104,14 +124,20 @@ where
         return Ok(Response::new(status, headers, Vec::new(), url.to_string()));
     }
 
-    // Read body
+    // Read body with optional rate limiting
+    let mut recv_limiter = RateLimiter::for_recv(speed_limits);
     let mut body_stream = h2_response.into_body();
     let mut body_bytes = Vec::new();
     while let Some(chunk) = body_stream.data().await {
         let chunk = chunk.map_err(|e| Error::Http(format!("h2 body read error: {e}")))?;
+        let chunk_len = chunk.len();
         body_bytes.extend_from_slice(&chunk);
         // Release flow control capacity
-        let _r = body_stream.flow_control().release_capacity(chunk.len());
+        let _r = body_stream.flow_control().release_capacity(chunk_len);
+        // Apply rate limiting after each data frame
+        if recv_limiter.is_active() {
+            recv_limiter.record(chunk_len).await?;
+        }
     }
 
     Ok(Response::new(status, headers, body_bytes, url.to_string()))

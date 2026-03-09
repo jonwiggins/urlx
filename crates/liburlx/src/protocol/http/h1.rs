@@ -16,6 +16,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::error::Error;
 use crate::protocol::http::response::Response;
+use crate::throttle::{RateLimiter, SpeedLimits, THROTTLE_CHUNK_SIZE};
 
 /// Maximum response header size (64 KB, same as curl's default).
 const MAX_HEADER_SIZE: usize = 64 * 1024;
@@ -39,7 +40,7 @@ const MAX_HEADER_SIZE: usize = 64 * 1024;
 /// # Errors
 ///
 /// Returns errors for I/O failures or malformed responses.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::large_futures)]
 pub async fn request<S>(
     stream: &mut S,
     method: &str,
@@ -52,6 +53,7 @@ pub async fn request<S>(
     use_http10: bool,
     expect_100_timeout: Option<Duration>,
     ignore_content_length: bool,
+    speed_limits: &SpeedLimits,
 ) -> Result<(Response, bool), Error>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -116,6 +118,9 @@ where
         .await
         .map_err(|e| Error::Http(format!("write failed: {e}")))?;
 
+    // Create send rate limiter for body uploads
+    let mut send_limiter = RateLimiter::for_send(speed_limits);
+
     // Handle Expect: 100-continue
     if use_expect {
         stream.flush().await.map_err(|e| Error::Http(format!("flush failed: {e}")))?;
@@ -127,10 +132,7 @@ where
                 if status == 100 {
                     // Server said continue — send body
                     if let Some(body_data) = body {
-                        stream
-                            .write_all(body_data)
-                            .await
-                            .map_err(|e| Error::Http(format!("body write failed: {e}")))?;
+                        throttled_write(stream, body_data, &mut send_limiter).await?;
                     }
                 } else {
                     // Server responded with final status — don't send body
@@ -141,6 +143,7 @@ where
                         || final_status == 204
                         || final_status == 304
                         || (100..200).contains(&final_status);
+                    let mut recv_limiter = RateLimiter::for_recv(speed_limits);
                     let (response_body, body_read_to_eof, trailers) = if no_body {
                         (Vec::new(), false, HashMap::new())
                     } else {
@@ -150,6 +153,7 @@ where
                             body_prefix,
                             keep_alive,
                             ignore_content_length,
+                            &mut recv_limiter,
                         )
                         .await?
                     };
@@ -169,10 +173,7 @@ where
             Err(_) => {
                 // Timeout waiting for 100 Continue — send body anyway (curl behavior)
                 if let Some(body_data) = body {
-                    stream
-                        .write_all(body_data)
-                        .await
-                        .map_err(|e| Error::Http(format!("body write failed: {e}")))?;
+                    throttled_write(stream, body_data, &mut send_limiter).await?;
                 }
             }
             Ok(Err(e)) => return Err(e),
@@ -180,10 +181,7 @@ where
     } else {
         // No 100-continue — send body immediately
         if let Some(body_data) = body {
-            stream
-                .write_all(body_data)
-                .await
-                .map_err(|e| Error::Http(format!("body write failed: {e}")))?;
+            throttled_write(stream, body_data, &mut send_limiter).await?;
         }
     }
 
@@ -209,7 +207,8 @@ where
     // 204 and 304 responses have no body per HTTP spec
     let no_body = is_head || status == 204 || status == 304;
 
-    // Read body
+    // Read body with download rate limiting
+    let mut recv_limiter = RateLimiter::for_recv(speed_limits);
     let (response_body, body_read_to_eof, trailers) = if no_body {
         (Vec::new(), false, HashMap::new())
     } else {
@@ -219,6 +218,7 @@ where
             body_prefix,
             keep_alive && !use_http10,
             ignore_content_length,
+            &mut recv_limiter,
         )
         .await?
     };
@@ -372,11 +372,45 @@ fn parse_headers(data: &[u8]) -> Result<(u16, HashMap<String, String>), Error> {
     Ok((status, headers))
 }
 
+/// Write body data with optional rate limiting.
+///
+/// If the rate limiter is active, writes data in chunks with throttling.
+/// Otherwise, writes all data at once.
+async fn throttled_write<S>(
+    stream: &mut S,
+    data: &[u8],
+    limiter: &mut RateLimiter,
+) -> Result<(), Error>
+where
+    S: AsyncWrite + Unpin,
+{
+    if !limiter.is_active() {
+        stream.write_all(data).await.map_err(|e| Error::Http(format!("body write failed: {e}")))?;
+        return Ok(());
+    }
+
+    let mut offset = 0;
+    while offset < data.len() {
+        let end = (offset + THROTTLE_CHUNK_SIZE).min(data.len());
+        let chunk = &data[offset..end];
+        stream
+            .write_all(chunk)
+            .await
+            .map_err(|e| Error::Http(format!("body write failed: {e}")))?;
+        limiter.record(chunk.len()).await?;
+        offset = end;
+    }
+    Ok(())
+}
+
 /// Read exactly `content_length` bytes of body, using any already-read prefix.
+///
+/// When a rate limiter is active, reads in chunks with throttling.
 async fn read_exact_body<S>(
     stream: &mut S,
     content_length: usize,
     prefix: Vec<u8>,
+    limiter: &mut RateLimiter,
 ) -> Result<Vec<u8>, Error>
 where
     S: AsyncRead + Unpin,
@@ -385,28 +419,56 @@ where
 
     if body.len() >= content_length {
         body.truncate(content_length);
+        if limiter.is_active() {
+            limiter.record(content_length).await?;
+        }
         return Ok(body);
     }
 
-    let remaining = content_length - body.len();
-    let mut remaining_buf = vec![0u8; remaining];
-    let _n = stream
-        .read_exact(&mut remaining_buf)
-        .await
-        .map_err(|e| Error::Http(format!("body read failed: {e}")))?;
-    body.extend_from_slice(&remaining_buf);
+    if !limiter.is_active() {
+        // Fast path: read all remaining bytes at once
+        let remaining = content_length - body.len();
+        let mut remaining_buf = vec![0u8; remaining];
+        let _n = stream
+            .read_exact(&mut remaining_buf)
+            .await
+            .map_err(|e| Error::Http(format!("body read failed: {e}")))?;
+        body.extend_from_slice(&remaining_buf);
+        return Ok(body);
+    }
+
+    // Throttled path: read in chunks
+    // Account for prefix bytes already received
+    if !body.is_empty() {
+        limiter.record(body.len()).await?;
+    }
+
+    while body.len() < content_length {
+        let remaining = content_length - body.len();
+        let chunk_size = remaining.min(THROTTLE_CHUNK_SIZE);
+        let mut chunk_buf = vec![0u8; chunk_size];
+        let _n = stream
+            .read_exact(&mut chunk_buf)
+            .await
+            .map_err(|e| Error::Http(format!("body read failed: {e}")))?;
+        body.extend_from_slice(&chunk_buf);
+        limiter.record(chunk_size).await?;
+    }
+
     Ok(body)
 }
 
 /// Read the response body based on headers (Content-Length, chunked, or EOF).
 ///
 /// Returns the body bytes, whether the body was read to EOF, and any trailer headers.
+#[allow(clippy::large_futures)]
 async fn read_body_from_headers<S>(
     stream: &mut S,
     headers: &HashMap<String, String>,
     body_prefix: Vec<u8>,
     keep_alive: bool,
     ignore_content_length: bool,
+    limiter: &mut RateLimiter,
 ) -> Result<(Vec<u8>, bool, HashMap<String, String>), Error>
 where
     S: AsyncRead + Unpin,
@@ -415,35 +477,73 @@ where
         headers.get("transfer-encoding").is_some_and(|te| te.eq_ignore_ascii_case("chunked"));
 
     if is_chunked {
-        let (body, trailers) = read_chunked_body_streaming(stream, body_prefix).await?;
+        let (body, trailers) = read_chunked_body_streaming(stream, body_prefix, limiter).await?;
         Ok((body, false, trailers))
     } else if !ignore_content_length && headers.contains_key("content-length") {
         let cl = &headers["content-length"];
         let content_length: usize =
             cl.parse().map_err(|e| Error::Http(format!("invalid Content-Length: {e}")))?;
-        let body = read_exact_body(stream, content_length, body_prefix).await?;
+        let body = read_exact_body(stream, content_length, body_prefix, limiter).await?;
         Ok((body, false, HashMap::new()))
     } else if keep_alive && !ignore_content_length {
         // No Content-Length, no chunked, but keep-alive → assume empty body
         Ok((body_prefix, false, HashMap::new()))
     } else {
         // No Content-Length (or ignoring it), connection close → read until EOF
-        let mut body = body_prefix;
+        let body = read_to_eof_throttled(stream, body_prefix, limiter).await?;
+        Ok((body, true, HashMap::new()))
+    }
+}
+
+/// Read until EOF with optional throttling.
+async fn read_to_eof_throttled<S>(
+    stream: &mut S,
+    prefix: Vec<u8>,
+    limiter: &mut RateLimiter,
+) -> Result<Vec<u8>, Error>
+where
+    S: AsyncRead + Unpin,
+{
+    if !limiter.is_active() {
+        // Fast path: read all at once
+        let mut body = prefix;
         match stream.read_to_end(&mut body).await {
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof && !body.is_empty() => {}
             Err(e) => return Err(Error::Http(format!("read failed: {e}"))),
         }
-        Ok((body, true, HashMap::new()))
+        return Ok(body);
     }
+
+    // Throttled path: read in chunks
+    let mut body = prefix;
+    if !body.is_empty() {
+        limiter.record(body.len()).await?;
+    }
+
+    let mut buf = [0u8; THROTTLE_CHUNK_SIZE];
+    loop {
+        match stream.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(n) => {
+                body.extend_from_slice(&buf[..n]);
+                limiter.record(n).await?;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof && !body.is_empty() => break,
+            Err(e) => return Err(Error::Http(format!("read failed: {e}"))),
+        }
+    }
+    Ok(body)
 }
 
 /// Read a chunked transfer-encoded body incrementally from a stream.
 ///
-/// Returns the decoded body and any trailer headers.
+/// Returns the decoded body and any trailer headers. Applies rate
+/// limiting after each decoded chunk.
 async fn read_chunked_body_streaming<S>(
     stream: &mut S,
     prefix: Vec<u8>,
+    limiter: &mut RateLimiter,
 ) -> Result<(Vec<u8>, HashMap<String, String>), Error>
 where
     S: AsyncRead + Unpin,
@@ -530,6 +630,11 @@ where
 
         decoded.extend_from_slice(&buf[pos..pos + chunk_size]);
         pos += chunk_size + 2;
+
+        // Apply rate limiting after each decoded chunk
+        if limiter.is_active() {
+            limiter.record(chunk_size).await?;
+        }
     }
 }
 
@@ -661,7 +766,7 @@ pub fn parse_response(data: &[u8], effective_url: &str, is_head: bool) -> Result
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::large_futures)]
 mod tests {
     use super::*;
 
@@ -820,6 +925,7 @@ mod tests {
             false,
             None,
             false,
+            &SpeedLimits::default(),
         )
         .await
         .unwrap();
@@ -860,6 +966,7 @@ mod tests {
             false,
             None,
             false,
+            &SpeedLimits::default(),
         )
         .await
         .unwrap();
@@ -904,6 +1011,7 @@ mod tests {
             false,
             None,
             false,
+            &SpeedLimits::default(),
         )
         .await
         .unwrap();
@@ -943,6 +1051,7 @@ mod tests {
             false,
             None,
             false,
+            &SpeedLimits::default(),
         )
         .await
         .unwrap();
@@ -983,6 +1092,7 @@ mod tests {
             false,
             None,
             false,
+            &SpeedLimits::default(),
         )
         .await
         .unwrap();
@@ -1024,6 +1134,7 @@ mod tests {
             true, // use_http10
             None,
             false,
+            &SpeedLimits::default(),
         )
         .await
         .unwrap();
@@ -1076,6 +1187,7 @@ mod tests {
             false,
             Some(Duration::from_secs(5)),
             false,
+            &SpeedLimits::default(),
         )
         .await
         .unwrap();
@@ -1114,6 +1226,7 @@ mod tests {
             false,
             Some(Duration::from_secs(5)),
             false,
+            &SpeedLimits::default(),
         )
         .await
         .unwrap();
@@ -1157,6 +1270,7 @@ mod tests {
             false,
             None,
             false,
+            &SpeedLimits::default(),
         )
         .await
         .unwrap();
@@ -1203,6 +1317,7 @@ mod tests {
             false,
             None,
             false,
+            &SpeedLimits::default(),
         )
         .await
         .unwrap();
@@ -1247,6 +1362,7 @@ mod tests {
             false,
             None,
             false,
+            &SpeedLimits::default(),
         )
         .await
         .unwrap();
@@ -1283,6 +1399,7 @@ mod tests {
             false,
             None,
             true, // ignore_content_length
+            &SpeedLimits::default(),
         )
         .await
         .unwrap();
@@ -1325,6 +1442,7 @@ mod tests {
             false,
             None,
             false,
+            &SpeedLimits::default(),
         )
         .await
         .unwrap();
@@ -1367,6 +1485,7 @@ mod tests {
             false,
             None,
             false,
+            &SpeedLimits::default(),
         )
         .await
         .unwrap();

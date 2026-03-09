@@ -23,6 +23,7 @@ pub mod progress;
 pub mod protocol;
 pub mod proxy;
 pub mod share;
+pub mod throttle;
 pub mod tls;
 pub mod url;
 
@@ -37,6 +38,7 @@ pub use progress::{make_progress_callback, ProgressCallback, ProgressInfo};
 pub use protocol::http::multipart::MultipartForm;
 pub use protocol::http::response::{Response, TransferInfo};
 pub use share::{Share, ShareType};
+pub use throttle::SpeedLimits;
 pub use tls::{TlsConfig, TlsVersion};
 pub use url::Url;
 
