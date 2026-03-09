@@ -14,14 +14,14 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 10 — Completeness Review + Curl Test Suite Porting
-**Last completed:** Phase 9 (Advanced Transfer Features + Cookie Persistence) — 2026-03-08
-**Total tests:** 1610+
-**In progress:** Planning Phase 10
+**Phase:** 11 — FFI Expansion: Timeout, Transfer & Connection Options
+**Last completed:** Phase 10 (Completeness Review) — 2026-03-08
+**Total tests:** 1,590+
+**In progress:** Planning Phase 11
 **Blockers:** None
-**Next up:** Comprehensive review, gap analysis, differential testing
+**Next up:** FFI option expansion, transfer-level rate limiting enforcement
 
-### Completeness Summary
+### Completeness Summary (updated Phase 10 review)
 
 | Feature Area | Parity | Notes |
 |---|---|---|
@@ -37,10 +37,10 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 | SSH/SFTP/SCP | 0% | Not implemented |
 | Multi API | 55% | Connection limiting, message queue, share interface, pipelining config; no poll/socket/timer callbacks |
 | FFI (libcurl C ABI) | ~18% | 37 options, 12 info codes, 25 error codes, multi API, slist, duphandle |
-| CLI | ~22% | ~68 of ~250 flags |
+| CLI | ~24% | ~72 of ~250 flags |
 | Connection | 80% | Pool, TCP_NODELAY, keepalive, Unix sockets, interface/port binding |
 | Transfer control | 40% | Rate limiting, speed enforcement API; not wired into transfer engine yet |
-| Overall | ~52% | ~90% for basic HTTP/HTTPS use cases |
+| Overall | ~53% | ~90% for basic HTTP/HTTPS use cases |
 
 ---
 
@@ -332,30 +332,132 @@ Cookie persistence (Netscape format read/write, `-b <file>` import, `-c/--cookie
 
 ---
 
-### Phase 10: Completeness Review + Curl Test Suite Porting
+### Phase 10: Completeness Review — COMPLETED (2026-03-08)
 
-**Goal:** Full codebase audit and differential testing against real curl.
+Comprehensive codebase audit against libcurl. Key findings:
+- **Rust API:** 41 Easy methods, 14 Multi methods — 73-74% coverage of top-used libcurl API surface
+- **FFI:** 37 CURLOPT options (35% of top 100), 12 CURLINFO codes (22%), 25 CURLcode values (27%)
+- **CLI:** 56 flags (56% of top 100 curl flags). Added 4 high-priority missing flags: `-O/--remote-name`, `-e/--referer`, `-G/--get`, `--create-dirs`
+- **Tests:** 1,590+ across unit (370+), integration (1,108), FFI (48), CLI (105), fuzz (4)
+- **No TODO/FIXME/HACK comments** in codebase — clean technical debt
+- **Gaps:** Rate limiting not enforced in transfer engine; READFUNCTION callback missing; NTLM/Negotiate deferred; HTTP/3 not started; no streaming upload support
 
-**This is a mandatory review phase.** Every 10th phase (10, 20, 30, ...) is a comprehensive review of the entire codebase to assess what is still needed for a complete, robust drop-in replacement.
+Planned Phases 11-20 based on gap analysis (see below).
 
-**Review checklist:**
-- Audit every public API method against libcurl's documentation
-- Run urlx CLI against curl's Python HTTP test suite (`tests/http/test_*.py`)
-- Set up differential testing — run same operations with both urlx and real curl, compare outputs
-- Port curl's XML test data runner (start with HTTP-only: ~893 tests)
-- Measure FFI option coverage against libcurl.h
-- Profile performance against curl for common operations (GET, POST, download, upload)
-- Identify and document all remaining gaps in a gap-analysis report
-- Update the Completeness Summary table in Current Status
-- Plan the next 10 phases based on findings
+---
 
-**Curl test suite porting strategy:**
+### Phase 11: FFI Expansion — Timeout, Transfer & Connection Options
 
-1. **Python HTTP tests** (`curl/tests/http/test_*.py`): Rewrite as Rust integration tests. ~280 test functions covering HTTP, downloads, uploads, proxies, auth, TLS, WebSockets.
+**Goal:** Close low-hanging FFI gaps; enforce rate limiting in transfer engine.
 
-2. **XML test data** (`curl/tests/data/test1` through `test1918`): Build a test runner that parses curl's XML format, starts mock servers, runs equivalent urlx operations, verifies wire protocol matches.
+- Expose CURLOPT_TIMEOUT_MS, CURLOPT_CONNECTTIMEOUT_MS in FFI
+- Expose CURLOPT_MAX_SEND_SPEED_LARGE, CURLOPT_MAX_RECV_SPEED_LARGE in FFI
+- Enforce low_speed_limit/low_speed_time in transfer loop (currently stored but not used)
+- Add CURLOPT_FRESH_CONNECT, CURLOPT_FORBID_REUSE
+- Add CURLINFO_SIZE_UPLOAD, CURLINFO_SPEED_UPLOAD
+- Add `timeout_ms()`, `connect_timeout_ms()` methods to Easy
 
-3. **Differential testing**: For any test that passes with urlx, also run with real curl binary and compare outputs.
+---
+
+### Phase 12: TLS Session Management & Cipher Control
+
+**Goal:** Production-grade TLS configuration.
+
+- CURLOPT_SSL_CIPHER_LIST (cipher suite selection)
+- CURLOPT_SSL_SESSIONID_CACHE (session resumption)
+- CURLINFO_SSL_VERIFYRESULT, CURLINFO_CERTINFO
+- CURLOPT_CRLFILE (CRL checking)
+- TLS session ID reuse in ConnectionPool
+
+---
+
+### Phase 13: Proxy Enhancements — HTTPS Proxy & Auth
+
+**Goal:** Real-world proxy scenarios.
+
+- CURLOPT_HTTPS_PROXY (requires separate TLS to proxy)
+- CURLOPT_PROXYUSERPWD, CURLOPT_PROXYAUTH (Digest proxy auth)
+- CURLOPT_PROXY_SSLCERT, CURLOPT_PROXY_SSLKEY
+- NTLM auth skeleton (Type 1/2/3)
+
+---
+
+### Phase 14: Streaming Upload & Callback API
+
+**Goal:** Dynamic request/response handling.
+
+- CURLOPT_READFUNCTION + CURLOPT_READDATA (streaming upload)
+- CURLOPT_INFILESIZE_LARGE
+- CURLOPT_TRAILERFUNCTION (chunked trailer headers)
+- CURLOPT_DEBUGFUNCTION (wire protocol logging)
+
+---
+
+### Phase 15: DNS Hardening & DoH
+
+**Goal:** Modern DNS features.
+
+- CURLOPT_DNS_SERVERS, CURLOPT_DOH_URL
+- CURLOPT_DNS_CACHE_TIMEOUT
+- Async DNS resolver via hickory-dns (feature-gated)
+- CURLOPT_HAPPY_EYEBALLS_TIMEOUT_MS
+
+---
+
+### Phase 16: Connection Control & Header Management
+
+**Goal:** Fine-grained connection management.
+
+- CURLOPT_FRESH_CONNECT, CURLOPT_FORBID_REUSE
+- Header deduplication (prevent User-Agent/Content-Type duplicates)
+- CURLOPT_UNRESTRICTED_AUTH (auth on redirect)
+- CURLOPT_IGNORE_CONTENT_LENGTH
+
+---
+
+### Phase 17: HTTP/1.1 Edge Cases & Protocol Refinements
+
+**Goal:** HTTP/1.1 parity for edge cases.
+
+- Trailer header parsing + exposure in Response
+- HEAD request body skipping optimization
+- Content-Encoding vs Transfer-Encoding distinction
+- Redirect method downgrade verification
+
+---
+
+### Phase 18: HTTP/3 (QUIC) & Alt-Svc
+
+**Goal:** Next-generation HTTP.
+
+- Quinn-based QUIC transport (feature-gated `http3`)
+- Alt-Svc caching and persistence
+- HttpVersion::Http3 enum variant
+- 0-RTT early data
+
+---
+
+### Phase 19: CLI Expansion & Debug Tools
+
+**Goal:** Expand CLI towards curl parity.
+
+- `--trace`, `--trace-ascii`, `--trace-time` (wire debugging)
+- `-K/--config` (config file support)
+- `--libcurl` (output equivalent C code)
+- `--proto`, `--proto-redir` (protocol restriction)
+- `--max-filesize`, `--no-keepalive`
+
+---
+
+### Phase 20: Completeness Review + Curl Test Suite Porting
+
+**Goal:** Second mandatory review. Run differential tests against curl, port curl test cases.
+
+- Differential testing: run same operations with urlx and curl, compare outputs
+- Port curl's Python HTTP test suite subset (~50 representative tests)
+- FFI audit: target top 75 CURLOPT options coverage
+- Performance profiling: throughput comparison against curl
+- Plan Phases 21-30
 
 ---
 
