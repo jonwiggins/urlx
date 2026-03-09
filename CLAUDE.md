@@ -17,9 +17,9 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 **Phase:** 3 — DNS + Connection Infrastructure
 **Last completed:** Phase 2 (TLS hardening + authentication) — 2026-03-08
 **Total tests:** 1400+
-**In progress:** Planning Phase 3
+**In progress:** Phase 3 — DNS cache, TCP options, timing instrumentation done; Happy Eyeballs, Unix sockets, DoH remaining
 **Blockers:** None
-**Next up:** DNS caching, Happy Eyeballs, TCP options
+**Next up:** Happy Eyeballs (RFC 6555), Unix domain sockets, DNS-over-HTTPS
 
 ### Completeness Summary
 
@@ -32,7 +32,7 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 | Authentication | 50% | Basic, Bearer, Digest (MD5/SHA-256), AWS SigV4 |
 | Cookie engine | 75% | In-memory only, no persistence |
 | Proxy | 80% | HTTP + SOCKS + proxy auth; no HTTPS proxy or PAC |
-| DNS | 10% | Manual overrides only |
+| DNS | 25% | Manual overrides + in-memory cache with TTL |
 | FTP | 30% | Download only; no upload or FTPS |
 | SSH/SFTP/SCP | 0% | Not implemented |
 | Multi API | 30% | Simple concurrency; no event-driven model |
@@ -55,6 +55,9 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 - **2026-03-08:** AWS SigV4 uses inline HMAC-SHA256 implementation (~20 lines) rather than adding the `hmac` crate, since it's the only HMAC user. Same approach as WebSocket SHA-1.
 - **2026-03-08:** NTLM and Negotiate/SPNEGO auth deferred from Phase 2 — they are complex, platform-specific, and rarely needed. Can be added later if demanded.
 - **2026-03-08:** Cipher suite selection deferred from Phase 2 — rustls defaults are secure and appropriate. The `CryptoProvider` API exists for future use if needed.
+- **2026-03-08:** Migrated from `rustls-pemfile` (RUSTSEC-2025-0134, unmaintained) to `rustls-pki-types` `PemObject` trait for PEM parsing. The `rustls-pki-types` API is the maintained replacement.
+- **2026-03-08:** TCP_NODELAY defaults to `true` (matching curl behavior). TCP keepalive uses `socket2` crate (already in dependency tree via tokio) for cross-platform `SO_KEEPALIVE` + `TCP_KEEPIDLE`.
+- **2026-03-08:** TransferInfo timing instrumentation captures `time_namelookup` = `time_connect` since `TcpStream::connect` does DNS+TCP together. Separate DNS timing requires pre-resolving with a standalone DNS resolver.
 
 ---
 
@@ -243,25 +246,24 @@ TLS configuration and authentication mechanisms:
 
 **Goal:** Intelligent DNS resolution and robust connection setup.
 
-**DNS:**
-- DNS caching with TTL-based expiry
-- Async DNS resolver via hickory-dns (feature-gated)
-- Happy Eyeballs (RFC 6555) — race IPv4/IPv6 connections
-- DNS-over-HTTPS (DoH) — `CURLOPT_DOH_URL`
-- DNS shuffle (randomize resolver results)
+**Completed:**
+- DNS cache module (`dns.rs`) with TTL-based expiry (default 60s), case-insensitive lookup, purge
+- `TCP_NODELAY` socket option (enabled by default, matching curl) via `Easy::tcp_nodelay()`
+- TCP keepalive configuration via socket2 — `Easy::tcp_keepalive()`
+- TransferInfo expanded with all timing fields: `time_namelookup`, `time_connect`, `time_appconnect`, `time_pretransfer`, `time_starttransfer`, `speed_download`, `speed_upload`, `size_upload`
+- Per-phase timing instrumentation in `do_single_request` (DNS, TCP, TLS, request, response)
+- CLI `--write-out` variables for all new timing fields
+- Migrated PEM parsing from unmaintained `rustls-pemfile` to `rustls-pki-types`
 
-**Connection:**
-- TCP keepalive socket option — `CURLOPT_TCP_KEEPALIVE`, `CURLOPT_TCP_KEEPIDLE`
-- TCP_NODELAY — `CURLOPT_TCP_NODELAY`
+**Remaining:**
+- Happy Eyeballs (RFC 6555) — race IPv4/IPv6 connections
 - Unix domain socket connections — `CURLOPT_UNIX_SOCKET_PATH`
 - Abstract Unix sockets — `CURLOPT_ABSTRACT_UNIX_SOCKET`
 - Local interface/port binding — `CURLOPT_INTERFACE`, `CURLOPT_LOCALPORT`
-- Connection timeout per-phase timing (DNS, connect, TLS, first byte)
-
-**TransferInfo expansion:**
-- time_namelookup, time_connect, time_appconnect, time_starttransfer, time_pretransfer
-- speed_download, speed_upload, size_upload
-- CLI `--write-out` variables for all new timing fields
+- Async DNS resolver via hickory-dns (feature-gated)
+- DNS-over-HTTPS (DoH) — `CURLOPT_DOH_URL`
+- DNS shuffle (randomize resolver results)
+- Wire DNS cache into the transfer pipeline (currently standalone)
 
 ---
 
