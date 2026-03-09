@@ -29,7 +29,7 @@ pub mod url;
 pub use auth::{AuthCredentials, AuthMethod};
 pub use cookie::CookieJar;
 pub use dns::DnsCache;
-pub use easy::Easy;
+pub use easy::{Easy, HttpVersion};
 pub use error::Error;
 pub use hsts::HstsCache;
 pub use multi::{Multi, PipeliningMode};

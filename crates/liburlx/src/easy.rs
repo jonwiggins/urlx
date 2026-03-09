@@ -18,6 +18,24 @@ use crate::protocol::http::response::Response;
 use crate::tls::TlsConfig;
 use crate::url::Url;
 
+/// HTTP version selection.
+///
+/// Controls which HTTP version is used for requests.
+/// Equivalent to `CURLOPT_HTTP_VERSION`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HttpVersion {
+    /// Let the library choose the best version (default).
+    /// Uses HTTP/2 via ALPN if available, otherwise HTTP/1.1.
+    #[default]
+    None,
+    /// Force HTTP/1.0 requests.
+    Http10,
+    /// Force HTTP/1.1 requests (no HTTP/2 upgrade).
+    Http11,
+    /// Prefer HTTP/2 via ALPN (fallback to HTTP/1.1 if not negotiated).
+    Http2,
+}
+
 /// A handle for performing a single URL transfer.
 ///
 /// This is the main entry point for the liburlx API, modeled after
@@ -56,6 +74,8 @@ pub struct Easy {
     dns_cache: DnsCache,
     pool: ConnectionPool,
     share: Option<crate::share::Share>,
+    http_version: HttpVersion,
+    expect_100_timeout: Option<Duration>,
 }
 
 impl std::fmt::Debug for Easy {
@@ -93,6 +113,8 @@ impl std::fmt::Debug for Easy {
             .field("dns_cache", &self.dns_cache)
             .field("pool", &"<ConnectionPool>")
             .field("share", &self.share)
+            .field("http_version", &self.http_version)
+            .field("expect_100_timeout", &self.expect_100_timeout)
             .finish()
     }
 }
@@ -132,6 +154,8 @@ impl Clone for Easy {
             dns_cache: DnsCache::new(),
             pool: ConnectionPool::new(),
             share: self.share.clone(),
+            http_version: self.http_version,
+            expect_100_timeout: self.expect_100_timeout,
         }
     }
 }
@@ -173,6 +197,8 @@ impl Easy {
             dns_cache: DnsCache::new(),
             pool: ConnectionPool::new(),
             share: None,
+            http_version: HttpVersion::None,
+            expect_100_timeout: None,
         }
     }
 
@@ -551,6 +577,31 @@ impl Easy {
         self.share = Some(share);
     }
 
+    /// Set the preferred HTTP version.
+    ///
+    /// Controls which HTTP protocol version to use for requests.
+    /// - [`HttpVersion::None`] (default): auto-select (HTTP/2 via ALPN if available)
+    /// - [`HttpVersion::Http10`]: force HTTP/1.0
+    /// - [`HttpVersion::Http11`]: force HTTP/1.1 (skip HTTP/2 ALPN)
+    /// - [`HttpVersion::Http2`]: prefer HTTP/2 (same as default for HTTPS)
+    ///
+    /// Equivalent to `CURLOPT_HTTP_VERSION`.
+    pub fn http_version(&mut self, version: HttpVersion) {
+        self.http_version = version;
+    }
+
+    /// Set the Expect: 100-continue timeout.
+    ///
+    /// When set, POST/PUT requests with a body will send an
+    /// `Expect: 100-continue` header and wait up to this duration for
+    /// a `100 Continue` response before sending the body. If the server
+    /// responds with an error status, the body is not sent.
+    ///
+    /// Equivalent to `CURLOPT_EXPECT_100_TIMEOUT_MS`.
+    pub fn expect_100_timeout(&mut self, timeout: Duration) {
+        self.expect_100_timeout = Some(timeout);
+    }
+
     /// Perform the transfer and return the response (blocking).
     ///
     /// Creates a new tokio runtime internally. Do not call from within
@@ -697,6 +748,8 @@ impl Easy {
             self.dns_shuffle,
             &mut self.dns_cache,
             &mut self.pool,
+            self.http_version,
+            self.expect_100_timeout,
         );
 
         // Apply total transfer timeout if set
@@ -783,6 +836,8 @@ async fn perform_transfer(
     dns_shuffle: bool,
     dns_cache: &mut DnsCache,
     pool: &mut ConnectionPool,
+    http_version: HttpVersion,
+    expect_100_timeout: Option<Duration>,
 ) -> Result<Response, Error> {
     let transfer_start = Instant::now();
     let mut current_url = url.clone();
@@ -827,6 +882,8 @@ async fn perform_transfer(
             dns_shuffle,
             dns_cache,
             pool,
+            http_version,
+            expect_100_timeout,
         )
         .await?;
 
@@ -880,6 +937,8 @@ async fn perform_transfer(
                                 dns_shuffle,
                                 dns_cache,
                                 pool,
+                                http_version,
+                                expect_100_timeout,
                             )
                             .await?;
                         }
@@ -987,6 +1046,8 @@ async fn do_single_request(
     dns_shuffle: bool,
     dns_cache: &mut DnsCache,
     pool: &mut ConnectionPool,
+    http_version: HttpVersion,
+    expect_100_timeout: Option<Duration>,
 ) -> Result<Response, Error> {
     // Handle non-HTTP schemes directly
     match url.scheme() {
@@ -1027,6 +1088,7 @@ async fn do_single_request(
             }
 
             let request_target = url.request_target();
+            let use_http10 = http_version == HttpVersion::Http10;
             let result = crate::protocol::http::h1::request(
                 &mut stream,
                 method,
@@ -1036,6 +1098,8 @@ async fn do_single_request(
                 body,
                 url.as_str(),
                 true,
+                use_http10,
+                expect_100_timeout,
             )
             .await;
 
@@ -1106,6 +1170,7 @@ async fn do_single_request(
         let time_pretransfer = request_start.elapsed();
 
         let request_target = url.request_target();
+        let use_http10 = http_version == HttpVersion::Http10;
         let mut stream = PooledStream::Unix(uds_stream);
         let (resp, _can_reuse) = crate::protocol::http::h1::request(
             &mut stream,
@@ -1116,6 +1181,8 @@ async fn do_single_request(
             body,
             url.as_str(),
             false, // Don't pool Unix socket connections
+            use_http10,
+            expect_100_timeout,
         )
         .await?;
         let time_starttransfer = request_start.elapsed();
@@ -1247,8 +1314,10 @@ async fn do_single_request(
 
                 let request_target = url.request_target();
 
+                // Use HTTP/2 if ALPN negotiated it, unless user forced HTTP/1.x
+                let allow_h2 = !matches!(http_version, HttpVersion::Http10 | HttpVersion::Http11);
                 #[cfg(feature = "http2")]
-                if alpn == crate::tls::AlpnProtocol::H2 {
+                if allow_h2 && alpn == crate::tls::AlpnProtocol::H2 {
                     if verbose {
                         #[allow(clippy::print_stderr)]
                         {
@@ -1278,7 +1347,8 @@ async fn do_single_request(
                     return Ok(resp);
                 }
 
-                // HTTP/1.1 over TLS
+                // HTTP/1.x over TLS
+                let use_http10 = http_version == HttpVersion::Http10;
                 let time_pretransfer = request_start.elapsed();
                 let mut stream = PooledStream::Tls(tls_stream);
                 let (resp, can_reuse) = crate::protocol::http::h1::request(
@@ -1290,6 +1360,8 @@ async fn do_single_request(
                     body,
                     url.as_str(),
                     use_pool,
+                    use_http10,
+                    expect_100_timeout,
                 )
                 .await?;
                 let time_starttransfer = request_start.elapsed();
@@ -1321,6 +1393,7 @@ async fn do_single_request(
                 url.request_target()
             };
 
+            let use_http10 = http_version == HttpVersion::Http10;
             let time_pretransfer = request_start.elapsed();
             let mut stream = PooledStream::Tcp(tcp_stream);
             let (resp, can_reuse) = crate::protocol::http::h1::request(
@@ -1332,6 +1405,8 @@ async fn do_single_request(
                 body,
                 url.as_str(),
                 use_pool,
+                use_http10,
+                expect_100_timeout,
             )
             .await?;
             let time_starttransfer = request_start.elapsed();
@@ -2169,5 +2244,42 @@ mod tests {
         // Bind to loopback interface
         let result = connect_with_bind(addr, Some("127.0.0.1"), None, None).await;
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn http_version_default_is_none() {
+        let easy = Easy::new();
+        assert_eq!(easy.http_version, HttpVersion::None);
+    }
+
+    #[test]
+    fn easy_set_http_version() {
+        let mut easy = Easy::new();
+        easy.http_version(HttpVersion::Http10);
+        assert_eq!(easy.http_version, HttpVersion::Http10);
+    }
+
+    #[test]
+    fn easy_set_http_version_h2() {
+        let mut easy = Easy::new();
+        easy.http_version(HttpVersion::Http2);
+        assert_eq!(easy.http_version, HttpVersion::Http2);
+    }
+
+    #[test]
+    fn easy_set_expect_100_timeout() {
+        let mut easy = Easy::new();
+        easy.expect_100_timeout(Duration::from_millis(500));
+        assert_eq!(easy.expect_100_timeout, Some(Duration::from_millis(500)));
+    }
+
+    #[test]
+    fn http_version_clone() {
+        let mut easy = Easy::new();
+        easy.http_version(HttpVersion::Http11);
+        easy.expect_100_timeout(Duration::from_secs(2));
+        let cloned = easy.clone();
+        assert_eq!(cloned.http_version, HttpVersion::Http11);
+        assert_eq!(cloned.expect_100_timeout, Some(Duration::from_secs(2)));
     }
 }

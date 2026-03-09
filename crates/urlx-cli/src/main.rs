@@ -84,7 +84,10 @@ fn print_usage() {
     eprintln!("      --data-binary <data>  POST binary data (use @filename)");
     eprintln!("      --data-urlencode <d>  POST URL-encoded data");
     eprintln!("      --resolve <h:p:a>     Resolve host:port to address");
+    eprintln!("      --http1.0             Use HTTP/1.0");
+    eprintln!("      --http1.1             Use HTTP/1.1");
     eprintln!("      --http2               Request HTTP/2");
+    eprintln!("      --expect100-timeout <ms>  Expect: 100-continue timeout (milliseconds)");
     eprintln!("      --retry <num>         Retry on transient errors");
     eprintln!("      --retry-delay <s>     Wait between retries (seconds)");
     eprintln!("      --retry-max-time <s>  Maximum total retry time (seconds)");
@@ -449,8 +452,24 @@ fn parse_args(args: &[String]) -> Option<CliOptions> {
                     return None;
                 }
             }
+            "--http1.0" => {
+                opts.easy.http_version(liburlx::HttpVersion::Http10);
+            }
+            "--http1.1" => {
+                opts.easy.http_version(liburlx::HttpVersion::Http11);
+            }
             "--http2" => {
-                // HTTP/2 is auto-negotiated via ALPN; this flag is accepted for compat
+                opts.easy.http_version(liburlx::HttpVersion::Http2);
+            }
+            "--expect100-timeout" => {
+                i += 1;
+                let val = require_arg(args, i, "--expect100-timeout")?;
+                if let Ok(ms) = val.parse::<u64>() {
+                    opts.easy.expect_100_timeout(std::time::Duration::from_millis(ms));
+                } else {
+                    eprintln!("urlx: invalid expect100-timeout value: {val}");
+                    return None;
+                }
             }
             "--retry" => {
                 i += 1;
@@ -1569,10 +1588,47 @@ mod tests {
     }
 
     #[test]
+    fn parse_args_http10() {
+        let args = vec!["urlx".to_string(), "--http1.0".to_string(), "http://x.com".to_string()];
+        let opts = parse_args(&args);
+        assert!(opts.is_some());
+    }
+
+    #[test]
+    fn parse_args_http11() {
+        let args = vec!["urlx".to_string(), "--http1.1".to_string(), "http://x.com".to_string()];
+        let opts = parse_args(&args);
+        assert!(opts.is_some());
+    }
+
+    #[test]
     fn parse_args_http2() {
         let args = vec!["urlx".to_string(), "--http2".to_string(), "http://x.com".to_string()];
         let opts = parse_args(&args);
         assert!(opts.is_some());
+    }
+
+    #[test]
+    fn parse_args_expect100_timeout() {
+        let args = vec![
+            "urlx".to_string(),
+            "--expect100-timeout".to_string(),
+            "1000".to_string(),
+            "http://x.com".to_string(),
+        ];
+        let opts = parse_args(&args);
+        assert!(opts.is_some());
+    }
+
+    #[test]
+    fn parse_args_expect100_timeout_invalid() {
+        let args = vec![
+            "urlx".to_string(),
+            "--expect100-timeout".to_string(),
+            "abc".to_string(),
+            "http://x.com".to_string(),
+        ];
+        assert!(parse_args(&args).is_none());
     }
 
     #[test]

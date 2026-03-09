@@ -1,12 +1,16 @@
-//! HTTP/1.1 request/response codec.
+//! HTTP/1.x request/response codec.
 //!
-//! Constructs HTTP/1.1 requests, sends them over a stream, and parses responses.
-//! Supports both `Connection: close` and keep-alive modes. In keep-alive mode,
-//! the response body is read precisely using Content-Length or chunked encoding,
-//! leaving the stream ready for reuse.
+//! Constructs HTTP/1.0 and HTTP/1.1 requests, sends them over a stream,
+//! and parses responses. Supports both `Connection: close` and keep-alive
+//! modes. In keep-alive mode, the response body is read precisely using
+//! Content-Length or chunked encoding, leaving the stream ready for reuse.
+//!
+//! Supports `Expect: 100-continue` for delaying body transmission until
+//! the server confirms readiness.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
+use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -16,11 +20,18 @@ use crate::protocol::http::response::Response;
 /// Maximum response header size (64 KB, same as curl's default).
 const MAX_HEADER_SIZE: usize = 64 * 1024;
 
-/// Send an HTTP/1.1 request and read the response.
+/// Send an HTTP/1.x request and read the response.
 ///
 /// When `keep_alive` is true, the request omits `Connection: close` and
 /// reads the response body precisely (using Content-Length or chunked
 /// encoding), leaving the stream ready for reuse.
+///
+/// If `use_http10` is true, the request line uses `HTTP/1.0` instead of
+/// `HTTP/1.1`. HTTP/1.0 connections are not kept alive.
+///
+/// If `expect_100_timeout` is set and the request has a body, the
+/// `Expect: 100-continue` header is sent. The client waits up to the
+/// timeout for a `100 Continue` before sending the body.
 ///
 /// Returns the response and a boolean indicating whether the connection
 /// can be reused.
@@ -38,12 +49,15 @@ pub async fn request<S>(
     body: Option<&[u8]>,
     url: &str,
     keep_alive: bool,
+    use_http10: bool,
+    expect_100_timeout: Option<Duration>,
 ) -> Result<(Response, bool), Error>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    let http_ver = if use_http10 { "HTTP/1.0" } else { "HTTP/1.1" };
     // Build the request line
-    let mut req = format!("{method} {request_target} HTTP/1.1\r\nHost: {host}\r\n");
+    let mut req = format!("{method} {request_target} {http_ver}\r\nHost: {host}\r\n");
 
     // Add default headers if not overridden
     let has_user_agent = custom_headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("user-agent"));
@@ -62,12 +76,16 @@ where
     }
 
     // Add Content-Length for bodies
+    let use_expect = expect_100_timeout.is_some() && body.is_some_and(|b| !b.is_empty());
     if let Some(body_data) = body {
         let _ = write!(req, "Content-Length: {}\r\n", body_data.len());
     }
+    if use_expect {
+        req.push_str("Expect: 100-continue\r\n");
+    }
 
-    // Connection management
-    if !keep_alive {
+    // Connection management — HTTP/1.0 always closes
+    if !keep_alive || use_http10 {
         req.push_str("Connection: close\r\n");
     }
 
@@ -79,62 +97,102 @@ where
         .await
         .map_err(|e| Error::Http(format!("write failed: {e}")))?;
 
-    // Send body if present
-    if let Some(body_data) = body {
-        stream
-            .write_all(body_data)
-            .await
-            .map_err(|e| Error::Http(format!("body write failed: {e}")))?;
+    // Handle Expect: 100-continue
+    if use_expect {
+        stream.flush().await.map_err(|e| Error::Http(format!("flush failed: {e}")))?;
+
+        let timeout_dur = expect_100_timeout.unwrap_or(Duration::from_secs(1));
+        match tokio::time::timeout(timeout_dur, read_response_headers(stream)).await {
+            Ok(Ok((header_bytes, body_prefix))) => {
+                let (status, _headers) = parse_headers(&header_bytes)?;
+                if status == 100 {
+                    // Server said continue — send body
+                    if let Some(body_data) = body {
+                        stream
+                            .write_all(body_data)
+                            .await
+                            .map_err(|e| Error::Http(format!("body write failed: {e}")))?;
+                    }
+                } else {
+                    // Server responded with final status — don't send body
+                    // Re-parse the full response from what we already have
+                    let (final_status, final_headers) = parse_headers(&header_bytes)?;
+                    let is_head = method.eq_ignore_ascii_case("HEAD");
+                    let no_body = is_head
+                        || final_status == 204
+                        || final_status == 304
+                        || (100..200).contains(&final_status);
+                    let (response_body, body_read_to_eof) = if no_body {
+                        (Vec::new(), false)
+                    } else {
+                        read_body_from_headers(stream, &final_headers, body_prefix, keep_alive)
+                            .await?
+                    };
+                    let server_wants_close = final_headers
+                        .get("connection")
+                        .is_some_and(|v| v.eq_ignore_ascii_case("close"));
+                    let can_reuse =
+                        keep_alive && !use_http10 && !server_wants_close && !body_read_to_eof;
+                    return Ok((
+                        Response::new(final_status, final_headers, response_body, url.to_string()),
+                        can_reuse,
+                    ));
+                }
+            }
+            Err(_) => {
+                // Timeout waiting for 100 Continue — send body anyway (curl behavior)
+                if let Some(body_data) = body {
+                    stream
+                        .write_all(body_data)
+                        .await
+                        .map_err(|e| Error::Http(format!("body write failed: {e}")))?;
+                }
+            }
+            Ok(Err(e)) => return Err(e),
+        }
+    } else {
+        // No 100-continue — send body immediately
+        if let Some(body_data) = body {
+            stream
+                .write_all(body_data)
+                .await
+                .map_err(|e| Error::Http(format!("body write failed: {e}")))?;
+        }
     }
 
     stream.flush().await.map_err(|e| Error::Http(format!("flush failed: {e}")))?;
 
     let is_head = method.eq_ignore_ascii_case("HEAD");
 
-    // Read response headers incrementally
-    let (header_bytes, body_prefix) = read_response_headers(stream).await?;
+    // Read response headers, skipping 1xx informational responses
+    let (mut header_bytes, mut body_prefix) = read_response_headers(stream).await?;
+    let (mut status, mut headers) = parse_headers(&header_bytes)?;
 
-    // Parse response headers
-    let (status, headers) = parse_headers(&header_bytes)?;
+    // Skip 1xx informational responses (100 Continue, 103 Early Hints, etc.)
+    while (100..200).contains(&status) {
+        // The body_prefix may contain the start of the next response
+        let next = read_response_headers_with_prefix(stream, body_prefix).await?;
+        header_bytes = next.0;
+        body_prefix = next.1;
+        let parsed = parse_headers(&header_bytes)?;
+        status = parsed.0;
+        headers = parsed.1;
+    }
 
-    // 1xx, 204, and 304 responses have no body per HTTP spec
-    let no_body = is_head || status == 204 || status == 304 || (100..200).contains(&status);
+    // 204 and 304 responses have no body per HTTP spec
+    let no_body = is_head || status == 204 || status == 304;
 
     // Read body
     let (response_body, body_read_to_eof) = if no_body {
         (Vec::new(), false)
     } else {
-        let is_chunked =
-            headers.get("transfer-encoding").is_some_and(|te| te.eq_ignore_ascii_case("chunked"));
-
-        if is_chunked {
-            let body = read_chunked_body_streaming(stream, body_prefix).await?;
-            (body, false)
-        } else if let Some(cl) = headers.get("content-length") {
-            let content_length: usize =
-                cl.parse().map_err(|e| Error::Http(format!("invalid Content-Length: {e}")))?;
-            let body = read_exact_body(stream, content_length, body_prefix).await?;
-            (body, false)
-        } else if keep_alive {
-            // No Content-Length, no chunked, but keep-alive → assume empty body
-            // (reading to EOF would hang since the server keeps the connection open)
-            (body_prefix, false)
-        } else {
-            // No Content-Length, no chunked, connection close → read until EOF
-            let mut body = body_prefix;
-            match stream.read_to_end(&mut body).await {
-                Ok(_) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof && !body.is_empty() => {}
-                Err(e) => return Err(Error::Http(format!("read failed: {e}"))),
-            }
-            (body, true)
-        }
+        read_body_from_headers(stream, &headers, body_prefix, keep_alive && !use_http10).await?
     };
 
     // Determine if connection can be reused
     let server_wants_close =
         headers.get("connection").is_some_and(|v| v.eq_ignore_ascii_case("close"));
-    let can_reuse = keep_alive && !server_wants_close && !body_read_to_eof;
+    let can_reuse = keep_alive && !use_http10 && !server_wants_close && !body_read_to_eof;
 
     Ok((Response::new(status, headers, response_body, url.to_string()), can_reuse))
 }
@@ -164,6 +222,57 @@ where
         buf.extend_from_slice(&tmp[..n]);
 
         // Check for end of headers
+        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            let header_end = pos + 4;
+            let body_prefix = buf[header_end..].to_vec();
+            buf.truncate(header_end);
+            return Ok((buf, body_prefix));
+        }
+
+        if buf.len() > MAX_HEADER_SIZE {
+            return Err(Error::Http(format!(
+                "response headers too large: {} bytes (max {MAX_HEADER_SIZE})",
+                buf.len()
+            )));
+        }
+    }
+}
+
+/// Read response headers with an initial prefix buffer.
+///
+/// Like [`read_response_headers`] but starts with existing data in the buffer
+/// (e.g., leftover from a previous 1xx response).
+async fn read_response_headers_with_prefix<S>(
+    stream: &mut S,
+    prefix: Vec<u8>,
+) -> Result<(Vec<u8>, Vec<u8>), Error>
+where
+    S: AsyncRead + Unpin,
+{
+    let mut buf = prefix;
+    let mut tmp = [0u8; 4096];
+
+    // Check if headers are already complete in the prefix
+    if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+        let header_end = pos + 4;
+        let body_prefix = buf[header_end..].to_vec();
+        buf.truncate(header_end);
+        return Ok((buf, body_prefix));
+    }
+
+    loop {
+        let n =
+            stream.read(&mut tmp).await.map_err(|e| Error::Http(format!("read failed: {e}")))?;
+
+        if n == 0 {
+            if buf.is_empty() {
+                return Err(Error::Http("empty response (connection closed)".to_string()));
+            }
+            return Err(Error::Http("incomplete response headers".to_string()));
+        }
+
+        buf.extend_from_slice(&tmp[..n]);
+
         if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
             let header_end = pos + 4;
             let body_prefix = buf[header_end..].to_vec();
@@ -249,6 +358,44 @@ where
         .map_err(|e| Error::Http(format!("body read failed: {e}")))?;
     body.extend_from_slice(&remaining_buf);
     Ok(body)
+}
+
+/// Read the response body based on headers (Content-Length, chunked, or EOF).
+///
+/// Returns the body bytes and whether the body was read to EOF.
+async fn read_body_from_headers<S>(
+    stream: &mut S,
+    headers: &HashMap<String, String>,
+    body_prefix: Vec<u8>,
+    keep_alive: bool,
+) -> Result<(Vec<u8>, bool), Error>
+where
+    S: AsyncRead + Unpin,
+{
+    let is_chunked =
+        headers.get("transfer-encoding").is_some_and(|te| te.eq_ignore_ascii_case("chunked"));
+
+    if is_chunked {
+        let body = read_chunked_body_streaming(stream, body_prefix).await?;
+        Ok((body, false))
+    } else if let Some(cl) = headers.get("content-length") {
+        let content_length: usize =
+            cl.parse().map_err(|e| Error::Http(format!("invalid Content-Length: {e}")))?;
+        let body = read_exact_body(stream, content_length, body_prefix).await?;
+        Ok((body, false))
+    } else if keep_alive {
+        // No Content-Length, no chunked, but keep-alive → assume empty body
+        Ok((body_prefix, false))
+    } else {
+        // No Content-Length, no chunked, connection close → read until EOF
+        let mut body = body_prefix;
+        match stream.read_to_end(&mut body).await {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof && !body.is_empty() => {}
+            Err(e) => return Err(Error::Http(format!("read failed: {e}"))),
+        }
+        Ok((body, true))
+    }
 }
 
 /// Read a chunked transfer-encoded body incrementally from a stream.
@@ -609,6 +756,8 @@ mod tests {
             None,
             "http://example.com/test",
             false,
+            false,
+            None,
         )
         .await
         .unwrap();
@@ -646,6 +795,8 @@ mod tests {
             Some(b"hello request"),
             "http://example.com/submit",
             false,
+            false,
+            None,
         )
         .await
         .unwrap();
@@ -687,6 +838,8 @@ mod tests {
             None,
             "http://example.com/",
             false,
+            false,
+            None,
         )
         .await
         .unwrap();
@@ -723,6 +876,8 @@ mod tests {
             None,
             "http://example.com/test",
             true,
+            false,
+            None,
         )
         .await
         .unwrap();
@@ -760,6 +915,8 @@ mod tests {
             None,
             "http://example.com/test",
             true,
+            false,
+            None,
         )
         .await
         .unwrap();
@@ -767,6 +924,175 @@ mod tests {
         assert_eq!(resp.status(), 200);
         assert_eq!(resp.body_str().unwrap(), "hello");
         assert!(!can_reuse, "server said Connection: close");
+
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn request_http10_sends_correct_version() {
+        use tokio::io::duplex;
+
+        let (mut client, mut server) = duplex(4096);
+
+        let server_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 1024];
+            let n = server.read(&mut buf).await.unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]);
+            assert!(req.starts_with("GET /test HTTP/1.0\r\n"), "expected HTTP/1.0: {req}");
+            assert!(req.contains("Connection: close"), "HTTP/1.0 should have Connection: close");
+
+            let response = b"HTTP/1.0 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+            server.write_all(response).await.unwrap();
+            server.shutdown().await.unwrap();
+        });
+
+        let (resp, can_reuse) = request(
+            &mut client,
+            "GET",
+            "example.com",
+            "/test",
+            &[],
+            None,
+            "http://example.com/test",
+            true, // keep_alive requested
+            true, // use_http10
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.body_str().unwrap(), "hello");
+        assert!(!can_reuse, "HTTP/1.0 should not be reusable");
+
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn request_expect_100_continue() {
+        use tokio::io::duplex;
+
+        let (mut client, mut server) = duplex(4096);
+
+        let server_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 2048];
+            let n = server.read(&mut buf).await.unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]);
+            assert!(req.contains("Expect: 100-continue"), "should have Expect header");
+            assert!(!req.contains("hello body"), "body should not be sent before 100 Continue");
+
+            // Send 100 Continue
+            server.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await.unwrap();
+            server.flush().await.unwrap();
+
+            // Read the body
+            let mut body_buf = vec![0u8; 1024];
+            let n = server.read(&mut body_buf).await.unwrap();
+            let body = String::from_utf8_lossy(&body_buf[..n]);
+            assert!(body.contains("hello body"), "should receive body after 100 Continue");
+
+            // Send final response
+            let response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+            server.write_all(response).await.unwrap();
+            server.shutdown().await.unwrap();
+        });
+
+        let (resp, _can_reuse) = request(
+            &mut client,
+            "POST",
+            "example.com",
+            "/upload",
+            &[],
+            Some(b"hello body"),
+            "http://example.com/upload",
+            false,
+            false,
+            Some(Duration::from_secs(5)),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.body_str().unwrap(), "ok");
+
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn request_expect_100_server_rejects() {
+        use tokio::io::duplex;
+
+        let (mut client, mut server) = duplex(4096);
+
+        let server_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 2048];
+            let _n = server.read(&mut buf).await.unwrap();
+
+            // Server rejects with 417 (Expectation Failed)
+            let response = b"HTTP/1.1 417 Expectation Failed\r\nContent-Length: 8\r\n\r\nrejected";
+            server.write_all(response).await.unwrap();
+            server.shutdown().await.unwrap();
+        });
+
+        let (resp, _can_reuse) = request(
+            &mut client,
+            "POST",
+            "example.com",
+            "/upload",
+            &[],
+            Some(b"should not be sent"),
+            "http://example.com/upload",
+            false,
+            false,
+            Some(Duration::from_secs(5)),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(resp.status(), 417);
+        assert_eq!(resp.body_str().unwrap(), "rejected");
+
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn request_skips_1xx_responses() {
+        use tokio::io::duplex;
+
+        let (mut client, mut server) = duplex(4096);
+
+        let server_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 1024];
+            let _n = server.read(&mut buf).await.unwrap();
+
+            // Send 100 Continue and actual response in a single write
+            // (both arrive in the buffer together, as they would on a real connection)
+            server
+                .write_all(
+                    b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ndone",
+                )
+                .await
+                .unwrap();
+            server.shutdown().await.unwrap();
+        });
+
+        let (resp, _can_reuse) = request(
+            &mut client,
+            "GET",
+            "example.com",
+            "/test",
+            &[],
+            None,
+            "http://example.com/test",
+            false,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.body_str().unwrap(), "done");
 
         server_task.await.unwrap();
     }
