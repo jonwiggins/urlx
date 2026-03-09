@@ -35,7 +35,8 @@ async fn error_unresolvable_host() {
 }
 
 /// curl: exit code 7 = Failed to connect
-/// Connection refused should give a clear connect error
+/// Connection refused should give a clear connect/timeout error.
+/// On Windows, connecting to a closed port may timeout rather than ECONNREFUSED.
 #[tokio::test]
 async fn error_connection_refused() {
     let mut easy = liburlx::Easy::new();
@@ -45,8 +46,8 @@ async fn error_connection_refused() {
     let err = easy.perform_async().await.unwrap_err();
     let msg = err.to_string().to_lowercase();
     assert!(
-        msg.contains("connect") || msg.contains("refused"),
-        "Expected connection refused error, got: {err}"
+        msg.contains("connect") || msg.contains("refused") || msg.contains("timeout"),
+        "Expected connection refused/timeout error, got: {err}"
     );
 }
 
