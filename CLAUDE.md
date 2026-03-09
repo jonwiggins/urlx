@@ -14,12 +14,12 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 17 — Planning
-**Last completed:** Phase 16 (Connection Control & Header Management) — 2026-03-08
-**Total tests:** 1,730+
-**In progress:** Planning Phase 17
+**Phase:** 18 — Planning
+**Last completed:** Phase 17 (HTTP/1.1 Edge Cases & Protocol Refinements) — 2026-03-08
+**Total tests:** 1,735+
+**In progress:** Planning Phase 18
 **Blockers:** None
-**Next up:** Phase 17 — Cookie Persistence Hardening & HSTS Preload
+**Next up:** Phase 18 — HTTP/3 (QUIC) & Alt-Svc
 
 ### Completeness Summary (updated Phase 10 review)
 
@@ -383,14 +383,9 @@ Header deduplication (last wins), CURLOPT_UNRESTRICTED_AUTH (auth on cross-origi
 
 ---
 
-### Phase 17: HTTP/1.1 Edge Cases & Protocol Refinements
+### Phase 17: HTTP/1.1 Edge Cases & Protocol Refinements — COMPLETED (2026-03-08)
 
-**Goal:** HTTP/1.1 parity for edge cases.
-
-- Trailer header parsing + exposure in Response
-- HEAD request body skipping optimization
-- Content-Encoding vs Transfer-Encoding distinction
-- Redirect method downgrade verification
+Chunked trailer header parsing and exposure in Response API (trailers(), trailer(), set_trailers()). HEAD body skipping, Content-Encoding/Transfer-Encoding distinction, and redirect method downgrade already complete from prior phases. 5 new tests.
 
 ---
 
