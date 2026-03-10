@@ -15,17 +15,17 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 ## Current Status
 
 **Version:** v0.1.0 published (crates.io + GitHub Releases + Homebrew)
-**Last completed:** Phase 53 — Protocol Dispatch & Integration — 2026-03-10
-**Total tests:** 2,318
-**In progress:** Phase 54
+**Last completed:** Phase 54 — HTTP/2 Robustness — 2026-03-10
+**Total tests:** 2,322
+**In progress:** Phase 55
 **Blockers:** None
 
 ### Completeness Summary (post-v0.1.0 audit)
 
 | Feature Area | Parity | Notes |
 |---|---|---|
-| HTTP/1.1 | 97% | Expect, HTTP/1.0, trailer headers; no chunked upload |
-| HTTP/2 | 85% | ALPN, multiplexing, flow control, google.com compat; no connection pooling |
+| HTTP/1.1 | 98% | Expect, HTTP/1.0, trailer headers, chunked upload |
+| HTTP/2 | 90% | ALPN, multiplexing, flow control, connection pooling, server push; stream priority stored but not wired (deprecated in RFC 9113) |
 | HTTP/3 | 55% | QUIC via quinn, Alt-Svc, 0-RTT; no pooling/push; **untested** |
 | TLS | 85% | rustls, insecure mode, CA/client certs, pinning, version selection, cipher list, session cache |
 | Authentication | 65% | Basic, Bearer, Digest (CSPRNG cnonce), AWS SigV4, NTLM skeleton |
@@ -40,7 +40,7 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 | CLI | ~65% | ~150 flags, --help, --version, combined short flags (-sSfL) |
 | Connection | 80% | Pool, TCP_NODELAY, keepalive, Unix sockets, interface/port binding |
 | Transfer control | 80% | Rate limiting enforced (max recv/send speed, low speed timeout) |
-| Overall | ~64% | ~92% for basic HTTP/HTTPS use cases |
+| Overall | ~65% | ~93% for basic HTTP/HTTPS use cases |
 
 ### Known Issues
 
@@ -60,14 +60,9 @@ Added `--help`/`-h`, `--version`/`-V`, combined short flags (`-sSfL`), `Response
 
 Wired smtp://, imap://, pop3://, mqtt://, dict:// dispatch in `do_single_request`. Updated SMTP `send_mail` to accept optional `mail_from`/`mail_rcpt` and return `Response`. Added integration tests with mock TCP servers for dict, pop3, imap, smtp. Added HSTS file persistence (`load_from_file`/`save_to_file`). Deferred ws:// dispatch (needs handler) and HTTP/3 tests (needs quinn server).
 
-### Phase 54 — HTTP/2 Robustness
+### Phase 54 — HTTP/2 Robustness (Completed 2026-03-10)
 
-Improve HTTP/2 to work reliably against real-world servers.
-
-- HTTP/2 connection pooling (reuse h2 connections across requests)
-- Server push exposure to caller
-- Chunked transfer encoding for request uploads (HTTP/1.1)
-- HTTP/2 stream priority (RFC 9113 deprecated but API compat)
+Added HTTP/2 connection pooling (`H2Pool` storing `SendRequest` handles, pool check before TLS connect). Refactored `h2::request` into `handshake()` + `send_request()` for connection reuse. Added HTTP/1.1 chunked transfer encoding for request uploads (`write_chunked_body`, `Transfer-Encoding: chunked`). Server push already fully implemented (PushedResponse collection, `pushed_responses()` getter). Stream priority stored in `Http2Config` for API compat (RFC 9113 deprecated). Fixed clippy `doc_markdown` warnings in ssh.rs.
 
 ### Phase 55 — FFI Hardening
 
