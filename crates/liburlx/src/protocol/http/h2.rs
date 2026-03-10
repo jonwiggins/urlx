@@ -258,8 +258,10 @@ where
 
     // HEAD responses have no body
     if is_head {
-        // Collect any push promises that arrived
-        let pushed = push_task.await.unwrap_or_default();
+        // Collect any push promises that arrived (short timeout)
+        let pushed = tokio::time::timeout(Duration::from_millis(50), push_task)
+            .await
+            .map_or_else(|_| Vec::new(), std::result::Result::unwrap_or_default);
         // Stop PING keep-alive task
         if let Some(task) = ping_task {
             task.abort();
@@ -287,8 +289,12 @@ where
         }
     }
 
-    // Collect any push promises that arrived during the transfer
-    let pushed = push_task.await.unwrap_or_default();
+    // Collect any push promises that arrived during the transfer.
+    // Use a short timeout since push promises should arrive before/during
+    // the response — if none arrived by now, none are coming.
+    let pushed = tokio::time::timeout(Duration::from_millis(50), push_task)
+        .await
+        .map_or_else(|_| Vec::new(), std::result::Result::unwrap_or_default);
 
     // Stop PING keep-alive task
     if let Some(task) = ping_task {
