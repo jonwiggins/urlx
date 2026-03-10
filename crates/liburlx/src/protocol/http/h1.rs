@@ -40,7 +40,7 @@ const MAX_HEADER_SIZE: usize = 64 * 1024;
 /// # Errors
 ///
 /// Returns errors for I/O failures or malformed responses.
-#[allow(clippy::too_many_arguments, clippy::large_futures)]
+#[allow(clippy::too_many_arguments, clippy::large_futures, clippy::fn_params_excessive_bools)]
 pub async fn request<S>(
     stream: &mut S,
     method: &str,
@@ -54,6 +54,7 @@ pub async fn request<S>(
     expect_100_timeout: Option<Duration>,
     ignore_content_length: bool,
     speed_limits: &SpeedLimits,
+    chunked_upload: bool,
 ) -> Result<(Response, bool), Error>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -92,12 +93,19 @@ where
         }
     }
 
-    // Add Content-Length for bodies (only if not set by custom headers)
+    // Add Content-Length or Transfer-Encoding for bodies
     let has_content_length =
         custom_headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("content-length"));
+    let has_transfer_encoding =
+        custom_headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("transfer-encoding"));
+    // Use chunked encoding if requested and HTTP/1.1 (HTTP/1.0 doesn't support chunked)
+    let use_chunked =
+        chunked_upload && !use_http10 && !has_content_length && !has_transfer_encoding;
     let use_expect = expect_100_timeout.is_some() && body.is_some_and(|b| !b.is_empty());
     if let Some(body_data) = body {
-        if !has_content_length {
+        if use_chunked {
+            req.push_str("Transfer-Encoding: chunked\r\n");
+        } else if !has_content_length {
             let _ = write!(req, "Content-Length: {}\r\n", body_data.len());
         }
     }
@@ -132,7 +140,11 @@ where
                 if status == 100 {
                     // Server said continue — send body
                     if let Some(body_data) = body {
-                        throttled_write(stream, body_data, &mut send_limiter).await?;
+                        if use_chunked {
+                            write_chunked_body(stream, body_data, &mut send_limiter).await?;
+                        } else {
+                            throttled_write(stream, body_data, &mut send_limiter).await?;
+                        }
                     }
                 } else {
                     // Server responded with final status — don't send body
@@ -178,7 +190,11 @@ where
             Err(_) => {
                 // Timeout waiting for 100 Continue — send body anyway (curl behavior)
                 if let Some(body_data) = body {
-                    throttled_write(stream, body_data, &mut send_limiter).await?;
+                    if use_chunked {
+                        write_chunked_body(stream, body_data, &mut send_limiter).await?;
+                    } else {
+                        throttled_write(stream, body_data, &mut send_limiter).await?;
+                    }
                 }
             }
             Ok(Err(e)) => return Err(e),
@@ -186,7 +202,11 @@ where
     } else {
         // No 100-continue — send body immediately
         if let Some(body_data) = body {
-            throttled_write(stream, body_data, &mut send_limiter).await?;
+            if use_chunked {
+                write_chunked_body(stream, body_data, &mut send_limiter).await?;
+            } else {
+                throttled_write(stream, body_data, &mut send_limiter).await?;
+            }
         }
     }
 
@@ -253,6 +273,77 @@ where
 fn is_close_notify_error(e: &std::io::Error) -> bool {
     let msg = e.to_string();
     msg.contains("close_notify") || msg.contains("CloseNotify")
+}
+
+/// Write a request body using HTTP/1.1 chunked transfer encoding.
+///
+/// Each chunk is sent as `{hex_length}\r\n{data}\r\n`. The body is
+/// terminated with a final `0\r\n\r\n` chunk.
+///
+/// # Errors
+///
+/// Returns an error if writing to the stream fails.
+async fn write_chunked_body<S>(
+    stream: &mut S,
+    body: &[u8],
+    send_limiter: &mut RateLimiter,
+) -> Result<(), Error>
+where
+    S: AsyncWrite + Unpin,
+{
+    if send_limiter.is_active() {
+        let mut offset = 0;
+        while offset < body.len() {
+            let end = (offset + THROTTLE_CHUNK_SIZE).min(body.len());
+            let chunk = &body[offset..end];
+            let chunk_len = chunk.len();
+
+            // Write chunk header: hex size + CRLF
+            let header = format!("{chunk_len:x}\r\n");
+            stream
+                .write_all(header.as_bytes())
+                .await
+                .map_err(|e| Error::Http(format!("chunked header write failed: {e}")))?;
+
+            // Write chunk data
+            stream
+                .write_all(chunk)
+                .await
+                .map_err(|e| Error::Http(format!("chunked data write failed: {e}")))?;
+
+            // Write chunk trailer CRLF
+            stream
+                .write_all(b"\r\n")
+                .await
+                .map_err(|e| Error::Http(format!("chunked trailer write failed: {e}")))?;
+
+            send_limiter.record(chunk_len).await?;
+            offset = end;
+        }
+    } else {
+        // Write entire body as single chunk
+        let header = format!("{:x}\r\n", body.len());
+        stream
+            .write_all(header.as_bytes())
+            .await
+            .map_err(|e| Error::Http(format!("chunked header write failed: {e}")))?;
+        stream
+            .write_all(body)
+            .await
+            .map_err(|e| Error::Http(format!("chunked data write failed: {e}")))?;
+        stream
+            .write_all(b"\r\n")
+            .await
+            .map_err(|e| Error::Http(format!("chunked trailer write failed: {e}")))?;
+    }
+
+    // Write terminating chunk: 0\r\n\r\n
+    stream
+        .write_all(b"0\r\n\r\n")
+        .await
+        .map_err(|e| Error::Http(format!("chunked terminator write failed: {e}")))?;
+
+    Ok(())
 }
 
 /// Read response headers incrementally from a stream.
@@ -973,6 +1064,7 @@ mod tests {
             None,
             false,
             &SpeedLimits::default(),
+            false,
         )
         .await
         .unwrap();
@@ -1014,6 +1106,7 @@ mod tests {
             None,
             false,
             &SpeedLimits::default(),
+            false,
         )
         .await
         .unwrap();
@@ -1059,6 +1152,7 @@ mod tests {
             None,
             false,
             &SpeedLimits::default(),
+            false,
         )
         .await
         .unwrap();
@@ -1099,6 +1193,7 @@ mod tests {
             None,
             false,
             &SpeedLimits::default(),
+            false,
         )
         .await
         .unwrap();
@@ -1140,6 +1235,7 @@ mod tests {
             None,
             false,
             &SpeedLimits::default(),
+            false,
         )
         .await
         .unwrap();
@@ -1182,6 +1278,7 @@ mod tests {
             None,
             false,
             &SpeedLimits::default(),
+            false,
         )
         .await
         .unwrap();
@@ -1235,6 +1332,7 @@ mod tests {
             Some(Duration::from_secs(5)),
             false,
             &SpeedLimits::default(),
+            false,
         )
         .await
         .unwrap();
@@ -1274,6 +1372,7 @@ mod tests {
             Some(Duration::from_secs(5)),
             false,
             &SpeedLimits::default(),
+            false,
         )
         .await
         .unwrap();
@@ -1318,6 +1417,7 @@ mod tests {
             None,
             false,
             &SpeedLimits::default(),
+            false,
         )
         .await
         .unwrap();
@@ -1365,6 +1465,7 @@ mod tests {
             None,
             false,
             &SpeedLimits::default(),
+            false,
         )
         .await
         .unwrap();
@@ -1410,6 +1511,7 @@ mod tests {
             None,
             false,
             &SpeedLimits::default(),
+            false,
         )
         .await
         .unwrap();
@@ -1447,6 +1549,7 @@ mod tests {
             None,
             true, // ignore_content_length
             &SpeedLimits::default(),
+            false,
         )
         .await
         .unwrap();
@@ -1490,6 +1593,7 @@ mod tests {
             None,
             false,
             &SpeedLimits::default(),
+            false,
         )
         .await
         .unwrap();
@@ -1533,12 +1637,140 @@ mod tests {
             None,
             false,
             &SpeedLimits::default(),
+            false,
         )
         .await
         .unwrap();
 
         assert_eq!(resp.body_str().unwrap(), "hello");
         assert!(resp.trailers().is_empty());
+
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn chunked_upload_sends_chunked_body() {
+        use tokio::io::{duplex, AsyncReadExt};
+
+        let (client, mut server) = duplex(4096);
+        let mut client = client;
+
+        let server_task = tokio::spawn(async move {
+            // Read the request and verify chunked encoding
+            let mut buf = vec![0u8; 4096];
+            let mut received = Vec::new();
+            loop {
+                let n = server.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                received.extend_from_slice(&buf[..n]);
+                let s = String::from_utf8_lossy(&received);
+                // Wait until we see the end of chunked body (0\r\n\r\n)
+                if s.contains("0\r\n\r\n") {
+                    break;
+                }
+            }
+
+            let request_text = String::from_utf8_lossy(&received).to_string();
+
+            let lower = request_text.to_lowercase();
+            // Verify Transfer-Encoding: chunked header is present
+            assert!(
+                lower.contains("transfer-encoding: chunked"),
+                "should contain chunked header: {request_text}"
+            );
+            // Verify body is chunked encoded
+            assert!(
+                request_text.contains("5\r\nhello\r\n0\r\n"),
+                "should contain chunked body: {request_text}"
+            );
+
+            // Send response
+            let response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+            server.write_all(response).await.unwrap();
+            server.shutdown().await.unwrap();
+        });
+
+        let (resp, _) = request(
+            &mut client,
+            "POST",
+            "example.com",
+            "/upload",
+            &[],
+            Some(b"hello"),
+            "http://example.com/upload",
+            false,
+            false,
+            None,
+            false,
+            &SpeedLimits::default(),
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.body_str().unwrap(), "ok");
+
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn chunked_upload_disabled_sends_content_length() {
+        use tokio::io::{duplex, AsyncReadExt};
+
+        let (client, mut server) = duplex(4096);
+        let mut client = client;
+
+        let server_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            let mut received = Vec::new();
+            loop {
+                let n = server.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                received.extend_from_slice(&buf[..n]);
+                let s = String::from_utf8_lossy(&received);
+                if s.contains("hello") {
+                    break;
+                }
+            }
+
+            let request_text = String::from_utf8_lossy(&received).to_string();
+            let lower = request_text.to_lowercase();
+            assert!(
+                lower.contains("content-length: 5"),
+                "should contain content-length: {request_text}"
+            );
+            assert!(
+                !lower.contains("transfer-encoding"),
+                "should not contain chunked: {request_text}"
+            );
+
+            let response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+            server.write_all(response).await.unwrap();
+            server.shutdown().await.unwrap();
+        });
+
+        let (resp, _) = request(
+            &mut client,
+            "POST",
+            "example.com",
+            "/upload",
+            &[],
+            Some(b"hello"),
+            "http://example.com/upload",
+            false,
+            false,
+            None,
+            false,
+            &SpeedLimits::default(),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 200);
 
         server_task.await.unwrap();
     }

@@ -2175,6 +2175,7 @@ async fn do_single_request(
                 expect_100_timeout,
                 ignore_content_length,
                 speed_limits,
+                false,
             )
             .await;
 
@@ -2260,6 +2261,7 @@ async fn do_single_request(
             expect_100_timeout,
             ignore_content_length,
             speed_limits,
+            false,
         )
         .await?;
         let time_starttransfer = request_start.elapsed();
@@ -2491,6 +2493,7 @@ async fn do_single_request(
                         expect_100_timeout,
                         ignore_content_length,
                         speed_limits,
+                        false,
                     )
                     .await?;
                     let time_starttransfer = request_start.elapsed();
@@ -2585,6 +2588,7 @@ async fn do_single_request(
                     expect_100_timeout,
                     ignore_content_length,
                     speed_limits,
+                    false,
                 )
                 .await?;
                 let time_starttransfer = request_start.elapsed();
@@ -2635,6 +2639,7 @@ async fn do_single_request(
                 expect_100_timeout,
                 ignore_content_length,
                 speed_limits,
+                false,
             )
             .await?;
             let time_starttransfer = request_start.elapsed();
