@@ -3,7 +3,7 @@
 //! Provides SFTP file transfer and SCP file copy over SSH connections
 //! using the `russh` and `russh-sftp` crates (pure-Rust, async).
 //!
-//! Supports password and public key authentication, known_hosts verification,
+//! Supports password and public key authentication, `known_hosts` verification,
 //! and SHA-256 host key fingerprint pinning.
 
 use std::collections::HashMap;
@@ -27,13 +27,13 @@ pub enum SshHostKeyPolicy {
     /// Accept all host keys (default, matches curl without `--known-hosts`).
     #[default]
     AcceptAll,
-    /// Verify against a known_hosts file.
+    /// Verify against a `known_hosts` file.
     KnownHosts(Vec<KnownHostEntry>),
     /// Verify against a specific SHA-256 fingerprint (base64-encoded, no prefix).
     Sha256Fingerprint(String),
 }
 
-/// A parsed known_hosts entry for host key verification.
+/// A parsed `known_hosts` entry for host key verification.
 #[derive(Debug, Clone)]
 pub struct KnownHostEntry {
     /// Host patterns (plain hostnames or hashed).
@@ -44,7 +44,7 @@ pub struct KnownHostEntry {
     pub public_key_bytes: Vec<u8>,
 }
 
-/// Host pattern types from known_hosts file.
+/// Host pattern types from `known_hosts` file.
 #[derive(Debug, Clone)]
 pub enum KnownHostPatterns {
     /// Comma-separated hostname patterns.
@@ -58,9 +58,9 @@ pub enum KnownHostPatterns {
     },
 }
 
-/// Parse a known_hosts file into entries.
+/// Parse a `known_hosts` file into entries.
 ///
-/// Supports both plain and hashed hostname formats (RFC 4251 known_hosts).
+/// Supports both plain and hashed hostname formats (RFC 4251 `known_hosts`).
 ///
 /// # Errors
 ///
@@ -71,7 +71,11 @@ pub fn parse_known_hosts_file(path: &str) -> Result<Vec<KnownHostEntry>, Error> 
     parse_known_hosts(&contents)
 }
 
-/// Parse known_hosts content string into entries.
+/// Parse `known_hosts` content string into entries.
+///
+/// # Errors
+///
+/// Returns [`Error::Ssh`] if the content cannot be parsed.
 pub fn parse_known_hosts(contents: &str) -> Result<Vec<KnownHostEntry>, Error> {
     use russh::keys::ssh_key::known_hosts::KnownHosts;
 
@@ -102,7 +106,7 @@ pub fn parse_known_hosts(contents: &str) -> Result<Vec<KnownHostEntry>, Error> {
     Ok(entries)
 }
 
-/// Check if a hostname matches a known_hosts entry.
+/// Check if a hostname matches a `known_hosts` entry.
 fn host_matches_entry(hostname: &str, entry: &KnownHostEntry) -> bool {
     match &entry.host_patterns {
         KnownHostPatterns::Patterns(patterns) => {
@@ -116,7 +120,7 @@ fn host_matches_entry(hostname: &str, entry: &KnownHostEntry) -> bool {
     }
 }
 
-/// Simple glob-style pattern matching for known_hosts hostnames.
+/// Simple glob-style pattern matching for `known_hosts` hostnames.
 ///
 /// Supports `*` and `?` wildcards and `!` negation prefix.
 fn host_matches_pattern(hostname: &str, pattern: &str) -> bool {
@@ -169,7 +173,7 @@ fn glob_match_recursive(text: &[u8], pattern: &[u8]) -> bool {
 
 /// Compute HMAC-SHA1(key, message).
 ///
-/// Used for hashed known_hosts hostname verification.
+/// Used for hashed `known_hosts` hostname verification.
 fn hmac_sha1(key: &[u8], message: &[u8]) -> [u8; 20] {
     const BLOCK_SIZE: usize = 64;
     const OPAD: u8 = 0x5C;
@@ -204,7 +208,7 @@ fn hmac_sha1(key: &[u8], message: &[u8]) -> [u8; 20] {
     sha1_hash(&outer)
 }
 
-/// Minimal SHA-1 implementation for HMAC-SHA1 known_hosts verification.
+/// Minimal SHA-1 implementation for HMAC-SHA1 `known_hosts` verification.
 ///
 /// Not used for security purposes — only for hostname hash verification
 /// in `known_hosts` files (`OpenSSH` format).
