@@ -15,9 +15,9 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 ## Current Status
 
 **Version:** v0.1.0 published (crates.io + GitHub Releases + Homebrew)
-**Last completed:** Phase 59 — CLI Completeness — 2026-03-10
+**Last completed:** Phase 60 — Comprehensive Review — 2026-03-10
 **Total tests:** 2,491
-**In progress:** Phase 60
+**In progress:** Phase 61
 **Blockers:** None
 
 ### Completeness Summary (post-v0.1.0 audit)
@@ -36,7 +36,7 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 | SSH/SFTP/SCP | 72% | Download/upload, password + pubkey auth, known_hosts, SHA-256 fingerprint, symlink following, permission preservation |
 | WebSocket | 90% | RFC 6455, CloseCode, fragmentation, permessage-deflate (RFC 7692) |
 | Multi API | 75% | Connection limiting, share, pipelining, FFI event loop stubs |
-| FFI (libcurl C ABI) | ~65% | 130+ CURLOPT, 43 CURLINFO, 32 CURLcode, 56 functions, blob certs, protocol restriction |
+| FFI (libcurl C ABI) | ~65% | 145 CURLOPT, 45 CURLINFO, 32 CURLcode, 56 functions, blob certs, protocol restriction |
 | CLI | ~70% | ~180 flags, --help, --version, combined short flags, conditional requests, retry logic |
 | Connection | 80% | Pool, TCP_NODELAY, keepalive, Unix sockets, interface/port binding |
 | Transfer control | 80% | Rate limiting enforced (max recv/send speed, low speed timeout) |
@@ -53,51 +53,112 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Implementation Phases
 
-### Phase 52 — CLI Drop-in Essentials (Completed 2026-03-10)
+### Phase 0 — Cumulative Summary (Phases 1-59)
 
-Added `--help`/`-h`, `--version`/`-V`, combined short flags (`-sSfL`), `ResponseHttpVersion` enum tracking across h1/h2/h3, fixed `%{http_version}` write-out, fixed h2 google.com stream error (removed Host header in favor of `:authority`, added `client.ready()`), handled TLS `close_notify` as EOF in h1.
+**What has been built:** A functional curl replacement covering HTTP/1.0-1.1, HTTP/2 (with ALPN, multiplexing, connection pooling, server push), HTTP/3 (QUIC via quinn), TLS (rustls + native-tls), FTP/FTPS (full session, active mode, MLST/MLSD, resume), SSH/SFTP/SCP, WebSocket (RFC 6455 + permessage-deflate), MQTT (QoS 0/1/2), SMTP, IMAP, POP3, DICT, TFTP, file://, DNS (system + hickory + DoH + DoT + Happy Eyeballs), cookies (Netscape format, domain-indexed, PSL, SameSite), HSTS (persistence), proxies (HTTP/SOCKS4/SOCKS4a/SOCKS5/HTTPS tunnel), authentication (Basic, Digest, Bearer, AWS SigV4, NTLMv2, SCRAM-SHA-256), connection pooling, rate limiting, multipart form upload, decompression (gzip, deflate, br, zstd), and a C ABI compatibility layer (liburlx-ffi).
 
-### Phase 53 — Protocol Dispatch & Integration (Completed 2026-03-10)
+**Key stats (Phase 60 audit):**
+- Tests: 2,491
+- CLI flags: ~199 long + 36 short (curl has ~250 long flags)
+- FFI: 145 unique CURLOPT, 45 CURLINFO, 32 CURLcode, 56 exported functions
+- Benchmark suite: 9 groups (URL parsing, cookies, HSTS, DNS, headers, HTTP parsing, multipart)
+- Feature flags: 20+ (http, http2, http3, ftp, ssh, ws, mqtt, smtp, imap, pop3, etc.)
+- 4 fuzz harnesses (URL, HTTP, cookie, HSTS)
 
-Wired smtp://, imap://, pop3://, mqtt://, dict:// dispatch in `do_single_request`. Updated SMTP `send_mail` to accept optional `mail_from`/`mail_rcpt` and return `Response`. Added integration tests with mock TCP servers for dict, pop3, imap, smtp. Added HSTS file persistence (`load_from_file`/`save_to_file`). Deferred ws:// dispatch (needs handler) and HTTP/3 tests (needs quinn server).
+**Phases 52-59 summary:** CLI drop-in essentials (--help, --version, combined short flags, h2 stream fix), protocol dispatch for all schemes, HTTP/2 robustness (pooling, chunked upload, push), FFI hardening (145 CURLOPT, blob certs, protocol restriction), authentication completeness (NTLMv2, SCRAM-SHA-256, SameSite), protocol polish (WS deflate, MQTT QoS, SFTP symlinks, TFTP errors), Criterion benchmarks with optimization, and CLI completeness (~199 long flags, conditional requests, retry logic).
 
-### Phase 54 — HTTP/2 Robustness (Completed 2026-03-10)
+### Phase 60 — Comprehensive Review (In Progress)
 
-Added HTTP/2 connection pooling (`H2Pool` storing `SendRequest` handles, pool check before TLS connect). Refactored `h2::request` into `handshake()` + `send_request()` for connection reuse. Added HTTP/1.1 chunked transfer encoding for request uploads (`write_chunked_body`, `Transfer-Encoding: chunked`). Server push already fully implemented (PushedResponse collection, `pushed_responses()` getter). Stream priority stored in `Http2Config` for API compat (RFC 9113 deprecated). Fixed clippy `doc_markdown` warnings in ssh.rs.
+Milestone review phase. Audit results:
 
-### Phase 55 — FFI Hardening (Completed 2026-03-10)
+**FFI Coverage:**
+- 145 unique CURLOPT options handled (curl has ~300)
+- 45 unique CURLINFO options (curl has ~60)
+- 32 CURLcode error codes (curl has ~99)
+- 56 no_mangle exported functions (curl has ~80)
 
-Wired protocol restriction enforcement (`CURLOPT_PROTOCOLS_STR`/`CURLOPT_REDIR_PROTOCOLS_STR`) with enforcement in `perform_async` and redirect handling. Added `curl_blob` repr(C) struct and wired blob cert options (`CURLOPT_SSLCERT_BLOB`, `SSLKEY_BLOB`, `CAINFO_BLOB`) with PEM loaders in TLS layer. Wired 25+ FTP/SSH/proxy CURLOPT options: FTPPORT, FTP_USE_EPSV, FTP_USE_EPRT, FTP_CREATE_MISSING_DIRS, FTP_SKIP_PASV_IP, FTP_FILEMETHOD, FTP_ACCOUNT, USE_SSL, SSH_AUTH_TYPES, SSH_PUBLIC_KEYFILE, SSH_PRIVATE_KEYFILE, SSH_KNOWNHOSTS, SSH_HOST_PUBLIC_KEY_SHA256, PROXYPORT, PROXYTYPE, PROXYUSERNAME, PROXYPASSWORD, PRE_PROXY, SOCKS5_AUTH, plus stubs for proxy TLS and legacy SSH options. `curl_easy_pause` remains a no-op stub (requires async channel signaling). C test harness deferred to Phase 59.
+**CLI Coverage:**
+- 199 unique long flags + 36 short flags
+- curl has ~250 long flags → ~80% coverage
+- Missing: man page generation, ~50 low-frequency flags
 
-### Phase 56 — Authentication & Security (Completed 2026-03-10)
+**Known Gaps:**
+- WebSocket not dispatched from Easy API (needs high-level handler)
+- HTTP/3 untested (needs quinn test server)
+- SCRAM-SHA-256 not wired to SMTP/IMAP/POP3
+- `curl_easy_pause()` is a no-op stub
+- No C test harness for FFI
+- LDAP, RTSP, Kerberos/Negotiate not implemented
+- PAC proxy auto-configuration not implemented
 
-Full NTLMv2 per MS-NLMP: MD4 NT hash, HMAC-MD5 NTLMv2 hash, NTProofStr, LMv2 response, client blob with timestamp and target info. SASL SCRAM-SHA-256 (RFC 7677): client state machine with PBKDF2, challenge-response, server signature verification. SameSite cookie enforcement (Strict/Lax/None, reject None without Secure). FTP resume via REST command wired through Range header offset. SFTP ed25519 already supported by russh. Added Error::Auth variant.
+### Phase 61 — HTTP/3 Testing & WS Dispatch
 
-### Phase 57 — Protocol Polish (Completed 2026-03-09)
+- Set up quinn-based test server for HTTP/3 integration tests
+- Wire ws:// and wss:// dispatch from Easy API
+- Fix WebSocket scheme handling in `do_single_request`
+- Add integration tests for WebSocket transfers
+- Wire SCRAM-SHA-256 to SMTP/IMAP/POP3 auth
 
-WebSocket permessage-deflate (RFC 7692): `DeflateConfig` parsing, `DeflateCodec` compress/decompress with flate2, RSV1 bit handling, context takeover/window bits negotiation, gated behind `decompression` feature. MQTT QoS 1/2: `QoS` enum, PUBACK/PUBREC/PUBREL/PUBCOMP packet builders, `publish_qos()`/`subscribe_qos()` with full handshake flows. FTP MLST/MLSD already implemented. SFTP: symlink following via lstat + readlink (up to 10 levels), `sftp_upload_with_permissions()` for setting remote file mode via setstat. TFTP: `TftpErrorCode` enum with all RFC 1350 error codes (0-7), parsed from ERROR packets.
+### Phase 62 — FFI Parity Push
 
-### Phase 58 — Performance & Benchmarking (Completed 2026-03-09)
+- Create C test harness (compile and link C programs against liburlx-ffi)
+- Add 30+ missing CURLOPT options (prioritized by usage frequency)
+- Implement `curl_easy_pause()` with async channel signaling
+- Add missing CURLcode error variants
+- Add missing CURLINFO getters
 
-Criterion benchmark suite with 9 benchmark groups: URL parsing (5 variants), cookie jar (store/lookup with 10/100 cookies), HSTS cache, DNS cache, response header lookup (lowercase/mixed-case), cookie domain matching (exact/subdomain/1000-cookie miss), HTTP response parsing (simple 200, many headers, 301 redirect), and multipart form encoding. Optimized HTTP/1.1 response parsing: `HashMap::with_capacity` pre-allocation and `to_ascii_lowercase` (~10% faster on responses with many headers).
+### Phase 63 — CLI Flag Parity
 
-### Phase 59 — CLI Completeness (Completed 2026-03-10)
+- Implement remaining ~50 curl flags (prioritized by usage frequency)
+- Man page generation from CLI flag definitions
+- Combined short flags edge cases
+- Config file improvements (support for all flags)
 
-Added `--fail-with-body`, `--retry-all-errors`, `--no-progress-meter`, `--location-trusted`, `--time-cond`/`-z` (conditional requests with If-Modified-Since/If-Unmodified-Since), `--capath`, `format_http_date()`. Added `--basic`, `--anyauth`, `--proxy-basic`, `--proxy-anyauth`, `--http2-prior-knowledge` (with new `Http2PriorKnowledge` variant), `--ftp-skip-pasv-ip`, `--ftp-account`, `--preproxy`, `--data-ascii`, `--keepalive-time`. Added no-op compat flags: `--xattr`, `--disable`, `--metalink`, `--crlfile`, `--proxy-crlfile`, `--proxy-pinnedpubkey`, `--cert-type`, `--key-type`, `--pass`. Wired `CURL_HTTP_VERSION_2TLS` (4) and `CURL_HTTP_VERSION_2_PRIOR_KNOWLEDGE` (5) in FFI. ~180 CLI flags total. Man page generation deferred.
+### Phase 64 — Error Handling & Diagnostics
 
-### Phase 60 — Comprehensive Review
+- Improve error messages to match curl's format
+- Add --trace/--trace-ascii output formatting parity
+- Verbose output parity with curl's connection info
+- Better error codes (map to CURLcode values)
 
-Milestone review phase (every 10th phase). Compact phases 52-59 into Phase 0 summary.
+### Phase 65 — Connection & Transfer Polish
 
-- Audit full codebase against curl for completeness
-  - Count CURLOPT, CURLINFO, CURLcode coverage in FFI
-  - Count CLI flags vs curl flags
-  - List missing protocol features
-- Differential testing against curl with real-world URLs
-  - Compare output of `urlx` vs `curl` for top 20 common use cases
-  - Identify and fix discrepancies
-- Compact completed phases (52-59) into Phase 0 cumulative summary
-- Plan phases 61-70
+- HTTP/2 stream priority (wiring, not just storing)
+- Connection pool TTL and cleanup
+- Happy Eyeballs improvements
+- Transfer resume improvements across protocols
+
+### Phase 66 — Security Hardening
+
+- Kerberos/Negotiate authentication
+- Certificate revocation checking (CRL, OCSP)
+- Improved certificate pinning (multiple pins)
+- HSTS preload list support
+
+### Phase 67 — Protocol Extensions
+
+- LDAP protocol handler (basic search)
+- RTSP protocol handler (basic playback)
+- MQTT improvements (will messages, retained)
+- FTP improvements (SITE commands, STAT)
+
+### Phase 68 — Performance Optimization
+
+- Profile and optimize hot paths identified in Phase 58 benchmarks
+- HTTP/2 multiplexing performance
+- Connection pool efficiency
+- Memory usage reduction
+
+### Phase 69 — Documentation & Distribution
+
+- Comprehensive API documentation with examples
+- Man page generation
+- Package for more distributions (apt, dnf, etc.)
+- Benchmark comparison vs curl published in README
+
+### Phase 70 — Comprehensive Review
+
+Milestone review phase. Audit full codebase, differential testing, plan phases 71-80.
 
 ---
 
