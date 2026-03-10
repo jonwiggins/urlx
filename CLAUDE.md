@@ -15,9 +15,9 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 ## Current Status
 
 **Version:** v0.1.0 published (crates.io + GitHub Releases + Homebrew)
-**Last completed:** Phase 52 — CLI Drop-in Essentials — 2026-03-10
-**Total tests:** 2,303
-**In progress:** Phase 53
+**Last completed:** Phase 53 — Protocol Dispatch & Integration — 2026-03-10
+**Total tests:** 2,318
+**In progress:** Phase 54
 **Blockers:** None
 
 ### Completeness Summary (post-v0.1.0 audit)
@@ -44,7 +44,8 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ### Known Issues
 
-- MQTT, SMTP, IMAP, POP3, DICT modules exist but are not dispatched from Easy API
+- WebSocket (ws://, wss://) not dispatched from Easy API (needs high-level handler)
+- HTTP/3 untested (needs quinn test server)
 - NTLM auth is a skeleton (SHA-256, not real MD4+DES)
 
 ---
@@ -55,15 +56,9 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 Added `--help`/`-h`, `--version`/`-V`, combined short flags (`-sSfL`), `ResponseHttpVersion` enum tracking across h1/h2/h3, fixed `%{http_version}` write-out, fixed h2 google.com stream error (removed Host header in favor of `:authority`, added `client.ready()`), handled TLS `close_notify` as EOF in h1.
 
-### Phase 53 — Protocol Dispatch & Integration
+### Phase 53 — Protocol Dispatch & Integration (Completed 2026-03-10)
 
-Wire orphaned protocol modules into the Easy API and add integration tests.
-
-- Add scheme dispatch for `smtp://`, `imap://`, `pop3://`, `mqtt://`, `dict://`, `ws://`, `wss://`
-- Wire `mail_from`, `mail_rcpt`, `mail_auth` Easy fields to SMTP handler
-- Add integration tests for each newly-dispatched protocol
-- Add HTTP/3 integration tests (quinn + h3 test server)
-- Wire HSTS file persistence (load/save to disk)
+Wired smtp://, imap://, pop3://, mqtt://, dict:// dispatch in `do_single_request`. Updated SMTP `send_mail` to accept optional `mail_from`/`mail_rcpt` and return `Response`. Added integration tests with mock TCP servers for dict, pop3, imap, smtp. Added HSTS file persistence (`load_from_file`/`save_to_file`). Deferred ws:// dispatch (needs handler) and HTTP/3 tests (needs quinn server).
 
 ### Phase 54 — HTTP/2 Robustness
 
