@@ -15,9 +15,9 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 ## Current Status
 
 **Version:** v0.1.0 published (crates.io + GitHub Releases + Homebrew)
-**Last completed:** Phase 54 — HTTP/2 Robustness — 2026-03-10
-**Total tests:** 2,322
-**In progress:** Phase 55
+**Last completed:** Phase 55 — FFI Hardening — 2026-03-10
+**Total tests:** 2,396
+**In progress:** Phase 56
 **Blockers:** None
 
 ### Completeness Summary (post-v0.1.0 audit)
@@ -27,7 +27,7 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 | HTTP/1.1 | 98% | Expect, HTTP/1.0, trailer headers, chunked upload |
 | HTTP/2 | 90% | ALPN, multiplexing, flow control, connection pooling, server push; stream priority stored but not wired (deprecated in RFC 9113) |
 | HTTP/3 | 55% | QUIC via quinn, Alt-Svc, 0-RTT; no pooling/push; **untested** |
-| TLS | 85% | rustls, insecure mode, CA/client certs, pinning, version selection, cipher list, session cache |
+| TLS | 88% | rustls, insecure mode, CA/client certs, pinning, version selection, cipher list, session cache, blob cert options |
 | Authentication | 65% | Basic, Bearer, Digest (CSPRNG cnonce), AWS SigV4, NTLM skeleton |
 | Cookie engine | 95% | Netscape file format, domain-indexed jar, PSL validation |
 | Proxy | 90% | HTTP + SOCKS + HTTPS tunnel (TLS-in-TLS), proxy auth; no PAC |
@@ -36,11 +36,11 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 | SSH/SFTP/SCP | 65% | Download/upload, password + pubkey auth, known_hosts, SHA-256 fingerprint |
 | WebSocket | 85% | RFC 6455, CloseCode, fragmentation; no permessage-deflate |
 | Multi API | 75% | Connection limiting, share, pipelining, FFI event loop stubs |
-| FFI (libcurl C ABI) | ~60% | 102 CURLOPT, 43 CURLINFO, 32 CURLcode, 56 functions |
+| FFI (libcurl C ABI) | ~65% | 130+ CURLOPT, 43 CURLINFO, 32 CURLcode, 56 functions, blob certs, protocol restriction |
 | CLI | ~65% | ~150 flags, --help, --version, combined short flags (-sSfL) |
 | Connection | 80% | Pool, TCP_NODELAY, keepalive, Unix sockets, interface/port binding |
 | Transfer control | 80% | Rate limiting enforced (max recv/send speed, low speed timeout) |
-| Overall | ~65% | ~93% for basic HTTP/HTTPS use cases |
+| Overall | ~66% | ~93% for basic HTTP/HTTPS use cases |
 
 ### Known Issues
 
@@ -64,15 +64,9 @@ Wired smtp://, imap://, pop3://, mqtt://, dict:// dispatch in `do_single_request
 
 Added HTTP/2 connection pooling (`H2Pool` storing `SendRequest` handles, pool check before TLS connect). Refactored `h2::request` into `handshake()` + `send_request()` for connection reuse. Added HTTP/1.1 chunked transfer encoding for request uploads (`write_chunked_body`, `Transfer-Encoding: chunked`). Server push already fully implemented (PushedResponse collection, `pushed_responses()` getter). Stream priority stored in `Http2Config` for API compat (RFC 9113 deprecated). Fixed clippy `doc_markdown` warnings in ssh.rs.
 
-### Phase 55 — FFI Hardening
+### Phase 55 — FFI Hardening (Completed 2026-03-10)
 
-Improve FFI coverage and add C-side testing.
-
-- Create C test harness (compile and link C programs against liburlx-ffi)
-- Wire blob cert options (`CURLOPT_SSLCERT_BLOB`, `SSLKEY_BLOB`, `CAINFO_BLOB`)
-- Wire `CURLOPT_PROTOCOLS_STR` / `CURLOPT_REDIR_PROTOCOLS_STR` enforcement
-- Implement `curl_easy_pause()` (pause/unpause transfers)
-- Add 20+ new CURLOPT options for FTP, SSH, proxy
+Wired protocol restriction enforcement (`CURLOPT_PROTOCOLS_STR`/`CURLOPT_REDIR_PROTOCOLS_STR`) with enforcement in `perform_async` and redirect handling. Added `curl_blob` repr(C) struct and wired blob cert options (`CURLOPT_SSLCERT_BLOB`, `SSLKEY_BLOB`, `CAINFO_BLOB`) with PEM loaders in TLS layer. Wired 25+ FTP/SSH/proxy CURLOPT options: FTPPORT, FTP_USE_EPSV, FTP_USE_EPRT, FTP_CREATE_MISSING_DIRS, FTP_SKIP_PASV_IP, FTP_FILEMETHOD, FTP_ACCOUNT, USE_SSL, SSH_AUTH_TYPES, SSH_PUBLIC_KEYFILE, SSH_PRIVATE_KEYFILE, SSH_KNOWNHOSTS, SSH_HOST_PUBLIC_KEY_SHA256, PROXYPORT, PROXYTYPE, PROXYUSERNAME, PROXYPASSWORD, PRE_PROXY, SOCKS5_AUTH, plus stubs for proxy TLS and legacy SSH options. `curl_easy_pause` remains a no-op stub (requires async channel signaling). C test harness deferred to Phase 59.
 
 ### Phase 56 — Authentication & Security
 
