@@ -15,9 +15,10 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 ## Current Status
 
 **Version:** v0.1.0 published (crates.io + GitHub Releases + Homebrew)
-**Last completed:** Phase 56 — Authentication & Security — 2026-03-10
-**Total tests:** 2,413
-**In progress:** Phase 57
+**Last completed:** Phase 57 — Protocol Polish — 2026-03-09
+**Total tests:** 2,454
+**In progress:** Phase 58
+
 **Blockers:** None
 
 ### Completeness Summary (post-v0.1.0 audit)
@@ -32,21 +33,22 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 | Cookie engine | 97% | Netscape file format, domain-indexed jar, PSL validation, SameSite enforcement |
 | Proxy | 90% | HTTP + SOCKS + HTTPS tunnel (TLS-in-TLS), proxy auth; no PAC |
 | DNS | 85% | Cache, Happy Eyeballs, shuffle, custom servers, DoH, DoT, hickory-dns |
-| FTP | 90% | Full session API, FTPS, active mode, FtpMethod, resume via REST; no MLST |
-| SSH/SFTP/SCP | 65% | Download/upload, password + pubkey auth, known_hosts, SHA-256 fingerprint |
-| WebSocket | 85% | RFC 6455, CloseCode, fragmentation; no permessage-deflate |
+| FTP | 90% | Full session API, FTPS, active mode, FtpMethod, resume via REST, MLST/MLSD |
+| SSH/SFTP/SCP | 72% | Download/upload, password + pubkey auth, known_hosts, SHA-256 fingerprint, symlink following, permission preservation |
+| WebSocket | 90% | RFC 6455, CloseCode, fragmentation, permessage-deflate (RFC 7692) |
 | Multi API | 75% | Connection limiting, share, pipelining, FFI event loop stubs |
 | FFI (libcurl C ABI) | ~65% | 130+ CURLOPT, 43 CURLINFO, 32 CURLcode, 56 functions, blob certs, protocol restriction |
 | CLI | ~65% | ~150 flags, --help, --version, combined short flags (-sSfL) |
 | Connection | 80% | Pool, TCP_NODELAY, keepalive, Unix sockets, interface/port binding |
 | Transfer control | 80% | Rate limiting enforced (max recv/send speed, low speed timeout) |
-| Overall | ~68% | ~93% for basic HTTP/HTTPS use cases |
+| Overall | ~70% | ~93% for basic HTTP/HTTPS use cases |
 
 ### Known Issues
 
 - WebSocket (ws://, wss://) not dispatched from Easy API (needs high-level handler)
 - HTTP/3 untested (needs quinn test server)
-- SCRAM-SHA-256 implemented but not yet wired to SMTP/IMAP/POP3 (pending Phase 53 dispatch)
+- SCRAM-SHA-256 implemented but not yet wired to SMTP/IMAP/POP3 (pending dispatch)
+- Some integration tests hang/timeout (pre-existing, not affecting lib tests)
 
 ---
 
@@ -72,40 +74,33 @@ Wired protocol restriction enforcement (`CURLOPT_PROTOCOLS_STR`/`CURLOPT_REDIR_P
 
 Full NTLMv2 per MS-NLMP: MD4 NT hash, HMAC-MD5 NTLMv2 hash, NTProofStr, LMv2 response, client blob with timestamp and target info. SASL SCRAM-SHA-256 (RFC 7677): client state machine with PBKDF2, challenge-response, server signature verification. SameSite cookie enforcement (Strict/Lax/None, reject None without Secure). FTP resume via REST command wired through Range header offset. SFTP ed25519 already supported by russh. Added Error::Auth variant.
 
-### Phase 57 — Protocol Polish
+### Phase 57 — Protocol Polish (Completed 2026-03-09)
 
-Improve protocol implementations to near-complete parity.
-
-- WebSocket `permessage-deflate` (RFC 7692)
-  - Implement deflate compression/decompression for WS frames
-  - Negotiate `permessage-deflate` extension in handshake
-  - Handle `RSV1` bit for compressed frames
-  - Add context takeover configuration
-  - Integration tests with compressed echo server
-- MQTT QoS 1/2 support
-  - Add `PUBACK` handling for QoS 1
-  - Add `PUBREC`/`PUBREL`/`PUBCOMP` flow for QoS 2
-  - Track packet identifiers for retransmission
-  - Integration tests with QoS levels
-- FTP MLST/MLSD (RFC 3659)
-  - Parse MLST/MLSD response format (facts + filename)
-  - Wire `MLST` and `MLSD` commands in FTP session
-  - Integration tests with mock FTP server
-- SFTP symlink following, permission preservation
-  - Follow symlinks during download/stat
-  - Preserve file permissions on upload
-  - Integration tests
-- TFTP RFC 2478 error extensions
+WebSocket permessage-deflate (RFC 7692): `DeflateConfig` parsing, `DeflateCodec` compress/decompress with flate2, RSV1 bit handling, context takeover/window bits negotiation, gated behind `decompression` feature. MQTT QoS 1/2: `QoS` enum, PUBACK/PUBREC/PUBREL/PUBCOMP packet builders, `publish_qos()`/`subscribe_qos()` with full handshake flows. FTP MLST/MLSD already implemented. SFTP: symlink following via lstat + readlink (up to 10 levels), `sftp_upload_with_permissions()` for setting remote file mode via setstat. TFTP: `TftpErrorCode` enum with all RFC 1350 error codes (0-7), parsed from ERROR packets.
 
 ### Phase 58 — Performance & Benchmarking
 
 Profile, optimize, and publish benchmarks.
 
-- Benchmark against curl for throughput, latency, concurrency
-- HTTP/2 multiplexing performance
-- Connection pool efficiency
-- Memory usage profiling
-- Publish benchmark results in README
+- Set up Criterion benchmark harness
+  - Add `benches/` directory with HTTP/1.1 throughput benchmark
+  - Add HTTP/2 throughput benchmark
+  - Add connection pool reuse benchmark
+  - Add URL parsing throughput benchmark
+- Measure baseline performance
+  - Single-request latency (HTTP/1.1, HTTP/2)
+  - Throughput on large file transfers
+  - Connection pool hit rate under concurrent load
+  - Cookie jar lookup performance
+- Profile memory usage
+  - Track peak RSS during large transfers
+  - Measure per-connection memory overhead
+  - Identify and reduce unnecessary allocations
+- Optimize hot paths
+  - Header parsing and lookup
+  - URL parsing
+  - Connection pool operations
+- Document benchmark results in README
 
 ### Phase 59 — CLI Completeness
 
