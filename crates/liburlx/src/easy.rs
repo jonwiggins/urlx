@@ -2588,6 +2588,13 @@ async fn do_single_request(
         }
     }
 
+    if verbose {
+        #[allow(clippy::print_stderr)]
+        for addr in &addrs {
+            eprintln!("*   Trying {addr}...");
+        }
+    }
+
     // Happy Eyeballs (RFC 6555): prefer IPv6, fall back to IPv4
     let tcp_stream = happy_eyeballs_connect(
         &addrs,
@@ -2599,6 +2606,13 @@ async fn do_single_request(
     )
     .await?;
     let time_connect = request_start.elapsed();
+
+    if verbose {
+        #[allow(clippy::print_stderr)]
+        if let Ok(peer) = tcp_stream.peer_addr() {
+            eprintln!("* Connected to {host} ({}) port {connect_port}", peer.ip());
+        }
+    }
 
     // Apply TCP socket options
     tcp_stream.set_nodelay(tcp_nodelay).map_err(Error::Connect)?;
