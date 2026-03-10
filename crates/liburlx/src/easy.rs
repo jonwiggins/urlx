@@ -2352,6 +2352,9 @@ async fn do_single_request(
         "dict" => {
             return crate::protocol::dict::lookup(url).await;
         }
+        "ws" | "wss" => {
+            return crate::protocol::ws::connect(url, headers, tls_config).await;
+        }
         _ => {}
     }
 

@@ -934,6 +934,155 @@ fn sha1_hash(data: &[u8]) -> [u8; 20] {
     result
 }
 
+/// Perform a WebSocket handshake and return the upgrade response.
+///
+/// Connects to the server at the given URL (ws:// or wss://), sends an HTTP
+/// upgrade request, and returns a [`Response`] with the server's handshake reply.
+/// The response body is empty; the connection status is reported via the HTTP
+/// status code (101 = success).
+///
+/// # Errors
+///
+/// Returns an error if the connection fails, TLS negotiation fails, or the
+/// server rejects the upgrade.
+/// Perform a WebSocket handshake and return the upgrade response.
+///
+/// Connects to the server at the given URL (ws:// or wss://), sends an HTTP
+/// upgrade request, and returns a [`Response`] with the server's handshake reply.
+/// The response body is empty; the connection status is reported via the HTTP
+/// status code (101 = success).
+///
+/// # Errors
+///
+/// Returns an error if the connection fails, TLS negotiation fails, or the
+/// server rejects the upgrade.
+pub async fn connect(
+    url: &crate::url::Url,
+    headers: &[(String, String)],
+    tls_config: &crate::tls::TlsConfig,
+) -> Result<crate::protocol::http::response::Response, Error> {
+    let (host, port) = url.host_and_port()?;
+    let is_tls = url.scheme() == "wss";
+
+    // Build the WebSocket key
+    let ws_key = generate_ws_key();
+    let expected_accept = compute_accept_key(&ws_key);
+
+    // Build the HTTP upgrade request
+    let path = if url.path().is_empty() { "/" } else { url.path() };
+    let query = url.query().map_or(String::new(), |q| format!("?{q}"));
+
+    let mut request = format!(
+        "GET {path}{query} HTTP/1.1\r\n\
+         Host: {host}\r\n\
+         Upgrade: websocket\r\n\
+         Connection: Upgrade\r\n\
+         Sec-WebSocket-Key: {ws_key}\r\n\
+         Sec-WebSocket-Version: 13\r\n"
+    );
+    for (key, val) in headers {
+        use std::fmt::Write;
+        let _ = write!(request, "{key}: {val}\r\n");
+    }
+    request.push_str("\r\n");
+
+    // Connect via TCP
+    let tcp_stream = tokio::net::TcpStream::connect(format!("{host}:{port}"))
+        .await
+        .map_err(|e| Error::Http(format!("WebSocket connect error: {e}")))?;
+
+    if is_tls {
+        let connector = crate::tls::TlsConnector::new_no_alpn(tls_config)?;
+        let (mut tls_stream, _alpn) = connector.connect(tcp_stream, &host).await?;
+
+        tokio::io::AsyncWriteExt::write_all(&mut tls_stream, request.as_bytes())
+            .await
+            .map_err(|e| Error::Http(format!("WebSocket write error: {e}")))?;
+        tokio::io::AsyncWriteExt::flush(&mut tls_stream)
+            .await
+            .map_err(|e| Error::Http(format!("WebSocket flush error: {e}")))?;
+
+        parse_upgrade_response(&mut tls_stream, &expected_accept, url.as_str()).await
+    } else {
+        let mut tcp_stream = tcp_stream;
+        tokio::io::AsyncWriteExt::write_all(&mut tcp_stream, request.as_bytes())
+            .await
+            .map_err(|e| Error::Http(format!("WebSocket write error: {e}")))?;
+        tokio::io::AsyncWriteExt::flush(&mut tcp_stream)
+            .await
+            .map_err(|e| Error::Http(format!("WebSocket flush error: {e}")))?;
+
+        parse_upgrade_response(&mut tcp_stream, &expected_accept, url.as_str()).await
+    }
+}
+
+/// Parse the HTTP upgrade response from the server.
+async fn parse_upgrade_response<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    expected_accept: &str,
+    url_str: &str,
+) -> Result<crate::protocol::http::response::Response, Error> {
+    // Read response bytes until we see \r\n\r\n
+    let mut buf = Vec::with_capacity(1024);
+    loop {
+        let mut byte = [0u8; 1];
+        let n = stream
+            .read(&mut byte)
+            .await
+            .map_err(|e| Error::Http(format!("WebSocket read error: {e}")))?;
+        if n == 0 {
+            return Err(Error::Http("WebSocket: connection closed during handshake".to_string()));
+        }
+        buf.push(byte[0]);
+        if buf.len() >= 4 && buf[buf.len() - 4..] == *b"\r\n\r\n" {
+            break;
+        }
+        if buf.len() > 8192 {
+            return Err(Error::Http("WebSocket: handshake response too large".to_string()));
+        }
+    }
+
+    let response_str = String::from_utf8_lossy(&buf);
+
+    // Parse status line
+    let status_line = response_str
+        .lines()
+        .next()
+        .ok_or_else(|| Error::Http("WebSocket: empty response".to_string()))?;
+
+    let status_code: u16 =
+        status_line.split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+
+    // Parse headers
+    let mut resp_headers = std::collections::HashMap::new();
+    for line in response_str.lines().skip(1) {
+        if line.is_empty() {
+            break;
+        }
+        if let Some((key, val)) = line.split_once(':') {
+            let _old = resp_headers.insert(key.trim().to_ascii_lowercase(), val.trim().to_string());
+        }
+    }
+
+    // Validate the accept key for 101 responses
+    if status_code == 101 {
+        if let Some(accept) = resp_headers.get("sec-websocket-accept") {
+            if accept != expected_accept {
+                return Err(Error::Http(format!(
+                    "WebSocket: invalid Sec-WebSocket-Accept (got {accept}, expected {expected_accept})"
+                )));
+            }
+        }
+    }
+
+    Ok(crate::protocol::http::response::Response::new(
+        status_code,
+        resp_headers,
+        Vec::new(),
+        url_str.to_string(),
+    ))
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -1393,5 +1542,93 @@ mod tests {
                 assert_eq!(received, Message::Text(msg));
             }
         }
+    }
+
+    #[tokio::test]
+    async fn parse_upgrade_response_101() {
+        let ws_key = generate_ws_key();
+        let accept = compute_accept_key(&ws_key);
+        let response = format!(
+            "HTTP/1.1 101 Switching Protocols\r\n\
+             Upgrade: websocket\r\n\
+             Connection: Upgrade\r\n\
+             Sec-WebSocket-Accept: {accept}\r\n\
+             \r\n"
+        );
+        let mut cursor = std::io::Cursor::new(response.into_bytes());
+        let resp = parse_upgrade_response(&mut cursor, &accept, "ws://example.com").await.unwrap();
+        assert_eq!(resp.status(), 101);
+        assert_eq!(resp.header("upgrade"), Some("websocket"));
+    }
+
+    #[tokio::test]
+    async fn parse_upgrade_response_403() {
+        let response = b"HTTP/1.1 403 Forbidden\r\n\
+             Content-Length: 0\r\n\
+             \r\n";
+        let mut cursor = std::io::Cursor::new(response.to_vec());
+        let resp =
+            parse_upgrade_response(&mut cursor, "ignored", "ws://example.com").await.unwrap();
+        assert_eq!(resp.status(), 403);
+    }
+
+    #[tokio::test]
+    async fn parse_upgrade_response_invalid_accept() {
+        let response = b"HTTP/1.1 101 Switching Protocols\r\n\
+             Upgrade: websocket\r\n\
+             Connection: Upgrade\r\n\
+             Sec-WebSocket-Accept: wrong_value\r\n\
+             \r\n";
+        let mut cursor = std::io::Cursor::new(response.to_vec());
+        let result = parse_upgrade_response(&mut cursor, "correct_value", "ws://example.com").await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("invalid Sec-WebSocket-Accept"));
+    }
+
+    #[tokio::test]
+    async fn ws_connect_mock_server() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Spawn a mock WebSocket server
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let n = stream.read(&mut buf).await.unwrap();
+            let request = String::from_utf8_lossy(&buf[..n]);
+
+            // Extract the Sec-WebSocket-Key from the request
+            let key = request
+                .lines()
+                .find(|l| l.starts_with("Sec-WebSocket-Key:"))
+                .unwrap()
+                .split(':')
+                .nth(1)
+                .unwrap()
+                .trim();
+
+            let accept = compute_accept_key(key);
+            let response = format!(
+                "HTTP/1.1 101 Switching Protocols\r\n\
+                 Upgrade: websocket\r\n\
+                 Connection: Upgrade\r\n\
+                 Sec-WebSocket-Accept: {accept}\r\n\
+                 \r\n"
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            stream.flush().await.unwrap();
+        });
+
+        let url = crate::url::Url::parse(&format!("ws://127.0.0.1:{}/chat", addr.port())).unwrap();
+        let tls_config = crate::tls::TlsConfig::default();
+        let resp = connect(&url, &[], &tls_config).await.unwrap();
+        assert_eq!(resp.status(), 101);
+        assert_eq!(resp.header("upgrade"), Some("websocket"));
+
+        server.await.unwrap();
     }
 }
