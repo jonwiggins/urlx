@@ -22,6 +22,21 @@ pub struct CookieJar {
     domain_index: HashMap<String, Vec<usize>>,
 }
 
+/// `SameSite` cookie attribute (RFC 6265bis).
+///
+/// Controls when cookies are sent with cross-site requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SameSite {
+    /// Cookie is not sent with cross-site requests.
+    /// This is the default when no `SameSite` attribute is present (per RFC 6265bis).
+    #[default]
+    Lax,
+    /// Cookie is sent with all requests (requires `Secure` flag).
+    None,
+    /// Cookie is never sent with cross-site requests.
+    Strict,
+}
+
 /// A single HTTP cookie.
 #[derive(Debug, Clone)]
 struct Cookie {
@@ -33,6 +48,10 @@ struct Cookie {
     secure: bool,
     #[allow(dead_code)] // Stored for future use (e.g., JavaScript cookie access filtering)
     http_only: bool,
+    /// `SameSite` attribute controlling cross-site cookie behavior.
+    /// Stored for completeness; CLI requests are always top-level navigations.
+    #[allow(dead_code)]
+    same_site: SameSite,
 }
 
 impl CookieJar {
@@ -222,7 +241,16 @@ impl CookieJar {
             // Replace existing cookie with same name+domain+path
             self.cookies.retain(|c| !(c.name == name && c.domain == domain && c.path == path));
 
-            self.cookies.push(Cookie { name, value, domain, path, expires, secure, http_only });
+            self.cookies.push(Cookie {
+                name,
+                value,
+                domain,
+                path,
+                expires,
+                secure,
+                http_only,
+                same_site: SameSite::default(),
+            });
         }
         self.rebuild_index();
         Ok(())
@@ -299,6 +327,7 @@ impl CookieJar {
         let mut expires: Option<SystemTime> = None;
         let mut secure = false;
         let mut http_only = false;
+        let mut same_site = SameSite::default();
         let mut has_explicit_domain = false;
 
         // Parse attributes
@@ -330,6 +359,14 @@ impl CookieJar {
                                 expires = SystemTime::now().checked_add(dur);
                             }
                         }
+                    } else if attr_name.eq_ignore_ascii_case("samesite") {
+                        if attr_value.eq_ignore_ascii_case("strict") {
+                            same_site = SameSite::Strict;
+                        } else if attr_value.eq_ignore_ascii_case("none") {
+                            same_site = SameSite::None;
+                        } else {
+                            same_site = SameSite::Lax;
+                        }
                     }
                 } else if attr.eq_ignore_ascii_case("secure") {
                     secure = true;
@@ -337,6 +374,11 @@ impl CookieJar {
                     http_only = true;
                 }
             }
+        }
+
+        // SameSite=None requires Secure (RFC 6265bis §5.4.7)
+        if same_site == SameSite::None && !secure {
+            return; // Reject the cookie
         }
 
         // Reject cookies with explicit Domain attribute set to a public suffix
@@ -349,7 +391,16 @@ impl CookieJar {
         // Replace existing cookie with same name+domain+path
         self.cookies.retain(|c| !(c.name == name && c.domain == domain && c.path == path));
 
-        self.cookies.push(Cookie { name, value, domain, path, expires, secure, http_only });
+        self.cookies.push(Cookie {
+            name,
+            value,
+            domain,
+            path,
+            expires,
+            secure,
+            http_only,
+            same_site,
+        });
 
         // Rebuild the index (retain may have invalidated indices)
         self.rebuild_index();
@@ -884,5 +935,76 @@ mod tests {
         assert_eq!(jar.cookie_header("host50.com", "/", false), Some("k50=v50".to_string()));
         // No match
         assert_eq!(jar.cookie_header("unknown.com", "/", false), None);
+    }
+
+    // ─── SameSite tests ───
+
+    #[test]
+    fn samesite_lax_parsed() {
+        let mut jar = CookieJar::new();
+        jar.store_cookies(&["id=123; SameSite=Lax"], "example.com", "/");
+        assert_eq!(jar.len(), 1);
+        assert_eq!(jar.cookies[0].same_site, SameSite::Lax);
+    }
+
+    #[test]
+    fn samesite_strict_parsed() {
+        let mut jar = CookieJar::new();
+        jar.store_cookies(&["id=456; SameSite=Strict"], "example.com", "/");
+        assert_eq!(jar.len(), 1);
+        assert_eq!(jar.cookies[0].same_site, SameSite::Strict);
+    }
+
+    #[test]
+    fn samesite_none_with_secure_accepted() {
+        let mut jar = CookieJar::new();
+        jar.store_cookies(&["id=789; SameSite=None; Secure"], "example.com", "/");
+        assert_eq!(jar.len(), 1);
+        assert_eq!(jar.cookies[0].same_site, SameSite::None);
+        assert!(jar.cookies[0].secure);
+    }
+
+    #[test]
+    fn samesite_none_without_secure_rejected() {
+        let mut jar = CookieJar::new();
+        jar.store_cookies(&["id=bad; SameSite=None"], "example.com", "/");
+        // SameSite=None without Secure must be rejected
+        assert_eq!(jar.len(), 0);
+    }
+
+    #[test]
+    fn samesite_default_is_lax() {
+        let mut jar = CookieJar::new();
+        jar.store_cookies(&["id=def"], "example.com", "/");
+        assert_eq!(jar.len(), 1);
+        assert_eq!(jar.cookies[0].same_site, SameSite::Lax);
+    }
+
+    #[test]
+    fn samesite_case_insensitive() {
+        let mut jar = CookieJar::new();
+        jar.store_cookies(&["a=1; samesite=STRICT"], "example.com", "/");
+        assert_eq!(jar.cookies[0].same_site, SameSite::Strict);
+
+        jar.store_cookies(&["b=2; SAMESITE=lax"], "example.com", "/");
+        assert_eq!(jar.cookies[1].same_site, SameSite::Lax);
+    }
+
+    #[test]
+    fn samesite_unknown_value_defaults_to_lax() {
+        let mut jar = CookieJar::new();
+        jar.store_cookies(&["id=x; SameSite=Invalid"], "example.com", "/");
+        assert_eq!(jar.len(), 1);
+        assert_eq!(jar.cookies[0].same_site, SameSite::Lax);
+    }
+
+    #[test]
+    fn samesite_none_secure_cookie_sent_over_https() {
+        let mut jar = CookieJar::new();
+        jar.store_cookies(&["id=s; SameSite=None; Secure"], "example.com", "/");
+        // Secure cookies should be sent over HTTPS
+        assert!(jar.cookie_header("example.com", "/", true).is_some());
+        // But not over HTTP
+        assert!(jar.cookie_header("example.com", "/", false).is_none());
     }
 }
