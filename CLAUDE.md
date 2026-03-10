@@ -15,9 +15,9 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 ## Current Status
 
 **Version:** v0.1.0 published (crates.io + GitHub Releases + Homebrew)
-**Last completed:** v0.1.0 release — 2026-03-10
-**Total tests:** 2,288
-**In progress:** Planning Phase 52
+**Last completed:** Phase 52 — CLI Drop-in Essentials — 2026-03-10
+**Total tests:** 2,303
+**In progress:** Phase 53
 **Blockers:** None
 
 ### Completeness Summary (post-v0.1.0 audit)
@@ -25,7 +25,7 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 | Feature Area | Parity | Notes |
 |---|---|---|
 | HTTP/1.1 | 97% | Expect, HTTP/1.0, trailer headers; no chunked upload |
-| HTTP/2 | 80% | ALPN, multiplexing, flow control; no connection pooling or stream priority |
+| HTTP/2 | 85% | ALPN, multiplexing, flow control, google.com compat; no connection pooling |
 | HTTP/3 | 55% | QUIC via quinn, Alt-Svc, 0-RTT; no pooling/push; **untested** |
 | TLS | 85% | rustls, insecure mode, CA/client certs, pinning, version selection, cipher list, session cache |
 | Authentication | 65% | Basic, Bearer, Digest (CSPRNG cnonce), AWS SigV4, NTLM skeleton |
@@ -37,33 +37,23 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 | WebSocket | 85% | RFC 6455, CloseCode, fragmentation; no permessage-deflate |
 | Multi API | 75% | Connection limiting, share, pipelining, FFI event loop stubs |
 | FFI (libcurl C ABI) | ~60% | 102 CURLOPT, 43 CURLINFO, 32 CURLcode, 56 functions |
-| CLI | ~60% | ~150 flags; no combined short flags; no --help/--version |
+| CLI | ~65% | ~150 flags, --help, --version, combined short flags (-sSfL) |
 | Connection | 80% | Pool, TCP_NODELAY, keepalive, Unix sockets, interface/port binding |
 | Transfer control | 80% | Rate limiting enforced (max recv/send speed, low speed timeout) |
 | Overall | ~64% | ~92% for basic HTTP/HTTPS use cases |
 
 ### Known Issues
 
-- `urlx -L https://google.com` fails with h2 stream error
-- `%{http_version}` in `--write-out` always returns "1.1" (version not tracked in Response)
 - MQTT, SMTP, IMAP, POP3, DICT modules exist but are not dispatched from Easy API
-- Combined short flags (`-sSf`) not supported — must use `-s -S -f`
 - NTLM auth is a skeleton (SHA-256, not real MD4+DES)
 
 ---
 
 ## Implementation Phases
 
-### Phase 52 — CLI Drop-in Essentials
+### Phase 52 — CLI Drop-in Essentials (Completed 2026-03-10)
 
-Fix the critical gaps that prevent urlx from being a credible curl replacement.
-
-- Add `--help` / `-h` flag (wire existing `print_usage()` to flag)
-- Add `--version` / `-V` flag
-- Implement combined short flags (`-sSfL`, `-Lo`, etc.)
-- Track HTTP version (1.0, 1.1, 2, 3) in Response struct
-- Fix `%{http_version}` in `--write-out`
-- Debug and fix h2 stream error on google.com / major sites
+Added `--help`/`-h`, `--version`/`-V`, combined short flags (`-sSfL`), `ResponseHttpVersion` enum tracking across h1/h2/h3, fixed `%{http_version}` write-out, fixed h2 google.com stream error (removed Host header in favor of `:authority`, added `client.ready()`), handled TLS `close_notify` as EOF in h1.
 
 ### Phase 53 — Protocol Dispatch & Integration
 
@@ -79,10 +69,10 @@ Wire orphaned protocol modules into the Easy API and add integration tests.
 
 Improve HTTP/2 to work reliably against real-world servers.
 
-- Debug and fix h2 compatibility with major sites (google.com, cloudflare, etc.)
 - HTTP/2 connection pooling (reuse h2 connections across requests)
 - Server push exposure to caller
 - Chunked transfer encoding for request uploads (HTTP/1.1)
+- HTTP/2 stream priority (RFC 9113 deprecated but API compat)
 
 ### Phase 55 — FFI Hardening
 
