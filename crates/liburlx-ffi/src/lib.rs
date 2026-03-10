@@ -2069,8 +2069,10 @@ pub unsafe extern "C" fn curl_easy_setopt(
                 1 => h.easy.http_version(liburlx::HttpVersion::Http10),
                 // CURL_HTTP_VERSION_1_1 = 2
                 2 => h.easy.http_version(liburlx::HttpVersion::Http11),
-                // CURL_HTTP_VERSION_2_0 = 3
-                3 => h.easy.http_version(liburlx::HttpVersion::Http2),
+                // CURL_HTTP_VERSION_2_0 = 3, CURL_HTTP_VERSION_2TLS = 4
+                3 | 4 => h.easy.http_version(liburlx::HttpVersion::Http2),
+                // CURL_HTTP_VERSION_2_PRIOR_KNOWLEDGE = 5
+                5 => h.easy.http_version(liburlx::HttpVersion::Http2PriorKnowledge),
                 _ => {}
             }
             CURLcode::CURLE_OK

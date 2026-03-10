@@ -36,6 +36,8 @@ pub enum HttpVersion {
     Http11,
     /// Prefer HTTP/2 via ALPN (fallback to HTTP/1.1 if not negotiated).
     Http2,
+    /// Use HTTP/2 without TLS negotiation (h2c prior knowledge, RFC 7540 §3.4).
+    Http2PriorKnowledge,
     /// Request HTTP/3 via QUIC (requires `http3` feature).
     Http3,
 }

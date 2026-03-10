@@ -428,6 +428,14 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
                     opts.easy.method("POST");
                 }
             }
+            "--data-ascii" => {
+                i += 1;
+                let val = require_arg(args, i, "--data-ascii")?;
+                opts.easy.body(val.as_bytes());
+                if opts.easy.method_is_default() {
+                    opts.easy.method("POST");
+                }
+            }
             "-L" | "--location" => {
                 opts.easy.follow_redirects(true);
             }
@@ -805,6 +813,9 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
             "--http3" => {
                 opts.easy.http_version(liburlx::HttpVersion::Http3);
             }
+            "--http2-prior-knowledge" => {
+                opts.easy.http_version(liburlx::HttpVersion::Http2PriorKnowledge);
+            }
             "--expect100-timeout" => {
                 i += 1;
                 let val = require_arg(args, i, "--expect100-timeout")?;
@@ -880,6 +891,16 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
                     opts.easy.tcp_keepalive(std::time::Duration::from_secs(secs));
                 } else {
                     eprintln!("urlx: invalid tcp-keepalive value: {val}");
+                    return None;
+                }
+            }
+            "--keepalive-time" => {
+                i += 1;
+                let val = require_arg(args, i, "--keepalive-time")?;
+                if let Ok(secs) = val.parse::<u64>() {
+                    opts.easy.tcp_keepalive(std::time::Duration::from_secs(secs));
+                } else {
+                    eprintln!("urlx: invalid keepalive-time value: {val}");
                     return None;
                 }
             }
@@ -1122,6 +1143,14 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
             "--ftp-create-dirs" => {
                 opts.easy.ftp_create_dirs(true);
             }
+            "--ftp-skip-pasv-ip" => {
+                opts.easy.ftp_skip_pasv_ip(true);
+            }
+            "--ftp-account" => {
+                i += 1;
+                let val = require_arg(args, i, "--ftp-account")?;
+                opts.easy.ftp_account(val);
+            }
             "--ftp-method" => {
                 i += 1;
                 let val = require_arg(args, i, "--ftp-method")?;
@@ -1255,6 +1284,11 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
                 }
                 opts.easy.http_version(liburlx::HttpVersion::Http10);
             }
+            "--preproxy" => {
+                i += 1;
+                let val = require_arg(args, i, "--preproxy")?;
+                opts.easy.pre_proxy(val);
+            }
             "--tftp-blksize" => {
                 i += 1;
                 let val = require_arg(args, i, "--tftp-blksize")?;
@@ -1308,7 +1342,9 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
             "-N" | "--no-buffer" | "--no-sessionid" | "--no-alpn" | "--no-npn"
             | "--cert-status" | "--false-start" | "--disable-eprt" | "--disable-epsv"
             | "--compressed-ssh" | "--doh-cert-status" | "--next" | "--ftp-pasv"
-            | "--styled-output" | "--no-styled-output" | "--negotiate" => {}
+            | "--styled-output" | "--no-styled-output" | "--negotiate" | "--xattr"
+            | "--disable" | "--metalink" | "--basic" | "--anyauth" | "--proxy-basic"
+            | "--proxy-anyauth" => {}
             // No-op flags that take an argument
             "--create-file-mode"
             | "--service-name"
@@ -1323,6 +1359,9 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
             | "--pass"
             | "--proxy-cert-type"
             | "--proxy-key-type"
+            | "--crlfile"
+            | "--proxy-crlfile"
+            | "--proxy-pinnedpubkey"
             | "--proxy-pass" => {
                 i += 1;
                 let _val = require_arg(args, i, &args[i - 1].clone())?;
@@ -3889,6 +3928,98 @@ mod tests {
     #[test]
     fn parse_args_pass_noop() {
         let args = make_args(&["--pass", "mypassword", "http://example.com"]);
+        let opts = unwrap_opts(parse_args(&args));
+        assert!(!opts.urls.is_empty());
+    }
+
+    #[test]
+    fn parse_args_basic_auth() {
+        let args = make_args(&["--basic", "-u", "user:pass", "http://example.com"]);
+        let opts = unwrap_opts(parse_args(&args));
+        assert!(!opts.urls.is_empty());
+    }
+
+    #[test]
+    fn parse_args_anyauth() {
+        let args = make_args(&["--anyauth", "-u", "user:pass", "http://example.com"]);
+        let opts = unwrap_opts(parse_args(&args));
+        assert!(!opts.urls.is_empty());
+    }
+
+    #[test]
+    fn parse_args_proxy_basic() {
+        let args = make_args(&["--proxy-basic", "http://example.com"]);
+        let opts = unwrap_opts(parse_args(&args));
+        assert!(!opts.urls.is_empty());
+    }
+
+    #[test]
+    fn parse_args_proxy_anyauth() {
+        let args = make_args(&["--proxy-anyauth", "http://example.com"]);
+        let opts = unwrap_opts(parse_args(&args));
+        assert!(!opts.urls.is_empty());
+    }
+
+    #[test]
+    fn parse_args_http2_prior_knowledge() {
+        let args = make_args(&["--http2-prior-knowledge", "http://example.com"]);
+        let opts = unwrap_opts(parse_args(&args));
+        // Verifies flag parses without error
+        assert!(!opts.urls.is_empty());
+    }
+
+    #[test]
+    fn parse_args_ftp_skip_pasv_ip() {
+        let args = make_args(&["--ftp-skip-pasv-ip", "ftp://example.com"]);
+        let opts = unwrap_opts(parse_args(&args));
+        assert!(!opts.urls.is_empty());
+    }
+
+    #[test]
+    fn parse_args_ftp_account() {
+        let args = make_args(&["--ftp-account", "myaccount", "ftp://example.com"]);
+        let opts = unwrap_opts(parse_args(&args));
+        assert!(!opts.urls.is_empty());
+    }
+
+    #[test]
+    fn parse_args_preproxy() {
+        let args = make_args(&["--preproxy", "socks5://proxy:1080", "http://example.com"]);
+        let opts = unwrap_opts(parse_args(&args));
+        assert!(!opts.urls.is_empty());
+    }
+
+    #[test]
+    fn parse_args_data_ascii() {
+        let args = make_args(&["--data-ascii", "hello", "http://example.com"]);
+        let opts = unwrap_opts(parse_args(&args));
+        assert!(!opts.urls.is_empty());
+    }
+
+    #[test]
+    fn parse_args_keepalive_time() {
+        let args = make_args(&["--keepalive-time", "30", "http://example.com"]);
+        let opts = unwrap_opts(parse_args(&args));
+        assert!(!opts.urls.is_empty());
+    }
+
+    #[test]
+    fn parse_args_crlfile_noop() {
+        let args = make_args(&["--crlfile", "/path/to/crl.pem", "http://example.com"]);
+        let opts = unwrap_opts(parse_args(&args));
+        assert!(!opts.urls.is_empty());
+    }
+
+    #[test]
+    fn parse_args_proxy_pinnedpubkey_noop() {
+        let args = make_args(&["--proxy-pinnedpubkey", "sha256//abc123", "https://example.com"]);
+        let opts = unwrap_opts(parse_args(&args));
+        assert!(!opts.urls.is_empty());
+    }
+
+    #[test]
+    fn parse_args_xattr_noop() {
+        let args = make_args(&["--xattr", "http://example.com"]);
         let opts = unwrap_opts(parse_args(&args));
         assert!(!opts.urls.is_empty());
     }
