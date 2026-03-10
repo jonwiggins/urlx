@@ -1654,7 +1654,7 @@ impl Easy {
             // If DoH URL is configured, use DoH resolver
             if let Some(ref doh_url) = self.doh_url {
                 return crate::dns::DnsResolver::Hickory(Box::new(
-                    crate::dns::HickoryResolver::from_doh(doh_url),
+                    crate::dns::HickoryResolver::from_doh(doh_url, self.doh_insecure),
                 ));
             }
             // If custom DNS servers are configured, use hickory with those servers
@@ -1772,7 +1772,23 @@ impl Easy {
 
         // Resolve proxy: explicit setting takes priority, then env vars
         let env_proxy = if self.proxy.is_none() { proxy_from_env(url.scheme()) } else { None };
-        let effective_proxy = self.proxy.as_ref().or(env_proxy.as_ref());
+        let mut effective_proxy_owned = self.proxy.clone().or(env_proxy);
+
+        // Apply proxy_port override
+        if let (Some(ref mut proxy_url), Some(port)) = (&mut effective_proxy_owned, self.proxy_port)
+        {
+            let _ = proxy_url.set_port(Some(port));
+        }
+
+        // Apply proxy_type override (rewrite scheme)
+        if let (Some(ref mut proxy_url), Some(ptype)) =
+            (&mut effective_proxy_owned, self.proxy_type)
+        {
+            let scheme = proxy_type_to_scheme(ptype);
+            let _ = proxy_url.set_scheme(scheme);
+        }
+
+        let effective_proxy = effective_proxy_owned.as_ref();
 
         // Resolve noproxy: explicit setting takes priority, then env vars
         let env_noproxy = if self.noproxy.is_none() { noproxy_from_env() } else { None };
@@ -1816,6 +1832,16 @@ impl Easy {
             enable_push: self.http2_enable_push,
             stream_weight: self.http2_stream_weight,
             ping_interval: self.http2_ping_interval,
+        };
+
+        let ftp_config = crate::protocol::ftp::FtpConfig {
+            use_epsv: self.ftp_use_epsv,
+            use_eprt: self.ftp_use_eprt,
+            skip_pasv_ip: self.ftp_skip_pasv_ip,
+            account: self.ftp_account.clone(),
+            create_dirs: self.ftp_create_dirs,
+            method: self.ftp_method,
+            active_port: self.ftp_active_port.clone(),
         };
 
         let dns_resolver = self.build_dns_resolver();
@@ -1879,6 +1905,19 @@ impl Easy {
             self.mail_from.as_deref(),
             &self.mail_rcpt,
             self.redir_protocols.as_deref(),
+            self.fresh_connect,
+            self.forbid_reuse,
+            &ftp_config,
+            &self.proxy_headers,
+            &self.connect_to,
+            self.path_as_is,
+            self.ssh_public_keyfile.as_deref(),
+            self.ssh_auth_types,
+            self.mail_auth.as_deref(),
+            self.sasl_authzid.as_deref(),
+            self.sasl_ir,
+            self.haproxy_protocol,
+            self.abstract_unix_socket.as_deref(),
         );
 
         // Apply total transfer timeout if set.
@@ -1992,6 +2031,19 @@ async fn perform_transfer(
     mail_from: Option<&str>,
     mail_rcpt: &[String],
     redir_protocols: Option<&[String]>,
+    fresh_connect: bool,
+    forbid_reuse: bool,
+    ftp_config: &crate::protocol::ftp::FtpConfig,
+    proxy_headers: &[(String, String)],
+    connect_to: &[String],
+    path_as_is: bool,
+    #[cfg_attr(not(feature = "ssh"), allow(unused_variables))] ssh_public_keyfile: Option<&str>,
+    #[cfg_attr(not(feature = "ssh"), allow(unused_variables))] ssh_auth_types: Option<u32>,
+    mail_auth: Option<&str>,
+    sasl_authzid: Option<&str>,
+    sasl_ir: bool,
+    haproxy_protocol: bool,
+    abstract_unix_socket: Option<&str>,
 ) -> Result<Response, Error> {
     let transfer_start = Instant::now();
     let original_url = url.clone();
@@ -2066,6 +2118,25 @@ async fn perform_transfer(
             ssh_host_key_policy,
             mail_from,
             mail_rcpt,
+            fresh_connect,
+            forbid_reuse,
+            ftp_config,
+            proxy_headers,
+            connect_to,
+            path_as_is,
+            #[cfg(feature = "ssh")]
+            ssh_public_keyfile,
+            #[cfg(not(feature = "ssh"))]
+            None,
+            #[cfg(feature = "ssh")]
+            ssh_auth_types,
+            #[cfg(not(feature = "ssh"))]
+            None,
+            mail_auth,
+            sasl_authzid,
+            sasl_ir,
+            haproxy_protocol,
+            abstract_unix_socket,
         ))
         .await?;
 
@@ -2086,7 +2157,11 @@ async fn perform_transfer(
                                 }
                             }
 
-                            let uri = resolve_request_target(custom_request_target, &current_url);
+                            let uri = resolve_request_target(
+                                custom_request_target,
+                                &current_url,
+                                path_as_is,
+                            );
                             let cnonce = crate::auth::digest::generate_cnonce();
                             let auth_header = challenge.respond(
                                 &auth.username,
@@ -2141,6 +2216,25 @@ async fn perform_transfer(
                                 ssh_host_key_policy,
                                 mail_from,
                                 mail_rcpt,
+                                fresh_connect,
+                                forbid_reuse,
+                                ftp_config,
+                                proxy_headers,
+                                connect_to,
+                                path_as_is,
+                                #[cfg(feature = "ssh")]
+                                ssh_public_keyfile,
+                                #[cfg(not(feature = "ssh"))]
+                                None,
+                                #[cfg(feature = "ssh")]
+                                ssh_auth_types,
+                                #[cfg(not(feature = "ssh"))]
+                                None,
+                                mail_auth,
+                                sasl_authzid,
+                                sasl_ir,
+                                haproxy_protocol,
+                                abstract_unix_socket,
                             ))
                             .await?;
                         }
@@ -2301,6 +2395,19 @@ async fn do_single_request(
     #[cfg(feature = "ssh")] ssh_host_key_policy: &crate::protocol::ssh::SshHostKeyPolicy,
     mail_from: Option<&str>,
     mail_rcpt: &[String],
+    fresh_connect: bool,
+    forbid_reuse: bool,
+    ftp_config: &crate::protocol::ftp::FtpConfig,
+    proxy_headers: &[(String, String)],
+    connect_to: &[String],
+    path_as_is: bool,
+    #[cfg_attr(not(feature = "ssh"), allow(unused_variables))] ssh_public_keyfile: Option<&str>,
+    #[cfg_attr(not(feature = "ssh"), allow(unused_variables))] ssh_auth_types: Option<u32>,
+    mail_auth: Option<&str>,
+    sasl_authzid: Option<&str>,
+    sasl_ir: bool,
+    haproxy_protocol: bool,
+    #[cfg_attr(not(unix), allow(unused_variables))] abstract_unix_socket: Option<&str>,
 ) -> Result<Response, Error> {
     // Handle non-HTTP schemes directly
     match url.scheme() {
@@ -2312,10 +2419,24 @@ async fn do_single_request(
         "sftp" | "scp" => {
             return if method == "PUT" {
                 let upload_data = body.unwrap_or(&[]);
-                crate::protocol::ssh::upload(url, upload_data, ssh_key_path, ssh_host_key_policy)
-                    .await
+                crate::protocol::ssh::upload(
+                    url,
+                    upload_data,
+                    ssh_key_path,
+                    ssh_host_key_policy,
+                    ssh_public_keyfile,
+                    ssh_auth_types,
+                )
+                .await
             } else {
-                crate::protocol::ssh::download(url, ssh_key_path, ssh_host_key_policy).await
+                crate::protocol::ssh::download(
+                    url,
+                    ssh_key_path,
+                    ssh_host_key_policy,
+                    ssh_public_keyfile,
+                    ssh_auth_types,
+                )
+                .await
             };
         }
         "ftp" | "ftps" => {
@@ -2337,15 +2458,37 @@ async fn do_single_request(
             });
             return if method == "PUT" {
                 let upload_data = body.unwrap_or(&[]);
-                crate::protocol::ftp::upload(url, upload_data, effective_ssl_mode, tls_config).await
+                crate::protocol::ftp::upload(
+                    url,
+                    upload_data,
+                    effective_ssl_mode,
+                    tls_config,
+                    ftp_config,
+                )
+                .await
             } else {
-                crate::protocol::ftp::download(url, effective_ssl_mode, tls_config, resume_offset)
-                    .await
+                crate::protocol::ftp::download(
+                    url,
+                    effective_ssl_mode,
+                    tls_config,
+                    resume_offset,
+                    ftp_config,
+                )
+                .await
             };
         }
         "smtp" | "smtps" => {
             let mail_data = body.unwrap_or(&[]);
-            return crate::protocol::smtp::send_mail(url, mail_data, mail_from, mail_rcpt).await;
+            return crate::protocol::smtp::send_mail(
+                url,
+                mail_data,
+                mail_from,
+                mail_rcpt,
+                mail_auth,
+                sasl_authzid,
+                sasl_ir,
+            )
+            .await;
         }
         "imap" | "imaps" => {
             return crate::protocol::imap::fetch(url).await;
@@ -2373,7 +2516,7 @@ async fn do_single_request(
     let (host, port) = url.host_and_port()?;
     let host_header = url.host_header_value();
     let is_tls = url.scheme() == "https";
-    let use_pool = proxy.is_none();
+    let use_pool = proxy.is_none() && !fresh_connect;
 
     // Build effective headers (add Accept-Encoding if decompression enabled)
     let mut effective_headers: Vec<(String, String)> = headers.to_vec();
@@ -2401,7 +2544,7 @@ async fn do_single_request(
                         eprintln!("* Re-using existing HTTP/2 connection to {host} port {port}");
                     }
                 }
-                let request_target = resolve_request_target(custom_request_target, url);
+                let request_target = resolve_request_target(custom_request_target, url, path_as_is);
                 let result = crate::protocol::http::h2::send_request(
                     h2_client,
                     method,
@@ -2416,7 +2559,9 @@ async fn do_single_request(
 
                 match result {
                     Ok((resp, h2_client)) => {
-                        h2_pool.put(&host, port, h2_client);
+                        if !forbid_reuse {
+                            h2_pool.put(&host, port, h2_client);
+                        }
                         return maybe_decompress(resp, accept_encoding);
                     }
                     Err(_) => {
@@ -2442,7 +2587,7 @@ async fn do_single_request(
                 }
             }
 
-            let request_target = resolve_request_target(custom_request_target, url);
+            let request_target = resolve_request_target(custom_request_target, url, path_as_is);
             let use_http10 = http_version == HttpVersion::Http10;
             let result = crate::protocol::http::h1::request(
                 &mut stream,
@@ -2463,7 +2608,7 @@ async fn do_single_request(
 
             match result {
                 Ok((response, can_reuse)) => {
-                    if can_reuse {
+                    if can_reuse && !forbid_reuse {
                         pool.put(&host, port, is_tls, stream);
                     }
                     return maybe_decompress(response, accept_encoding);
@@ -2485,6 +2630,22 @@ async fn do_single_request(
     let (connect_host, connect_port) =
         if let Some(proxy_url) = proxy { proxy_url.host_and_port()? } else { (host.clone(), port) };
 
+    // Apply --connect-to remapping (only for direct connections, not proxied)
+    let (connect_host, connect_port) = if proxy.is_none() && !connect_to.is_empty() {
+        let (new_host, new_port) = apply_connect_to(&connect_host, connect_port, connect_to);
+        if verbose && (new_host != connect_host || new_port != connect_port) {
+            #[allow(clippy::print_stderr)]
+            {
+                eprintln!(
+                    "* connect-to: remapped {connect_host}:{connect_port} -> {new_host}:{new_port}"
+                );
+            }
+        }
+        (new_host, new_port)
+    } else {
+        (connect_host, connect_port)
+    };
+
     if verbose {
         #[allow(clippy::print_stderr)]
         {
@@ -2504,6 +2665,19 @@ async fn do_single_request(
 
     // Connect via Unix socket or TCP
     let request_start = Instant::now();
+
+    // Abstract Unix domain socket — Linux-only, requires OS-specific APIs
+    #[cfg(unix)]
+    if let Some(_abstract_path) = abstract_unix_socket {
+        return Err(Error::Http(
+            "Abstract Unix sockets are not yet supported (requires OS-specific APIs)".to_string(),
+        ));
+    }
+
+    #[cfg(not(unix))]
+    if abstract_unix_socket.is_some() {
+        return Err(Error::Http("Abstract Unix sockets are only supported on Linux".to_string()));
+    }
 
     // Unix domain socket path — bypasses DNS, TCP, proxy, SOCKS, and TLS
     #[cfg(unix)]
@@ -2527,7 +2701,7 @@ async fn do_single_request(
         let time_namelookup = time_connect;
         let time_pretransfer = request_start.elapsed();
 
-        let request_target = resolve_request_target(custom_request_target, url);
+        let request_target = resolve_request_target(custom_request_target, url, path_as_is);
         let use_http10 = http_version == HttpVersion::Http10;
         let mut stream = PooledStream::Unix(uds_stream);
         let (resp, _can_reuse) = crate::protocol::http::h1::request(
@@ -2613,7 +2787,7 @@ async fn do_single_request(
     }
 
     // Happy Eyeballs (RFC 6555): prefer IPv6, fall back to IPv4
-    let tcp_stream = happy_eyeballs_connect(
+    let mut tcp_stream = happy_eyeballs_connect(
         &addrs,
         connect_timeout,
         request_start,
@@ -2637,6 +2811,31 @@ async fn do_single_request(
         let sock = socket2::SockRef::from(&tcp_stream);
         let keepalive = socket2::TcpKeepalive::new().with_time(keepalive_idle);
         sock.set_tcp_keepalive(&keepalive).map_err(Error::Connect)?;
+    }
+
+    // Send HAProxy PROXY protocol v1 header before any TLS or protocol data
+    if haproxy_protocol {
+        use tokio::io::AsyncWriteExt;
+        if let (Ok(local), Ok(peer)) = (tcp_stream.local_addr(), tcp_stream.peer_addr()) {
+            let proto = if local.ip().is_ipv4() { "TCP4" } else { "TCP6" };
+            let header = format!(
+                "PROXY {proto} {} {} {} {}\r\n",
+                local.ip(),
+                peer.ip(),
+                local.port(),
+                peer.port()
+            );
+            tcp_stream
+                .write_all(header.as_bytes())
+                .await
+                .map_err(|e| Error::Http(format!("HAProxy PROXY header write failed: {e}")))?;
+            if verbose {
+                #[allow(clippy::print_stderr)]
+                {
+                    eprintln!("* Sent HAProxy PROXY protocol v1 header");
+                }
+            }
+        }
     }
 
     // Handle SOCKS proxy tunneling
@@ -2702,7 +2901,8 @@ async fn do_single_request(
                             }
                         }
                     }
-                    let request_target = resolve_request_target(custom_request_target, url);
+                    let request_target =
+                        resolve_request_target(custom_request_target, url, path_as_is);
                     let time_pretransfer = request_start.elapsed();
                     let resp = crate::protocol::http::h3::request(
                         addr,
@@ -2764,6 +2964,7 @@ async fn do_single_request(
                         port,
                         &effective_headers,
                         proxy_credentials,
+                        proxy_headers,
                         verbose,
                     )
                     .await?;
@@ -2772,7 +2973,8 @@ async fn do_single_request(
                     let (mut tls_stream, _alpn) = tls.connect_generic(tunnel_stream, &host).await?;
                     let time_appconnect = request_start.elapsed();
 
-                    let request_target = resolve_request_target(custom_request_target, url);
+                    let request_target =
+                        resolve_request_target(custom_request_target, url, path_as_is);
                     let use_http10 = http_version == HttpVersion::Http10;
                     let time_pretransfer = request_start.elapsed();
 
@@ -2819,6 +3021,7 @@ async fn do_single_request(
                         port,
                         &effective_headers,
                         proxy_credentials,
+                        proxy_headers,
                         verbose,
                     )
                     .await?
@@ -2830,7 +3033,7 @@ async fn do_single_request(
                 let (tls_stream, alpn) = tls.connect(tls_stream_inner, &host).await?;
                 let time_appconnect = request_start.elapsed();
 
-                let request_target = resolve_request_target(custom_request_target, url);
+                let request_target = resolve_request_target(custom_request_target, url, path_as_is);
 
                 // Use HTTP/2 if ALPN negotiated it, unless user forced HTTP/1.x
                 let allow_h2 = !matches!(http_version, HttpVersion::Http10 | HttpVersion::Http11);
@@ -2857,7 +3060,9 @@ async fn do_single_request(
                     )
                     .await?;
                     // Return h2 connection to pool for reuse
-                    h2_pool.put(&host, port, h2_client);
+                    if !forbid_reuse {
+                        h2_pool.put(&host, port, h2_client);
+                    }
                     let time_starttransfer = request_start.elapsed();
                     let mut resp = maybe_decompress(resp, accept_encoding)?;
                     let mut info = resp.transfer_info().clone();
@@ -2892,7 +3097,7 @@ async fn do_single_request(
                 .await?;
                 let time_starttransfer = request_start.elapsed();
 
-                if can_reuse && use_pool {
+                if can_reuse && use_pool && !forbid_reuse {
                     pool.put(&host, port, is_tls, stream);
                 }
 
@@ -2918,9 +3123,17 @@ async fn do_single_request(
                 target.to_string()
             } else if proxy.is_some() && !is_socks_proxy {
                 url.as_str().to_string()
+            } else if path_as_is {
+                extract_path_and_query(url.as_str())
             } else {
                 url.request_target()
             };
+
+            // Add proxy-specific headers for non-tunnel HTTP proxy requests
+            let mut proxy_effective_headers = effective_headers.clone();
+            if proxy.is_some() && !is_socks_proxy {
+                proxy_effective_headers.extend_from_slice(proxy_headers);
+            }
 
             let use_http10 = http_version == HttpVersion::Http10;
             let time_pretransfer = request_start.elapsed();
@@ -2930,7 +3143,7 @@ async fn do_single_request(
                 method,
                 &host_header,
                 &request_target,
-                &effective_headers,
+                &proxy_effective_headers,
                 body,
                 url.as_str(),
                 use_pool,
@@ -2943,7 +3156,7 @@ async fn do_single_request(
             .await?;
             let time_starttransfer = request_start.elapsed();
 
-            if can_reuse && use_pool {
+            if can_reuse && use_pool && !forbid_reuse {
                 pool.put(&host, port, is_tls, stream);
             }
 
@@ -2996,6 +3209,7 @@ async fn establish_connect_tunnel<S>(
     target_port: u16,
     headers: &[(String, String)],
     proxy_credentials: Option<&ProxyAuthCredentials>,
+    proxy_headers: &[(String, String)],
     verbose: bool,
 ) -> Result<S, Error>
 where
@@ -3003,7 +3217,8 @@ where
 {
     // Send initial CONNECT request
     let (status, response_headers) =
-        send_connect_request(&mut stream, target_host, target_port, headers, None).await?;
+        send_connect_request(&mut stream, target_host, target_port, headers, None, proxy_headers)
+            .await?;
 
     if status == 200 {
         return Ok(stream);
@@ -3047,6 +3262,7 @@ where
                                 target_port,
                                 headers,
                                 Some(&format!("Proxy-Authorization: {auth_value}")),
+                                proxy_headers,
                             )
                             .await?;
 
@@ -3078,6 +3294,7 @@ where
                         target_port,
                         headers,
                         Some(&format!("Proxy-Authorization: NTLM {type1}")),
+                        proxy_headers,
                     )
                     .await?;
 
@@ -3101,6 +3318,7 @@ where
                                     target_port,
                                     headers,
                                     Some(&format!("Proxy-Authorization: NTLM {type3}")),
+                                    proxy_headers,
                                 )
                                 .await?;
 
@@ -3144,6 +3362,7 @@ async fn send_connect_request<S>(
     target_port: u16,
     headers: &[(String, String)],
     extra_header: Option<&str>,
+    proxy_headers: &[(String, String)],
 ) -> Result<(u16, Vec<(String, String)>), Error>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -3161,6 +3380,12 @@ where
             use std::fmt::Write as _;
             let _ = write!(connect_req, "{name}: {value}\r\n");
         }
+    }
+
+    // Add proxy-specific headers (--proxy-header / CURLOPT_PROXYHEADER)
+    for (name, value) in proxy_headers {
+        use std::fmt::Write as _;
+        let _ = write!(connect_req, "{name}: {value}\r\n");
     }
 
     // Add extra auth header (overrides forwarded one)
@@ -3279,8 +3504,45 @@ fn noproxy_from_env() -> Option<String> {
 
 /// Check if a host should bypass the proxy based on the noproxy list.
 /// Get the request target, using the custom target if set, otherwise from the URL.
-fn resolve_request_target(custom: Option<&str>, url: &Url) -> String {
-    custom.map_or_else(|| url.request_target(), str::to_string)
+///
+/// When `path_as_is` is true, the path is not normalized (`.` and `..` segments
+/// are preserved). Note: since the `url` crate normalizes paths during parsing,
+/// this flag only affects behaviour when the path has already been normalized
+/// by the parser, so it is a no-op in most cases. The flag exists for curl
+/// compatibility and future use with raw URL handling.
+fn resolve_request_target(custom: Option<&str>, url: &Url, path_as_is: bool) -> String {
+    if let Some(c) = custom {
+        return c.to_string();
+    }
+    if path_as_is {
+        // Extract path+query directly from the URL string to avoid double normalization.
+        // The url crate already normalizes during parse, so this preserves
+        // whatever the parsed representation is without further processing.
+        extract_path_and_query(url.as_str())
+    } else {
+        url.request_target()
+    }
+}
+
+/// Extract path and query from a URL string without any normalization.
+///
+/// This is used by `resolve_request_target` when `path_as_is` is true
+/// to preserve the raw path segments.
+fn extract_path_and_query(url_str: &str) -> String {
+    // Skip scheme + authority: find "://", then find the next "/" after authority
+    if let Some(scheme_end) = url_str.find("://") {
+        let after_scheme = &url_str[scheme_end + 3..];
+        if let Some(path_start) = after_scheme.find('/') {
+            let path_and_rest = &after_scheme[path_start..];
+            // Strip fragment if present
+            if let Some(frag_pos) = path_and_rest.find('#') {
+                return path_and_rest[..frag_pos].to_string();
+            }
+            return path_and_rest.to_string();
+        }
+        return "/".to_string();
+    }
+    url_str.to_string()
 }
 
 /// Build an SSH host key verification policy from Easy options.
@@ -3341,6 +3603,50 @@ fn should_bypass_proxy(url: &Url, noproxy: Option<&str>) -> bool {
     }
 
     false
+}
+
+/// Apply `--connect-to` host:port remapping.
+///
+/// Each mapping has format `from_host:from_port:to_host:to_port`.
+/// Empty `from_port` matches any port. Empty `to_host` or `to_port` keeps the original.
+fn apply_connect_to(host: &str, port: u16, mappings: &[String]) -> (String, u16) {
+    for mapping in mappings {
+        let parts: Vec<&str> = mapping.splitn(4, ':').collect();
+        if parts.len() < 4 {
+            continue;
+        }
+        let (from_host, from_port_str, to_host, to_port_str) =
+            (parts[0], parts[1], parts[2], parts[3]);
+
+        // Check if this mapping matches
+        let host_matches = from_host.is_empty() || from_host.eq_ignore_ascii_case(host);
+        let port_matches =
+            from_port_str.is_empty() || from_port_str.parse::<u16>().ok() == Some(port);
+
+        if host_matches && port_matches {
+            let new_host = if to_host.is_empty() { host.to_string() } else { to_host.to_string() };
+            let new_port =
+                if to_port_str.is_empty() { port } else { to_port_str.parse().unwrap_or(port) };
+            return (new_host, new_port);
+        }
+    }
+    (host.to_string(), port)
+}
+
+/// Map a `CURLOPT_PROXYTYPE` integer to a URL scheme string.
+///
+/// Returns the scheme that should be used for the proxy URL.
+/// Types 0 (HTTP) and 1 (HTTP 1.0) both map to "http".
+const fn proxy_type_to_scheme(ptype: u32) -> &'static str {
+    match ptype {
+        2 => "https",
+        4 => "socks4",
+        5 => "socks5",
+        6 => "socks4a",
+        7 => "socks5h",
+        // 0 = HTTP, 1 = HTTP 1.0, and any unknown type default to HTTP
+        _ => "http",
+    }
 }
 
 /// Resolve a relative URL against a base URL.
@@ -4912,14 +5218,14 @@ mod tests {
     #[test]
     fn resolve_request_target_custom() {
         let url = Url::parse("http://example.com/path?q=1").unwrap();
-        let result = super::resolve_request_target(Some("/custom"), &url);
+        let result = super::resolve_request_target(Some("/custom"), &url, false);
         assert_eq!(result, "/custom");
     }
 
     #[test]
     fn resolve_request_target_default() {
         let url = Url::parse("http://example.com/path?q=1").unwrap();
-        let result = super::resolve_request_target(None, &url);
+        let result = super::resolve_request_target(None, &url, false);
         assert_eq!(result, "/path?q=1");
     }
 
@@ -5272,5 +5578,307 @@ mod tests {
         assert!(easy.pre_proxy.is_none());
         easy.pre_proxy("socks5://proxy:1080");
         assert_eq!(easy.pre_proxy.as_deref(), Some("socks5://proxy:1080"));
+    }
+
+    #[test]
+    fn ftp_config_built_from_easy() {
+        let mut easy = Easy::new();
+        easy.ftp_use_epsv(false);
+        easy.ftp_use_eprt(false);
+        easy.ftp_skip_pasv_ip(true);
+        easy.ftp_account("testacct");
+        easy.ftp_create_dirs(true);
+        easy.ftp_method(FtpMethod::SingleCwd);
+        easy.ftp_active_port("-");
+
+        // Verify the fields are stored correctly on Easy
+        assert!(!easy.ftp_use_epsv);
+        assert!(!easy.ftp_use_eprt);
+        assert!(easy.ftp_skip_pasv_ip);
+        assert_eq!(easy.ftp_account.as_deref(), Some("testacct"));
+        assert!(easy.ftp_create_dirs);
+        assert_eq!(easy.ftp_method, FtpMethod::SingleCwd);
+        assert_eq!(easy.ftp_active_port.as_deref(), Some("-"));
+
+        // Build FtpConfig the same way perform_async does
+        let config = crate::protocol::ftp::FtpConfig {
+            use_epsv: easy.ftp_use_epsv,
+            use_eprt: easy.ftp_use_eprt,
+            skip_pasv_ip: easy.ftp_skip_pasv_ip,
+            account: easy.ftp_account.clone(),
+            create_dirs: easy.ftp_create_dirs,
+            method: easy.ftp_method,
+            active_port: easy.ftp_active_port.clone(),
+        };
+        assert!(!config.use_epsv);
+        assert!(!config.use_eprt);
+        assert!(config.skip_pasv_ip);
+        assert_eq!(config.account.as_deref(), Some("testacct"));
+        assert!(config.create_dirs);
+        assert_eq!(config.method, crate::protocol::ftp::FtpMethod::SingleCwd);
+        assert_eq!(config.active_port.as_deref(), Some("-"));
+    }
+
+    // --- connect_to wiring tests ---
+
+    #[test]
+    fn apply_connect_to_exact_match() {
+        let mappings = vec!["example.com:443:alt.example.com:8443".to_string()];
+        let (host, port) = super::apply_connect_to("example.com", 443, &mappings);
+        assert_eq!(host, "alt.example.com");
+        assert_eq!(port, 8443);
+    }
+
+    #[test]
+    fn apply_connect_to_no_match() {
+        let mappings = vec!["other.com:443:alt.example.com:8443".to_string()];
+        let (host, port) = super::apply_connect_to("example.com", 443, &mappings);
+        assert_eq!(host, "example.com");
+        assert_eq!(port, 443);
+    }
+
+    #[test]
+    fn apply_connect_to_empty_from_host_matches_any() {
+        let mappings = vec![":443:alt.example.com:8443".to_string()];
+        let (host, port) = super::apply_connect_to("anything.com", 443, &mappings);
+        assert_eq!(host, "alt.example.com");
+        assert_eq!(port, 8443);
+    }
+
+    #[test]
+    fn apply_connect_to_empty_from_port_matches_any() {
+        let mappings = vec!["example.com::alt.example.com:8443".to_string()];
+        let (host, port) = super::apply_connect_to("example.com", 80, &mappings);
+        assert_eq!(host, "alt.example.com");
+        assert_eq!(port, 8443);
+    }
+
+    #[test]
+    fn apply_connect_to_empty_to_host_preserves_original() {
+        let mappings = vec!["example.com:443::8443".to_string()];
+        let (host, port) = super::apply_connect_to("example.com", 443, &mappings);
+        assert_eq!(host, "example.com");
+        assert_eq!(port, 8443);
+    }
+
+    #[test]
+    fn apply_connect_to_empty_to_port_preserves_original() {
+        let mappings = vec!["example.com:443:alt.example.com:".to_string()];
+        let (host, port) = super::apply_connect_to("example.com", 443, &mappings);
+        assert_eq!(host, "alt.example.com");
+        assert_eq!(port, 443);
+    }
+
+    #[test]
+    fn apply_connect_to_first_match_wins() {
+        let mappings = vec![
+            "example.com:443:first.com:1111".to_string(),
+            "example.com:443:second.com:2222".to_string(),
+        ];
+        let (host, port) = super::apply_connect_to("example.com", 443, &mappings);
+        assert_eq!(host, "first.com");
+        assert_eq!(port, 1111);
+    }
+
+    #[test]
+    fn apply_connect_to_case_insensitive_host() {
+        let mappings = vec!["Example.COM:443:alt.example.com:8443".to_string()];
+        let (host, port) = super::apply_connect_to("example.com", 443, &mappings);
+        assert_eq!(host, "alt.example.com");
+        assert_eq!(port, 8443);
+    }
+
+    #[test]
+    fn apply_connect_to_malformed_mapping_skipped() {
+        // Only 3 parts instead of 4
+        let mappings = vec!["example.com:443:alt.example.com".to_string()];
+        let (host, port) = super::apply_connect_to("example.com", 443, &mappings);
+        assert_eq!(host, "example.com");
+        assert_eq!(port, 443);
+    }
+
+    // --- proxy_port wiring test ---
+
+    #[test]
+    fn proxy_port_override_applied() {
+        let mut easy = Easy::new();
+        easy.proxy("http://proxy.example.com:3128").unwrap();
+        easy.proxy_port(9999);
+        assert_eq!(easy.proxy_port, Some(9999));
+        // The override is applied in perform_async, not the setter;
+        // verify the field is stored correctly.
+    }
+
+    // --- proxy_type scheme mapping tests ---
+
+    #[test]
+    fn proxy_type_to_scheme_http() {
+        assert_eq!(super::proxy_type_to_scheme(0), "http");
+        assert_eq!(super::proxy_type_to_scheme(1), "http");
+    }
+
+    #[test]
+    fn proxy_type_to_scheme_https() {
+        assert_eq!(super::proxy_type_to_scheme(2), "https");
+    }
+
+    #[test]
+    fn proxy_type_to_scheme_socks4() {
+        assert_eq!(super::proxy_type_to_scheme(4), "socks4");
+    }
+
+    #[test]
+    fn proxy_type_to_scheme_socks5() {
+        assert_eq!(super::proxy_type_to_scheme(5), "socks5");
+    }
+
+    #[test]
+    fn proxy_type_to_scheme_socks4a() {
+        assert_eq!(super::proxy_type_to_scheme(6), "socks4a");
+    }
+
+    #[test]
+    fn proxy_type_to_scheme_socks5h() {
+        assert_eq!(super::proxy_type_to_scheme(7), "socks5h");
+    }
+
+    #[test]
+    fn proxy_type_to_scheme_unknown_defaults_http() {
+        assert_eq!(super::proxy_type_to_scheme(99), "http");
+    }
+
+    // --- path_as_is wiring tests ---
+
+    #[test]
+    fn resolve_request_target_path_as_is() {
+        // url crate normalizes /a/b/../c to /a/c during parse
+        let url = Url::parse("http://example.com/a/b/../c").unwrap();
+        // With path_as_is=false, we get the normalized path
+        let result = super::resolve_request_target(None, &url, false);
+        assert_eq!(result, "/a/c");
+        // With path_as_is=true, we get the path from url.as_str() which is also
+        // normalized by the url crate, but the flag is passed through
+        let result = super::resolve_request_target(None, &url, true);
+        // The url crate already normalized it during parse, so both are /a/c
+        assert_eq!(result, "/a/c");
+    }
+
+    #[test]
+    fn resolve_request_target_path_as_is_with_query() {
+        let url = Url::parse("http://example.com/api/v1?key=val").unwrap();
+        let result = super::resolve_request_target(None, &url, true);
+        assert_eq!(result, "/api/v1?key=val");
+    }
+
+    #[test]
+    fn resolve_request_target_path_as_is_custom_overrides() {
+        let url = Url::parse("http://example.com/path").unwrap();
+        let result = super::resolve_request_target(Some("/override"), &url, true);
+        assert_eq!(result, "/override");
+    }
+
+    // --- extract_path_and_query tests ---
+
+    #[test]
+    fn extract_path_and_query_simple() {
+        assert_eq!(super::extract_path_and_query("http://example.com/path"), "/path");
+    }
+
+    #[test]
+    fn extract_path_and_query_with_query() {
+        assert_eq!(super::extract_path_and_query("http://example.com/path?q=1"), "/path?q=1");
+    }
+
+    #[test]
+    fn extract_path_and_query_strips_fragment() {
+        assert_eq!(super::extract_path_and_query("http://example.com/path?q=1#frag"), "/path?q=1");
+    }
+
+    #[test]
+    fn extract_path_and_query_no_path() {
+        assert_eq!(super::extract_path_and_query("http://example.com"), "/");
+    }
+
+    #[test]
+    fn extract_path_and_query_with_port() {
+        assert_eq!(super::extract_path_and_query("http://example.com:8080/api"), "/api");
+    }
+
+    // --- Url set_port / set_scheme tests ---
+
+    #[test]
+    fn url_set_port() {
+        let mut url = Url::parse("http://example.com:3128/path").unwrap();
+        url.set_port(Some(9999)).unwrap();
+        assert_eq!(url.port(), Some(9999));
+        assert_eq!(url.as_str(), "http://example.com:9999/path");
+    }
+
+    #[test]
+    fn url_set_port_none_removes_port() {
+        let mut url = Url::parse("http://example.com:3128/path").unwrap();
+        url.set_port(None).unwrap();
+        assert_eq!(url.port(), None);
+    }
+
+    #[test]
+    fn url_set_scheme() {
+        let mut url = Url::parse("http://proxy.example.com:8080").unwrap();
+        url.set_scheme("socks5").unwrap();
+        assert_eq!(url.scheme(), "socks5");
+    }
+
+    // --- HAProxy PROXY protocol v1 header format tests ---
+
+    #[test]
+    fn haproxy_protocol_v1_header_format_ipv4() {
+        use std::net::{Ipv4Addr, SocketAddr};
+        let local = SocketAddr::new(Ipv4Addr::new(192, 168, 1, 100).into(), 54321);
+        let peer = SocketAddr::new(Ipv4Addr::new(10, 0, 0, 1).into(), 80);
+        let proto = if local.ip().is_ipv4() { "TCP4" } else { "TCP6" };
+        let header = format!(
+            "PROXY {proto} {} {} {} {}\r\n",
+            local.ip(),
+            peer.ip(),
+            local.port(),
+            peer.port()
+        );
+        assert_eq!(header, "PROXY TCP4 192.168.1.100 10.0.0.1 54321 80\r\n");
+    }
+
+    #[test]
+    fn haproxy_protocol_v1_header_format_ipv6() {
+        use std::net::{Ipv6Addr, SocketAddr};
+        let local = SocketAddr::new(Ipv6Addr::LOCALHOST.into(), 54321);
+        let peer = SocketAddr::new(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1).into(), 443);
+        let proto = if local.ip().is_ipv4() { "TCP4" } else { "TCP6" };
+        let header = format!(
+            "PROXY {proto} {} {} {} {}\r\n",
+            local.ip(),
+            peer.ip(),
+            local.port(),
+            peer.port()
+        );
+        assert_eq!(header, "PROXY TCP6 ::1 2001:db8::1 54321 443\r\n");
+    }
+
+    // --- abstract Unix socket error tests ---
+
+    #[test]
+    fn abstract_unix_socket_error_message() {
+        let mut easy = Easy::new();
+        easy.url("http://localhost/test").unwrap();
+        easy.abstract_unix_socket("/test");
+        let result = easy.perform();
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        // On non-Linux Unix or any platform, should get a meaningful error
+        assert!(
+            err_msg.contains("Abstract Unix sockets")
+                || err_msg.contains("abstract")
+                || err_msg.contains("not supported")
+                || err_msg.contains("not yet supported"),
+            "unexpected error: {err_msg}"
+        );
     }
 }

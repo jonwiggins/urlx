@@ -140,6 +140,43 @@ impl Url {
             .map_or_else(|| self.inner.path().to_string(), |q| format!("{}?{q}", self.inner.path()))
     }
 
+    /// Set the port on the URL.
+    ///
+    /// Replaces any existing port. Use `None` to remove an explicit port
+    /// (reverting to the scheme default).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UrlParse`] if the URL does not support a port (e.g., `file://`).
+    pub fn set_port(&mut self, port: Option<u16>) -> Result<(), Error> {
+        self.inner
+            .set_port(port)
+            .map_err(|()| Error::UrlParse("cannot set port on this URL".to_string()))
+    }
+
+    /// Set the scheme on the URL.
+    ///
+    /// This rebuilds the URL string with the new scheme rather than using
+    /// `url::Url::set_scheme`, which rejects transitions between "special"
+    /// and "non-special" schemes (e.g., http → socks5).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UrlParse`] if the resulting URL cannot be parsed.
+    pub fn set_scheme(&mut self, scheme: &str) -> Result<(), Error> {
+        // Try the native method first (works for same-category scheme changes)
+        if self.inner.set_scheme(scheme).is_ok() {
+            return Ok(());
+        }
+        // Fallback: reconstruct the URL string with the new scheme
+        let old_str = self.inner.as_str();
+        let rest = old_str.find("://").map_or(old_str, |idx| &old_str[idx..]);
+        let new_str = format!("{scheme}{rest}");
+        self.inner = url::Url::parse(&new_str)
+            .map_err(|e| Error::UrlParse(format!("cannot set scheme to '{scheme}': {e}")))?;
+        Ok(())
+    }
+
     /// curl defaults to HTTP if no scheme is provided.
     fn maybe_add_scheme(input: &str) -> String {
         if input.contains("://") {
@@ -444,5 +481,37 @@ mod tests {
         let url = Url::parse("sftp://user@host.example.com:2222/file.txt").unwrap();
         assert_eq!(url.port(), Some(2222));
         assert_eq!(url.port_or_default(), Some(2222));
+    }
+
+    #[test]
+    fn set_port_explicit() {
+        let mut url = Url::parse("http://example.com:3128/path").unwrap();
+        url.set_port(Some(9999)).unwrap();
+        assert_eq!(url.port(), Some(9999));
+        assert_eq!(url.as_str(), "http://example.com:9999/path");
+    }
+
+    #[test]
+    fn set_port_remove() {
+        let mut url = Url::parse("http://example.com:3128/path").unwrap();
+        url.set_port(None).unwrap();
+        assert_eq!(url.port(), None);
+        assert_eq!(url.port_or_default(), Some(80));
+    }
+
+    #[test]
+    fn set_scheme_http_to_socks5() {
+        let mut url = Url::parse("http://proxy.example.com:8080/").unwrap();
+        url.set_scheme("socks5").unwrap();
+        assert_eq!(url.scheme(), "socks5");
+        assert_eq!(url.host_str(), Some("proxy.example.com"));
+        assert_eq!(url.port(), Some(8080));
+    }
+
+    #[test]
+    fn set_scheme_invalid() {
+        let mut url = Url::parse("http://example.com/").unwrap();
+        // Empty scheme should fail
+        assert!(url.set_scheme("").is_err());
     }
 }

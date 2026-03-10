@@ -817,12 +817,24 @@ pub async fn download(
     url: &crate::url::Url,
     ssh_key_path: Option<&str>,
     policy: &SshHostKeyPolicy,
+    ssh_public_keyfile: Option<&str>,
+    ssh_auth_types: Option<u32>,
 ) -> Result<Response, Error> {
     let (host, port) = url.host_and_port()?;
     let (user, pass) = url.credentials().unwrap_or(("", ""));
     let path = url.path();
 
-    let session = connect_session(&host, port, user, pass, ssh_key_path, policy).await?;
+    let session = connect_session(
+        &host,
+        port,
+        user,
+        pass,
+        ssh_key_path,
+        policy,
+        ssh_public_keyfile,
+        ssh_auth_types,
+    )
+    .await?;
 
     let data = if url.scheme() == "scp" {
         session.scp_download(path).await?
@@ -847,12 +859,24 @@ pub async fn upload(
     data: &[u8],
     ssh_key_path: Option<&str>,
     policy: &SshHostKeyPolicy,
+    ssh_public_keyfile: Option<&str>,
+    ssh_auth_types: Option<u32>,
 ) -> Result<Response, Error> {
     let (host, port) = url.host_and_port()?;
     let (user, pass) = url.credentials().unwrap_or(("", ""));
     let path = url.path();
 
-    let session = connect_session(&host, port, user, pass, ssh_key_path, policy).await?;
+    let session = connect_session(
+        &host,
+        port,
+        user,
+        pass,
+        ssh_key_path,
+        policy,
+        ssh_public_keyfile,
+        ssh_auth_types,
+    )
+    .await?;
 
     if url.scheme() == "scp" {
         session.scp_upload(path, data).await?;
@@ -865,7 +889,23 @@ pub async fn upload(
     Ok(Response::new(200, headers, Vec::new(), url.as_str().to_string()))
 }
 
+/// SSH auth type bitmask: public key authentication.
+const SSH_AUTH_PUBLICKEY: u32 = 1;
+/// SSH auth type bitmask: password authentication.
+const SSH_AUTH_PASSWORD: u32 = 2;
+
 /// Connect to an SSH server, choosing auth method based on available credentials.
+///
+/// `ssh_public_keyfile` is accepted for API compatibility (identifies which key to offer)
+/// but is not directly used by russh, which only needs the private key.
+///
+/// `ssh_auth_types` is an optional bitmask controlling which auth methods are attempted:
+/// - bit 0 (1): public key
+/// - bit 1 (2): password
+/// - bit 2 (4): keyboard-interactive
+/// - bit 3 (8): host-based
+///
+/// When `None`, all available methods are attempted (default behavior).
 async fn connect_session(
     host: &str,
     port: u16,
@@ -873,14 +913,32 @@ async fn connect_session(
     pass: &str,
     ssh_key_path: Option<&str>,
     policy: &SshHostKeyPolicy,
+    _ssh_public_keyfile: Option<&str>,
+    ssh_auth_types: Option<u32>,
 ) -> Result<SshSession, Error> {
     let effective_user = if user.is_empty() { "root" } else { user };
 
-    if let Some(key_path) = ssh_key_path {
-        SshSession::connect_with_key(host, port, effective_user, key_path, policy.clone()).await
-    } else if !pass.is_empty() {
-        SshSession::connect(host, port, effective_user, pass, policy.clone()).await
-    } else {
+    let allow_pubkey = ssh_auth_types.map_or(true, |mask| mask & SSH_AUTH_PUBLICKEY != 0);
+    let allow_password = ssh_auth_types.map_or(true, |mask| mask & SSH_AUTH_PASSWORD != 0);
+
+    if allow_pubkey {
+        if let Some(key_path) = ssh_key_path {
+            return SshSession::connect_with_key(
+                host,
+                port,
+                effective_user,
+                key_path,
+                policy.clone(),
+            )
+            .await;
+        }
+    }
+
+    if allow_password && !pass.is_empty() {
+        return SshSession::connect(host, port, effective_user, pass, policy.clone()).await;
+    }
+
+    if allow_pubkey {
         // Try default SSH key locations
         let home = std::env::var("HOME").unwrap_or_default();
         let default_keys = [
@@ -903,11 +961,12 @@ async fn connect_session(
                 }
             }
         }
-        Err(Error::Ssh(
-            "no SSH credentials provided: use URL credentials, --key, or have keys in ~/.ssh/"
-                .to_string(),
-        ))
     }
+
+    Err(Error::Ssh(
+        "no SSH credentials provided: use URL credentials, --key, or have keys in ~/.ssh/"
+            .to_string(),
+    ))
 }
 
 #[cfg(test)]
@@ -1205,5 +1264,39 @@ mod tests {
         let parent = current.rsplit_once('/').unwrap().0;
         let resolved = format!("{parent}/{target}");
         assert_eq!(resolved, "/data/links/../files/data.txt");
+    }
+
+    #[test]
+    fn ssh_auth_types_password_only() {
+        // With auth_types=2 (password only), pubkey bit is NOT set
+        let mask: u32 = SSH_AUTH_PASSWORD;
+        assert_eq!(mask & SSH_AUTH_PUBLICKEY, 0, "pubkey should be disabled");
+        assert_ne!(mask & SSH_AUTH_PASSWORD, 0, "password should be enabled");
+    }
+
+    #[test]
+    fn ssh_auth_types_pubkey_only() {
+        // With auth_types=1 (pubkey only), password bit is NOT set
+        let mask: u32 = SSH_AUTH_PUBLICKEY;
+        assert_ne!(mask & SSH_AUTH_PUBLICKEY, 0, "pubkey should be enabled");
+        assert_eq!(mask & SSH_AUTH_PASSWORD, 0, "password should be disabled");
+    }
+
+    #[test]
+    fn ssh_auth_types_all() {
+        // With auth_types=3 (pubkey + password), both bits are set
+        let mask: u32 = SSH_AUTH_PUBLICKEY | SSH_AUTH_PASSWORD;
+        assert_ne!(mask & SSH_AUTH_PUBLICKEY, 0, "pubkey should be enabled");
+        assert_ne!(mask & SSH_AUTH_PASSWORD, 0, "password should be enabled");
+    }
+
+    #[test]
+    fn ssh_auth_types_none_allows_all() {
+        // When auth_types is None, all methods should be allowed
+        let auth_types: Option<u32> = None;
+        let allow_pubkey = auth_types.map_or(true, |mask| mask & SSH_AUTH_PUBLICKEY != 0);
+        let allow_password = auth_types.map_or(true, |mask| mask & SSH_AUTH_PASSWORD != 0);
+        assert!(allow_pubkey);
+        assert!(allow_password);
     }
 }

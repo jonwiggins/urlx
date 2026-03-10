@@ -101,8 +101,15 @@ impl HickoryResolver {
     /// Uses Cloudflare's DNS-over-HTTPS by default. The `_doh_url` parameter
     /// is accepted for API compatibility but the resolver uses the well-known
     /// Cloudflare `DoH` endpoint directly.
+    ///
+    /// The `insecure` parameter is accepted for API compatibility with
+    /// `CURLOPT_DOH_SSL_VERIFYPEER`. The hickory-resolver crate does not
+    /// currently expose TLS verification configuration for `DoH` connections,
+    /// so this parameter is stored but not enforced. The `DoH` connection
+    /// always uses TLS with certificate verification.
+    // TODO: wire insecure to hickory TLS config when the crate supports it
     #[must_use]
-    pub fn from_doh(_doh_url: &str) -> Self {
+    pub fn from_doh(_doh_url: &str, _insecure: bool) -> Self {
         use hickory_resolver::config::ResolverConfig;
         let config = ResolverConfig::cloudflare_https();
         let provider = hickory_resolver::name_server::TokioConnectionProvider::default();
@@ -438,7 +445,17 @@ mod tests {
     #[cfg(feature = "hickory-dns")]
     #[test]
     fn hickory_resolver_from_doh() {
-        let resolver = HickoryResolver::from_doh("https://cloudflare-dns.com/dns-query");
+        let resolver = HickoryResolver::from_doh("https://cloudflare-dns.com/dns-query", false);
+        let dns = DnsResolver::Hickory(Box::new(resolver));
+        let debug = format!("{dns:?}");
+        assert!(debug.contains("Hickory"));
+    }
+
+    #[cfg(feature = "hickory-dns")]
+    #[test]
+    fn hickory_resolver_from_doh_insecure() {
+        // Verify the insecure parameter is accepted without panic
+        let resolver = HickoryResolver::from_doh("https://cloudflare-dns.com/dns-query", true);
         let dns = DnsResolver::Hickory(Box::new(resolver));
         let debug = format!("{dns:?}");
         assert!(debug.contains("Hickory"));

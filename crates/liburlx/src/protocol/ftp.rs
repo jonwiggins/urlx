@@ -158,6 +158,43 @@ pub struct FtpFeatures {
     pub raw: Vec<String>,
 }
 
+/// Configuration options for FTP transfers.
+///
+/// Controls passive/active mode selection, directory creation,
+/// CWD strategy, and account handling.
+#[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)] // These are independent FTP options, not state flags
+pub struct FtpConfig {
+    /// Use EPSV (extended passive) instead of PASV (default: true).
+    pub use_epsv: bool,
+    /// Use EPRT (extended active) instead of PORT (default: true).
+    pub use_eprt: bool,
+    /// Skip the IP from the PASV response, use control connection IP.
+    pub skip_pasv_ip: bool,
+    /// FTP account string (sent via ACCT after login).
+    pub account: Option<String>,
+    /// Create missing directories on server during upload.
+    pub create_dirs: bool,
+    /// Directory traversal method.
+    pub method: FtpMethod,
+    /// Active mode address (None = passive mode).
+    pub active_port: Option<String>,
+}
+
+impl Default for FtpConfig {
+    fn default() -> Self {
+        Self {
+            use_epsv: true,
+            use_eprt: true,
+            skip_pasv_ip: false,
+            account: None,
+            create_dirs: false,
+            method: FtpMethod::default(),
+            active_port: None,
+        }
+    }
+}
+
 /// An active FTP session with an established control connection.
 ///
 /// Handles login, passive/active mode, data transfer operations,
@@ -177,6 +214,8 @@ pub struct FtpSession {
     /// TLS connector for wrapping data connections.
     #[cfg(feature = "rustls")]
     tls_connector: Option<crate::tls::TlsConnector>,
+    /// FTP transfer configuration.
+    config: FtpConfig,
 }
 
 impl FtpSession {
@@ -185,7 +224,13 @@ impl FtpSession {
     /// # Errors
     ///
     /// Returns an error if connection, login, or greeting fails.
-    pub async fn connect(host: &str, port: u16, user: &str, pass: &str) -> Result<Self, Error> {
+    pub async fn connect(
+        host: &str,
+        port: u16,
+        user: &str,
+        pass: &str,
+        config: FtpConfig,
+    ) -> Result<Self, Error> {
         let addr = format!("{host}:{port}");
         let tcp = TcpStream::connect(&addr).await.map_err(Error::Connect)?;
         let local_addr = tcp.local_addr().map_err(Error::Connect)?;
@@ -202,6 +247,7 @@ impl FtpSession {
             )));
         }
 
+        let active_port = config.active_port.clone();
         let mut session = Self {
             reader,
             writer,
@@ -209,13 +255,27 @@ impl FtpSession {
             hostname: host.to_string(),
             local_addr,
             use_tls_data: false,
-            active_port: None,
+            active_port,
             #[cfg(feature = "rustls")]
             tls_connector: None,
+            config,
         };
 
         // Login
         session.login(user, pass).await?;
+
+        // Send ACCT command if configured
+        if let Some(ref account) = session.config.account {
+            let acct_cmd = format!("ACCT {account}");
+            send_command(&mut session.writer, &acct_cmd).await?;
+            let acct_resp = read_response(&mut session.reader).await?;
+            if !acct_resp.is_complete() {
+                return Err(Error::Http(format!(
+                    "FTP ACCT failed: {} {}",
+                    acct_resp.code, acct_resp.message
+                )));
+            }
+        }
 
         Ok(session)
     }
@@ -237,9 +297,10 @@ impl FtpSession {
         pass: &str,
         ssl_mode: FtpSslMode,
         tls_config: &crate::tls::TlsConfig,
+        config: FtpConfig,
     ) -> Result<Self, Error> {
         if ssl_mode == FtpSslMode::None {
-            return Self::connect(host, port, user, pass).await;
+            return Self::connect(host, port, user, pass, config).await;
         }
 
         let tls_connector = crate::tls::TlsConnector::new_no_alpn(tls_config)?;
@@ -272,6 +333,7 @@ impl FtpSession {
             )));
         }
 
+        let active_port = config.active_port.clone();
         let mut session = Self {
             reader,
             writer,
@@ -279,8 +341,9 @@ impl FtpSession {
             hostname: host.to_string(),
             local_addr,
             use_tls_data: false,
-            active_port: None,
+            active_port,
             tls_connector: Some(tls_connector),
+            config,
         };
 
         // For explicit FTPS, upgrade the control connection to TLS
@@ -293,6 +356,19 @@ impl FtpSession {
 
         // Login
         session.login(user, pass).await?;
+
+        // Send ACCT command if configured
+        if let Some(ref account) = session.config.account {
+            let acct_cmd = format!("ACCT {account}");
+            send_command(&mut session.writer, &acct_cmd).await?;
+            let acct_resp = read_response(&mut session.reader).await?;
+            if !acct_resp.is_complete() {
+                return Err(Error::Http(format!(
+                    "FTP ACCT failed: {} {}",
+                    acct_resp.code, acct_resp.message
+                )));
+            }
+        }
 
         Ok(session)
     }
@@ -345,6 +421,7 @@ impl FtpSession {
             use_tls_data: false,
             active_port: self.active_port,
             tls_connector: self.tls_connector,
+            config: self.config,
         })
     }
 
@@ -464,8 +541,27 @@ impl FtpSession {
         }
     }
 
-    /// Enter passive mode and open a data connection (PASV).
+    /// Enter passive mode and open a data connection (EPSV or PASV).
+    ///
+    /// If `config.use_epsv` is true, tries EPSV first and falls back to PASV.
+    /// If `config.skip_pasv_ip` is true, uses the control connection host
+    /// instead of the IP from the PASV response.
     async fn open_passive_data_connection(&mut self) -> Result<FtpStream, Error> {
+        // Try EPSV first if enabled
+        if self.config.use_epsv {
+            send_command(&mut self.writer, "EPSV").await?;
+            let epsv_resp = read_response(&mut self.reader).await?;
+            if epsv_resp.code == 229 {
+                let data_port = parse_epsv_response(&epsv_resp.message)?;
+                let data_addr = format!("{}:{data_port}", self.hostname);
+                let tcp = TcpStream::connect(&data_addr)
+                    .await
+                    .map_err(|e| Error::Http(format!("FTP data connection failed: {e}")))?;
+                return self.maybe_wrap_data_tls(tcp).await;
+            }
+            // EPSV failed (e.g. 500/502), fall through to PASV
+        }
+
         send_command(&mut self.writer, "PASV").await?;
         let pasv_resp = read_response(&mut self.reader).await?;
         if pasv_resp.code != 227 {
@@ -475,7 +571,13 @@ impl FtpSession {
             )));
         }
         let (data_host, data_port) = parse_pasv_response(&pasv_resp.message)?;
-        let data_addr = format!("{data_host}:{data_port}");
+
+        // If skip_pasv_ip is set, use the control connection host instead of
+        // the IP address returned in the PASV response.
+        let effective_host =
+            if self.config.skip_pasv_ip { self.hostname.clone() } else { data_host };
+
+        let data_addr = format!("{effective_host}:{data_port}");
         let tcp = TcpStream::connect(&data_addr)
             .await
             .map_err(|e| Error::Http(format!("FTP data connection failed: {e}")))?;
@@ -506,11 +608,13 @@ impl FtpSession {
             .local_addr()
             .map_err(|e| Error::Http(format!("FTP active mode local_addr failed: {e}")))?;
 
-        // Send PORT or EPRT depending on address family
-        let port_cmd = if local_ip.is_ipv4() {
-            format_port_command(&listen_addr)
-        } else {
+        // Send PORT or EPRT depending on address family and config.
+        // For IPv6, EPRT is always required (PORT doesn't support IPv6).
+        // For IPv4, use EPRT only if config.use_eprt is true.
+        let port_cmd = if local_ip.is_ipv6() || self.config.use_eprt {
             format_eprt_command(&listen_addr)
+        } else {
+            format_port_command(&listen_addr)
         };
         send_command(&mut self.writer, &port_cmd).await?;
         let resp = read_response(&mut self.reader).await?;
@@ -919,6 +1023,88 @@ impl FtpSession {
         Ok(())
     }
 
+    /// Navigate to the directory containing a file and return the effective
+    /// filename for RETR/STOR, according to the configured `FtpMethod`.
+    ///
+    /// - `NoCwd`: returns the full path unchanged (no CWD commands).
+    /// - `SingleCwd`: issues one CWD to the directory portion, returns the filename.
+    /// - `MultiCwd`: issues CWD for each path component, returns the filename.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any CWD command fails.
+    async fn navigate_to_path(&mut self, path: &str) -> Result<String, Error> {
+        match self.config.method {
+            FtpMethod::NoCwd => Ok(path.to_string()),
+            FtpMethod::SingleCwd => {
+                if let Some((dir, file)) = path.rsplit_once('/') {
+                    if !dir.is_empty() {
+                        self.cwd(dir).await?;
+                    }
+                    Ok(file.to_string())
+                } else {
+                    Ok(path.to_string())
+                }
+            }
+            FtpMethod::MultiCwd => {
+                if let Some((dir, file)) = path.rsplit_once('/') {
+                    for component in dir.split('/') {
+                        if !component.is_empty() {
+                            self.cwd(component).await?;
+                        }
+                    }
+                    Ok(file.to_string())
+                } else {
+                    Ok(path.to_string())
+                }
+            }
+        }
+    }
+
+    /// Create missing directories on the server for the given path.
+    ///
+    /// Tries MKD for each component. If CWD succeeds, the directory
+    /// already exists. If CWD fails, MKD is attempted before retrying CWD.
+    /// After creating directories, CWDs back to `/` so subsequent
+    /// commands use absolute paths.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a directory cannot be created.
+    async fn create_dirs(&mut self, dir_path: &str) -> Result<(), Error> {
+        for component in dir_path.split('/') {
+            if component.is_empty() {
+                continue;
+            }
+            // Try CWD first — the directory may already exist
+            send_command(&mut self.writer, &format!("CWD {component}")).await?;
+            let cwd_resp = read_response(&mut self.reader).await?;
+            if cwd_resp.is_complete() {
+                continue;
+            }
+            // CWD failed — try MKD then CWD again
+            send_command(&mut self.writer, &format!("MKD {component}")).await?;
+            let mkd_resp = read_response(&mut self.reader).await?;
+            if !mkd_resp.is_complete() {
+                return Err(Error::Http(format!(
+                    "FTP MKD failed for '{}': {} {}",
+                    component, mkd_resp.code, mkd_resp.message
+                )));
+            }
+            send_command(&mut self.writer, &format!("CWD {component}")).await?;
+            let retry_resp = read_response(&mut self.reader).await?;
+            if !retry_resp.is_complete() {
+                return Err(Error::Http(format!(
+                    "FTP CWD failed after MKD for '{}': {} {}",
+                    component, retry_resp.code, retry_resp.message
+                )));
+            }
+        }
+        // CWD back to root so we don't affect subsequent absolute path commands
+        let _ = self.cwd("/").await;
+        Ok(())
+    }
+
     /// Close the FTP session (QUIT).
     ///
     /// # Errors
@@ -1151,14 +1337,17 @@ async fn connect_session(
     pass: &str,
     ssl_mode: FtpSslMode,
     tls_config: &crate::tls::TlsConfig,
+    config: FtpConfig,
 ) -> Result<FtpSession, Error> {
     match ssl_mode {
-        FtpSslMode::None => FtpSession::connect(host, port, user, pass).await,
+        FtpSslMode::None => FtpSession::connect(host, port, user, pass, config).await,
         #[cfg(feature = "rustls")]
-        _ => FtpSession::connect_with_tls(host, port, user, pass, ssl_mode, tls_config).await,
+        _ => {
+            FtpSession::connect_with_tls(host, port, user, pass, ssl_mode, tls_config, config).await
+        }
         #[cfg(not(feature = "rustls"))]
         _ => {
-            let _ = tls_config;
+            let _ = (tls_config, config);
             Err(Error::Http("FTPS requires the 'rustls' feature".to_string()))
         }
     }
@@ -1175,16 +1364,22 @@ pub async fn download(
     ssl_mode: FtpSslMode,
     tls_config: &crate::tls::TlsConfig,
     resume_from: Option<u64>,
+    config: &FtpConfig,
 ) -> Result<Response, Error> {
     let (host, port) = url.host_and_port()?;
     let path = url.path();
     let (user, pass) = url.credentials().unwrap_or(("anonymous", "urlx@"));
 
-    let mut session = connect_session(&host, port, user, pass, ssl_mode, tls_config).await?;
+    let mut session =
+        connect_session(&host, port, user, pass, ssl_mode, tls_config, config.clone()).await?;
+
+    // Navigate according to FtpMethod, getting the effective filename
+    let effective_path = session.navigate_to_path(path).await?;
+
     let data = if let Some(offset) = resume_from {
-        session.download_resume(path, offset).await?
+        session.download_resume(&effective_path, offset).await?
     } else {
-        session.download(path).await?
+        session.download(&effective_path).await?
     };
     let _ = session.quit().await;
 
@@ -1204,12 +1399,14 @@ pub async fn list(
     url: &crate::url::Url,
     ssl_mode: FtpSslMode,
     tls_config: &crate::tls::TlsConfig,
+    config: &FtpConfig,
 ) -> Result<Response, Error> {
     let (host, port) = url.host_and_port()?;
     let path = url.path();
     let (user, pass) = url.credentials().unwrap_or(("anonymous", "urlx@"));
 
-    let mut session = connect_session(&host, port, user, pass, ssl_mode, tls_config).await?;
+    let mut session =
+        connect_session(&host, port, user, pass, ssl_mode, tls_config, config.clone()).await?;
     let path_opt = if path.is_empty() || path == "/" { None } else { Some(path) };
     let data = session.list(path_opt).await?;
     let _ = session.quit().await;
@@ -1230,13 +1427,27 @@ pub async fn upload(
     data: &[u8],
     ssl_mode: FtpSslMode,
     tls_config: &crate::tls::TlsConfig,
+    config: &FtpConfig,
 ) -> Result<Response, Error> {
     let (host, port) = url.host_and_port()?;
     let path = url.path();
     let (user, pass) = url.credentials().unwrap_or(("anonymous", "urlx@"));
 
-    let mut session = connect_session(&host, port, user, pass, ssl_mode, tls_config).await?;
-    session.upload(path, data).await?;
+    let mut session =
+        connect_session(&host, port, user, pass, ssl_mode, tls_config, config.clone()).await?;
+
+    // Create missing directories on the server if configured
+    if config.create_dirs {
+        let dir = path.rsplit_once('/').map_or("", |(d, _)| d);
+        if !dir.is_empty() {
+            session.create_dirs(dir).await?;
+        }
+    }
+
+    // Navigate according to FtpMethod, getting the effective filename
+    let effective_path = session.navigate_to_path(path).await?;
+
+    session.upload(&effective_path, data).await?;
     let _ = session.quit().await;
 
     let headers = std::collections::HashMap::new();
@@ -1500,5 +1711,39 @@ mod tests {
         let tls_config = crate::tls::TlsConfig::default();
         let connector = crate::tls::TlsConnector::new_no_alpn(&tls_config);
         assert!(connector.is_ok());
+    }
+
+    #[test]
+    fn ftp_config_default() {
+        let config = FtpConfig::default();
+        assert!(config.use_epsv);
+        assert!(config.use_eprt);
+        assert!(!config.skip_pasv_ip);
+        assert!(config.account.is_none());
+        assert!(!config.create_dirs);
+        assert_eq!(config.method, FtpMethod::MultiCwd);
+        assert!(config.active_port.is_none());
+    }
+
+    #[test]
+    fn ftp_config_clone() {
+        let config = FtpConfig {
+            use_epsv: false,
+            use_eprt: false,
+            skip_pasv_ip: true,
+            account: Some("myacct".to_string()),
+            create_dirs: true,
+            method: FtpMethod::NoCwd,
+            active_port: Some("-".to_string()),
+        };
+        #[allow(clippy::redundant_clone)] // Testing Clone impl
+        let cloned = config.clone();
+        assert!(!cloned.use_epsv);
+        assert!(!cloned.use_eprt);
+        assert!(cloned.skip_pasv_ip);
+        assert_eq!(cloned.account.as_deref(), Some("myacct"));
+        assert!(cloned.create_dirs);
+        assert_eq!(cloned.method, FtpMethod::NoCwd);
+        assert_eq!(cloned.active_port.as_deref(), Some("-"));
     }
 }

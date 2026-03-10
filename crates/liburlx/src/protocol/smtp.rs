@@ -133,12 +133,15 @@ pub async fn send_command<S: AsyncWrite + Unpin>(
 /// # Errors
 ///
 /// Returns an error if connection, auth, or sending fails.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub async fn send_mail(
     url: &crate::url::Url,
     mail_data: &[u8],
     mail_from: Option<&str>,
     mail_rcpt: &[String],
+    mail_auth: Option<&str>,
+    sasl_authzid: Option<&str>,
+    sasl_ir: bool,
 ) -> Result<crate::protocol::http::response::Response, Error> {
     let (host, port) = url.host_and_port()?;
 
@@ -177,11 +180,29 @@ pub async fn send_mail(
 
     // Authenticate if credentials provided
     if let Some((user, pass)) = credentials {
-        // Use AUTH PLAIN
+        // Use AUTH PLAIN with optional SASL authorization identity
         use base64::Engine;
-        let auth_string = format!("\0{user}\0{pass}");
+        let auth_string = sasl_authzid.map_or_else(
+            || format!("\0{user}\0{pass}"),
+            |authzid| format!("{authzid}\0{user}\0{pass}"),
+        );
         let encoded = base64::engine::general_purpose::STANDARD.encode(auth_string.as_bytes());
-        send_command(&mut writer, &format!("AUTH PLAIN {encoded}")).await?;
+
+        if sasl_ir {
+            // Send initial response inline with AUTH command (default curl behavior)
+            send_command(&mut writer, &format!("AUTH PLAIN {encoded}")).await?;
+        } else {
+            // Two-step: send AUTH PLAIN, wait for 334 continue, then send credentials
+            send_command(&mut writer, "AUTH PLAIN").await?;
+            let continue_resp = read_response(&mut reader).await?;
+            if continue_resp.code != 334 {
+                return Err(Error::Http(format!(
+                    "SMTP AUTH PLAIN expected 334 continue, got: {} {}",
+                    continue_resp.code, continue_resp.message
+                )));
+            }
+            send_command(&mut writer, &encoded).await?;
+        }
         let auth_resp = read_response(&mut reader).await?;
         if !auth_resp.is_ok() {
             return Err(Error::Http(format!(
@@ -210,8 +231,12 @@ pub async fn send_mail(
         mail_rcpt.to_vec()
     };
 
-    // MAIL FROM
-    send_command(&mut writer, &format!("MAIL FROM:<{from_addr}>")).await?;
+    // MAIL FROM (with optional AUTH= parameter per RFC 2554)
+    let mail_from_cmd = mail_auth.map_or_else(
+        || format!("MAIL FROM:<{from_addr}>"),
+        |auth| format!("MAIL FROM:<{from_addr}> AUTH=<{auth}>"),
+    );
+    send_command(&mut writer, &mail_from_cmd).await?;
     let mail_resp = read_response(&mut reader).await?;
     if !mail_resp.is_ok() {
         return Err(Error::Http(format!(
@@ -398,5 +423,55 @@ mod tests {
         let mail = "To: receiver@example.com\r\n\r\nBody";
         let (from, _to) = extract_mail_addresses(mail);
         assert!(from.is_none());
+    }
+
+    #[test]
+    fn mail_auth_parameter_format() {
+        // Verify MAIL FROM with AUTH= parameter is formatted correctly
+        let from_addr = "sender@example.com";
+        let auth: Option<&str> = Some("delegated@example.com");
+        let cmd = auth.map_or_else(
+            || format!("MAIL FROM:<{from_addr}>"),
+            |a| format!("MAIL FROM:<{from_addr}> AUTH=<{a}>"),
+        );
+        assert_eq!(cmd, "MAIL FROM:<sender@example.com> AUTH=<delegated@example.com>");
+    }
+
+    #[test]
+    fn mail_auth_parameter_none() {
+        // Without mail_auth, MAIL FROM should not have AUTH=
+        let from_addr = "sender@example.com";
+        let auth: Option<&str> = None;
+        let cmd = auth.map_or_else(
+            || format!("MAIL FROM:<{from_addr}>"),
+            |a| format!("MAIL FROM:<{from_addr}> AUTH=<{a}>"),
+        );
+        assert_eq!(cmd, "MAIL FROM:<sender@example.com>");
+    }
+
+    #[test]
+    fn sasl_authzid_in_auth_string() {
+        // With sasl_authzid, the auth string should be "authzid\0user\0pass"
+        use base64::Engine;
+        let authzid: Option<&str> = Some("admin@example.com");
+        let user = "user";
+        let pass = "secret";
+        let auth_string = authzid
+            .map_or_else(|| format!("\0{user}\0{pass}"), |az| format!("{az}\0{user}\0{pass}"));
+        assert_eq!(auth_string, "admin@example.com\0user\0secret");
+        // Verify it encodes properly
+        let encoded = base64::engine::general_purpose::STANDARD.encode(auth_string.as_bytes());
+        assert!(!encoded.is_empty());
+    }
+
+    #[test]
+    fn sasl_authzid_none_default() {
+        // Without sasl_authzid, the auth string should be "\0user\0pass"
+        let authzid: Option<&str> = None;
+        let user = "user";
+        let pass = "secret";
+        let auth_string = authzid
+            .map_or_else(|| format!("\0{user}\0{pass}"), |az| format!("{az}\0{user}\0{pass}"));
+        assert_eq!(auth_string, "\0user\0secret");
     }
 }
