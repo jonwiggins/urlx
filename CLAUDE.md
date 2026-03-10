@@ -15,37 +15,44 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 ## Current Status
 
 **Version:** v0.1.0 published (crates.io + GitHub Releases + Homebrew)
-**Last completed:** Phase 64 — Error Handling & Diagnostics — 2026-03-10
-**Total tests:** 2,533
-**In progress:** Phase 65
+**Last completed:** Phase 66 — Wire Unwired Easy API Fields — 2026-03-10
+**Total tests:** 2,605
+**In progress:** Phase 67
 **Blockers:** None
 
-### Completeness Summary (post-v0.1.0 audit)
+### Completeness Summary (post-Phase 66)
 
 | Feature Area | Parity | Notes |
 |---|---|---|
 | HTTP/1.1 | 98% | Expect, HTTP/1.0, trailer headers, chunked upload |
-| HTTP/2 | 90% | ALPN, multiplexing, flow control, connection pooling, server push; stream priority stored but not wired (deprecated in RFC 9113) |
+| HTTP/2 | 75% | ALPN, multiplexing, flow control, connection pooling, server push work; **all 7 tuning options stored but not wired to h2 crate** |
 | HTTP/3 | 55% | QUIC via quinn, Alt-Svc, 0-RTT; no pooling/push; **untested** |
-| TLS | 88% | rustls, insecure mode, CA/client certs, pinning, version selection, cipher list, session cache, blob cert options |
-| Authentication | 80% | Basic, Bearer, Digest, AWS SigV4, NTLMv2, SCRAM-SHA-256 |
+| TLS | 88% | rustls, insecure mode, CA/client certs, pinning, version selection, cipher list, blob cert options |
+| Authentication | 65% | Basic, Bearer, Digest, AWS SigV4 fully wired; **NTLMv2 proxy-only (not wired for HTTP 401)**; **SCRAM-SHA-256 implemented but wired to nothing** |
 | Cookie engine | 97% | Netscape file format, domain-indexed jar, PSL validation, SameSite enforcement |
-| Proxy | 90% | HTTP + SOCKS + HTTPS tunnel (TLS-in-TLS), proxy auth; no PAC |
-| DNS | 85% | Cache, Happy Eyeballs, shuffle, custom servers, DoH, DoT, hickory-dns |
-| FTP | 90% | Full session API, FTPS, active mode, FtpMethod, resume via REST, MLST/MLSD |
-| SSH/SFTP/SCP | 72% | Download/upload, password + pubkey auth, known_hosts, SHA-256 fingerprint, symlink following, permission preservation |
+| Proxy | 85% | HTTP + SOCKS + HTTPS tunnel (TLS-in-TLS), proxy NTLM auth, proxy_port, proxy_type, proxy_headers wired; **pre_proxy not wired**; no PAC |
+| DNS | 86% | Cache, Happy Eyeballs (RFC 8305), shuffle, custom servers, DoH, DoT, hickory-dns; doh_insecure accepted |
+| FTP | 85% | Session API, FTPS, active/passive mode, resume, MLST/MLSD; EPSV/EPRT, skip_pasv_ip, ACCT, create_dirs, FtpMethod all wired via FtpConfig |
+| SSH/SFTP/SCP | 72% | Download/upload, password + pubkey auth, known_hosts, SHA-256 fingerprint, symlink following; ssh_auth_types filtering wired |
 | WebSocket | 92% | RFC 6455, CloseCode, fragmentation, permessage-deflate (RFC 7692), ws:// wss:// dispatch |
-| Multi API | 75% | Connection limiting, share, pipelining, FFI event loop stubs |
-| FFI (libcurl C ABI) | ~70% | 119 CURLOPT, 47 CURLINFO, 42 CURLcode, 56 functions, C test harness |
-| CLI | ~85% | 246 long + 40 short flags (~98% of curl's ~250), --help, --version, combined short flags |
-| Connection | 80% | Pool, TCP_NODELAY, keepalive, Unix sockets, interface/port binding |
-| Transfer control | 80% | Rate limiting enforced (max recv/send speed, low speed timeout) |
-| Overall | ~75% | ~95% for basic HTTP/HTTPS use cases |
+| Multi API | 40% | Connection limiting, share; **curl_multi_fdset, curl_multi_socket_action, curl_multi_wakeup are no-ops**; event loop incompatible with tokio architecture |
+| FFI (libcurl C ABI) | ~60% | 119 CURLOPT, 47 CURLINFO, 42 CURLcode, 56 functions, C test harness; **~15 options return OK but do nothing; curl_easy_pause is a no-op** |
+| CLI | ~70% | 246 long + 39 short flags; **87 flags (30%) are silent no-ops**; ~159 functional flags |
+| Connection | 90% | Pool (TTL, max-per-host, max-total, cleanup), TCP_NODELAY, keepalive, Unix sockets, Happy Eyeballs; fresh_connect, forbid_reuse, connect_to, haproxy_protocol wired |
+| Transfer control | 80% | Rate limiting enforced; path_as_is wired; **curl_easy_pause is a no-op; abstract_unix_socket returns error** |
+| Overall | ~68% | ~92% for basic HTTP/HTTPS use cases |
 
-### Known Issues
+### Known Issues (post-Phase 66)
 
+- **~15 remaining unwired fields** — pre_proxy (complex two-hop chain), abstract_unix_socket (needs OS-specific API), doh_insecure (accepted but not enforced by hickory)
+- **NTLMv2 not wired for HTTP 401** — only works for proxy 407 (see Phase 67)
+- **SCRAM-SHA-256 fully implemented but wired to no protocol** — dead code (see Phase 67)
+- **FFI returns CURLE_OK for ~15 unimplemented options** — silent compatibility hazard (see Phase 67)
+- **87 of 285 CLI flags are no-ops** — no warning emitted (see Phase 68)
+- **All 7 HTTP/2 tuning options stored but not passed to h2** (see Phase 68)
+- **curl_easy_pause() returns OK but does nothing** (see Phase 69)
+- **Multi API event loop functions are no-ops** — tokio architecture mismatch (see Phase 69)
 - HTTP/3 untested (needs quinn test server)
-- SCRAM-SHA-256 implemented but not yet wired to SMTP/IMAP/POP3 (pending dispatch)
 - Some integration tests hang/timeout (pre-existing, not affecting lib tests)
 
 ---
@@ -107,44 +114,118 @@ Added ~40 curl flags: -4/--ipv4, -6/--ipv6, -j/--junk-session-cookies, -l/--list
 
 Added curl-style verbose output: `* Trying <addr>...` and `* Connected to <host> (<ip>) port <port>`. Improved error-to-exit-code mapping with codes for unsupported protocol (1), partial file (18), upload failed (25), and send error (55). Added 7 tests for exit code mapping. SCRAM-SHA-256 SMTP wiring and trace output parity deferred.
 
-### Phase 65 — Connection & Transfer Polish
+### Phase 65 — Connection & Transfer Polish (Completed 2026-03-10)
 
-- HTTP/2 stream priority (wiring, not just storing)
-- Connection pool TTL and cleanup
-- Happy Eyeballs improvements
-- Transfer resume improvements across protocols
+Connection pool now has TTL-based expiry (118s default matching curl), per-host limit (5), total limit (25), FIFO eviction, and proactive cleanup. Happy Eyeballs upgraded to RFC 8305 with address interleaving. CURLOPT_MAXCONNECTS wired to Easy::max_pool_connections(). 23 new tests. HTTP/2 stream priority not wired (deprecated by RFC 9113).
 
-### Phase 66 — Security Hardening
+### Phase 66 — Wire Unwired Easy API Fields (Completed 2026-03-10)
 
-- Kerberos/Negotiate authentication
-- Certificate revocation checking (CRL, OCSP)
-- Improved certificate pinning (multiple pins)
-- HSTS preload list support
+Wired ~20 previously stored-but-unused Easy API fields to their consumption points. Created FtpConfig struct bundling 7 FTP options (use_epsv, use_eprt, skip_pasv_ip, account, create_dirs, method, active_port) with EPSV/PASV fallback, ACCT command, MKD directory creation, and FtpMethod CWD strategies. Wired fresh_connect/forbid_reuse to connection pool get/put. Wired proxy_port, proxy_type (scheme rewriting), proxy_headers (CONNECT request injection). Added connect_to host:port remapping, path_as_is raw URL path preservation, haproxy_protocol PROXY v1 header. Wired ssh_auth_types bitmask filtering and ssh_public_keyfile passthrough. Added mail_auth (AUTH= in MAIL FROM), sasl_authzid, sasl_ir to SMTP. Passed doh_insecure to DoH resolver. Added Url::set_port/set_scheme helpers. Deferred: pre_proxy (complex two-hop), abstract_unix_socket (needs OS API). ~49 new tests.
 
-### Phase 67 — Protocol Extensions
+### Phase 67 — Wire Authentication & Fix FFI Honesty
 
-- LDAP protocol handler (basic search)
-- RTSP protocol handler (basic playback)
-- MQTT improvements (will messages, retained)
-- FTP improvements (SITE commands, STAT)
+**Problem:** NTLMv2 only works for proxy auth, not HTTP 401. SCRAM-SHA-256 is fully implemented but wired to nothing. FFI returns CURLE_OK for ~15 options it doesn't implement.
 
-### Phase 68 — Performance Optimization
+#### NTLMv2 for HTTP server auth (easy.rs)
+- In the 401-response handling path (~line 2075), add NTLM challenge-response alongside existing Digest handling
+- Implement Type 1 → Type 2 → Type 3 message exchange over HTTP (two round trips)
+- Test with mock server returning 401 + WWW-Authenticate: NTLM
 
-- Profile and optimize hot paths identified in Phase 58 benchmarks
-- HTTP/2 multiplexing performance
-- Connection pool efficiency
-- Memory usage reduction
+#### SCRAM-SHA-256 wiring (protocol/smtp.rs, protocol/imap.rs, protocol/pop3.rs)
+- Wire `auth/scram.rs` into SMTP AUTH command (after EHLO, check for AUTH SCRAM-SHA-256 capability)
+- Wire into IMAP AUTHENTICATE command
+- Wire into POP3 AUTH command
+- Test each with mock server exercising the full SASL exchange
 
-### Phase 69 — Documentation & Distribution
+#### FFI honesty — return CURLE_NOT_BUILT_IN instead of CURLE_OK for unimplemented options
+- Proxy TLS options: PROXY_CAPATH, PROXY_CRLFILE, PROXY_PINNEDPUBLICKEY, PROXY_SSLVERSION, PROXY_SSL_CIPHER_LIST, PROXY_TLS13_CIPHERS, SOCKS5_AUTH
+- Other no-ops that claim success: auto-referer, TCP Fast Open, HTTP/0.9, HSTS file I/O, FTP clear command channel, FTP PRET, FTP compression
+- Add CURLE_NOT_BUILT_IN variant to CURLcode if not present
+- Document which options are accepted-but-ignored vs truly unimplemented
 
-- Comprehensive API documentation with examples
-- Man page generation
-- Package for more distributions (apt, dnf, etc.)
-- Benchmark comparison vs curl published in README
+### Phase 68 — HTTP/2 Settings & CLI Honesty
 
-### Phase 70 — Comprehensive Review
+**Problem:** All 7 HTTP/2 tuning options are stored but never passed to the h2 crate. 87 of 285 CLI flags are silent no-ops.
 
-Milestone review phase. Audit full codebase, differential testing, plan phases 71-80.
+#### HTTP/2 settings wiring (easy.rs → protocol/http/h2.rs)
+- `http2_window_size` → pass to h2::client::Builder::initial_window_size()
+- `http2_connection_window_size` → pass to h2::client::Builder::initial_connection_window_size()
+- `http2_max_frame_size` → pass to h2::client::Builder::max_frame_size()
+- `http2_max_header_list_size` → pass to h2::client::Builder::max_header_list_size()
+- `http2_enable_push` → pass to h2::client::Builder::enable_push()
+- `http2_ping_interval` → spawn keepalive ping task on the h2 connection
+- Skip `http2_stream_weight` — stream priority is deprecated in RFC 9113, document why
+
+#### CLI flag audit (urlx-cli/src/args.rs)
+- For each of the 87 no-op flags, categorize:
+  - **Can implement now:** flags where the underlying Easy API supports it (e.g., `--ipv4`/`--ipv6` → `ip_resolve`, `--junk-session-cookies` → cookie jar clear, `--tcp-fastopen` if wired)
+  - **Needs underlying work:** flags where the Easy API doesn't support it yet
+  - **Genuinely unnecessary:** flags for features urlx will never support (e.g., `--metalink`, `--ntlm-wb`)
+- Wire flags in the first category to their Easy API equivalents
+- For genuinely unnecessary flags, emit a warning to stderr when used: `urlx: warning: --flag is not supported and has no effect`
+- Fix short flag count: verify 39 vs 40, correct CLAUDE.md
+
+### Phase 69 — curl_easy_pause, Multi API, & Transfer Control
+
+**Problem:** `curl_easy_pause()` returns OK but does nothing. Multi API event loop functions are no-ops. Several transfer control features are stubs.
+
+#### curl_easy_pause (liburlx-ffi)
+- Implement actual pause/resume for transfers using tokio channel or flag
+- Pause should stop reading from the socket (backpressure via not polling the read future)
+- Resume should re-poll the read future
+- CURLPAUSE_RECV, CURLPAUSE_SEND, CURLPAUSE_ALL, CURLPAUSE_CONT
+- Test with FFI C test and Rust unit test
+
+#### curl_easy_upkeep (liburlx-ffi)
+- Implement connection keepalive check (ping pooled connections, evict dead ones)
+- Useful for long-lived applications that hold a curl handle
+
+#### Multi API improvements (liburlx-ffi)
+- `curl_multi_fdset()` — Expose underlying tokio socket FDs if possible, or document why not
+- `curl_multi_socket_action()` — Bridge to tokio reactor, or return CURLE_NOT_BUILT_IN
+- Document architectural mismatch: tokio owns the event loop, libcurl's Multi expects the caller to own it
+
+### Phase 70 — v0.2.0 Release
+
+**Milestone release.** All audit remediation from Phases 66-69 is complete. Ship v0.2.0 with honest metrics.
+
+#### Pre-release audit
+- Compact phases 60-69 into Phase 0 summary
+- Re-count all metrics (tests, flags, FFI options) and update Completeness Summary
+- Verify all previously-unwired Easy API fields are now consumed or removed
+- Verify FFI no longer returns CURLE_OK for unimplemented options
+- Run full test suite (`cargo test --all`), clippy, fmt, doc — zero warnings
+- Differential testing against curl for top-20 use cases (GET, POST, upload, redirect, auth, proxy, FTP, cookies, HEAD, PUT, multipart, range, resume, compressed, HTTP/2, verbose, headers, timeout, retry, cert)
+
+#### Version bump
+- Bump version to `0.2.0` in all Cargo.toml files (workspace root, liburlx, liburlx-ffi, urlx-cli)
+- Update CHANGELOG.md with all changes since v0.1.0, organized by category:
+  - **Fixed:** Unwired fields, FFI honesty, NTLMv2 HTTP auth, CLI no-op warnings
+  - **Added:** SCRAM-SHA-256 for SMTP/IMAP/POP3, HTTP/2 tuning, curl_easy_pause, pool improvements
+  - **Changed:** Completeness percentages now reflect actual wired functionality
+
+#### Documentation
+- Update README.md:
+  - Revised completeness table, new features since v0.1.0, honest "what works" section
+  - Add `brew install urlx` to installation section (Homebrew is already set up)
+  - Add a Quick Start section with example commands showing common usage (GET request, POST JSON, download file, upload, follow redirects, custom headers, verbose output, auth, etc.) — make it easy for someone to start using urlx immediately
+- Update API docs (`cargo doc`): ensure all newly-wired options have accurate doc comments
+- Remove any doc comments that claim functionality that doesn't exist
+
+#### Publish
+- `cargo publish -p liburlx` → crates.io
+- `cargo publish -p liburlx-ffi` → crates.io
+- `cargo publish -p urlx-cli` → crates.io
+- Create GitHub Release v0.2.0 with release notes from CHANGELOG.md
+- Update Homebrew formula with new version and SHA
+
+#### Post-release
+- **STOP and report to the agent's driver.** Provide a summary of:
+  - What was accomplished in Phases 66-70
+  - Updated completeness percentages (before vs after)
+  - Total test count
+  - Remaining known gaps and recommended next phases (71-80)
+  - Any decisions that need human input before proceeding
 
 ---
 
