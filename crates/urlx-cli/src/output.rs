@@ -8,8 +8,17 @@ use std::process::ExitCode;
 
 /// Format response headers as HTTP status line + headers.
 pub fn format_headers(response: &liburlx::Response) -> String {
-    let mut result =
-        format!("HTTP/1.1 {} {}\r\n", response.status(), http_status_text(response.status()),);
+    let version = http_version_string(response);
+    let version_label = match version.as_str() {
+        "2" => "2".to_string(),
+        "3" => "3".to_string(),
+        v => v.to_string(),
+    };
+    let mut result = format!(
+        "HTTP/{version_label} {} {}\r\n",
+        response.status(),
+        http_status_text(response.status()),
+    );
     for (name, value) in response.headers() {
         result.push_str(name);
         result.push_str(": ");
@@ -237,9 +246,8 @@ pub fn output_response(
 }
 
 /// Return the HTTP version string for a response (e.g., "1.1", "2", "3").
-pub const fn http_version_string(_response: &liburlx::Response) -> &'static str {
-    // Default to "1.1" since we don't currently store HTTP version in Response
-    "1.1"
+pub fn http_version_string(response: &liburlx::Response) -> String {
+    response.http_version().to_string()
 }
 
 /// Format a `--write-out` string by replacing `%{variable}` placeholders.
@@ -268,7 +276,7 @@ pub fn format_write_out(fmt: &str, response: &liburlx::Response) -> String {
     result = result.replace("%{speed_upload}", &format!("{:.3}", info.speed_upload));
     result = result.replace("%{size_upload}", &info.size_upload.to_string());
     // Additional curl-compatible variables
-    result = result.replace("%{http_version}", http_version_string(response));
+    result = result.replace("%{http_version}", &http_version_string(response));
     result =
         result.replace("%{scheme}", response.effective_url().split("://").next().unwrap_or(""));
     // Header sizes: approximate from response headers

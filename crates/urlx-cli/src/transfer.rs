@@ -6,7 +6,10 @@
 use std::io::Write;
 use std::process::ExitCode;
 
-use crate::args::{is_protocol_allowed, parse_args, percent_encode, print_usage, CliOptions};
+use crate::args::{
+    is_protocol_allowed, parse_args, percent_encode, print_usage, print_version, CliOptions,
+    ParseResult,
+};
 use crate::output::{
     content_disposition_filename, format_headers, format_write_out, http_status_text,
     output_response, write_trace_file,
@@ -194,8 +197,19 @@ pub fn run(args: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let Some(mut opts) = parse_args(args) else {
-        return ExitCode::FAILURE;
+    let mut opts = match parse_args(args) {
+        ParseResult::Options(opts) => *opts,
+        ParseResult::Help => {
+            print_usage();
+            return ExitCode::SUCCESS;
+        }
+        ParseResult::Version => {
+            print_version();
+            return ExitCode::SUCCESS;
+        }
+        ParseResult::Error => {
+            return ExitCode::FAILURE;
+        }
     };
 
     // Expand URL globs unless --globoff is set

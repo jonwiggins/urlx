@@ -1,7 +1,23 @@
 //! CLI argument parsing and configuration.
 //!
-//! Contains the [`CliOptions`] struct and the [`parse_args`] function that
-//! converts command-line arguments into a structured options object.
+//! Contains the [`CliOptions`] struct, [`ParseResult`] enum, and the
+//! [`parse_args`] function that converts command-line arguments into a
+//! structured options object.
+
+/// Result of parsing CLI arguments.
+///
+/// Distinguishes between successful option parsing, early-exit actions
+/// (help/version), and errors.
+pub enum ParseResult {
+    /// Successfully parsed options — proceed with transfer.
+    Options(Box<CliOptions>),
+    /// `--help` / `-h` was requested — print usage and exit 0.
+    Help,
+    /// `--version` / `-V` was requested — print version and exit 0.
+    Version,
+    /// Parse error — message already printed to stderr.
+    Error,
+}
 
 /// Parsed CLI options.
 #[allow(clippy::struct_excessive_bools)]
@@ -60,6 +76,15 @@ pub struct CliOptions {
     pub(crate) proto_default: Option<String>,
     pub(crate) output_dir: Option<String>,
     pub(crate) remove_on_error: bool,
+}
+
+/// Print version information to stdout.
+///
+/// Matches curl's `--version` output format: name, version, and feature list.
+pub fn print_version() {
+    println!("urlx {}", env!("CARGO_PKG_VERSION"));
+    println!("Features: http https http2 http3 ftp ftps sftp scp mqtt ws wss smtp imap pop3");
+    println!("Protocols: dict file ftp ftps http https imap imaps mqtt pop3 pop3s scp sftp smtp smtps ws wss");
 }
 
 /// Print usage information to stderr.
@@ -224,9 +249,71 @@ pub fn print_usage() {
     eprintln!("      --disable-epsv        Disable EPSV for FTP (no-op)");
 }
 
-/// Returns `None` if parsing fails (error already printed).
+/// Parse command-line arguments into a [`ParseResult`].
+///
+/// Expands combined short flags (e.g. `-sSfL` → `-s -S -f -L`), checks for
+/// `--help`/`-h` and `--version`/`-V` early-exit flags, then delegates to
+/// the full option parser.
+pub fn parse_args(args: &[String]) -> ParseResult {
+    // Step 1: Expand combined short flags
+    let expanded = expand_combined_flags(args);
+
+    // Step 2: Check for --help/-h and --version/-V (early exit, like curl)
+    for arg in expanded.iter().skip(1) {
+        match arg.as_str() {
+            "-h" | "--help" => return ParseResult::Help,
+            "-V" | "--version" => return ParseResult::Version,
+            _ => {}
+        }
+    }
+
+    // Step 3: Parse options
+    parse_args_options(&expanded)
+        .map_or(ParseResult::Error, |opts| ParseResult::Options(Box::new(opts)))
+}
+
+/// Expand combined short flags into individual flags.
+///
+/// For example, `-sSfL` becomes `-s`, `-S`, `-f`, `-L`.
+/// If the last character in a combined group is a flag that takes an argument,
+/// the next argument is consumed as that flag's value (e.g., `-Lo output.txt`
+/// becomes `-L`, `-o`, `output.txt`).
+///
+/// Long flags (`--foo`) and single-character flags (`-s`) pass through unchanged.
+fn expand_combined_flags(args: &[String]) -> Vec<String> {
+    // Set of short flags that take an argument (next arg is the value)
+    const ARG_FLAGS: &[char] =
+        &['X', 'H', 'd', 'o', 'D', 'w', 'x', 'u', 'A', 'F', 'r', 'C', 'T', 'b', 'e', 'm', 'K', 'c'];
+
+    let mut result = Vec::with_capacity(args.len());
+    for arg in args {
+        if arg.starts_with('-')
+            && !arg.starts_with("--")
+            && arg.len() > 2
+            && arg.as_bytes()[1] != b'#'
+        {
+            // This is a combined short flag like -sSfL or -Lo
+            let chars: Vec<char> = arg[1..].chars().collect();
+            for (j, &ch) in chars.iter().enumerate() {
+                result.push(format!("-{ch}"));
+                // If this char takes an argument and there are remaining chars,
+                // treat the rest as the argument value (curl compat)
+                if ARG_FLAGS.contains(&ch) && j + 1 < chars.len() {
+                    let rest: String = chars[j + 1..].iter().collect();
+                    result.push(rest);
+                    break;
+                }
+            }
+        } else {
+            result.push(arg.clone());
+        }
+    }
+    result
+}
+
+/// Internal option parser. Returns `None` if parsing fails (error already printed).
 #[allow(clippy::too_many_lines)]
-pub fn parse_args(args: &[String]) -> Option<CliOptions> {
+fn parse_args_options(args: &[String]) -> Option<CliOptions> {
     let mut opts = CliOptions {
         easy: liburlx::Easy::new(),
         urls: Vec::new(),
@@ -850,7 +937,8 @@ pub fn parse_args(args: &[String]) -> Option<CliOptions> {
                         for arg in args.iter().skip(i + 1) {
                             full_args.push(arg.clone());
                         }
-                        return parse_args(&full_args);
+                        let expanded = expand_combined_flags(&full_args);
+                        return parse_args_options(&expanded);
                     }
                     Err(e) => {
                         eprintln!("urlx: can't read config file '{val}': {e}");
@@ -1377,13 +1465,28 @@ pub fn is_protocol_allowed(url: &str, proto_list: &str) -> bool {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
     use std::process::ExitCode;
 
     use super::*;
     use crate::output::*;
     use crate::transfer::*;
+
+    /// Helper to extract `CliOptions` from `ParseResult`, panicking if not Options.
+    fn unwrap_opts(result: ParseResult) -> CliOptions {
+        match result {
+            ParseResult::Options(opts) => *opts,
+            ParseResult::Help => panic!("expected Options, got Help"),
+            ParseResult::Version => panic!("expected Options, got Version"),
+            ParseResult::Error => panic!("expected Options, got Error"),
+        }
+    }
+
+    /// Helper to check if `ParseResult` is an error.
+    fn is_error(result: &ParseResult) -> bool {
+        matches!(result, ParseResult::Error)
+    }
 
     /// Helper to construct arg list from string slices.
     fn make_args(args: &[&str]) -> Vec<String> {
@@ -1402,6 +1505,32 @@ mod tests {
         );
         let result = format_write_out("%{http_code}", &response);
         assert_eq!(result, "200");
+    }
+
+    #[test]
+    fn format_write_out_http_version() {
+        let mut response = liburlx::Response::new(
+            200,
+            std::collections::HashMap::new(),
+            Vec::new(),
+            "http://example.com".to_string(),
+        );
+        response.set_http_version(liburlx::ResponseHttpVersion::Http2);
+        let result = format_write_out("%{http_version}", &response);
+        assert_eq!(result, "2");
+    }
+
+    #[test]
+    fn format_write_out_http_version_11() {
+        let mut response = liburlx::Response::new(
+            200,
+            std::collections::HashMap::new(),
+            Vec::new(),
+            "http://example.com".to_string(),
+        );
+        response.set_http_version(liburlx::ResponseHttpVersion::Http11);
+        let result = format_write_out("%{http_version}", &response);
+        assert_eq!(result, "1.1");
     }
 
     #[test]
@@ -1444,7 +1573,8 @@ mod tests {
     fn format_headers_basic() {
         let mut headers = std::collections::HashMap::new();
         let _old = headers.insert("content-type".to_string(), "text/plain".to_string());
-        let response = liburlx::Response::new(200, headers, Vec::new(), String::new());
+        let mut response = liburlx::Response::new(200, headers, Vec::new(), String::new());
+        response.set_http_version(liburlx::ResponseHttpVersion::Http11);
         let result = format_headers(&response);
         assert!(result.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(result.contains("content-type: text/plain\r\n"));
@@ -1454,7 +1584,7 @@ mod tests {
     #[test]
     fn parse_args_basic_url() {
         let args = vec!["urlx".to_string(), "http://example.com".to_string()];
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert_eq!(opts.urls, vec!["http://example.com"]);
         assert!(!opts.silent);
         assert!(!opts.fail_on_error);
@@ -1468,7 +1598,7 @@ mod tests {
             "-f".to_string(),
             "http://x.com".to_string(),
         ];
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert!(opts.silent);
         assert!(opts.fail_on_error);
     }
@@ -1476,7 +1606,7 @@ mod tests {
     #[test]
     fn parse_args_include_headers() {
         let args = vec!["urlx".to_string(), "-i".to_string(), "http://x.com".to_string()];
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert!(opts.include_headers);
     }
 
@@ -1489,7 +1619,7 @@ mod tests {
             "http://x.com".to_string(),
         ];
         let opts = parse_args(&args);
-        assert!(opts.is_some());
+        assert!(matches!(opts, ParseResult::Options(_)));
     }
 
     #[test]
@@ -1501,7 +1631,7 @@ mod tests {
             "http://x.com".to_string(),
         ];
         let opts = parse_args(&args);
-        assert!(opts.is_some());
+        assert!(matches!(opts, ParseResult::Options(_)));
     }
 
     #[test]
@@ -1512,7 +1642,7 @@ mod tests {
             "headers.txt".to_string(),
             "http://x.com".to_string(),
         ];
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert_eq!(opts.dump_header.as_deref(), Some("headers.txt"));
     }
 
@@ -1525,25 +1655,25 @@ mod tests {
             "http://x.com".to_string(),
         ];
         let opts = parse_args(&args);
-        assert!(opts.is_some());
+        assert!(matches!(opts, ParseResult::Options(_)));
     }
 
     #[test]
     fn parse_args_unknown_option() {
         let args = vec!["urlx".to_string(), "--bogus".to_string()];
-        assert!(parse_args(&args).is_none());
+        assert!(is_error(&parse_args(&args)));
     }
 
     #[test]
     fn parse_args_missing_arg() {
         let args = vec!["urlx".to_string(), "-X".to_string()];
-        assert!(parse_args(&args).is_none());
+        assert!(is_error(&parse_args(&args)));
     }
 
     #[test]
     fn parse_args_multiple_urls() {
         let args = vec!["urlx".to_string(), "http://a.com".to_string(), "http://b.com".to_string()];
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert_eq!(opts.urls.len(), 2);
         assert_eq!(opts.urls[0], "http://a.com");
         assert_eq!(opts.urls[1], "http://b.com");
@@ -1558,7 +1688,10 @@ mod tests {
                 method.to_string(),
                 "http://x.com".to_string(),
             ];
-            assert!(parse_args(&args).is_some(), "method {method} should parse");
+            assert!(
+                matches!(parse_args(&args), ParseResult::Options(_)),
+                "method {method} should parse"
+            );
         }
     }
 
@@ -1570,14 +1703,14 @@ mod tests {
             "NoColonHere".to_string(),
             "http://x.com".to_string(),
         ];
-        assert!(parse_args(&args).is_none());
+        assert!(is_error(&parse_args(&args)));
     }
 
     #[test]
     fn parse_args_compressed() {
         let args = vec!["urlx".to_string(), "--compressed".to_string(), "http://x.com".to_string()];
         let opts = parse_args(&args);
-        assert!(opts.is_some());
+        assert!(matches!(opts, ParseResult::Options(_)));
     }
 
     #[test]
@@ -1589,7 +1722,7 @@ mod tests {
             "http://x.com".to_string(),
         ];
         let opts = parse_args(&args);
-        assert!(opts.is_some());
+        assert!(matches!(opts, ParseResult::Options(_)));
     }
 
     #[test]
@@ -1600,7 +1733,7 @@ mod tests {
             "not-a-number".to_string(),
             "http://x.com".to_string(),
         ];
-        assert!(parse_args(&args).is_none());
+        assert!(is_error(&parse_args(&args)));
     }
 
     #[test]
@@ -1612,7 +1745,7 @@ mod tests {
             "http://x.com".to_string(),
         ];
         let opts = parse_args(&args);
-        assert!(opts.is_some());
+        assert!(matches!(opts, ParseResult::Options(_)));
     }
 
     #[test]
@@ -1623,7 +1756,7 @@ mod tests {
             "abc".to_string(),
             "http://x.com".to_string(),
         ];
-        assert!(parse_args(&args).is_none());
+        assert!(is_error(&parse_args(&args)));
     }
 
     #[test]
@@ -1635,7 +1768,7 @@ mod tests {
             "http://x.com".to_string(),
         ];
         let opts = parse_args(&args);
-        assert!(opts.is_some());
+        assert!(matches!(opts, ParseResult::Options(_)));
     }
 
     #[test]
@@ -1647,7 +1780,7 @@ mod tests {
             "http://x.com".to_string(),
         ];
         let opts = parse_args(&args);
-        assert!(opts.is_some());
+        assert!(matches!(opts, ParseResult::Options(_)));
     }
 
     #[test]
@@ -1658,7 +1791,7 @@ mod tests {
             "noequalssign".to_string(),
             "http://x.com".to_string(),
         ];
-        assert!(parse_args(&args).is_none());
+        assert!(is_error(&parse_args(&args)));
     }
 
     #[test]
@@ -1670,7 +1803,7 @@ mod tests {
             "http://x.com".to_string(),
         ];
         let opts = parse_args(&args);
-        assert!(opts.is_some());
+        assert!(matches!(opts, ParseResult::Options(_)));
     }
 
     #[test]
@@ -1682,7 +1815,7 @@ mod tests {
             "http://x.com".to_string(),
         ];
         let opts = parse_args(&args);
-        assert!(opts.is_some());
+        assert!(matches!(opts, ParseResult::Options(_)));
     }
 
     #[test]
@@ -1693,13 +1826,13 @@ mod tests {
             "not-a-number".to_string(),
             "http://x.com".to_string(),
         ];
-        assert!(parse_args(&args).is_none());
+        assert!(is_error(&parse_args(&args)));
     }
 
     #[test]
     fn parse_args_progress_bar() {
         let args = vec!["urlx".to_string(), "-#".to_string(), "http://x.com".to_string()];
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert!(opts.show_progress);
     }
 
@@ -1707,7 +1840,7 @@ mod tests {
     fn parse_args_verbose() {
         let args = vec!["urlx".to_string(), "-v".to_string(), "http://x.com".to_string()];
         let opts = parse_args(&args);
-        assert!(opts.is_some());
+        assert!(matches!(opts, ParseResult::Options(_)));
     }
 
     #[test]
@@ -1721,7 +1854,7 @@ mod tests {
             "-i".to_string(),
             "http://x.com".to_string(),
         ];
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert!(opts.silent);
         assert!(opts.show_error);
         assert!(opts.fail_on_error);
@@ -1736,7 +1869,7 @@ mod tests {
             "%{http_code}\\n".to_string(),
             "http://x.com".to_string(),
         ];
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert_eq!(opts.write_out.as_deref(), Some("%{http_code}\\n"));
     }
 
@@ -1748,7 +1881,7 @@ mod tests {
             "output.txt".to_string(),
             "http://x.com".to_string(),
         ];
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert_eq!(opts.output_file.as_deref(), Some("output.txt"));
     }
 
@@ -1761,7 +1894,7 @@ mod tests {
             "http://x.com".to_string(),
         ];
         let opts = parse_args(&args);
-        assert!(opts.is_some());
+        assert!(matches!(opts, ParseResult::Options(_)));
     }
 
     #[test]
@@ -1773,7 +1906,7 @@ mod tests {
             "http://x.com".to_string(),
         ];
         let opts = parse_args(&args);
-        assert!(opts.is_some());
+        assert!(matches!(opts, ParseResult::Options(_)));
     }
 
     #[test]
@@ -1849,14 +1982,14 @@ mod tests {
     fn parse_args_insecure() {
         let args = vec!["urlx".to_string(), "-k".to_string(), "https://x.com".to_string()];
         let opts = parse_args(&args);
-        assert!(opts.is_some());
+        assert!(matches!(opts, ParseResult::Options(_)));
     }
 
     #[test]
     fn parse_args_insecure_long() {
         let args = vec!["urlx".to_string(), "--insecure".to_string(), "https://x.com".to_string()];
         let opts = parse_args(&args);
-        assert!(opts.is_some());
+        assert!(matches!(opts, ParseResult::Options(_)));
     }
 
     #[test]
@@ -1868,7 +2001,7 @@ mod tests {
             "https://x.com".to_string(),
         ];
         let opts = parse_args(&args);
-        assert!(opts.is_some());
+        assert!(matches!(opts, ParseResult::Options(_)));
     }
 
     #[test]
@@ -1882,25 +2015,25 @@ mod tests {
             "https://x.com".to_string(),
         ];
         let opts = parse_args(&args);
-        assert!(opts.is_some());
+        assert!(matches!(opts, ParseResult::Options(_)));
     }
 
     #[test]
     fn parse_args_cacert_missing_arg() {
         let args = vec!["urlx".to_string(), "--cacert".to_string()];
-        assert!(parse_args(&args).is_none());
+        assert!(is_error(&parse_args(&args)));
     }
 
     #[test]
     fn parse_args_tlsv12() {
         let args = vec!["urlx".to_string(), "--tlsv1.2".to_string(), "https://x.com".to_string()];
-        assert!(parse_args(&args).is_some());
+        assert!(matches!(parse_args(&args), ParseResult::Options(_)));
     }
 
     #[test]
     fn parse_args_tlsv13() {
         let args = vec!["urlx".to_string(), "--tlsv1.3".to_string(), "https://x.com".to_string()];
-        assert!(parse_args(&args).is_some());
+        assert!(matches!(parse_args(&args), ParseResult::Options(_)));
     }
 
     #[test]
@@ -1911,7 +2044,7 @@ mod tests {
             "1.2".to_string(),
             "https://x.com".to_string(),
         ];
-        assert!(parse_args(&args).is_some());
+        assert!(matches!(parse_args(&args), ParseResult::Options(_)));
     }
 
     #[test]
@@ -1922,7 +2055,7 @@ mod tests {
             "1.1".to_string(),
             "https://x.com".to_string(),
         ];
-        assert!(parse_args(&args).is_none());
+        assert!(is_error(&parse_args(&args)));
     }
 
     #[test]
@@ -1934,7 +2067,7 @@ mod tests {
             "http://x.com".to_string(),
         ];
         let opts = parse_args(&args);
-        assert!(opts.is_some());
+        assert!(matches!(opts, ParseResult::Options(_)));
     }
 
     #[test]
@@ -1946,7 +2079,7 @@ mod tests {
             "http://x.com".to_string(),
         ];
         let opts = parse_args(&args);
-        assert!(opts.is_some());
+        assert!(matches!(opts, ParseResult::Options(_)));
     }
 
     #[test]
@@ -1958,7 +2091,7 @@ mod tests {
             "http://x.com".to_string(),
         ];
         let opts = parse_args(&args);
-        assert!(opts.is_some());
+        assert!(matches!(opts, ParseResult::Options(_)));
     }
 
     #[test]
@@ -1970,7 +2103,7 @@ mod tests {
             "http://x.com".to_string(),
         ];
         let opts = parse_args(&args);
-        assert!(opts.is_some());
+        assert!(matches!(opts, ParseResult::Options(_)));
     }
 
     #[test]
@@ -1982,7 +2115,7 @@ mod tests {
             "http://x.com".to_string(),
         ];
         let opts = parse_args(&args);
-        assert!(opts.is_some());
+        assert!(matches!(opts, ParseResult::Options(_)));
     }
 
     #[test]
@@ -1993,35 +2126,35 @@ mod tests {
             "bad-format".to_string(),
             "http://x.com".to_string(),
         ];
-        assert!(parse_args(&args).is_none());
+        assert!(is_error(&parse_args(&args)));
     }
 
     #[test]
     fn parse_args_http10() {
         let args = vec!["urlx".to_string(), "--http1.0".to_string(), "http://x.com".to_string()];
         let opts = parse_args(&args);
-        assert!(opts.is_some());
+        assert!(matches!(opts, ParseResult::Options(_)));
     }
 
     #[test]
     fn parse_args_http11() {
         let args = vec!["urlx".to_string(), "--http1.1".to_string(), "http://x.com".to_string()];
         let opts = parse_args(&args);
-        assert!(opts.is_some());
+        assert!(matches!(opts, ParseResult::Options(_)));
     }
 
     #[test]
     fn parse_args_http2() {
         let args = vec!["urlx".to_string(), "--http2".to_string(), "http://x.com".to_string()];
         let opts = parse_args(&args);
-        assert!(opts.is_some());
+        assert!(matches!(opts, ParseResult::Options(_)));
     }
 
     #[test]
     fn parse_args_http3() {
         let args = vec!["urlx".to_string(), "--http3".to_string(), "https://x.com".to_string()];
         let opts = parse_args(&args);
-        assert!(opts.is_some());
+        assert!(matches!(opts, ParseResult::Options(_)));
     }
 
     #[test]
@@ -2033,7 +2166,7 @@ mod tests {
             "http://x.com".to_string(),
         ];
         let opts = parse_args(&args);
-        assert!(opts.is_some());
+        assert!(matches!(opts, ParseResult::Options(_)));
     }
 
     #[test]
@@ -2044,7 +2177,7 @@ mod tests {
             "abc".to_string(),
             "http://x.com".to_string(),
         ];
-        assert!(parse_args(&args).is_none());
+        assert!(is_error(&parse_args(&args)));
     }
 
     #[test]
@@ -2055,7 +2188,7 @@ mod tests {
             "3".to_string(),
             "http://x.com".to_string(),
         ];
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert_eq!(opts.retry_count, 3);
     }
 
@@ -2067,7 +2200,7 @@ mod tests {
             "abc".to_string(),
             "http://x.com".to_string(),
         ];
-        assert!(parse_args(&args).is_none());
+        assert!(is_error(&parse_args(&args)));
     }
 
     #[test]
@@ -2078,7 +2211,7 @@ mod tests {
             "5".to_string(),
             "http://x.com".to_string(),
         ];
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert_eq!(opts.retry_delay_secs, 5);
     }
 
@@ -2090,14 +2223,14 @@ mod tests {
             "60".to_string(),
             "http://x.com".to_string(),
         ];
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert_eq!(opts.retry_max_time_secs, 60);
     }
 
     #[test]
     fn parse_args_parallel() {
         let args = vec!["urlx".to_string(), "-Z".to_string(), "http://x.com".to_string()];
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert!(opts.parallel);
         assert_eq!(opts.parallel_max, 50); // default
     }
@@ -2105,7 +2238,7 @@ mod tests {
     #[test]
     fn parse_args_parallel_long() {
         let args = vec!["urlx".to_string(), "--parallel".to_string(), "http://x.com".to_string()];
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert!(opts.parallel);
     }
 
@@ -2117,7 +2250,7 @@ mod tests {
             "10".to_string(),
             "http://x.com".to_string(),
         ];
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert_eq!(opts.parallel_max, 10);
     }
 
@@ -2129,7 +2262,7 @@ mod tests {
             "abc".to_string(),
             "http://x.com".to_string(),
         ];
-        assert!(parse_args(&args).is_none());
+        assert!(is_error(&parse_args(&args)));
     }
 
     #[test]
@@ -2141,7 +2274,7 @@ mod tests {
             "http://x.com".to_string(),
         ];
         let opts = parse_args(&args);
-        assert!(opts.is_some());
+        assert!(matches!(opts, ParseResult::Options(_)));
     }
 
     #[test]
@@ -2149,7 +2282,7 @@ mod tests {
         let args =
             vec!["urlx".to_string(), "--tcp-nodelay".to_string(), "http://x.com".to_string()];
         let opts = parse_args(&args);
-        assert!(opts.is_some());
+        assert!(matches!(opts, ParseResult::Options(_)));
     }
 
     #[test]
@@ -2161,7 +2294,7 @@ mod tests {
             "http://x.com".to_string(),
         ];
         let opts = parse_args(&args);
-        assert!(opts.is_some());
+        assert!(matches!(opts, ParseResult::Options(_)));
     }
 
     #[test]
@@ -2172,14 +2305,14 @@ mod tests {
             "abc".to_string(),
             "http://x.com".to_string(),
         ];
-        assert!(parse_args(&args).is_none());
+        assert!(is_error(&parse_args(&args)));
     }
 
     #[test]
     fn parse_args_hsts() {
         let args = vec!["urlx".to_string(), "--hsts".to_string(), "http://x.com".to_string()];
         let opts = parse_args(&args);
-        assert!(opts.is_some());
+        assert!(matches!(opts, ParseResult::Options(_)));
     }
 
     #[test]
@@ -2190,14 +2323,14 @@ mod tests {
             "mytoken123".to_string(),
             "http://x.com".to_string(),
         ];
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert!(opts.use_bearer);
     }
 
     #[test]
     fn parse_args_bearer_missing_arg() {
         let args = vec!["urlx".to_string(), "--bearer".to_string()];
-        assert!(parse_args(&args).is_none());
+        assert!(is_error(&parse_args(&args)));
     }
 
     #[test]
@@ -2284,7 +2417,7 @@ mod tests {
             "/tmp/cookies.txt".to_string(),
             "http://example.com".to_string(),
         ];
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert_eq!(opts.cookie_jar_file, Some("/tmp/cookies.txt".to_string()));
     }
 
@@ -2296,7 +2429,7 @@ mod tests {
             "/tmp/cookies.txt".to_string(),
             "http://example.com".to_string(),
         ];
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert_eq!(opts.cookie_jar_file, Some("/tmp/cookies.txt".to_string()));
     }
 
@@ -2308,7 +2441,7 @@ mod tests {
             "100K".to_string(),
             "http://example.com".to_string(),
         ];
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert_eq!(opts.limit_rate, Some("100K".to_string()));
     }
 
@@ -2320,7 +2453,7 @@ mod tests {
             "notanumber".to_string(),
             "http://example.com".to_string(),
         ];
-        assert!(parse_args(&args).is_none());
+        assert!(is_error(&parse_args(&args)));
     }
 
     #[test]
@@ -2331,7 +2464,7 @@ mod tests {
             "1000".to_string(),
             "http://example.com".to_string(),
         ];
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert_eq!(opts.speed_limit, Some(1000));
     }
 
@@ -2343,7 +2476,7 @@ mod tests {
             "60".to_string(),
             "http://example.com".to_string(),
         ];
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert_eq!(opts.speed_time, Some(60));
     }
 
@@ -2355,7 +2488,7 @@ mod tests {
             "http://prev.com".to_string(),
             "http://example.com".to_string(),
         ];
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert!(opts.urls.contains(&"http://example.com".to_string()));
     }
 
@@ -2367,7 +2500,7 @@ mod tests {
             "http://prev.com".to_string(),
             "http://example.com".to_string(),
         ];
-        assert!(parse_args(&args).is_some());
+        assert!(matches!(parse_args(&args), ParseResult::Options(_)));
     }
 
     #[test]
@@ -2377,14 +2510,14 @@ mod tests {
             "-O".to_string(),
             "http://example.com/file.tar.gz".to_string(),
         ];
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert!(opts.remote_name);
     }
 
     #[test]
     fn parse_args_get_flag() {
         let args = vec!["urlx".to_string(), "-G".to_string(), "http://example.com".to_string()];
-        assert!(parse_args(&args).is_some());
+        assert!(matches!(parse_args(&args), ParseResult::Options(_)));
     }
 
     #[test]
@@ -2396,7 +2529,7 @@ mod tests {
             "a/b/c/file.txt".to_string(),
             "http://example.com".to_string(),
         ];
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert!(opts.create_dirs);
     }
 
@@ -2433,7 +2566,7 @@ mod tests {
             "8.8.8.8,8.8.4.4".into(),
             "http://example.com".into(),
         ];
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert_eq!(opts.urls, vec!["http://example.com"]);
     }
 
@@ -2445,7 +2578,7 @@ mod tests {
             "https://dns.google/dns-query".into(),
             "http://example.com".into(),
         ];
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert_eq!(opts.urls, vec!["http://example.com"]);
     }
 
@@ -2457,7 +2590,7 @@ mod tests {
             "100".into(),
             "http://example.com".into(),
         ];
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert_eq!(opts.urls, vec!["http://example.com"]);
     }
 
@@ -2469,13 +2602,13 @@ mod tests {
             "abc".into(),
             "http://example.com".into(),
         ];
-        assert!(parse_args(&args).is_none());
+        assert!(is_error(&parse_args(&args)));
     }
 
     #[test]
     fn parse_args_unrestricted_auth() {
         let args = vec!["urlx".into(), "--unrestricted-auth".into(), "http://example.com".into()];
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert_eq!(opts.urls, vec!["http://example.com"]);
     }
 
@@ -2483,7 +2616,7 @@ mod tests {
     fn parse_args_ignore_content_length() {
         let args =
             vec!["urlx".into(), "--ignore-content-length".into(), "http://example.com".into()];
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert_eq!(opts.urls, vec!["http://example.com"]);
     }
 
@@ -2495,7 +2628,7 @@ mod tests {
             "/tmp/trace.log".into(),
             "http://example.com".into(),
         ];
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert_eq!(opts.trace_file, Some("/tmp/trace.log".to_string()));
     }
 
@@ -2507,21 +2640,21 @@ mod tests {
             "/tmp/trace.log".into(),
             "http://example.com".into(),
         ];
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert_eq!(opts.trace_ascii_file, Some("/tmp/trace.log".to_string()));
     }
 
     #[test]
     fn parse_args_trace_time() {
         let args = vec!["urlx".into(), "--trace-time".into(), "http://example.com".into()];
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert!(opts.trace_time);
     }
 
     #[test]
     fn parse_args_libcurl() {
         let args = vec!["urlx".into(), "--libcurl".into(), "http://example.com".into()];
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert!(opts.libcurl);
     }
 
@@ -2533,7 +2666,7 @@ mod tests {
             "=http,https".into(),
             "http://example.com".into(),
         ];
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert_eq!(opts.proto, Some("=http,https".to_string()));
     }
 
@@ -2545,7 +2678,7 @@ mod tests {
             "=https".into(),
             "http://example.com".into(),
         ];
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert_eq!(opts.proto_redir, Some("=https".to_string()));
     }
 
@@ -2557,7 +2690,7 @@ mod tests {
             "1048576".into(),
             "http://example.com".into(),
         ];
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert_eq!(opts.max_filesize, Some(1_048_576));
     }
 
@@ -2565,13 +2698,13 @@ mod tests {
     fn parse_args_max_filesize_invalid() {
         let args =
             vec!["urlx".into(), "--max-filesize".into(), "abc".into(), "http://example.com".into()];
-        assert!(parse_args(&args).is_none());
+        assert!(is_error(&parse_args(&args)));
     }
 
     #[test]
     fn parse_args_no_keepalive() {
         let args = vec!["urlx".into(), "--no-keepalive".into(), "http://example.com".into()];
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert!(opts.no_keepalive);
     }
 
@@ -2652,7 +2785,7 @@ mod tests {
     #[test]
     fn generate_libcurl_code_basic() {
         let args = vec!["urlx".into(), "http://example.com".into()];
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         let code = generate_libcurl_code(&opts);
         assert!(code.contains("#include <curl/curl.h>"));
         assert!(code.contains("CURLOPT_URL"));
@@ -2665,7 +2798,7 @@ mod tests {
     fn generate_libcurl_code_with_options() {
         let args =
             vec!["urlx".into(), "-s".into(), "-f".into(), "-i".into(), "http://example.com".into()];
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         let code = generate_libcurl_code(&opts);
         assert!(code.contains("CURLOPT_NOPROGRESS"));
         assert!(code.contains("CURLOPT_FAILONERROR"));
@@ -2675,21 +2808,21 @@ mod tests {
     #[test]
     fn parse_args_post301() {
         let args = vec!["urlx".into(), "--post301".into(), "http://example.com".into()];
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert!(opts.post301);
     }
 
     #[test]
     fn parse_args_post302() {
         let args = vec!["urlx".into(), "--post302".into(), "http://example.com".into()];
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert!(opts.post302);
     }
 
     #[test]
     fn parse_args_post303() {
         let args = vec!["urlx".into(), "--post303".into(), "http://example.com".into()];
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert!(opts.post303);
     }
 
@@ -2702,7 +2835,7 @@ mod tests {
             "http://example.com".into(),
         ];
         let opts = parse_args(&args);
-        assert!(opts.is_some());
+        assert!(matches!(opts, ParseResult::Options(_)));
     }
 
     #[test]
@@ -2713,13 +2846,13 @@ mod tests {
             "NoColonHere".into(),
             "http://example.com".into(),
         ];
-        assert!(parse_args(&args).is_none());
+        assert!(is_error(&parse_args(&args)));
     }
 
     #[test]
     fn parse_args_netrc() {
         let args = vec!["urlx".into(), "--netrc".into(), "http://example.com".into()];
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert!(opts.netrc_file.is_some());
         assert!(!opts.netrc_optional);
     }
@@ -2727,7 +2860,7 @@ mod tests {
     #[test]
     fn parse_args_netrc_optional() {
         let args = vec!["urlx".into(), "--netrc-optional".into(), "http://example.com".into()];
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert!(opts.netrc_file.is_some());
         assert!(opts.netrc_optional);
     }
@@ -2740,21 +2873,21 @@ mod tests {
             "/tmp/my.netrc".into(),
             "http://example.com".into(),
         ];
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert_eq!(opts.netrc_file.as_deref(), Some("/tmp/my.netrc"));
     }
 
     #[test]
     fn parse_args_remote_time() {
         let args = vec!["urlx".into(), "-R".into(), "http://example.com".into()];
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert!(opts.remote_time);
     }
 
     #[test]
     fn parse_args_remote_time_long() {
         let args = vec!["urlx".into(), "--remote-time".into(), "http://example.com".into()];
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert!(opts.remote_time);
     }
 
@@ -2762,38 +2895,38 @@ mod tests {
     fn parse_args_next() {
         let args =
             vec!["urlx".into(), "http://a.com".into(), "--next".into(), "http://b.com".into()];
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert_eq!(opts.urls.len(), 2);
     }
 
     #[test]
     fn parse_args_ftp_pasv() {
         let args = vec!["urlx".into(), "--ftp-pasv".into(), "ftp://example.com".into()];
-        assert!(parse_args(&args).is_some());
+        assert!(matches!(parse_args(&args), ParseResult::Options(_)));
     }
 
     #[test]
     fn parse_args_ftp_ssl() {
         let args = vec!["urlx".into(), "--ftp-ssl".into(), "ftp://example.com".into()];
-        assert!(parse_args(&args).is_some());
+        assert!(matches!(parse_args(&args), ParseResult::Options(_)));
     }
 
     #[test]
     fn parse_args_ssl() {
         let args = vec!["urlx".into(), "--ssl".into(), "ftp://example.com".into()];
-        assert!(parse_args(&args).is_some());
+        assert!(matches!(parse_args(&args), ParseResult::Options(_)));
     }
 
     #[test]
     fn parse_args_ftp_ssl_reqd() {
         let args = vec!["urlx".into(), "--ftp-ssl-reqd".into(), "ftp://example.com".into()];
-        assert!(parse_args(&args).is_some());
+        assert!(matches!(parse_args(&args), ParseResult::Options(_)));
     }
 
     #[test]
     fn parse_args_ssl_reqd() {
         let args = vec!["urlx".into(), "--ssl-reqd".into(), "ftp://example.com".into()];
-        assert!(parse_args(&args).is_some());
+        assert!(matches!(parse_args(&args), ParseResult::Options(_)));
     }
 
     #[test]
@@ -2804,7 +2937,7 @@ mod tests {
             "/home/user/.ssh/id_ed25519".into(),
             "sftp://example.com/file".into(),
         ];
-        assert!(parse_args(&args).is_some());
+        assert!(matches!(parse_args(&args), ParseResult::Options(_)));
     }
 
     #[test]
@@ -2815,7 +2948,7 @@ mod tests {
             "abcdef1234567890".into(),
             "sftp://example.com/file".into(),
         ];
-        assert!(parse_args(&args).is_some());
+        assert!(matches!(parse_args(&args), ParseResult::Options(_)));
     }
 
     #[test]
@@ -2826,7 +2959,7 @@ mod tests {
             "/home/user/.ssh/known_hosts".into(),
             "sftp://example.com/file".into(),
         ];
-        assert!(parse_args(&args).is_some());
+        assert!(matches!(parse_args(&args), ParseResult::Options(_)));
     }
 
     #[test]
@@ -2837,7 +2970,7 @@ mod tests {
             "00:11:22:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff".into(),
             "sftp://example.com/file".into(),
         ];
-        assert!(parse_args(&args).is_some());
+        assert!(matches!(parse_args(&args), ParseResult::Options(_)));
     }
 
     #[test]
@@ -2898,7 +3031,7 @@ mod tests {
             "/tmp/err.log".into(),
             "http://example.com".into(),
         ];
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert_eq!(opts.stderr_file, Some("/tmp/err.log".to_string()));
     }
 
@@ -3007,26 +3140,26 @@ mod tests {
     #[test]
     fn parse_args_globoff() {
         let args = vec!["urlx".into(), "--globoff".into(), "http://x.com".into()];
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert!(opts.globoff);
     }
 
     #[test]
     fn parse_args_path_as_is() {
         let args = vec!["urlx".into(), "--path-as-is".into(), "http://x.com/a/../b".into()];
-        assert!(parse_args(&args).is_some());
+        assert!(matches!(parse_args(&args), ParseResult::Options(_)));
     }
 
     #[test]
     fn parse_args_raw() {
         let args = vec!["urlx".into(), "--raw".into(), "http://x.com".into()];
-        assert!(parse_args(&args).is_some());
+        assert!(matches!(parse_args(&args), ParseResult::Options(_)));
     }
 
     #[test]
     fn parse_args_remote_header_name_short() {
         let args = vec!["urlx".into(), "-J".into(), "http://x.com/file".into()];
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert!(opts.remote_header_name);
         assert!(opts.remote_name);
     }
@@ -3034,27 +3167,27 @@ mod tests {
     #[test]
     fn parse_args_remote_header_name_long() {
         let args = vec!["urlx".into(), "--remote-header-name".into(), "http://x.com/file".into()];
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert!(opts.remote_header_name);
     }
 
     #[test]
     fn parse_args_styled_output() {
         let args = vec!["urlx".into(), "--styled-output".into(), "http://x.com".into()];
-        assert!(parse_args(&args).is_some());
+        assert!(matches!(parse_args(&args), ParseResult::Options(_)));
     }
 
     #[test]
     fn parse_args_no_styled_output() {
         let args = vec!["urlx".into(), "--no-styled-output".into(), "http://x.com".into()];
-        assert!(parse_args(&args).is_some());
+        assert!(matches!(parse_args(&args), ParseResult::Options(_)));
     }
 
     #[test]
     fn parse_args_url_query() {
         let args =
             vec!["urlx".into(), "--url-query".into(), "key=value".into(), "http://x.com".into()];
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert_eq!(opts.url_queries, vec!["key=value"]);
     }
 
@@ -3068,7 +3201,7 @@ mod tests {
             "b=2".into(),
             "http://x.com".into(),
         ];
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert_eq!(opts.url_queries, vec!["a=1", "b=2"]);
     }
 
@@ -3077,13 +3210,13 @@ mod tests {
         let args =
             vec!["urlx".into(), "--json".into(), r#"{"key":"val"}"#.into(), "http://x.com".into()];
         let opts = parse_args(&args);
-        assert!(opts.is_some());
+        assert!(matches!(opts, ParseResult::Options(_)));
     }
 
     #[test]
     fn parse_args_rate() {
         let args = vec!["urlx".into(), "--rate".into(), "10/s".into(), "http://x.com".into()];
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert_eq!(opts.rate, Some("10/s".to_string()));
     }
 
@@ -3169,42 +3302,42 @@ mod tests {
     #[test]
     fn parse_ciphers_flag() {
         let args = make_args(&["--ciphers", "ECDHE-RSA-AES256-GCM-SHA384", "http://example.com"]);
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert_eq!(opts.urls, vec!["http://example.com"]);
     }
 
     #[test]
     fn parse_ntlm_flag() {
         let args = make_args(&["--ntlm", "-u", "user:pass", "http://example.com"]);
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert!(opts.use_ntlm);
     }
 
     #[test]
     fn parse_negotiate_flag() {
         let args = make_args(&["--negotiate", "http://example.com"]);
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert_eq!(opts.urls, vec!["http://example.com"]);
     }
 
     #[test]
     fn parse_delegation_flag() {
         let args = make_args(&["--delegation", "always", "http://example.com"]);
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert_eq!(opts.urls, vec!["http://example.com"]);
     }
 
     #[test]
     fn parse_sasl_flags() {
         let args = make_args(&["--sasl-authzid", "myid", "--sasl-ir", "http://example.com"]);
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert_eq!(opts.urls, vec!["http://example.com"]);
     }
 
     #[test]
     fn parse_mail_from_flag() {
         let args = make_args(&["--mail-from", "sender@example.com", "smtp://mail.example.com"]);
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert_eq!(opts.urls, vec!["smtp://mail.example.com"]);
     }
 
@@ -3217,35 +3350,35 @@ mod tests {
             "bob@example.com",
             "smtp://mail.example.com",
         ]);
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert_eq!(opts.urls, vec!["smtp://mail.example.com"]);
     }
 
     #[test]
     fn parse_mail_auth_flag() {
         let args = make_args(&["--mail-auth", "sender@example.com", "smtp://mail.example.com"]);
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert_eq!(opts.urls, vec!["smtp://mail.example.com"]);
     }
 
     #[test]
     fn parse_ftp_create_dirs_flag() {
         let args = make_args(&["--ftp-create-dirs", "ftp://example.com/dir/file.txt"]);
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert_eq!(opts.urls, vec!["ftp://example.com/dir/file.txt"]);
     }
 
     #[test]
     fn parse_ftp_method_flag() {
         let args = make_args(&["--ftp-method", "singlecwd", "ftp://example.com/dir/file.txt"]);
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert_eq!(opts.urls, vec!["ftp://example.com/dir/file.txt"]);
     }
 
     #[test]
     fn parse_ftp_method_invalid() {
         let args = make_args(&["--ftp-method", "invalid", "ftp://example.com/"]);
-        assert!(parse_args(&args).is_none());
+        assert!(is_error(&parse_args(&args)));
     }
 
     // --- Phase 41 tests: URL globbing ---
@@ -3253,7 +3386,7 @@ mod tests {
     #[test]
     fn parse_args_globoff_sets_flag() {
         let args = make_args(&["--globoff", "http://example.com/{a,b}"]);
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert!(opts.globoff);
         // With globoff, URL is stored literally (not expanded)
         assert_eq!(opts.urls, vec!["http://example.com/{a,b}"]);
@@ -3263,7 +3396,7 @@ mod tests {
     fn glob_expansion_in_run() {
         // Verify that glob expansion works at the parse level
         let args = make_args(&["http://example.com/{a,b}"]);
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert!(!opts.globoff);
         // URLs collected as-is at parse time
         assert_eq!(opts.urls, vec!["http://example.com/{a,b}"]);
@@ -3273,7 +3406,7 @@ mod tests {
     #[test]
     fn glob_numeric_range_collected() {
         let args = make_args(&["http://example.com/[1-3]"]);
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert_eq!(opts.urls, vec!["http://example.com/[1-3]"]);
     }
 
@@ -3282,42 +3415,42 @@ mod tests {
     #[test]
     fn parse_connect_to() {
         let args = make_args(&["--connect-to", "a.com:80:b.com:8080", "http://a.com"]);
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert_eq!(opts.urls, vec!["http://a.com"]);
     }
 
     #[test]
     fn parse_alt_svc() {
         let args = make_args(&["--alt-svc", "/tmp/altsvc.txt", "http://example.com"]);
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert_eq!(opts.alt_svc_file.as_deref(), Some("/tmp/altsvc.txt"));
     }
 
     #[test]
     fn parse_etag_save() {
         let args = make_args(&["--etag-save", "/tmp/etag.txt", "http://example.com"]);
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert_eq!(opts.etag_save_file.as_deref(), Some("/tmp/etag.txt"));
     }
 
     #[test]
     fn parse_etag_compare() {
         let args = make_args(&["--etag-compare", "/tmp/etag.txt", "http://example.com"]);
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert_eq!(opts.etag_compare_file.as_deref(), Some("/tmp/etag.txt"));
     }
 
     #[test]
     fn parse_haproxy_protocol() {
         let args = make_args(&["--haproxy-protocol", "http://example.com"]);
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert_eq!(opts.urls, vec!["http://example.com"]);
     }
 
     #[test]
     fn parse_abstract_unix_socket() {
         let args = make_args(&["--abstract-unix-socket", "/my/sock", "http://example.com"]);
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert_eq!(opts.urls, vec!["http://example.com"]);
     }
 
@@ -3332,28 +3465,28 @@ mod tests {
             "/path/key.pem",
             "http://example.com",
         ]);
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert_eq!(opts.urls, vec!["http://example.com"]);
     }
 
     #[test]
     fn parse_doh_insecure() {
         let args = make_args(&["--doh-insecure", "http://example.com"]);
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert_eq!(opts.urls, vec!["http://example.com"]);
     }
 
     #[test]
     fn parse_proto_default() {
         let args = make_args(&["--proto-default", "https", "example.com"]);
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert_eq!(opts.proto_default.as_deref(), Some("https"));
     }
 
     #[test]
     fn parse_compressed_ssh_noop() {
         let args = make_args(&["--compressed-ssh", "sftp://example.com"]);
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert_eq!(opts.urls, vec!["sftp://example.com"]);
     }
 
@@ -3362,175 +3495,283 @@ mod tests {
     #[test]
     fn parse_form_string() {
         let args = make_args(&["--form-string", "name=@notafile", "http://example.com"]);
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert_eq!(opts.urls, vec!["http://example.com"]);
     }
 
     #[test]
     fn parse_request_target() {
         let args = make_args(&["--request-target", "/custom/path", "http://example.com"]);
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert_eq!(opts.urls, vec!["http://example.com"]);
     }
 
     #[test]
     fn parse_socks4() {
         let args = make_args(&["--socks4", "127.0.0.1:1080", "http://example.com"]);
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert_eq!(opts.urls, vec!["http://example.com"]);
     }
 
     #[test]
     fn parse_socks4a() {
         let args = make_args(&["--socks4a", "127.0.0.1:1080", "http://example.com"]);
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert_eq!(opts.urls, vec!["http://example.com"]);
     }
 
     #[test]
     fn parse_socks5() {
         let args = make_args(&["--socks5", "127.0.0.1:1080", "http://example.com"]);
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert_eq!(opts.urls, vec!["http://example.com"]);
     }
 
     #[test]
     fn parse_proxy_1_0() {
         let args = make_args(&["--proxy-1.0", "http://proxy:8080", "http://example.com"]);
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert_eq!(opts.urls, vec!["http://example.com"]);
     }
 
     #[test]
     fn parse_tftp_blksize() {
         let args = make_args(&["--tftp-blksize", "1024", "tftp://example.com/file"]);
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert_eq!(opts.urls, vec!["tftp://example.com/file"]);
     }
 
     #[test]
     fn parse_tftp_no_options() {
         let args = make_args(&["--tftp-no-options", "tftp://example.com/file"]);
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert_eq!(opts.urls, vec!["tftp://example.com/file"]);
     }
 
     #[test]
     fn parse_no_buffer() {
         let args = make_args(&["-N", "http://example.com"]);
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert_eq!(opts.urls, vec!["http://example.com"]);
     }
 
     #[test]
     fn parse_no_sessionid() {
         let args = make_args(&["--no-sessionid", "http://example.com"]);
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert_eq!(opts.urls, vec!["http://example.com"]);
     }
 
     #[test]
     fn parse_no_alpn() {
         let args = make_args(&["--no-alpn", "http://example.com"]);
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert_eq!(opts.urls, vec!["http://example.com"]);
     }
 
     #[test]
     fn parse_no_npn() {
         let args = make_args(&["--no-npn", "http://example.com"]);
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert_eq!(opts.urls, vec!["http://example.com"]);
     }
 
     #[test]
     fn parse_tlsv1() {
         let args = make_args(&["--tlsv1", "http://example.com"]);
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert_eq!(opts.urls, vec!["http://example.com"]);
     }
 
     #[test]
     fn parse_sslv3() {
         let args = make_args(&["--sslv3", "http://example.com"]);
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert_eq!(opts.urls, vec!["http://example.com"]);
     }
 
     #[test]
     fn parse_proxy_insecure() {
         let args = make_args(&["--proxy-insecure", "http://example.com"]);
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert_eq!(opts.urls, vec!["http://example.com"]);
     }
 
     #[test]
     fn parse_disable_eprt() {
         let args = make_args(&["--disable-eprt", "ftp://example.com/file"]);
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert_eq!(opts.urls, vec!["ftp://example.com/file"]);
     }
 
     #[test]
     fn parse_disable_epsv() {
         let args = make_args(&["--disable-epsv", "ftp://example.com/file"]);
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert_eq!(opts.urls, vec!["ftp://example.com/file"]);
     }
 
     #[test]
     fn parse_tlsv1_0() {
         let args = make_args(&["--tlsv1.0", "http://example.com"]);
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert_eq!(opts.urls, vec!["http://example.com"]);
     }
 
     #[test]
     fn parse_pinnedpubkey_sha256() {
         let args = make_args(&["--pinnedpubkey", "sha256//abc123", "https://example.com"]);
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert_eq!(opts.urls, vec!["https://example.com"]);
     }
 
     #[test]
     fn parse_cert_status() {
         let args = make_args(&["--cert-status", "https://example.com"]);
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert_eq!(opts.urls, vec!["https://example.com"]);
     }
 
     #[test]
     fn parse_false_start() {
         let args = make_args(&["--false-start", "https://example.com"]);
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert_eq!(opts.urls, vec!["https://example.com"]);
     }
 
     #[test]
     fn parse_create_file_mode() {
         let args = make_args(&["--create-file-mode", "0644", "http://example.com"]);
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert_eq!(opts.urls, vec!["http://example.com"]);
     }
 
     #[test]
     fn parse_output_dir() {
         let args = make_args(&["--output-dir", "/tmp", "http://example.com"]);
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert_eq!(opts.output_dir.as_deref(), Some("/tmp"));
     }
 
     #[test]
     fn parse_remove_on_error() {
         let args = make_args(&["--remove-on-error", "http://example.com"]);
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert!(opts.remove_on_error);
     }
 
     #[test]
     fn parse_url_flag() {
         let args = make_args(&["--url", "http://example.com"]);
-        let opts = parse_args(&args).unwrap();
+        let opts = unwrap_opts(parse_args(&args));
         assert_eq!(opts.urls, vec!["http://example.com"]);
+    }
+
+    // --- Phase 52: --help, --version, combined short flags ---
+
+    #[test]
+    fn parse_args_help_short() {
+        let args = make_args(&["-h"]);
+        assert!(matches!(parse_args(&args), ParseResult::Help));
+    }
+
+    #[test]
+    fn parse_args_help_long() {
+        let args = make_args(&["--help"]);
+        assert!(matches!(parse_args(&args), ParseResult::Help));
+    }
+
+    #[test]
+    fn parse_args_help_with_url() {
+        // --help takes priority even with a URL
+        let args = make_args(&["http://example.com", "--help"]);
+        assert!(matches!(parse_args(&args), ParseResult::Help));
+    }
+
+    #[test]
+    fn parse_args_version_short() {
+        let args = make_args(&["-V"]);
+        assert!(matches!(parse_args(&args), ParseResult::Version));
+    }
+
+    #[test]
+    fn parse_args_version_long() {
+        let args = make_args(&["--version"]);
+        assert!(matches!(parse_args(&args), ParseResult::Version));
+    }
+
+    #[test]
+    fn parse_args_combined_short_flags_basic() {
+        // -sSf should be expanded to -s -S -f
+        let args = make_args(&["-sSf", "http://x.com"]);
+        let opts = unwrap_opts(parse_args(&args));
+        assert!(opts.silent);
+        assert!(opts.show_error);
+        assert!(opts.fail_on_error);
+    }
+
+    #[test]
+    fn parse_args_combined_short_flags_sslfi() {
+        // -sSfLi should work
+        let args = make_args(&["-sSfLi", "http://x.com"]);
+        let opts = unwrap_opts(parse_args(&args));
+        assert!(opts.silent);
+        assert!(opts.show_error);
+        assert!(opts.fail_on_error);
+        assert!(opts.include_headers);
+    }
+
+    #[test]
+    fn parse_args_combined_with_arg_flag_last() {
+        // -Lo output.txt — -L is a boolean flag, -o takes an argument
+        let args = make_args(&["-Lo", "output.txt", "http://x.com"]);
+        let opts = unwrap_opts(parse_args(&args));
+        assert_eq!(opts.output_file.as_deref(), Some("output.txt"));
+    }
+
+    #[test]
+    fn parse_args_combined_with_arg_inline() {
+        // -ofile.txt — -o takes an argument, rest of the flag is the value
+        let args = make_args(&["-ofile.txt", "http://x.com"]);
+        let opts = unwrap_opts(parse_args(&args));
+        assert_eq!(opts.output_file.as_deref(), Some("file.txt"));
+    }
+
+    #[test]
+    fn parse_args_combined_help_in_group() {
+        // -sh should trigger help since -h is in the group
+        let args = make_args(&["-sh"]);
+        assert!(matches!(parse_args(&args), ParseResult::Help));
+    }
+
+    #[test]
+    fn parse_args_combined_version_in_group() {
+        // -sV should trigger version since -V is in the group
+        let args = make_args(&["-sV"]);
+        assert!(matches!(parse_args(&args), ParseResult::Version));
+    }
+
+    #[test]
+    fn expand_combined_flags_passthrough_long() {
+        // Long flags should pass through unchanged
+        let args = vec!["urlx".into(), "--silent".into(), "http://x.com".into()];
+        let expanded = expand_combined_flags(&args);
+        assert_eq!(expanded, args);
+    }
+
+    #[test]
+    fn expand_combined_flags_single_short() {
+        // Single short flags should pass through unchanged
+        let args = vec!["urlx".into(), "-s".into(), "http://x.com".into()];
+        let expanded = expand_combined_flags(&args);
+        assert_eq!(expanded, args);
+    }
+
+    #[test]
+    fn expand_combined_flags_hash() {
+        // -# should not be expanded (it's a valid single flag)
+        let args = vec!["urlx".into(), "-#".into(), "http://x.com".into()];
+        let expanded = expand_combined_flags(&args);
+        assert_eq!(expanded, args);
     }
 }
