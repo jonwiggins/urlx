@@ -84,7 +84,17 @@ pub enum CURLcode {
     CURLE_PARTIAL_FILE = 18,
     CURLE_RANGE_ERROR = 33,
     CURLE_AGAIN = 81,
+    CURLE_AUTH_ERROR = 94,
     CURLE_UNRECOVERABLE_POLL = 99,
+    CURLE_FTP_COULDNT_RETR_FILE = 19,
+    CURLE_UPLOAD_FAILED = 25,
+    CURLE_LDAP_SEARCH_FAILED = 39,
+    CURLE_FUNCTION_NOT_FOUND = 41,
+    CURLE_INTERFACE_FAILED = 45,
+    CURLE_SSL_ENGINE_NOTFOUND = 53,
+    CURLE_SSL_ENGINE_SETFAILED = 54,
+    CURLE_SSL_PINNEDPUBKEYNOTMATCH = 90,
+    CURLE_SSL_INVALIDCERTSTATUS = 91,
 }
 
 // ───────────────────────── CURLoption ─────────────────────────
@@ -174,6 +184,11 @@ pub enum CURLoption {
     CURLOPT_IGNORE_CONTENT_LENGTH = 136,
     CURLOPT_TCP_KEEPALIVE = 213,
     CURLOPT_SSL_SESSIONID_CACHE = 150,
+    CURLOPT_MAXCONNECTS = 71,
+    CURLOPT_PIPEWAIT = 237,
+    CURLOPT_STREAM_WEIGHT = 239,
+    CURLOPT_TCP_FASTOPEN = 244,
+    CURLOPT_HTTP09_ALLOWED = 285,
 
     // Off_t options (CURLOPTTYPE_OFF_T = 30000)
     CURLOPT_INFILESIZE_LARGE = 30115,
@@ -2084,6 +2099,36 @@ pub unsafe extern "C" fn curl_easy_setopt(
             CURLcode::CURLE_OK
         }
 
+        // CURLOPT_MAXCONNECTS = 71
+        71 => {
+            // Accepted for compat; connection pool limit managed internally
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_PIPEWAIT = 237
+        237 => {
+            // Accepted for compat; HTTP/2 multiplexing handled automatically
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_STREAM_WEIGHT = 239
+        239 => {
+            // Accepted for compat; stream priority deprecated in RFC 9113
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_TCP_FASTOPEN = 244
+        244 => {
+            // Accepted for compat; TCP Fast Open not yet supported
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_HTTP09_ALLOWED = 285
+        285 => {
+            // Accepted for compat; HTTP/0.9 not supported
+            CURLcode::CURLE_OK
+        }
+
         // CURLOPT_LOCALPORTRANGE = 164
         164 => {
             // Accept the range but only use the base port set via LOCALPORT
@@ -3261,7 +3306,19 @@ pub extern "C" fn curl_easy_strerror(code: CURLcode) -> *const c_char {
         CURLcode::CURLE_PARTIAL_FILE => c"Transferred a partial file",
         CURLcode::CURLE_RANGE_ERROR => c"Requested range was not delivered",
         CURLcode::CURLE_AGAIN => c"Socket is not ready for send/recv",
+        CURLcode::CURLE_AUTH_ERROR => c"An authentication function returned an error",
         CURLcode::CURLE_UNRECOVERABLE_POLL => c"Unrecoverable error in select/poll",
+        CURLcode::CURLE_FTP_COULDNT_RETR_FILE => c"FTP: couldn't retrieve (RETR failed)",
+        CURLcode::CURLE_UPLOAD_FAILED => c"Upload failed",
+        CURLcode::CURLE_LDAP_SEARCH_FAILED => c"LDAP search failed",
+        CURLcode::CURLE_FUNCTION_NOT_FOUND => c"A required function was not found",
+        CURLcode::CURLE_INTERFACE_FAILED => c"Failed binding local connection end",
+        CURLcode::CURLE_SSL_ENGINE_NOTFOUND => c"SSL crypto engine not found",
+        CURLcode::CURLE_SSL_ENGINE_SETFAILED => c"Can not set SSL crypto engine as default",
+        CURLcode::CURLE_SSL_PINNEDPUBKEYNOTMATCH => c"SSL public key does not match pinned key",
+        CURLcode::CURLE_SSL_INVALIDCERTSTATUS => {
+            c"SSL server certificate status verification failed"
+        }
     };
     msg.as_ptr()
 }
@@ -7267,5 +7324,55 @@ mod tests {
         let code = unsafe { curl_easy_setopt(handle, 267, 3_usize as *const c_void) };
         assert_eq!(code, CURLcode::CURLE_OK);
         unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_maxconnects() {
+        let handle = curl_easy_init();
+        let code = unsafe { curl_easy_setopt(handle, 71, 5_usize as *const c_void) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_pipewait() {
+        let handle = curl_easy_init();
+        let code = unsafe { curl_easy_setopt(handle, 237, std::ptr::dangling::<c_void>()) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_stream_weight() {
+        let handle = curl_easy_init();
+        let code = unsafe { curl_easy_setopt(handle, 239, 16_usize as *const c_void) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_tcp_fastopen() {
+        let handle = curl_easy_init();
+        let code = unsafe { curl_easy_setopt(handle, 244, std::ptr::dangling::<c_void>()) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_http09_allowed() {
+        let handle = curl_easy_init();
+        let code = unsafe { curl_easy_setopt(handle, 285, std::ptr::dangling::<c_void>()) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn curlcode_auth_error_exists() {
+        assert_eq!(CURLcode::CURLE_AUTH_ERROR as i32, 94);
+    }
+
+    #[test]
+    fn curlcode_ssl_pinnedpubkey_exists() {
+        assert_eq!(CURLcode::CURLE_SSL_PINNEDPUBKEYNOTMATCH as i32, 90);
     }
 }
