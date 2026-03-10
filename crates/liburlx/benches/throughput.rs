@@ -205,6 +205,84 @@ fn bench_cookie_domain_matching(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_http_response_parsing(c: &mut Criterion) {
+    let mut group = c.benchmark_group("http_response_parsing");
+
+    let simple_response = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+
+    group.bench_function("simple_200", |b| {
+        b.iter(|| {
+            liburlx::protocol::http::h1::parse_response(
+                black_box(simple_response),
+                black_box("http://example.com"),
+                black_box(false),
+            )
+        });
+    });
+
+    let response_with_headers = b"HTTP/1.1 200 OK\r\n\
+        Content-Type: text/html; charset=utf-8\r\n\
+        Content-Length: 13\r\n\
+        Server: nginx/1.24\r\n\
+        X-Request-Id: abc-123-def\r\n\
+        Cache-Control: max-age=3600, public\r\n\
+        Set-Cookie: session=abc; Path=/; HttpOnly; Secure\r\n\
+        \r\n\
+        Hello, World!";
+
+    group.bench_function("with_many_headers", |b| {
+        b.iter(|| {
+            liburlx::protocol::http::h1::parse_response(
+                black_box(response_with_headers),
+                black_box("http://example.com"),
+                black_box(false),
+            )
+        });
+    });
+
+    let redirect_response = b"HTTP/1.1 301 Moved Permanently\r\n\
+        Location: https://www.example.com/\r\n\
+        Content-Length: 0\r\n\
+        \r\n";
+
+    group.bench_function("redirect_301", |b| {
+        b.iter(|| {
+            liburlx::protocol::http::h1::parse_response(
+                black_box(redirect_response),
+                black_box("http://example.com"),
+                black_box(false),
+            )
+        });
+    });
+
+    group.finish();
+}
+
+fn bench_multipart_form(c: &mut Criterion) {
+    let mut group = c.benchmark_group("multipart_form");
+
+    group.bench_function("encode_text_fields", |b| {
+        b.iter(|| {
+            let mut form = liburlx::MultipartForm::new();
+            form.field(black_box("name"), black_box("John Doe"));
+            form.field(black_box("email"), black_box("john@example.com"));
+            form.field(black_box("message"), black_box("Hello, World!"));
+            form.encode()
+        });
+    });
+
+    group.bench_function("encode_file_data", |b| {
+        let data = vec![0u8; 1024];
+        b.iter(|| {
+            let mut form = liburlx::MultipartForm::new();
+            form.file_data(black_box("file"), black_box("test.bin"), black_box(&data));
+            form.encode()
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_url_parsing,
@@ -213,5 +291,7 @@ criterion_group!(
     bench_dns_cache,
     bench_response_header,
     bench_cookie_domain_matching,
+    bench_http_response_parsing,
+    bench_multipart_form,
 );
 criterion_main!(benches);
