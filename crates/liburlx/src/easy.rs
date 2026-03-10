@@ -1675,6 +1675,8 @@ impl Easy {
             self.tftp_blksize,
             self.tftp_no_options,
             &ssh_host_key_policy,
+            self.mail_from.as_deref(),
+            &self.mail_rcpt,
         );
 
         // Apply total transfer timeout if set.
@@ -1784,6 +1786,8 @@ async fn perform_transfer(
     tftp_no_options: bool,
     #[cfg(feature = "ssh")] ssh_host_key_policy: &crate::protocol::ssh::SshHostKeyPolicy,
     #[cfg(not(feature = "ssh"))] _ssh_host_key_policy: &(),
+    mail_from: Option<&str>,
+    mail_rcpt: &[String],
 ) -> Result<Response, Error> {
     let transfer_start = Instant::now();
     let original_url = url.clone();
@@ -1854,6 +1858,8 @@ async fn perform_transfer(
             tftp_no_options,
             #[cfg(feature = "ssh")]
             ssh_host_key_policy,
+            mail_from,
+            mail_rcpt,
         ))
         .await?;
 
@@ -1925,6 +1931,8 @@ async fn perform_transfer(
                                 tftp_no_options,
                                 #[cfg(feature = "ssh")]
                                 ssh_host_key_policy,
+                                mail_from,
+                                mail_rcpt,
                             ))
                             .await?;
                         }
@@ -2071,6 +2079,8 @@ async fn do_single_request(
     tftp_blksize: Option<u16>,
     tftp_no_options: bool,
     #[cfg(feature = "ssh")] ssh_host_key_policy: &crate::protocol::ssh::SshHostKeyPolicy,
+    mail_from: Option<&str>,
+    mail_rcpt: &[String],
 ) -> Result<Response, Error> {
     // Handle non-HTTP schemes directly
     match url.scheme() {
@@ -2101,6 +2111,27 @@ async fn do_single_request(
             } else {
                 crate::protocol::ftp::download(url, effective_ssl_mode, tls_config).await
             };
+        }
+        "smtp" | "smtps" => {
+            let mail_data = body.unwrap_or(&[]);
+            return crate::protocol::smtp::send_mail(url, mail_data, mail_from, mail_rcpt).await;
+        }
+        "imap" | "imaps" => {
+            return crate::protocol::imap::fetch(url).await;
+        }
+        "pop3" | "pop3s" => {
+            return crate::protocol::pop3::retrieve(url).await;
+        }
+        "mqtt" => {
+            return if method == "POST" || method == "PUT" {
+                let payload = body.unwrap_or(&[]);
+                crate::protocol::mqtt::publish(url, payload).await
+            } else {
+                crate::protocol::mqtt::subscribe(url).await
+            };
+        }
+        "dict" => {
+            return crate::protocol::dict::lookup(url).await;
         }
         _ => {}
     }
@@ -3230,7 +3261,7 @@ async fn connect_with_bind(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, unused_results)]
 mod tests {
     use super::*;
 
@@ -4530,5 +4561,212 @@ mod tests {
         let mut easy = Easy::new();
         easy.proxy_header("X-Foo\r\n", "value");
         assert!(easy.proxy_headers.is_empty());
+    }
+
+    /// Mock DICT server for integration testing.
+    async fn mock_dict_server(listener: tokio::net::TcpListener) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let (stream, _) = listener.accept().await.unwrap();
+        let (reader, mut writer) = tokio::io::split(stream);
+        let mut reader = BufReader::new(reader);
+
+        // Send banner
+        writer.write_all(b"220 mock dictd ready\r\n").await.unwrap();
+
+        // Read DEFINE command
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+
+        // Send definition response
+        writer.write_all(b"150 1 definitions found\r\n").await.unwrap();
+        writer.write_all(b"151 \"test\" mock-db \"Mock Dictionary\"\r\n").await.unwrap();
+        writer.write_all(b"A mock definition\r\n.\r\n").await.unwrap();
+        writer.write_all(b"250 ok\r\n").await.unwrap();
+
+        // Read QUIT
+        let mut line = String::new();
+        let _ = reader.read_line(&mut line).await;
+    }
+
+    #[tokio::test]
+    async fn dict_dispatch_integration() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(mock_dict_server(listener));
+
+        let mut easy = Easy::new();
+        easy.url(&format!("dict://127.0.0.1:{port}/d:test")).unwrap();
+        let response = easy.perform_async().await.unwrap();
+        assert_eq!(response.status(), 200);
+        let body = std::str::from_utf8(response.body()).unwrap();
+        assert!(body.contains("mock definition"));
+    }
+
+    /// Mock POP3 server for integration testing.
+    async fn mock_pop3_server(listener: tokio::net::TcpListener) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let (stream, _) = listener.accept().await.unwrap();
+        let (reader, mut writer) = tokio::io::split(stream);
+        let mut reader = BufReader::new(reader);
+
+        // Greeting
+        writer.write_all(b"+OK POP3 mock ready\r\n").await.unwrap();
+
+        // USER
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        writer.write_all(b"+OK\r\n").await.unwrap();
+
+        // PASS
+        line.clear();
+        reader.read_line(&mut line).await.unwrap();
+        writer.write_all(b"+OK logged in\r\n").await.unwrap();
+
+        // LIST
+        line.clear();
+        reader.read_line(&mut line).await.unwrap();
+        writer.write_all(b"+OK 2 messages\r\n").await.unwrap();
+        writer.write_all(b"1 100\r\n2 200\r\n.\r\n").await.unwrap();
+
+        // QUIT
+        line.clear();
+        let _ = reader.read_line(&mut line).await;
+    }
+
+    #[tokio::test]
+    async fn pop3_dispatch_integration() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(mock_pop3_server(listener));
+
+        let mut easy = Easy::new();
+        easy.url(&format!("pop3://user:pass@127.0.0.1:{port}/")).unwrap();
+        let response = easy.perform_async().await.unwrap();
+        assert_eq!(response.status(), 200);
+        let body = std::str::from_utf8(response.body()).unwrap();
+        assert!(body.contains("1 100"));
+    }
+
+    /// Mock IMAP server for integration testing.
+    async fn mock_imap_server(listener: tokio::net::TcpListener) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let (stream, _) = listener.accept().await.unwrap();
+        let (reader, mut writer) = tokio::io::split(stream);
+        let mut reader = BufReader::new(reader);
+
+        // Greeting
+        writer.write_all(b"* OK IMAP4rev1 mock ready\r\n").await.unwrap();
+
+        // LOGIN
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        let tag = line.split_whitespace().next().unwrap_or("A001").to_string();
+        writer.write_all(format!("{tag} OK logged in\r\n").as_bytes()).await.unwrap();
+
+        // SELECT INBOX
+        line.clear();
+        reader.read_line(&mut line).await.unwrap();
+        let tag = line.split_whitespace().next().unwrap_or("A002").to_string();
+        writer.write_all(b"* 1 EXISTS\r\n* 0 RECENT\r\n").await.unwrap();
+        writer.write_all(format!("{tag} OK SELECT completed\r\n").as_bytes()).await.unwrap();
+
+        // FETCH
+        line.clear();
+        reader.read_line(&mut line).await.unwrap();
+        let tag = line.split_whitespace().next().unwrap_or("A003").to_string();
+        writer.write_all(b"* 1 FETCH (FLAGS (\\Seen) INTERNALDATE \"01-Jan-2026 00:00:00 +0000\" ENVELOPE (\"test\"))\r\n").await.unwrap();
+        writer.write_all(format!("{tag} OK FETCH completed\r\n").as_bytes()).await.unwrap();
+
+        // LOGOUT
+        line.clear();
+        let _ = reader.read_line(&mut line).await;
+    }
+
+    #[tokio::test]
+    async fn imap_dispatch_integration() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(mock_imap_server(listener));
+
+        let mut easy = Easy::new();
+        easy.url(&format!("imap://user:pass@127.0.0.1:{port}/INBOX")).unwrap();
+        let response = easy.perform_async().await.unwrap();
+        assert_eq!(response.status(), 200);
+        assert!(!response.body().is_empty());
+    }
+
+    /// Mock SMTP server for integration testing.
+    async fn mock_smtp_server(listener: tokio::net::TcpListener) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let (stream, _) = listener.accept().await.unwrap();
+        let (reader, mut writer) = tokio::io::split(stream);
+        let mut reader = BufReader::new(reader);
+
+        // Greeting
+        writer.write_all(b"220 mock smtp ready\r\n").await.unwrap();
+
+        // EHLO
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        writer.write_all(b"250 OK\r\n").await.unwrap();
+
+        // MAIL FROM
+        line.clear();
+        reader.read_line(&mut line).await.unwrap();
+        writer.write_all(b"250 OK\r\n").await.unwrap();
+
+        // RCPT TO
+        line.clear();
+        reader.read_line(&mut line).await.unwrap();
+        writer.write_all(b"250 OK\r\n").await.unwrap();
+
+        // DATA
+        line.clear();
+        reader.read_line(&mut line).await.unwrap();
+        writer.write_all(b"354 Start mail input\r\n").await.unwrap();
+
+        // Read message body until ".\r\n"
+        loop {
+            line.clear();
+            reader.read_line(&mut line).await.unwrap();
+            if line.trim() == "." {
+                break;
+            }
+        }
+        writer.write_all(b"250 OK message accepted\r\n").await.unwrap();
+
+        // QUIT
+        line.clear();
+        let _ = reader.read_line(&mut line).await;
+    }
+
+    #[tokio::test]
+    async fn smtp_dispatch_integration() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(mock_smtp_server(listener));
+
+        let mut easy = Easy::new();
+        easy.url(&format!("smtp://127.0.0.1:{port}")).unwrap();
+        easy.mail_from("sender@example.com");
+        easy.mail_rcpt("receiver@example.com");
+        easy.body(b"From: sender@example.com\r\nTo: receiver@example.com\r\n\r\nHello");
+        let response = easy.perform_async().await.unwrap();
+        assert_eq!(response.status(), 250);
+    }
+
+    #[test]
+    fn try_connect_addrs_fails_unreachable_again() {
+        // Verify that invalid schemes don't panic — they should fall through to HTTP
+        // and fail with a connection error rather than a protocol error
+        let mut easy = Easy::new();
+        easy.url("gopher://127.0.0.1:1/resource").unwrap();
+        easy.connect_timeout(Duration::from_millis(100));
+        let result = easy.perform();
+        assert!(result.is_err());
     }
 }

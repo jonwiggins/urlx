@@ -122,6 +122,10 @@ pub async fn send_command<S: AsyncWrite + Unpin>(
 /// Connects to the SMTP server specified in the URL, authenticates if
 /// credentials are present, and sends the provided message data.
 ///
+/// If `mail_from` or `mail_rcpt` are provided, they override the addresses
+/// parsed from the message headers. This matches curl's `CURLOPT_MAIL_FROM`
+/// and `CURLOPT_MAIL_RCPT` behavior.
+///
 /// # URL format
 ///
 /// `smtp://host:port` — plain SMTP (port 25 default)
@@ -130,7 +134,12 @@ pub async fn send_command<S: AsyncWrite + Unpin>(
 ///
 /// Returns an error if connection, auth, or sending fails.
 #[allow(clippy::too_many_lines)]
-pub async fn send_mail(url: &crate::url::Url, mail_data: &[u8]) -> Result<(), Error> {
+pub async fn send_mail(
+    url: &crate::url::Url,
+    mail_data: &[u8],
+    mail_from: Option<&str>,
+    mail_rcpt: &[String],
+) -> Result<crate::protocol::http::response::Response, Error> {
     let (host, port) = url.host_and_port()?;
 
     // Extract credentials and mail parameters from URL
@@ -182,13 +191,24 @@ pub async fn send_mail(url: &crate::url::Url, mail_data: &[u8]) -> Result<(), Er
         }
     }
 
-    // Parse mail_data to extract From/To from headers
+    // Determine envelope sender and recipients.
+    // Explicit mail_from/mail_rcpt (from Easy handle) take priority over headers.
     let mail_str = String::from_utf8_lossy(mail_data);
-    let (from, to) = extract_mail_addresses(&mail_str);
+    let (header_from, header_to) = extract_mail_addresses(&mail_str);
 
-    let from_addr =
-        from.ok_or_else(|| Error::Http("no From address found in message".to_string()))?;
-    let to_addr = to.ok_or_else(|| Error::Http("no To address found in message".to_string()))?;
+    let from_addr = if let Some(from) = mail_from {
+        from.to_string()
+    } else {
+        header_from.ok_or_else(|| Error::Http("no From address found in message".to_string()))?
+    };
+
+    let rcpt_addrs: Vec<String> = if mail_rcpt.is_empty() {
+        let to =
+            header_to.ok_or_else(|| Error::Http("no To address found in message".to_string()))?;
+        vec![to]
+    } else {
+        mail_rcpt.to_vec()
+    };
 
     // MAIL FROM
     send_command(&mut writer, &format!("MAIL FROM:<{from_addr}>")).await?;
@@ -200,14 +220,16 @@ pub async fn send_mail(url: &crate::url::Url, mail_data: &[u8]) -> Result<(), Er
         )));
     }
 
-    // RCPT TO
-    send_command(&mut writer, &format!("RCPT TO:<{to_addr}>")).await?;
-    let rcpt_resp = read_response(&mut reader).await?;
-    if !rcpt_resp.is_ok() {
-        return Err(Error::Http(format!(
-            "SMTP RCPT TO failed: {} {}",
-            rcpt_resp.code, rcpt_resp.message
-        )));
+    // RCPT TO (one per recipient)
+    for rcpt in &rcpt_addrs {
+        send_command(&mut writer, &format!("RCPT TO:<{rcpt}>")).await?;
+        let rcpt_resp = read_response(&mut reader).await?;
+        if !rcpt_resp.is_ok() {
+            return Err(Error::Http(format!(
+                "SMTP RCPT TO failed: {} {}",
+                rcpt_resp.code, rcpt_resp.message
+            )));
+        }
     }
 
     // DATA
@@ -251,7 +273,13 @@ pub async fn send_mail(url: &crate::url::Url, mail_data: &[u8]) -> Result<(), Er
     // QUIT
     send_command(&mut writer, "QUIT").await?;
 
-    Ok(())
+    let headers = std::collections::HashMap::new();
+    Ok(crate::protocol::http::response::Response::new(
+        250,
+        headers,
+        Vec::new(),
+        url.as_str().to_string(),
+    ))
 }
 
 /// Extract From and To addresses from email headers.
