@@ -119,6 +119,58 @@ pub const fn is_leap_year(year: i64) -> bool {
     (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
 }
 
+/// Format a `SystemTime` as an HTTP date string (RFC 7231).
+///
+/// Returns a string like `"Sun, 06 Nov 1994 08:49:37 GMT"`.
+pub fn format_http_date(time: std::time::SystemTime) -> String {
+    let secs = time.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+
+    // Convert Unix timestamp to date components
+    #[allow(clippy::cast_possible_wrap)]
+    let days = (secs / 86400) as i64;
+    let time_of_day = secs % 86400;
+    let hour = time_of_day / 3600;
+    let minute = (time_of_day % 3600) / 60;
+    let second = time_of_day % 60;
+
+    // Day of week (1970-01-01 was Thursday = 4)
+    #[allow(clippy::cast_sign_loss)]
+    let dow = ((days + 4) % 7) as usize;
+    let day_names = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+    // Convert days since epoch to year/month/day
+    let month_days_normal = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let month_names =
+        ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+    let mut remaining_days = days;
+    let mut year: i64 = 1970;
+    loop {
+        let days_in_year = if is_leap_year(year) { 366 } else { 365 };
+        if remaining_days < days_in_year {
+            break;
+        }
+        remaining_days -= days_in_year;
+        year += 1;
+    }
+
+    let mut month = 0usize;
+    for (m, &days_in_month) in month_days_normal.iter().enumerate() {
+        let dim = if m == 1 && is_leap_year(year) { 29 } else { days_in_month };
+        if remaining_days < dim {
+            month = m;
+            break;
+        }
+        remaining_days -= dim;
+    }
+    let day = remaining_days + 1;
+
+    format!(
+        "{}, {:02} {} {year} {:02}:{:02}:{:02} GMT",
+        day_names[dow], day, month_names[month], hour, minute, second,
+    )
+}
+
 /// Extract hostname from a URL string.
 ///
 /// Handles `scheme://host:port/path` format. Returns the host part only.
@@ -331,6 +383,25 @@ pub fn run(args: &[String]) -> ExitCode {
         }
     }
 
+    // -z/--time-cond: set If-Modified-Since or If-Unmodified-Since header
+    if let Some(ref cond) = opts.time_cond {
+        let (negate, date_str) =
+            cond.strip_prefix('-').map_or((false, cond.as_str()), |stripped| (true, stripped));
+        // Try to parse as a file path first (use file mtime), then as a date string
+        let date_val = if std::path::Path::new(date_str).exists() {
+            std::fs::metadata(date_str).ok().and_then(|m| m.modified().ok()).map(format_http_date)
+        } else {
+            Some(date_str.to_string())
+        };
+        if let Some(date) = date_val {
+            if negate {
+                opts.easy.header("If-Unmodified-Since", &date);
+            } else {
+                opts.easy.header("If-Modified-Since", &date);
+            }
+        }
+    }
+
     if opts.show_progress && !opts.silent {
         opts.easy.progress_callback(liburlx::make_progress_callback(|info| {
             let pct = if info.dl_total > 0 { (info.dl_now * 100) / info.dl_total } else { 0 };
@@ -377,8 +448,8 @@ pub fn run(args: &[String]) -> ExitCode {
                 }
             }
 
-            // --fail: exit 22 on HTTP error status codes
-            if opts.fail_on_error && response.status() >= 400 {
+            // --fail / --fail-with-body: exit 22 on HTTP error status codes
+            if opts.fail_on_error && response.status() >= 400 && !opts.fail_with_body {
                 if !opts.silent || opts.show_error {
                     eprintln!(
                         "urlx: The requested URL returned error: {} {}",
@@ -471,6 +542,18 @@ pub fn run(args: &[String]) -> ExitCode {
                         set_file_mtime(path, last_modified, opts.silent);
                     }
                 }
+            }
+
+            // --fail-with-body: output body first, then return error exit code
+            if opts.fail_with_body && response.status() >= 400 {
+                if !opts.silent || opts.show_error {
+                    eprintln!(
+                        "urlx: The requested URL returned error: {} {}",
+                        response.status(),
+                        http_status_text(response.status()),
+                    );
+                }
+                return ExitCode::from(22);
             }
 
             exit
@@ -582,8 +665,13 @@ pub fn perform_with_retry(opts: &mut CliOptions) -> Result<liburlx::Response, li
 
         match opts.easy.perform() {
             Ok(response) => {
-                // Retry on 408, 429, 500, 502, 503, 504 if retries remain
-                if is_retryable_status(response.status()) && attempt < max_retries {
+                // Retry on 408, 429, 500, 502, 503, 504 (or all errors with --retry-all-errors)
+                let should_retry = if opts.retry_all_errors {
+                    response.status() >= 400
+                } else {
+                    is_retryable_status(response.status())
+                };
+                if should_retry && attempt < max_retries {
                     last_err = Some(liburlx::Error::Http(format!(
                         "HTTP {} {}",
                         response.status(),
@@ -681,5 +769,96 @@ pub fn run_multi(
         ExitCode::FAILURE
     } else {
         ExitCode::SUCCESS
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_http_date_epoch() {
+        let epoch = std::time::UNIX_EPOCH;
+        assert_eq!(format_http_date(epoch), "Thu, 01 Jan 1970 00:00:00 GMT");
+    }
+
+    #[test]
+    fn format_http_date_known() {
+        // Mon, 15 Jan 2024 11:30:00 GMT = 1705318200
+        let time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_705_318_200);
+        let result = format_http_date(time);
+        assert_eq!(result, "Mon, 15 Jan 2024 11:30:00 GMT");
+    }
+
+    #[test]
+    fn format_http_date_roundtrip() {
+        // Create a date, format it, parse it back, check consistency
+        let time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(784_111_777);
+        let formatted = format_http_date(time);
+        let parsed_ts = parse_http_date(&formatted);
+        assert_eq!(parsed_ts, Some(784_111_777));
+    }
+
+    #[test]
+    fn parse_http_date_valid() {
+        let ts = parse_http_date("Sun, 06 Nov 1994 08:49:37 GMT");
+        assert!(ts.is_some());
+        assert_eq!(ts.unwrap(), 784_111_777);
+    }
+
+    #[test]
+    fn parse_http_date_invalid() {
+        assert!(parse_http_date("not a date").is_none());
+    }
+
+    #[test]
+    fn remote_name_from_url_basic() {
+        assert_eq!(remote_name_from_url("http://example.com/file.tar.gz"), "file.tar.gz");
+    }
+
+    #[test]
+    fn remote_name_from_url_trailing_slash() {
+        assert_eq!(remote_name_from_url("http://example.com/"), "index.html");
+    }
+
+    #[test]
+    fn remote_name_from_url_with_query() {
+        assert_eq!(remote_name_from_url("http://example.com/file.zip?v=2"), "file.zip");
+    }
+
+    #[test]
+    fn is_retryable_status_codes() {
+        assert!(is_retryable_status(408));
+        assert!(is_retryable_status(429));
+        assert!(is_retryable_status(500));
+        assert!(is_retryable_status(502));
+        assert!(is_retryable_status(503));
+        assert!(is_retryable_status(504));
+        assert!(!is_retryable_status(200));
+        assert!(!is_retryable_status(404));
+    }
+
+    #[test]
+    fn extract_hostname_simple() {
+        assert_eq!(extract_hostname("https://example.com/path"), "example.com");
+    }
+
+    #[test]
+    fn extract_hostname_with_port() {
+        assert_eq!(extract_hostname("http://localhost:8080/"), "localhost");
+    }
+
+    #[test]
+    fn extract_hostname_with_userinfo() {
+        assert_eq!(extract_hostname("http://user:pass@host.com/"), "host.com");
+    }
+
+    #[test]
+    fn is_leap_year_tests() {
+        assert!(is_leap_year(2000));
+        assert!(is_leap_year(2024));
+        assert!(!is_leap_year(1900));
+        assert!(!is_leap_year(2023));
     }
 }

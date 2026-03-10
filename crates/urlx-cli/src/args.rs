@@ -76,6 +76,11 @@ pub struct CliOptions {
     pub(crate) proto_default: Option<String>,
     pub(crate) output_dir: Option<String>,
     pub(crate) remove_on_error: bool,
+    pub(crate) fail_with_body: bool,
+    pub(crate) retry_all_errors: bool,
+    pub(crate) no_progress_meter: bool,
+    pub(crate) location_trusted: bool,
+    pub(crate) time_cond: Option<String>,
 }
 
 /// Print version information to stdout.
@@ -282,8 +287,10 @@ pub fn parse_args(args: &[String]) -> ParseResult {
 /// Long flags (`--foo`) and single-character flags (`-s`) pass through unchanged.
 fn expand_combined_flags(args: &[String]) -> Vec<String> {
     // Set of short flags that take an argument (next arg is the value)
-    const ARG_FLAGS: &[char] =
-        &['X', 'H', 'd', 'o', 'D', 'w', 'x', 'u', 'A', 'F', 'r', 'C', 'T', 'b', 'e', 'm', 'K', 'c'];
+    const ARG_FLAGS: &[char] = &[
+        'X', 'H', 'd', 'o', 'D', 'w', 'x', 'u', 'A', 'F', 'r', 'C', 'T', 'b', 'e', 'm', 'K', 'c',
+        'z',
+    ];
 
     let mut result = Vec::with_capacity(args.len());
     for arg in args {
@@ -369,6 +376,11 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
         proto_default: None,
         output_dir: None,
         remove_on_error: false,
+        fail_with_body: false,
+        retry_all_errors: false,
+        no_progress_meter: false,
+        location_trusted: false,
+        time_cond: None,
     };
 
     let mut i = 1;
@@ -419,6 +431,11 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
             "-L" | "--location" => {
                 opts.easy.follow_redirects(true);
             }
+            "--location-trusted" => {
+                opts.easy.follow_redirects(true);
+                opts.easy.unrestricted_auth(true);
+                opts.location_trusted = true;
+            }
             "--max-redirs" => {
                 i += 1;
                 let val = require_arg(args, i, "--max-redirs")?;
@@ -468,8 +485,15 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
             "-S" | "--show-error" => {
                 opts.show_error = true;
             }
+            "--no-progress-meter" => {
+                opts.no_progress_meter = true;
+            }
             "-f" | "--fail" => {
                 opts.fail_on_error = true;
+            }
+            "--fail-with-body" => {
+                opts.fail_on_error = true;
+                opts.fail_with_body = true;
             }
             "--compressed" => {
                 opts.easy.accept_encoding(true);
@@ -820,6 +844,9 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
                     eprintln!("urlx: invalid retry-max-time value: {val}");
                     return None;
                 }
+            }
+            "--retry-all-errors" => {
+                opts.retry_all_errors = true;
             }
             "-Z" | "--parallel" => {
                 opts.parallel = true;
@@ -1266,6 +1293,17 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
                 // SSLv3 is insecure; accepted for compat but treated as TLS 1.2
                 opts.easy.ssl_min_version(liburlx::TlsVersion::Tls12);
             }
+            "-z" | "--time-cond" => {
+                i += 1;
+                let val = require_arg(args, i, "-z")?;
+                opts.time_cond = Some(val.to_string());
+            }
+            "--capath" => {
+                i += 1;
+                let val = require_arg(args, i, "--capath")?;
+                // rustls doesn't support CA directories — load all certs from directory
+                opts.easy.ssl_ca_cert(std::path::Path::new(val));
+            }
             // No-op flags for compatibility (accepted but not implemented)
             "-N" | "--no-buffer" | "--no-sessionid" | "--no-alpn" | "--no-npn"
             | "--cert-status" | "--false-start" | "--disable-eprt" | "--disable-epsv"
@@ -1279,7 +1317,13 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
             | "--proxy-tls13-ciphers"
             | "--proxy-ciphers"
             | "--tls13-ciphers"
-            | "--login-options" => {
+            | "--login-options"
+            | "--cert-type"
+            | "--key-type"
+            | "--pass"
+            | "--proxy-cert-type"
+            | "--proxy-key-type"
+            | "--proxy-pass" => {
                 i += 1;
                 let _val = require_arg(args, i, &args[i - 1].clone())?;
                 // Accepted for compatibility; not implemented
@@ -3773,5 +3817,79 @@ mod tests {
         let args = vec!["urlx".into(), "-#".into(), "http://x.com".into()];
         let expanded = expand_combined_flags(&args);
         assert_eq!(expanded, args);
+    }
+
+    #[test]
+    fn parse_args_fail_with_body() {
+        let args = make_args(&["--fail-with-body", "http://example.com"]);
+        let opts = unwrap_opts(parse_args(&args));
+        assert!(opts.fail_on_error);
+        assert!(opts.fail_with_body);
+    }
+
+    #[test]
+    fn parse_args_retry_all_errors() {
+        let args = make_args(&["--retry", "3", "--retry-all-errors", "http://example.com"]);
+        let opts = unwrap_opts(parse_args(&args));
+        assert_eq!(opts.retry_count, 3);
+        assert!(opts.retry_all_errors);
+    }
+
+    #[test]
+    fn parse_args_no_progress_meter() {
+        let args = make_args(&["--no-progress-meter", "http://example.com"]);
+        let opts = unwrap_opts(parse_args(&args));
+        assert!(opts.no_progress_meter);
+    }
+
+    #[test]
+    fn parse_args_location_trusted() {
+        let args = make_args(&["--location-trusted", "http://example.com"]);
+        let opts = unwrap_opts(parse_args(&args));
+        assert!(opts.location_trusted);
+    }
+
+    #[test]
+    fn parse_args_time_cond() {
+        let args = make_args(&["-z", "Wed, 01 Jan 2025 00:00:00 GMT", "http://example.com"]);
+        let opts = unwrap_opts(parse_args(&args));
+        assert_eq!(opts.time_cond.as_deref(), Some("Wed, 01 Jan 2025 00:00:00 GMT"));
+    }
+
+    #[test]
+    fn parse_args_time_cond_negate() {
+        let args =
+            make_args(&["--time-cond", "-Wed, 01 Jan 2025 00:00:00 GMT", "http://example.com"]);
+        let opts = unwrap_opts(parse_args(&args));
+        assert!(opts.time_cond.as_deref().unwrap().starts_with('-'));
+    }
+
+    #[test]
+    fn parse_args_capath() {
+        let args = make_args(&["--capath", "/etc/ssl/certs", "http://example.com"]);
+        let opts = unwrap_opts(parse_args(&args));
+        // --capath is wired to ssl_ca_cert for compat; just verify it parses
+        assert!(!opts.urls.is_empty());
+    }
+
+    #[test]
+    fn parse_args_cert_type_noop() {
+        let args = make_args(&["--cert-type", "PEM", "http://example.com"]);
+        let opts = unwrap_opts(parse_args(&args));
+        assert!(!opts.urls.is_empty());
+    }
+
+    #[test]
+    fn parse_args_key_type_noop() {
+        let args = make_args(&["--key-type", "PEM", "http://example.com"]);
+        let opts = unwrap_opts(parse_args(&args));
+        assert!(!opts.urls.is_empty());
+    }
+
+    #[test]
+    fn parse_args_pass_noop() {
+        let args = make_args(&["--pass", "mypassword", "http://example.com"]);
+        let opts = unwrap_opts(parse_args(&args));
+        assert!(!opts.urls.is_empty());
     }
 }
