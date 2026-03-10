@@ -45,40 +45,6 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ---
 
-## v0.1.0 Launch Plan
-
-### Phase 48 — Security & Correctness Hardening (COMPLETE — 2026-03-09)
-
-- Audited all `unwrap()` calls: confirmed zero violations in non-test library code (enforced by `unwrap_used = "deny"`)
-- Replaced Digest auth cnonce with CSPRNG (`rand` crate, 16 random bytes)
-- Added CRLF injection prevention in `easy.header()` and `easy.proxy_header()`
-- Added comprehensive FFI safety documentation (module-level invariants + targeted SAFETY comments)
-- Verified total transfer timeout wraps all protocol handlers via `tokio::time::timeout`
-
-### Phase 49 — CLI Polish (COMPLETE — 2026-03-09)
-
-- Implemented `-d @-` and `--data-binary @-` for stdin data
-- Mapped liburlx errors to curl-compatible exit codes (3, 6, 7, 22, 28, 35, 47, 60, 67)
-- Expanded `--write-out` with 9 new variables (http_version, scheme, size_header, etc.)
-- CLI refactor deferred to post-0.1.0
-
-### Phase 50 — Test Gap Closure (COMPLETE — 2026-03-09)
-
-- Added 6 AWS SigV4 integration tests (authorization format, amz-date, content hash, POST body)
-- Added 8 Bearer/Basic auth integration tests (token format, redirects, HTTP methods)
-- Added 11 HTTP version selection integration tests
-- Total tests: 2,282 (up from 2,243 pre-launch track)
-
-### Phase 51 — Documentation & Release Prep (COMPLETE — 2026-03-09)
-
-- Updated README (MSRV badge, test count)
-- Added crates.io metadata (repository, homepage, documentation, keywords, categories)
-- Added .gitignore entries for proptest regressions and .DS_Store
-- Verified `cargo publish --dry-run` succeeds for liburlx
-- Publish order: `liburlx` → `liburlx-ffi` → `urlx-cli`
-
----
-
 ## Guiding Principles
 
 1. **Test-driven development is non-negotiable.** Every feature begins with a failing test. No code is merged without tests. Integration tests run against real protocol servers.
