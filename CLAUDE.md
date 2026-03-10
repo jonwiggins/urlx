@@ -14,22 +14,21 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Phase:** 51 — Documentation & Release Prep (COMPLETE)
-**Last completed:** Phase 51 (Documentation & Release Prep) — 2026-03-09
-**Total tests:** 2,282
-**In progress:** Ready for v0.1.0 publish
+**Version:** v0.1.0 published (crates.io + GitHub Releases + Homebrew)
+**Last completed:** v0.1.0 release — 2026-03-10
+**Total tests:** 2,288
+**In progress:** Planning Phase 52
 **Blockers:** None
-**Target:** v0.1.0 release — publish to crates.io
 
-### Completeness Summary (updated Phase 47 review)
+### Completeness Summary (post-v0.1.0 audit)
 
 | Feature Area | Parity | Notes |
 |---|---|---|
 | HTTP/1.1 | 97% | Expect, HTTP/1.0, trailer headers; no chunked upload |
-| HTTP/2 | 80% | Server push, flow control, PING; no stream priority |
-| HTTP/3 | 55% | QUIC via quinn, Alt-Svc, 0-RTT; no pooling/push; untested |
+| HTTP/2 | 80% | ALPN, multiplexing, flow control; no connection pooling or stream priority |
+| HTTP/3 | 55% | QUIC via quinn, Alt-Svc, 0-RTT; no pooling/push; **untested** |
 | TLS | 85% | rustls, insecure mode, CA/client certs, pinning, version selection, cipher list, session cache |
-| Authentication | 65% | Basic, Bearer, Digest (CSPRNG cnonce), AWS SigV4, NTLM skeleton, SASL |
+| Authentication | 65% | Basic, Bearer, Digest (CSPRNG cnonce), AWS SigV4, NTLM skeleton |
 | Cookie engine | 95% | Netscape file format, domain-indexed jar, PSL validation |
 | Proxy | 90% | HTTP + SOCKS + HTTPS tunnel (TLS-in-TLS), proxy auth; no PAC |
 | DNS | 85% | Cache, Happy Eyeballs, shuffle, custom servers, DoH, DoT, hickory-dns |
@@ -37,11 +36,113 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 | SSH/SFTP/SCP | 65% | Download/upload, password + pubkey auth, known_hosts, SHA-256 fingerprint |
 | WebSocket | 85% | RFC 6455, CloseCode, fragmentation; no permessage-deflate |
 | Multi API | 75% | Connection limiting, share, pipelining, FFI event loop stubs |
-| FFI (libcurl C ABI) | ~60% | 177 CURLOPT, 47 CURLINFO, 32 CURLcode, 56 functions; comprehensive SAFETY docs |
-| CLI | ~60% | ~154 flags; stdin data support; curl-compatible exit codes; expanded write-out |
+| FFI (libcurl C ABI) | ~60% | 102 CURLOPT, 43 CURLINFO, 32 CURLcode, 56 functions |
+| CLI | ~60% | ~150 flags; no combined short flags; no --help/--version |
 | Connection | 80% | Pool, TCP_NODELAY, keepalive, Unix sockets, interface/port binding |
 | Transfer control | 80% | Rate limiting enforced (max recv/send speed, low speed timeout) |
 | Overall | ~64% | ~92% for basic HTTP/HTTPS use cases |
+
+### Known Issues
+
+- `urlx -L https://google.com` fails with h2 stream error
+- `%{http_version}` in `--write-out` always returns "1.1" (version not tracked in Response)
+- MQTT, SMTP, IMAP, POP3, DICT modules exist but are not dispatched from Easy API
+- Combined short flags (`-sSf`) not supported — must use `-s -S -f`
+- NTLM auth is a skeleton (SHA-256, not real MD4+DES)
+
+---
+
+## Implementation Phases
+
+### Phase 52 — CLI Drop-in Essentials
+
+Fix the critical gaps that prevent urlx from being a credible curl replacement.
+
+- Add `--help` / `-h` flag (wire existing `print_usage()` to flag)
+- Add `--version` / `-V` flag
+- Implement combined short flags (`-sSfL`, `-Lo`, etc.)
+- Track HTTP version (1.0, 1.1, 2, 3) in Response struct
+- Fix `%{http_version}` in `--write-out`
+- Debug and fix h2 stream error on google.com / major sites
+
+### Phase 53 — Protocol Dispatch & Integration
+
+Wire orphaned protocol modules into the Easy API and add integration tests.
+
+- Add scheme dispatch for `smtp://`, `imap://`, `pop3://`, `mqtt://`, `dict://`, `ws://`, `wss://`
+- Wire `mail_from`, `mail_rcpt`, `mail_auth` Easy fields to SMTP handler
+- Add integration tests for each newly-dispatched protocol
+- Add HTTP/3 integration tests (quinn + h3 test server)
+- Wire HSTS file persistence (load/save to disk)
+
+### Phase 54 — HTTP/2 Robustness
+
+Improve HTTP/2 to work reliably against real-world servers.
+
+- Debug and fix h2 compatibility with major sites (google.com, cloudflare, etc.)
+- HTTP/2 connection pooling (reuse h2 connections across requests)
+- Server push exposure to caller
+- Chunked transfer encoding for request uploads (HTTP/1.1)
+
+### Phase 55 — FFI Hardening
+
+Improve FFI coverage and add C-side testing.
+
+- Create C test harness (compile and link C programs against liburlx-ffi)
+- Wire blob cert options (`CURLOPT_SSLCERT_BLOB`, `SSLKEY_BLOB`, `CAINFO_BLOB`)
+- Wire `CURLOPT_PROTOCOLS_STR` / `CURLOPT_REDIR_PROTOCOLS_STR` enforcement
+- Implement `curl_easy_pause()` (pause/unpause transfers)
+- Add 20+ new CURLOPT options for FTP, SSH, proxy
+
+### Phase 56 — Authentication & Security
+
+Fill auth gaps and harden security features.
+
+- Full NTLMv2 implementation (MD4 + DES per MS-NLMP spec)
+- SASL mechanism support (SCRAM-SHA-256)
+- SameSite cookie enforcement
+- FTP resume (wire REST command to upload/download)
+- SFTP ed25519 key support
+
+### Phase 57 — Protocol Polish
+
+Improve protocol implementations to near-complete parity.
+
+- WebSocket `permessage-deflate` (RFC 7692)
+- MQTT QoS 1/2 support
+- FTP MLST/MLSD (RFC 3659)
+- SFTP symlink following, permission preservation
+- TFTP RFC 2478 error extensions
+
+### Phase 58 — Performance & Benchmarking
+
+Profile, optimize, and publish benchmarks.
+
+- Benchmark against curl for throughput, latency, concurrency
+- HTTP/2 multiplexing performance
+- Connection pool efficiency
+- Memory usage profiling
+- Publish benchmark results in README
+
+### Phase 59 — CLI Completeness
+
+Push CLI toward full curl flag parity.
+
+- Implement remaining ~100 curl flags (prioritized by usage frequency)
+- PAC proxy auto-configuration
+- Kerberos/Negotiate authentication
+- LDAP/RTSP protocol stubs
+- Man page generation
+
+### Phase 60 — Comprehensive Review
+
+Milestone review phase (every 10th phase).
+
+- Audit full codebase against curl for completeness
+- Differential testing against curl with real-world URLs
+- FFI coverage measurement
+- Performance profiling
+- Plan phases 61-70
 
 ---
 
