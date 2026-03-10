@@ -360,6 +360,18 @@ pub struct curl_waitfd {
     pub revents: c_short,
 }
 
+/// `curl_blob` — in-memory binary data for TLS certificate/key options.
+///
+/// Equivalent to libcurl's `struct curl_blob`. Used with `CURLOPT_SSLCERT_BLOB`,
+/// `CURLOPT_SSLKEY_BLOB`, and `CURLOPT_CAINFO_BLOB`.
+#[repr(C)]
+#[allow(non_camel_case_types, missing_docs)]
+pub struct curl_blob {
+    pub data: *const c_void,
+    pub len: usize,
+    pub flags: u32,
+}
+
 /// Socket callback type matching libcurl's `CURLMOPT_SOCKETFUNCTION`.
 #[allow(non_camel_case_types)]
 type CurlSocketCallback =
@@ -2191,13 +2203,19 @@ pub unsafe extern "C" fn curl_easy_setopt(
 
         // CURLOPT_PROTOCOLS_STR = 10318
         10318 => {
-            // Accept protocol restriction string (e.g., "http,https,ftp")
+            // SAFETY: value must be a valid C string pointer
+            if let Some(s) = unsafe { read_cstr(value) } {
+                h.easy.set_protocols_str(s);
+            }
             CURLcode::CURLE_OK
         }
 
         // CURLOPT_REDIR_PROTOCOLS_STR = 10319
         10319 => {
-            // Accept redirect protocol restriction string
+            // SAFETY: value must be a valid C string pointer
+            if let Some(s) = unsafe { read_cstr(value) } {
+                h.easy.set_redir_protocols_str(s);
+            }
             CURLcode::CURLE_OK
         }
 
@@ -2262,19 +2280,49 @@ pub unsafe extern "C" fn curl_easy_setopt(
 
         // CURLOPT_SSLCERT_BLOB = 40291
         40291 => {
-            // Accept client cert blob — not yet wired (accept for compatibility)
+            if value.is_null() {
+                return CURLcode::CURLE_BAD_FUNCTION_ARGUMENT;
+            }
+            // SAFETY: Caller guarantees value points to a valid curl_blob
+            let blob = unsafe { &*value.cast::<curl_blob>() };
+            if blob.data.is_null() || blob.len == 0 {
+                return CURLcode::CURLE_BAD_FUNCTION_ARGUMENT;
+            }
+            // SAFETY: Caller guarantees blob.data points to blob.len bytes
+            let data = unsafe { std::slice::from_raw_parts(blob.data.cast::<u8>(), blob.len) };
+            h.easy.ssl_client_cert_blob(data.to_vec());
             CURLcode::CURLE_OK
         }
 
         // CURLOPT_SSLKEY_BLOB = 40292
         40292 => {
-            // Accept client key blob — not yet wired
+            if value.is_null() {
+                return CURLcode::CURLE_BAD_FUNCTION_ARGUMENT;
+            }
+            // SAFETY: Caller guarantees value points to a valid curl_blob
+            let blob = unsafe { &*value.cast::<curl_blob>() };
+            if blob.data.is_null() || blob.len == 0 {
+                return CURLcode::CURLE_BAD_FUNCTION_ARGUMENT;
+            }
+            // SAFETY: Caller guarantees blob.data points to blob.len bytes
+            let data = unsafe { std::slice::from_raw_parts(blob.data.cast::<u8>(), blob.len) };
+            h.easy.ssl_client_key_blob(data.to_vec());
             CURLcode::CURLE_OK
         }
 
         // CURLOPT_CAINFO_BLOB = 40309
         40309 => {
-            // Accept CA cert blob — not yet wired
+            if value.is_null() {
+                return CURLcode::CURLE_BAD_FUNCTION_ARGUMENT;
+            }
+            // SAFETY: Caller guarantees value points to a valid curl_blob
+            let blob = unsafe { &*value.cast::<curl_blob>() };
+            if blob.data.is_null() || blob.len == 0 {
+                return CURLcode::CURLE_BAD_FUNCTION_ARGUMENT;
+            }
+            // SAFETY: Caller guarantees blob.data points to blob.len bytes
+            let data = unsafe { std::slice::from_raw_parts(blob.data.cast::<u8>(), blob.len) };
+            h.easy.ssl_ca_cert_blob(data.to_vec());
             CURLcode::CURLE_OK
         }
 
@@ -6746,5 +6794,76 @@ mod tests {
         assert_eq!(CURLPAUSE_SEND, 4);
         assert_eq!(CURLPAUSE_ALL, 5);
         assert_eq!(CURLPAUSE_CONT, 0);
+    }
+
+    // ─── Phase 55: Blob cert options ───
+
+    #[test]
+    fn easy_setopt_cainfo_blob() {
+        let handle = curl_easy_init();
+        let pem_data = b"-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----\n";
+        let blob =
+            curl_blob { data: pem_data.as_ptr().cast::<c_void>(), len: pem_data.len(), flags: 0 };
+        // CURLOPT_CAINFO_BLOB = 40309
+        let code =
+            unsafe { curl_easy_setopt(handle, 40309, ptr::from_ref(&blob).cast::<c_void>()) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_sslcert_blob() {
+        let handle = curl_easy_init();
+        let pem_data = b"-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----\n";
+        let blob =
+            curl_blob { data: pem_data.as_ptr().cast::<c_void>(), len: pem_data.len(), flags: 0 };
+        // CURLOPT_SSLCERT_BLOB = 40291
+        let code =
+            unsafe { curl_easy_setopt(handle, 40291, ptr::from_ref(&blob).cast::<c_void>()) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_sslkey_blob() {
+        let handle = curl_easy_init();
+        let pem_data = b"-----BEGIN PRIVATE KEY-----\ntest\n-----END PRIVATE KEY-----\n";
+        let blob =
+            curl_blob { data: pem_data.as_ptr().cast::<c_void>(), len: pem_data.len(), flags: 0 };
+        // CURLOPT_SSLKEY_BLOB = 40292
+        let code =
+            unsafe { curl_easy_setopt(handle, 40292, ptr::from_ref(&blob).cast::<c_void>()) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_blob_null_returns_error() {
+        let handle = curl_easy_init();
+        // Null value pointer
+        let code = unsafe { curl_easy_setopt(handle, 40309, ptr::null()) };
+        assert_eq!(code, CURLcode::CURLE_BAD_FUNCTION_ARGUMENT);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_blob_null_data_returns_error() {
+        let handle = curl_easy_init();
+        let blob = curl_blob { data: ptr::null(), len: 10, flags: 0 };
+        let code =
+            unsafe { curl_easy_setopt(handle, 40291, ptr::from_ref(&blob).cast::<c_void>()) };
+        assert_eq!(code, CURLcode::CURLE_BAD_FUNCTION_ARGUMENT);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_blob_zero_len_returns_error() {
+        let handle = curl_easy_init();
+        let data = b"some data";
+        let blob = curl_blob { data: data.as_ptr().cast::<c_void>(), len: 0, flags: 0 };
+        let code =
+            unsafe { curl_easy_setopt(handle, 40292, ptr::from_ref(&blob).cast::<c_void>()) };
+        assert_eq!(code, CURLcode::CURLE_BAD_FUNCTION_ARGUMENT);
+        unsafe { curl_easy_cleanup(handle) };
     }
 }

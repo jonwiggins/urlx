@@ -77,6 +77,24 @@ pub struct TlsConfig {
     /// When enabled (the default), TLS session tickets are accepted for
     /// faster reconnections. Equivalent to `CURLOPT_SSL_SESSIONID_CACHE`.
     pub session_cache: bool,
+
+    /// In-memory CA certificate bundle in PEM or DER format.
+    ///
+    /// Alternative to `ca_cert` (file path). When set, these bytes are used
+    /// as the trusted CA store. Equivalent to `CURLOPT_CAINFO_BLOB`.
+    pub ca_cert_blob: Option<Vec<u8>>,
+
+    /// In-memory client certificate in PEM or DER format.
+    ///
+    /// Alternative to `client_cert` (file path). Used for mutual TLS.
+    /// Equivalent to `CURLOPT_SSLCERT_BLOB`.
+    pub client_cert_blob: Option<Vec<u8>>,
+
+    /// In-memory client private key in PEM or DER format.
+    ///
+    /// Alternative to `client_key` (file path). Must correspond to the
+    /// client certificate. Equivalent to `CURLOPT_SSLKEY_BLOB`.
+    pub client_key_blob: Option<Vec<u8>>,
 }
 
 impl Default for TlsConfig {
@@ -92,6 +110,9 @@ impl Default for TlsConfig {
             pinned_public_key: None,
             cipher_list: None,
             session_cache: true,
+            ca_cert_blob: None,
+            client_cert_blob: None,
+            client_key_blob: None,
         }
     }
 }
@@ -166,8 +187,19 @@ mod rustls_impl {
                 }
                 config
             } else if let Some(ref ca_path) = tls_config.ca_cert {
-                // Custom CA bundle
+                // Custom CA bundle from file
                 let root_store = load_ca_certs(ca_path)?;
+
+                let builder = Self::config_builder(&versions).with_root_certificates(root_store);
+
+                let mut config = Self::with_client_auth(builder, tls_config)?;
+                if use_http_alpn {
+                    Self::configure_alpn(&mut config);
+                }
+                config
+            } else if let Some(ref ca_blob) = tls_config.ca_cert_blob {
+                // Custom CA bundle from in-memory blob
+                let root_store = load_ca_certs_from_blob(ca_blob)?;
 
                 let builder = Self::config_builder(&versions).with_root_certificates(root_store);
 
@@ -231,11 +263,18 @@ mod rustls_impl {
             builder: rustls::ConfigBuilder<rustls::ClientConfig, WantsClientCert>,
             tls_config: &TlsConfig,
         ) -> Result<rustls::ClientConfig, Error> {
+            // Try file-based client auth first, then blob-based
             if let (Some(ref cert_path), Some(ref key_path)) =
                 (&tls_config.client_cert, &tls_config.client_key)
             {
                 let certs = load_client_certs(cert_path)?;
                 let key = load_client_key(key_path)?;
+                builder.with_client_auth_cert(certs, key).map_err(|e| Error::Tls(Box::new(e)))
+            } else if let (Some(ref cert_blob), Some(ref key_blob)) =
+                (&tls_config.client_cert_blob, &tls_config.client_key_blob)
+            {
+                let certs = load_client_certs_from_blob(cert_blob)?;
+                let key = load_client_key_from_blob(key_blob)?;
                 builder.with_client_auth_cert(certs, key).map_err(|e| Error::Tls(Box::new(e)))
             } else {
                 Ok(builder.with_no_client_auth())
@@ -470,6 +509,55 @@ mod rustls_impl {
         let key = PrivateKeyDer::from_pem_file(path).map_err(|e| Error::Tls(Box::new(e)))?;
 
         Ok(key)
+    }
+
+    /// Load CA certificates from an in-memory PEM blob.
+    fn load_ca_certs_from_blob(blob: &[u8]) -> Result<rustls::RootCertStore, Error> {
+        use rustls::pki_types::pem::PemObject;
+        use rustls::pki_types::CertificateDer;
+
+        let certs = CertificateDer::pem_slice_iter(blob)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| Error::Tls(Box::new(e)))?;
+
+        let mut root_store = rustls::RootCertStore::empty();
+        for cert in certs {
+            root_store.add(cert).map_err(|e| Error::Tls(Box::new(e)))?;
+        }
+
+        if root_store.is_empty() {
+            return Err(Error::Tls("no valid CA certificates found in blob".into()));
+        }
+
+        Ok(root_store)
+    }
+
+    /// Load client certificates from an in-memory PEM blob.
+    fn load_client_certs_from_blob(
+        blob: &[u8],
+    ) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>, Error> {
+        use rustls::pki_types::pem::PemObject;
+        use rustls::pki_types::CertificateDer;
+
+        let certs = CertificateDer::pem_slice_iter(blob)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| Error::Tls(Box::new(e)))?;
+
+        if certs.is_empty() {
+            return Err(Error::Tls("no valid client certificates found in blob".into()));
+        }
+
+        Ok(certs)
+    }
+
+    /// Load a private key from an in-memory PEM blob.
+    fn load_client_key_from_blob(
+        blob: &[u8],
+    ) -> Result<rustls::pki_types::PrivateKeyDer<'static>, Error> {
+        use rustls::pki_types::pem::PemObject;
+        use rustls::pki_types::PrivateKeyDer;
+
+        PrivateKeyDer::from_pem_slice(blob).map_err(|e| Error::Tls(Box::new(e)))
     }
 
     /// Extract the Subject Public Key Info (SPKI) DER bytes from an X.509 certificate.

@@ -159,6 +159,12 @@ pub struct Easy {
     http2_ping_interval: Option<Duration>,
     /// Custom request target (curl `--request-target`).
     custom_request_target: Option<String>,
+    /// Allowed protocols for initial request (e.g., `["http", "https", "ftp"]`).
+    /// When `None`, all protocols are allowed.
+    allowed_protocols: Option<Vec<String>>,
+    /// Allowed protocols for redirects.
+    /// When `None`, all protocols are allowed.
+    redir_protocols: Option<Vec<String>>,
     /// TFTP block size (curl `--tftp-blksize`).
     tftp_blksize: Option<u16>,
     /// Disable TFTP options negotiation (curl `--tftp-no-options`).
@@ -253,6 +259,8 @@ impl std::fmt::Debug for Easy {
             .field("http2_stream_weight", &self.http2_stream_weight)
             .field("http2_ping_interval", &self.http2_ping_interval)
             .field("custom_request_target", &self.custom_request_target)
+            .field("allowed_protocols", &self.allowed_protocols)
+            .field("redir_protocols", &self.redir_protocols)
             .field("tftp_blksize", &self.tftp_blksize)
             .field("tftp_no_options", &self.tftp_no_options)
             .finish()
@@ -345,6 +353,8 @@ impl Clone for Easy {
             http2_stream_weight: self.http2_stream_weight,
             http2_ping_interval: self.http2_ping_interval,
             custom_request_target: self.custom_request_target.clone(),
+            allowed_protocols: self.allowed_protocols.clone(),
+            redir_protocols: self.redir_protocols.clone(),
             tftp_blksize: self.tftp_blksize,
             tftp_no_options: self.tftp_no_options,
         }
@@ -439,6 +449,8 @@ impl Easy {
             http2_stream_weight: None,
             http2_ping_interval: None,
             custom_request_target: None,
+            allowed_protocols: None,
+            redir_protocols: None,
             tftp_blksize: None,
             tftp_no_options: false,
         }
@@ -905,6 +917,30 @@ impl Easy {
     /// Equivalent to curl's `--key` flag or `CURLOPT_SSLKEY`.
     pub fn ssl_client_key(&mut self, path: &Path) {
         self.tls_config.client_key = Some(path.to_path_buf());
+    }
+
+    /// Set an in-memory CA certificate bundle (PEM format).
+    ///
+    /// Alternative to `ssl_ca_cert` (file path).
+    /// Equivalent to `CURLOPT_CAINFO_BLOB`.
+    pub fn ssl_ca_cert_blob(&mut self, blob: Vec<u8>) {
+        self.tls_config.ca_cert_blob = Some(blob);
+    }
+
+    /// Set an in-memory client certificate (PEM format).
+    ///
+    /// Alternative to `ssl_client_cert` (file path).
+    /// Equivalent to `CURLOPT_SSLCERT_BLOB`.
+    pub fn ssl_client_cert_blob(&mut self, blob: Vec<u8>) {
+        self.tls_config.client_cert_blob = Some(blob);
+    }
+
+    /// Set an in-memory client private key (PEM format).
+    ///
+    /// Alternative to `ssl_client_key` (file path).
+    /// Equivalent to `CURLOPT_SSLKEY_BLOB`.
+    pub fn ssl_client_key_blob(&mut self, blob: Vec<u8>) {
+        self.tls_config.client_key_blob = Some(blob);
     }
 
     /// Set the minimum TLS version to allow.
@@ -1462,6 +1498,26 @@ impl Easy {
         self.tftp_no_options = disable;
     }
 
+    /// Set allowed protocols for the initial request.
+    ///
+    /// Accepts a comma-separated string of protocol names (e.g., `"http,https,ftp"`).
+    /// When set, requests to protocols not in the list will be rejected.
+    /// Equivalent to `CURLOPT_PROTOCOLS_STR`.
+    pub fn set_protocols_str(&mut self, protocols: &str) {
+        let protos: Vec<String> = protocols.split(',').map(|s| s.trim().to_lowercase()).collect();
+        self.allowed_protocols = Some(protos);
+    }
+
+    /// Set allowed protocols for redirects.
+    ///
+    /// Accepts a comma-separated string of protocol names (e.g., `"http,https"`).
+    /// When set, redirects to protocols not in the list will be rejected.
+    /// Equivalent to `CURLOPT_REDIR_PROTOCOLS_STR`.
+    pub fn set_redir_protocols_str(&mut self, protocols: &str) {
+        let protos: Vec<String> = protocols.split(',').map(|s| s.trim().to_lowercase()).collect();
+        self.redir_protocols = Some(protos);
+    }
+
     /// Build a DNS resolver from the current configuration.
     ///
     /// Uses hickory-dns when available and custom DNS servers or `DoH` URL
@@ -1532,6 +1588,17 @@ impl Easy {
         } else {
             url.clone()
         };
+
+        // Check allowed protocols
+        if let Some(ref allowed) = self.allowed_protocols {
+            let scheme = url.scheme().to_lowercase();
+            if !allowed.iter().any(|p| p == &scheme) {
+                return Err(Error::Http(format!(
+                    "protocol '{scheme}' not allowed (allowed: {})",
+                    allowed.join(",")
+                )));
+            }
+        }
 
         // Build effective headers, body, and method considering multipart and range
         let mut headers = self.headers.clone();
@@ -1686,6 +1753,7 @@ impl Easy {
             &ssh_host_key_policy,
             self.mail_from.as_deref(),
             &self.mail_rcpt,
+            self.redir_protocols.as_deref(),
         );
 
         // Apply total transfer timeout if set.
@@ -1798,6 +1866,7 @@ async fn perform_transfer(
     #[cfg(not(feature = "ssh"))] _ssh_host_key_policy: &(),
     mail_from: Option<&str>,
     mail_rcpt: &[String],
+    redir_protocols: Option<&[String]>,
 ) -> Result<Response, Error> {
     let transfer_start = Instant::now();
     let original_url = url.clone();
@@ -2003,6 +2072,17 @@ async fn perform_transfer(
                         let base = current_url.as_str();
                         Url::parse(&resolve_relative(base, location))?
                     };
+
+                // Check redirect protocol restriction
+                if let Some(allowed) = redir_protocols {
+                    let scheme = next_url.scheme().to_lowercase();
+                    if !allowed.iter().any(|p| p.as_str() == scheme) {
+                        return Err(Error::Http(format!(
+                            "redirect to protocol '{scheme}' not allowed (allowed: {})",
+                            allowed.iter().map(String::as_str).collect::<Vec<_>>().join(",")
+                        )));
+                    }
+                }
 
                 if verbose {
                     #[allow(clippy::print_stderr)]
@@ -4834,5 +4914,47 @@ mod tests {
         easy.connect_timeout(Duration::from_millis(100));
         let result = easy.perform();
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn protocols_str_blocks_disallowed_scheme() {
+        let mut easy = Easy::new();
+        easy.url("ftp://example.com/file").unwrap();
+        easy.set_protocols_str("http,https");
+        easy.connect_timeout(Duration::from_millis(100));
+        let result = easy.perform();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("not allowed"), "expected protocol error: {err}");
+    }
+
+    #[test]
+    fn protocols_str_allows_matching_scheme() {
+        let mut easy = Easy::new();
+        easy.url("http://127.0.0.1:1/test").unwrap();
+        easy.set_protocols_str("http,https,ftp");
+        easy.connect_timeout(Duration::from_millis(100));
+        let result = easy.perform();
+        // Should fail with connection error, not protocol error
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(!err.contains("not allowed"), "unexpected protocol error: {err}");
+    }
+
+    #[test]
+    fn set_protocols_str_parses_comma_list() {
+        let mut easy = Easy::new();
+        easy.set_protocols_str("http, https, ftp");
+        assert_eq!(
+            easy.allowed_protocols,
+            Some(vec!["http".to_string(), "https".to_string(), "ftp".to_string()])
+        );
+    }
+
+    #[test]
+    fn set_redir_protocols_str_parses_list() {
+        let mut easy = Easy::new();
+        easy.set_redir_protocols_str("http,https");
+        assert_eq!(easy.redir_protocols, Some(vec!["http".to_string(), "https".to_string()]));
     }
 }
