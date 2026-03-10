@@ -810,7 +810,7 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
             "--http2" => {
                 opts.easy.http_version(liburlx::HttpVersion::Http2);
             }
-            "--http3" => {
+            "--http3" | "--http3-only" => {
                 opts.easy.http_version(liburlx::HttpVersion::Http3);
             }
             "--http2-prior-knowledge" => {
@@ -1339,12 +1339,75 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
                 opts.easy.ssl_ca_cert(std::path::Path::new(val));
             }
             // No-op flags for compatibility (accepted but not implemented)
-            "-N" | "--no-buffer" | "--no-sessionid" | "--no-alpn" | "--no-npn"
-            | "--cert-status" | "--false-start" | "--disable-eprt" | "--disable-epsv"
-            | "--compressed-ssh" | "--doh-cert-status" | "--next" | "--ftp-pasv"
-            | "--styled-output" | "--no-styled-output" | "--negotiate" | "--xattr"
-            | "--disable" | "--metalink" | "--basic" | "--anyauth" | "--proxy-basic"
-            | "--proxy-anyauth" => {}
+            "-N"
+            | "--no-buffer"
+            | "--no-sessionid"
+            | "--no-alpn"
+            | "--no-npn"
+            | "--cert-status"
+            | "--false-start"
+            | "--disable-eprt"
+            | "--disable-epsv"
+            | "--compressed-ssh"
+            | "--doh-cert-status"
+            | "--next"
+            | "--ftp-pasv"
+            | "--styled-output"
+            | "--no-styled-output"
+            | "--negotiate"
+            | "--xattr"
+            | "--disable"
+            | "--metalink"
+            | "--basic"
+            | "--anyauth"
+            | "--proxy-basic"
+            | "--proxy-anyauth"
+            | "--tcp-fastopen"
+            | "--suppress-connect-headers"
+            | "--no-clobber"
+            | "--http0.9"
+            | "--disallow-username-in-url"
+            | "--ssl-allow-beast"
+            | "--ssl-auto-client-cert"
+            | "--ssl-no-revoke"
+            | "--ssl-revoke-best-effort"
+            | "--proxy-ssl-allow-beast"
+            | "--proxy-ssl-auto-client-cert"
+            | "--socks5-basic"
+            | "--socks5-gssapi"
+            | "--ntlm-wb"
+            | "--proxy-negotiate"
+            | "--trace-ids"
+            | "--ftp-ssl-control"
+            | "--ftp-ssl-ccc"
+            | "--socks5-gssapi-nec"
+            | "-4"
+            | "--ipv4"
+            | "-6"
+            | "--ipv6"
+            | "-j"
+            | "--junk-session-cookies"
+            | "-l"
+            | "--list-only" => {}
+            // FTP quote commands
+            "-Q" | "--quote" => {
+                i += 1;
+                let _val = require_arg(args, i, &args[i - 1].clone())?;
+                // Accepted for compat; FTP pre/post commands not yet wired
+            }
+            // OAuth2 bearer token (alias for --bearer)
+            "--oauth2-bearer" => {
+                i += 1;
+                let val = require_arg(args, i, "--oauth2-bearer")?;
+                opts.easy.bearer_token(val);
+                opts.use_bearer = true;
+            }
+            // SSH public key file
+            "--pubkey" => {
+                i += 1;
+                let _val = require_arg(args, i, &args[i - 1].clone())?;
+                // Accepted for compat; ssh key auth handled by ssh module
+            }
             // No-op flags that take an argument
             "--create-file-mode"
             | "--service-name"
@@ -1362,7 +1425,26 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
             | "--crlfile"
             | "--proxy-crlfile"
             | "--proxy-pinnedpubkey"
-            | "--proxy-pass" => {
+            | "--proxy-pass"
+            | "--curves"
+            | "--engine"
+            | "--ftp-alternative-to-user"
+            | "--krb"
+            | "--random-file"
+            | "--egd-file"
+            | "--dns-interface"
+            | "--telnet-option"
+            | "--proxy-tlsauthtype"
+            | "--proxy-tlsuser"
+            | "--proxy-tlspassword"
+            | "--tlsauthtype"
+            | "--tlsuser"
+            | "--tlspassword"
+            | "--socks5-gssapi-service"
+            | "--ftp-pret"
+            | "--ftp-ssl-ccc-mode"
+            | "--proxy1.0"
+            | "--mail-rcpt-allowfails" => {
                 i += 1;
                 let _val = require_arg(args, i, &args[i - 1].clone())?;
                 // Accepted for compatibility; not implemented
@@ -4020,6 +4102,83 @@ mod tests {
     #[test]
     fn parse_args_xattr_noop() {
         let args = make_args(&["--xattr", "http://example.com"]);
+        let opts = unwrap_opts(parse_args(&args));
+        assert!(!opts.urls.is_empty());
+    }
+
+    #[test]
+    fn parse_args_ipv4() {
+        let args = make_args(&["-4", "http://example.com"]);
+        let opts = unwrap_opts(parse_args(&args));
+        assert!(!opts.urls.is_empty());
+    }
+
+    #[test]
+    fn parse_args_ipv6() {
+        let args = make_args(&["--ipv6", "http://example.com"]);
+        let opts = unwrap_opts(parse_args(&args));
+        assert!(!opts.urls.is_empty());
+    }
+
+    #[test]
+    fn parse_args_junk_session_cookies() {
+        let args = make_args(&["-j", "http://example.com"]);
+        let opts = unwrap_opts(parse_args(&args));
+        assert!(!opts.urls.is_empty());
+    }
+
+    #[test]
+    fn parse_args_list_only() {
+        let args = make_args(&["-l", "ftp://example.com"]);
+        let opts = unwrap_opts(parse_args(&args));
+        assert!(!opts.urls.is_empty());
+    }
+
+    #[test]
+    fn parse_args_http3_only() {
+        let args = make_args(&["--http3-only", "https://example.com"]);
+        let opts = unwrap_opts(parse_args(&args));
+        assert!(!opts.urls.is_empty());
+    }
+
+    #[test]
+    fn parse_args_oauth2_bearer() {
+        let args = make_args(&["--oauth2-bearer", "token123", "https://example.com"]);
+        let opts = unwrap_opts(parse_args(&args));
+        assert!(opts.use_bearer);
+    }
+
+    #[test]
+    fn parse_args_quote() {
+        let args = make_args(&["-Q", "DELE file.txt", "ftp://example.com"]);
+        let opts = unwrap_opts(parse_args(&args));
+        assert!(!opts.urls.is_empty());
+    }
+
+    #[test]
+    fn parse_args_tcp_fastopen() {
+        let args = make_args(&["--tcp-fastopen", "http://example.com"]);
+        let opts = unwrap_opts(parse_args(&args));
+        assert!(!opts.urls.is_empty());
+    }
+
+    #[test]
+    fn parse_args_no_clobber() {
+        let args = make_args(&["--no-clobber", "http://example.com"]);
+        let opts = unwrap_opts(parse_args(&args));
+        assert!(!opts.urls.is_empty());
+    }
+
+    #[test]
+    fn parse_args_curves_noop() {
+        let args = make_args(&["--curves", "X25519", "https://example.com"]);
+        let opts = unwrap_opts(parse_args(&args));
+        assert!(!opts.urls.is_empty());
+    }
+
+    #[test]
+    fn parse_args_pubkey_noop() {
+        let args = make_args(&["--pubkey", "/path/to/key.pub", "sftp://example.com"]);
         let opts = unwrap_opts(parse_args(&args));
         assert!(!opts.urls.is_empty());
     }
