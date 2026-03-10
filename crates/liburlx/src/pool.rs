@@ -123,6 +123,45 @@ impl ConnectionPool {
     }
 }
 
+/// Pool for reusable HTTP/2 connections.
+///
+/// Stores `h2::client::SendRequest` handles keyed by (host, port).
+/// The background connection driver task continues running as long as
+/// the `SendRequest` handle is alive, so pooled connections remain active.
+#[cfg(feature = "http2")]
+pub struct H2Pool {
+    connections: HashMap<PoolKey, h2::client::SendRequest<bytes::Bytes>>,
+}
+
+#[cfg(feature = "http2")]
+impl std::fmt::Debug for H2Pool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("H2Pool").field("pooled_connections", &self.connections.len()).finish()
+    }
+}
+
+#[cfg(feature = "http2")]
+impl H2Pool {
+    /// Create a new empty HTTP/2 pool.
+    pub fn new() -> Self {
+        Self { connections: HashMap::new() }
+    }
+
+    /// Retrieve a pooled HTTP/2 connection for the given host/port.
+    ///
+    /// Returns `None` if no connection is available.
+    pub fn get(&mut self, host: &str, port: u16) -> Option<h2::client::SendRequest<bytes::Bytes>> {
+        let key = PoolKey { host: host.to_string(), port, is_tls: true };
+        self.connections.remove(&key)
+    }
+
+    /// Store an HTTP/2 connection for later reuse.
+    pub fn put(&mut self, host: &str, port: u16, client: h2::client::SendRequest<bytes::Bytes>) {
+        let key = PoolKey { host: host.to_string(), port, is_tls: true };
+        let _old = self.connections.insert(key, client);
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -158,6 +197,21 @@ mod tests {
 
         // Pool should now be empty
         assert!(pool.get("127.0.0.1", addr.port(), false).is_none());
+    }
+
+    #[cfg(feature = "http2")]
+    #[test]
+    fn h2_pool_new_is_empty() {
+        let mut pool = H2Pool::new();
+        assert!(pool.get("example.com", 443).is_none());
+    }
+
+    #[cfg(feature = "http2")]
+    #[test]
+    fn h2_pool_debug() {
+        let pool = H2Pool::new();
+        let debug = format!("{pool:?}");
+        assert!(debug.contains("H2Pool"));
     }
 
     #[tokio::test]

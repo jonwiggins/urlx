@@ -78,6 +78,8 @@ pub struct Easy {
     dns_shuffle: bool,
     dns_cache: DnsCache,
     pool: ConnectionPool,
+    #[cfg(feature = "http2")]
+    h2_pool: crate::pool::H2Pool,
     share: Option<crate::share::Share>,
     http_version: HttpVersion,
     expect_100_timeout: Option<Duration>,
@@ -163,6 +165,7 @@ pub struct Easy {
     tftp_no_options: bool,
 }
 
+#[allow(clippy::missing_fields_in_debug)] // h2_pool is cfg-gated and opaque
 impl std::fmt::Debug for Easy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Easy")
@@ -291,6 +294,8 @@ impl Clone for Easy {
             dns_shuffle: self.dns_shuffle,
             dns_cache: DnsCache::new(),
             pool: ConnectionPool::new(),
+            #[cfg(feature = "http2")]
+            h2_pool: crate::pool::H2Pool::new(),
             share: self.share.clone(),
             http_version: self.http_version,
             expect_100_timeout: self.expect_100_timeout,
@@ -383,6 +388,8 @@ impl Easy {
             dns_shuffle: false,
             dns_cache: DnsCache::new(),
             pool: ConnectionPool::new(),
+            #[cfg(feature = "http2")]
+            h2_pool: crate::pool::H2Pool::new(),
             share: None,
             http_version: HttpVersion::None,
             expect_100_timeout: None,
@@ -1655,6 +1662,8 @@ impl Easy {
             self.dns_shuffle,
             &mut self.dns_cache,
             &mut self.pool,
+            #[cfg(feature = "http2")]
+            &mut self.h2_pool,
             self.http_version,
             self.expect_100_timeout,
             self.happy_eyeballs_timeout,
@@ -1766,6 +1775,7 @@ async fn perform_transfer(
     dns_shuffle: bool,
     dns_cache: &mut DnsCache,
     pool: &mut ConnectionPool,
+    #[cfg(feature = "http2")] h2_pool: &mut crate::pool::H2Pool,
     http_version: HttpVersion,
     expect_100_timeout: Option<Duration>,
     happy_eyeballs_timeout: Option<Duration>,
@@ -1841,6 +1851,8 @@ async fn perform_transfer(
             dns_shuffle,
             dns_cache,
             pool,
+            #[cfg(feature = "http2")]
+            h2_pool,
             http_version,
             expect_100_timeout,
             happy_eyeballs_timeout,
@@ -1914,6 +1926,8 @@ async fn perform_transfer(
                                 dns_shuffle,
                                 dns_cache,
                                 pool,
+                                #[cfg(feature = "http2")]
+                                h2_pool,
                                 http_version,
                                 expect_100_timeout,
                                 happy_eyeballs_timeout,
@@ -2063,6 +2077,7 @@ async fn do_single_request(
     dns_shuffle: bool,
     dns_cache: &mut DnsCache,
     pool: &mut ConnectionPool,
+    #[cfg(feature = "http2")] h2_pool: &mut crate::pool::H2Pool,
     http_version: HttpVersion,
     expect_100_timeout: Option<Duration>,
     happy_eyeballs_timeout: Option<Duration>,
@@ -2150,7 +2165,50 @@ async fn do_single_request(
         ));
     }
 
-    // Try to use a pooled connection
+    // Try to use a pooled HTTP/2 connection
+    #[cfg(feature = "http2")]
+    if use_pool && is_tls {
+        let allow_h2 = !matches!(http_version, HttpVersion::Http10 | HttpVersion::Http11);
+        if allow_h2 {
+            if let Some(h2_client) = h2_pool.get(&host, port) {
+                if verbose {
+                    #[allow(clippy::print_stderr)]
+                    {
+                        eprintln!("* Re-using existing HTTP/2 connection to {host} port {port}");
+                    }
+                }
+                let request_target = resolve_request_target(custom_request_target, url);
+                let result = crate::protocol::http::h2::send_request(
+                    h2_client,
+                    method,
+                    &host_header,
+                    &request_target,
+                    &effective_headers,
+                    body,
+                    url.as_str(),
+                    speed_limits,
+                )
+                .await;
+
+                match result {
+                    Ok((resp, h2_client)) => {
+                        h2_pool.put(&host, port, h2_client);
+                        return maybe_decompress(resp, accept_encoding);
+                    }
+                    Err(_) => {
+                        if verbose {
+                            #[allow(clippy::print_stderr)]
+                            {
+                                eprintln!("* HTTP/2 connection stale, creating new connection");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Try to use a pooled HTTP/1.1 connection
     if use_pool {
         if let Some(mut stream) = pool.get(&host, port, is_tls) {
             if verbose {
@@ -2547,8 +2605,10 @@ async fn do_single_request(
                         }
                     }
                     let time_pretransfer = request_start.elapsed();
-                    let resp = crate::protocol::http::h2::request(
-                        tls_stream,
+                    let client =
+                        crate::protocol::http::h2::handshake(tls_stream, h2_config).await?;
+                    let (resp, h2_client) = crate::protocol::http::h2::send_request(
+                        client,
                         method,
                         &host_header,
                         &request_target,
@@ -2556,9 +2616,10 @@ async fn do_single_request(
                         body,
                         url.as_str(),
                         speed_limits,
-                        h2_config,
                     )
                     .await?;
+                    // Return h2 connection to pool for reuse
+                    h2_pool.put(&host, port, h2_client);
                     let time_starttransfer = request_start.elapsed();
                     let mut resp = maybe_decompress(resp, accept_encoding)?;
                     let mut info = resp.transfer_info().clone();

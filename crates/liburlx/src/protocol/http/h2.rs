@@ -63,31 +63,21 @@ pub struct Http2Config {
     pub ping_interval: Option<Duration>,
 }
 
-/// Send an HTTP/2 request and read the response.
+/// Perform an HTTP/2 handshake and return a reusable `SendRequest` handle.
 ///
-/// Takes ownership of the stream since h2 manages its own I/O.
-/// Collects any server-pushed responses (`PUSH_PROMISE` frames) during
-/// the transfer and attaches them to the returned Response.
+/// Takes ownership of the stream. Spawns a background task to drive
+/// the h2 connection, and optionally a PING keep-alive task.
 ///
 /// # Errors
 ///
-/// Returns errors for I/O failures or protocol errors.
-#[allow(clippy::too_many_arguments)]
-pub async fn request<S>(
+/// Returns errors if the handshake fails.
+pub async fn handshake<S>(
     stream: S,
-    method: &str,
-    host: &str,
-    request_target: &str,
-    custom_headers: &[(String, String)],
-    body: Option<&[u8]>,
-    url: &str,
-    speed_limits: &SpeedLimits,
     h2_config: &Http2Config,
-) -> Result<Response, Error>
+) -> Result<h2::client::SendRequest<bytes::Bytes>, Error>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    // Build h2 client with configured settings
     let mut builder = h2::client::Builder::new();
     if let Some(window_size) = h2_config.window_size {
         let _b = builder.initial_window_size(window_size);
@@ -105,7 +95,6 @@ where
         let _b = builder.enable_push(enable_push);
     }
 
-    // Perform h2 client handshake with configured builder
     let (client, mut h2_conn): (
         h2::client::SendRequest<bytes::Bytes>,
         h2::client::Connection<S, bytes::Bytes>,
@@ -115,15 +104,43 @@ where
         .map_err(|e| Error::Http(format!("h2 handshake failed: {e}")))?;
 
     // Spawn PING keep-alive task if interval is configured
-    let ping_task = h2_config.ping_interval.and_then(|interval| {
-        h2_conn.ping_pong().map(|ping_pong| tokio::spawn(ping_keepalive(ping_pong, interval)))
-    });
+    if let Some(interval) = h2_config.ping_interval {
+        if let Some(ping_pong) = h2_conn.ping_pong() {
+            let _handle = tokio::spawn(ping_keepalive(ping_pong, interval));
+        }
+    }
 
     // Spawn a task to drive the h2 connection in the background
     let _handle = tokio::spawn(async move {
         let _r = h2_conn.await;
     });
 
+    Ok(client)
+}
+
+/// Send an HTTP/2 request on an existing connection and read the response.
+///
+/// Uses the provided `SendRequest` handle (from [`handshake`] or a pool).
+/// Collects any server-pushed responses (`PUSH_PROMISE` frames) during
+/// the transfer and attaches them to the returned `Response`.
+///
+/// Returns the `SendRequest` handle alongside the response so it can
+/// be returned to a connection pool for reuse.
+///
+/// # Errors
+///
+/// Returns errors for I/O failures or protocol errors.
+#[allow(clippy::too_many_arguments)]
+pub async fn send_request(
+    client: h2::client::SendRequest<bytes::Bytes>,
+    method: &str,
+    host: &str,
+    request_target: &str,
+    custom_headers: &[(String, String)],
+    body: Option<&[u8]>,
+    url: &str,
+    speed_limits: &SpeedLimits,
+) -> Result<(Response, h2::client::SendRequest<bytes::Bytes>), Error> {
     // Build the request
     let uri: http::Uri = format!("https://{host}{request_target}")
         .parse()
@@ -263,20 +280,15 @@ where
 
     // HEAD responses have no body
     if is_head {
-        // Collect any push promises that arrived (short timeout)
         let pushed = tokio::time::timeout(Duration::from_millis(50), push_task)
             .await
             .map_or_else(|_| Vec::new(), std::result::Result::unwrap_or_default);
-        // Stop PING keep-alive task
-        if let Some(task) = ping_task {
-            task.abort();
-        }
         let mut resp = Response::new(status, headers, Vec::new(), url.to_string());
         resp.set_http_version(ResponseHttpVersion::Http2);
         if !pushed.is_empty() {
             resp.set_pushed_responses(pushed);
         }
-        return Ok(resp);
+        return Ok((resp, client));
     }
 
     // Read body with optional rate limiting
@@ -289,29 +301,51 @@ where
         body_bytes.extend_from_slice(&chunk);
         // Release flow control capacity
         let _r = body_stream.flow_control().release_capacity(chunk_len);
-        // Apply rate limiting after each data frame
         if recv_limiter.is_active() {
             recv_limiter.record(chunk_len).await?;
         }
     }
 
-    // Collect any push promises that arrived during the transfer.
-    // Use a short timeout since push promises should arrive before/during
-    // the response — if none arrived by now, none are coming.
     let pushed = tokio::time::timeout(Duration::from_millis(50), push_task)
         .await
         .map_or_else(|_| Vec::new(), std::result::Result::unwrap_or_default);
-
-    // Stop PING keep-alive task
-    if let Some(task) = ping_task {
-        task.abort();
-    }
 
     let mut resp = Response::new(status, headers, body_bytes, url.to_string());
     resp.set_http_version(ResponseHttpVersion::Http2);
     if !pushed.is_empty() {
         resp.set_pushed_responses(pushed);
     }
+    Ok((resp, client))
+}
+
+/// Send an HTTP/2 request on a new connection (handshake + send).
+///
+/// Convenience wrapper that performs the h2 handshake and sends a single
+/// request. For connection reuse, use [`handshake`] and [`send_request`]
+/// separately.
+///
+/// # Errors
+///
+/// Returns errors for I/O failures or protocol errors.
+#[allow(clippy::too_many_arguments)]
+pub async fn request<S>(
+    stream: S,
+    method: &str,
+    host: &str,
+    request_target: &str,
+    custom_headers: &[(String, String)],
+    body: Option<&[u8]>,
+    url: &str,
+    speed_limits: &SpeedLimits,
+    h2_config: &Http2Config,
+) -> Result<Response, Error>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let client = handshake(stream, h2_config).await?;
+    let (resp, _client) =
+        send_request(client, method, host, request_target, custom_headers, body, url, speed_limits)
+            .await?;
     Ok(resp)
 }
 
