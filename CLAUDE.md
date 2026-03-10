@@ -15,9 +15,9 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 ## Current Status
 
 **Version:** v0.1.0 published (crates.io + GitHub Releases + Homebrew)
-**Last completed:** Phase 55 — FFI Hardening — 2026-03-10
-**Total tests:** 2,396
-**In progress:** Phase 56
+**Last completed:** Phase 56 — Authentication & Security — 2026-03-10
+**Total tests:** 2,413
+**In progress:** Phase 57
 **Blockers:** None
 
 ### Completeness Summary (post-v0.1.0 audit)
@@ -28,11 +28,11 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 | HTTP/2 | 90% | ALPN, multiplexing, flow control, connection pooling, server push; stream priority stored but not wired (deprecated in RFC 9113) |
 | HTTP/3 | 55% | QUIC via quinn, Alt-Svc, 0-RTT; no pooling/push; **untested** |
 | TLS | 88% | rustls, insecure mode, CA/client certs, pinning, version selection, cipher list, session cache, blob cert options |
-| Authentication | 65% | Basic, Bearer, Digest (CSPRNG cnonce), AWS SigV4, NTLM skeleton |
-| Cookie engine | 95% | Netscape file format, domain-indexed jar, PSL validation |
+| Authentication | 80% | Basic, Bearer, Digest, AWS SigV4, NTLMv2, SCRAM-SHA-256 |
+| Cookie engine | 97% | Netscape file format, domain-indexed jar, PSL validation, SameSite enforcement |
 | Proxy | 90% | HTTP + SOCKS + HTTPS tunnel (TLS-in-TLS), proxy auth; no PAC |
 | DNS | 85% | Cache, Happy Eyeballs, shuffle, custom servers, DoH, DoT, hickory-dns |
-| FTP | 87% | Full session API, FTPS, active mode, FtpMethod; no MLST |
+| FTP | 90% | Full session API, FTPS, active mode, FtpMethod, resume via REST; no MLST |
 | SSH/SFTP/SCP | 65% | Download/upload, password + pubkey auth, known_hosts, SHA-256 fingerprint |
 | WebSocket | 85% | RFC 6455, CloseCode, fragmentation; no permessage-deflate |
 | Multi API | 75% | Connection limiting, share, pipelining, FFI event loop stubs |
@@ -40,13 +40,13 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 | CLI | ~65% | ~150 flags, --help, --version, combined short flags (-sSfL) |
 | Connection | 80% | Pool, TCP_NODELAY, keepalive, Unix sockets, interface/port binding |
 | Transfer control | 80% | Rate limiting enforced (max recv/send speed, low speed timeout) |
-| Overall | ~66% | ~93% for basic HTTP/HTTPS use cases |
+| Overall | ~68% | ~93% for basic HTTP/HTTPS use cases |
 
 ### Known Issues
 
 - WebSocket (ws://, wss://) not dispatched from Easy API (needs high-level handler)
 - HTTP/3 untested (needs quinn test server)
-- NTLM auth is a skeleton (SHA-256, not real MD4+DES)
+- SCRAM-SHA-256 implemented but not yet wired to SMTP/IMAP/POP3 (pending Phase 53 dispatch)
 
 ---
 
@@ -68,24 +68,33 @@ Added HTTP/2 connection pooling (`H2Pool` storing `SendRequest` handles, pool ch
 
 Wired protocol restriction enforcement (`CURLOPT_PROTOCOLS_STR`/`CURLOPT_REDIR_PROTOCOLS_STR`) with enforcement in `perform_async` and redirect handling. Added `curl_blob` repr(C) struct and wired blob cert options (`CURLOPT_SSLCERT_BLOB`, `SSLKEY_BLOB`, `CAINFO_BLOB`) with PEM loaders in TLS layer. Wired 25+ FTP/SSH/proxy CURLOPT options: FTPPORT, FTP_USE_EPSV, FTP_USE_EPRT, FTP_CREATE_MISSING_DIRS, FTP_SKIP_PASV_IP, FTP_FILEMETHOD, FTP_ACCOUNT, USE_SSL, SSH_AUTH_TYPES, SSH_PUBLIC_KEYFILE, SSH_PRIVATE_KEYFILE, SSH_KNOWNHOSTS, SSH_HOST_PUBLIC_KEY_SHA256, PROXYPORT, PROXYTYPE, PROXYUSERNAME, PROXYPASSWORD, PRE_PROXY, SOCKS5_AUTH, plus stubs for proxy TLS and legacy SSH options. `curl_easy_pause` remains a no-op stub (requires async channel signaling). C test harness deferred to Phase 59.
 
-### Phase 56 — Authentication & Security
+### Phase 56 — Authentication & Security (Completed 2026-03-10)
 
-Fill auth gaps and harden security features.
-
-- Full NTLMv2 implementation (MD4 + DES per MS-NLMP spec)
-- SASL mechanism support (SCRAM-SHA-256)
-- SameSite cookie enforcement
-- FTP resume (wire REST command to upload/download)
-- SFTP ed25519 key support
+Full NTLMv2 per MS-NLMP: MD4 NT hash, HMAC-MD5 NTLMv2 hash, NTProofStr, LMv2 response, client blob with timestamp and target info. SASL SCRAM-SHA-256 (RFC 7677): client state machine with PBKDF2, challenge-response, server signature verification. SameSite cookie enforcement (Strict/Lax/None, reject None without Secure). FTP resume via REST command wired through Range header offset. SFTP ed25519 already supported by russh. Added Error::Auth variant.
 
 ### Phase 57 — Protocol Polish
 
 Improve protocol implementations to near-complete parity.
 
 - WebSocket `permessage-deflate` (RFC 7692)
+  - Implement deflate compression/decompression for WS frames
+  - Negotiate `permessage-deflate` extension in handshake
+  - Handle `RSV1` bit for compressed frames
+  - Add context takeover configuration
+  - Integration tests with compressed echo server
 - MQTT QoS 1/2 support
+  - Add `PUBACK` handling for QoS 1
+  - Add `PUBREC`/`PUBREL`/`PUBCOMP` flow for QoS 2
+  - Track packet identifiers for retransmission
+  - Integration tests with QoS levels
 - FTP MLST/MLSD (RFC 3659)
+  - Parse MLST/MLSD response format (facts + filename)
+  - Wire `MLST` and `MLSD` commands in FTP session
+  - Integration tests with mock FTP server
 - SFTP symlink following, permission preservation
+  - Follow symlinks during download/stat
+  - Preserve file permissions on upload
+  - Integration tests
 - TFTP RFC 2478 error extensions
 
 ### Phase 58 — Performance & Benchmarking
