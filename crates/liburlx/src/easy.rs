@@ -1094,6 +1094,18 @@ impl Easy {
         self.happy_eyeballs_timeout = Some(duration);
     }
 
+    /// Set the maximum total number of connections in the pool.
+    ///
+    /// Equivalent to `CURLOPT_MAXCONNECTS`. Default is 25.
+    /// Setting to 0 disables connection reuse entirely.
+    pub const fn max_pool_connections(&mut self, max: usize) {
+        if max == 0 {
+            self.pool.set_ttl(std::time::Duration::ZERO);
+        } else {
+            self.pool.set_max_total(max);
+        }
+    }
+
     /// Set custom DNS server addresses.
     ///
     /// Accepts a comma-separated list of IP:port addresses (e.g., `"8.8.8.8:53,8.8.4.4:53"`).
@@ -2372,6 +2384,11 @@ async fn do_single_request(
         ));
     }
 
+    // Proactively evict expired connections from the pool
+    if use_pool {
+        pool.cleanup();
+    }
+
     // Try to use a pooled HTTP/2 connection
     #[cfg(feature = "http2")]
     if use_pool && is_tls {
@@ -3374,11 +3391,37 @@ const fn einprogress_code() -> i32 {
     36 // fallback
 }
 
-/// Happy Eyeballs (RFC 6555) TCP connection.
+/// Interleave IPv6 and IPv4 addresses per RFC 8305 §4.
+///
+/// Produces a list with alternating address families, starting with IPv6.
+/// Example: `[v6_0, v4_0, v6_1, v4_1, v6_2, ...]`
+fn interleave_addrs(addrs: &[std::net::SocketAddr]) -> Vec<std::net::SocketAddr> {
+    use std::net::SocketAddr;
+    let v6: Vec<SocketAddr> = addrs.iter().copied().filter(SocketAddr::is_ipv6).collect();
+    let v4: Vec<SocketAddr> = addrs.iter().copied().filter(SocketAddr::is_ipv4).collect();
+
+    let mut result = Vec::with_capacity(addrs.len());
+    let mut i6 = 0;
+    let mut i4 = 0;
+    while i6 < v6.len() || i4 < v4.len() {
+        if i6 < v6.len() {
+            result.push(v6[i6]);
+            i6 += 1;
+        }
+        if i4 < v4.len() {
+            result.push(v4[i4]);
+            i4 += 1;
+        }
+    }
+    result
+}
+
+/// Happy Eyeballs (RFC 8305) TCP connection.
 ///
 /// Given a list of resolved addresses (may contain both IPv4 and IPv6),
 /// try IPv6 first. If IPv6 doesn't connect within 250ms, start an IPv4
-/// attempt in parallel. Returns the first successful connection.
+/// attempt in parallel. Addresses within each family are interleaved
+/// per RFC 8305 §4. Returns the first successful connection.
 /// If only one address family is present, connects directly.
 async fn happy_eyeballs_connect(
     addrs: &[std::net::SocketAddr],
@@ -3391,16 +3434,19 @@ async fn happy_eyeballs_connect(
     use std::net::SocketAddr;
 
     // Happy Eyeballs delay before starting the other address family
-    // Default: 250ms (RFC 6555 recommendation)
+    // Default: 250ms (RFC 8305 recommendation)
     let eyeballs_delay = eyeballs_timeout.unwrap_or(Duration::from_millis(250));
 
-    // Separate into IPv6 and IPv4
-    let v6: Vec<SocketAddr> = addrs.iter().copied().filter(SocketAddr::is_ipv6).collect();
-    let v4: Vec<SocketAddr> = addrs.iter().copied().filter(SocketAddr::is_ipv4).collect();
+    // Interleave addresses per RFC 8305 §4
+    let interleaved = interleave_addrs(addrs);
+
+    // Separate into IPv6 and IPv4 (preserving interleaved order within each family)
+    let v6: Vec<SocketAddr> = interleaved.iter().copied().filter(SocketAddr::is_ipv6).collect();
+    let v4: Vec<SocketAddr> = interleaved.iter().copied().filter(SocketAddr::is_ipv4).collect();
 
     // If only one family, just try them in order
     if v6.is_empty() || v4.is_empty() {
-        return try_connect_addrs(addrs, connect_timeout, interface, local_port).await;
+        return try_connect_addrs(&interleaved, connect_timeout, interface, local_port).await;
     }
 
     // Both families present: race with head start for IPv6
@@ -3868,6 +3914,55 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[test]
+    fn interleave_addrs_v4_only() {
+        use std::net::{Ipv4Addr, SocketAddr};
+        let a1 = SocketAddr::new(Ipv4Addr::new(1, 1, 1, 1).into(), 80);
+        let a2 = SocketAddr::new(Ipv4Addr::new(8, 8, 8, 8).into(), 80);
+        let result = interleave_addrs(&[a1, a2]);
+        assert_eq!(result, vec![a1, a2]);
+    }
+
+    #[test]
+    fn interleave_addrs_v6_only() {
+        use std::net::{Ipv6Addr, SocketAddr};
+        let a1 = SocketAddr::new(Ipv6Addr::LOCALHOST.into(), 80);
+        let a2 = SocketAddr::new(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1).into(), 80);
+        let result = interleave_addrs(&[a1, a2]);
+        assert_eq!(result, vec![a1, a2]);
+    }
+
+    #[test]
+    fn interleave_addrs_mixed() {
+        use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+        let v6a = SocketAddr::new(Ipv6Addr::LOCALHOST.into(), 80);
+        let v6b = SocketAddr::new(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1).into(), 80);
+        let v4a = SocketAddr::new(Ipv4Addr::new(1, 1, 1, 1).into(), 80);
+        let v4b = SocketAddr::new(Ipv4Addr::new(8, 8, 8, 8).into(), 80);
+
+        // Input: v6, v6, v4, v4 → Output: v6, v4, v6, v4 (interleaved)
+        let result = interleave_addrs(&[v6a, v6b, v4a, v4b]);
+        assert_eq!(result, vec![v6a, v4a, v6b, v4b]);
+    }
+
+    #[test]
+    fn interleave_addrs_uneven() {
+        use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+        let v6a = SocketAddr::new(Ipv6Addr::LOCALHOST.into(), 80);
+        let v4a = SocketAddr::new(Ipv4Addr::new(1, 1, 1, 1).into(), 80);
+        let v4b = SocketAddr::new(Ipv4Addr::new(8, 8, 8, 8).into(), 80);
+
+        // 1 v6 + 2 v4 → v6, v4a, v4b
+        let result = interleave_addrs(&[v6a, v4a, v4b]);
+        assert_eq!(result, vec![v6a, v4a, v4b]);
+    }
+
+    #[test]
+    fn interleave_addrs_empty() {
+        let result = interleave_addrs(&[]);
+        assert!(result.is_empty());
+    }
+
     #[tokio::test]
     async fn try_connect_addrs_succeeds() {
         use tokio::net::TcpListener;
@@ -4267,6 +4362,20 @@ mod tests {
         easy.happy_eyeballs_timeout(Duration::from_millis(500));
         let cloned = easy.clone();
         assert_eq!(cloned.happy_eyeballs_timeout, Some(Duration::from_millis(500)));
+    }
+
+    #[test]
+    fn easy_max_pool_connections() {
+        let mut easy = Easy::new();
+        easy.max_pool_connections(10);
+        assert_eq!(easy.pool.max_total, 10);
+    }
+
+    #[test]
+    fn easy_max_pool_connections_zero_disables() {
+        let mut easy = Easy::new();
+        easy.max_pool_connections(0);
+        assert_eq!(easy.pool.ttl, Duration::ZERO);
     }
 
     #[test]

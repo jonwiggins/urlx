@@ -2124,7 +2124,8 @@ pub unsafe extern "C" fn curl_easy_setopt(
 
         // CURLOPT_MAXCONNECTS = 71
         71 => {
-            // Accepted for compat; connection pool limit managed internally
+            let max = value as usize;
+            h.easy.max_pool_connections(max);
             CURLcode::CURLE_OK
         }
 
