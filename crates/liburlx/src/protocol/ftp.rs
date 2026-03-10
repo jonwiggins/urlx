@@ -1174,13 +1174,18 @@ pub async fn download(
     url: &crate::url::Url,
     ssl_mode: FtpSslMode,
     tls_config: &crate::tls::TlsConfig,
+    resume_from: Option<u64>,
 ) -> Result<Response, Error> {
     let (host, port) = url.host_and_port()?;
     let path = url.path();
     let (user, pass) = url.credentials().unwrap_or(("anonymous", "urlx@"));
 
     let mut session = connect_session(&host, port, user, pass, ssl_mode, tls_config).await?;
-    let data = session.download(path).await?;
+    let data = if let Some(offset) = resume_from {
+        session.download_resume(path, offset).await?
+    } else {
+        session.download(path).await?
+    };
     let _ = session.quit().await;
 
     let mut headers = std::collections::HashMap::new();

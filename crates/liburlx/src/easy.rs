@@ -2311,11 +2311,22 @@ async fn do_single_request(
             } else {
                 ftp_ssl_mode
             };
+            // Extract resume offset from Range header (e.g., "bytes=42-" → 42)
+            let resume_offset = headers.iter().find_map(|(k, v)| {
+                if k.eq_ignore_ascii_case("range") {
+                    v.strip_prefix("bytes=")
+                        .and_then(|r| r.strip_suffix('-'))
+                        .and_then(|n| n.parse::<u64>().ok())
+                } else {
+                    None
+                }
+            });
             return if method == "PUT" {
                 let upload_data = body.unwrap_or(&[]);
                 crate::protocol::ftp::upload(url, upload_data, effective_ssl_mode, tls_config).await
             } else {
-                crate::protocol::ftp::download(url, effective_ssl_mode, tls_config).await
+                crate::protocol::ftp::download(url, effective_ssl_mode, tls_config, resume_offset)
+                    .await
             };
         }
         "smtp" | "smtps" => {
