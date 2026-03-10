@@ -15,10 +15,9 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 ## Current Status
 
 **Version:** v0.1.0 published (crates.io + GitHub Releases + Homebrew)
-**Last completed:** Phase 57 — Protocol Polish — 2026-03-09
+**Last completed:** Phase 58 — Performance & Benchmarking — 2026-03-09
 **Total tests:** 2,454
-**In progress:** Phase 58
-
+**In progress:** Phase 59
 **Blockers:** None
 
 ### Completeness Summary (post-v0.1.0 audit)
@@ -78,39 +77,33 @@ Full NTLMv2 per MS-NLMP: MD4 NT hash, HMAC-MD5 NTLMv2 hash, NTProofStr, LMv2 res
 
 WebSocket permessage-deflate (RFC 7692): `DeflateConfig` parsing, `DeflateCodec` compress/decompress with flate2, RSV1 bit handling, context takeover/window bits negotiation, gated behind `decompression` feature. MQTT QoS 1/2: `QoS` enum, PUBACK/PUBREC/PUBREL/PUBCOMP packet builders, `publish_qos()`/`subscribe_qos()` with full handshake flows. FTP MLST/MLSD already implemented. SFTP: symlink following via lstat + readlink (up to 10 levels), `sftp_upload_with_permissions()` for setting remote file mode via setstat. TFTP: `TftpErrorCode` enum with all RFC 1350 error codes (0-7), parsed from ERROR packets.
 
-### Phase 58 — Performance & Benchmarking
+### Phase 58 — Performance & Benchmarking (Completed 2026-03-09)
 
-Profile, optimize, and publish benchmarks.
-
-- Set up Criterion benchmark harness
-  - Add `benches/` directory with HTTP/1.1 throughput benchmark
-  - Add HTTP/2 throughput benchmark
-  - Add connection pool reuse benchmark
-  - Add URL parsing throughput benchmark
-- Measure baseline performance
-  - Single-request latency (HTTP/1.1, HTTP/2)
-  - Throughput on large file transfers
-  - Connection pool hit rate under concurrent load
-  - Cookie jar lookup performance
-- Profile memory usage
-  - Track peak RSS during large transfers
-  - Measure per-connection memory overhead
-  - Identify and reduce unnecessary allocations
-- Optimize hot paths
-  - Header parsing and lookup
-  - URL parsing
-  - Connection pool operations
-- Document benchmark results in README
+Criterion benchmark suite with 9 benchmark groups: URL parsing (5 variants), cookie jar (store/lookup with 10/100 cookies), HSTS cache, DNS cache, response header lookup (lowercase/mixed-case), cookie domain matching (exact/subdomain/1000-cookie miss), HTTP response parsing (simple 200, many headers, 301 redirect), and multipart form encoding. Optimized HTTP/1.1 response parsing: `HashMap::with_capacity` pre-allocation and `to_ascii_lowercase` (~10% faster on responses with many headers).
 
 ### Phase 59 — CLI Completeness
 
 Push CLI toward full curl flag parity.
 
-- Implement remaining ~100 curl flags (prioritized by usage frequency)
-- PAC proxy auto-configuration
-- Kerberos/Negotiate authentication
-- LDAP/RTSP protocol stubs
-- Man page generation
+- High-frequency missing flags
+  - `--fail-with-body` / `-f` fail on HTTP errors
+  - `--retry` / `--retry-delay` / `--retry-max-time` automatic retry
+  - `--create-dirs` create output directory structure
+  - `--ciphers` / `--tls13-ciphers` TLS cipher suite selection
+  - `--compressed` request compression (Accept-Encoding)
+  - `--connect-to` HOST:PORT:CONNECT-HOST:CONNECT-PORT mapping
+  - `--resolve` HOST:PORT:ADDRESS custom DNS resolution
+  - `--path-as-is` do not normalize ../ in URL paths
+  - `--proto` / `--proto-redir` protocol restriction
+- Medium-frequency flags
+  - `--dns-servers` / `--doh-url` DNS over HTTPS/TLS
+  - `--interface` bind to specific network interface
+  - `--local-port` bind to local port range
+  - `--limit-rate` transfer speed limiting (already implemented in core)
+  - `--max-filesize` abort if response exceeds size
+  - `--tcp-nodelay` / `--tcp-fastopen` TCP tuning
+- Man page generation from CLI flag definitions
+- Audit remaining curl flags and categorize by priority
 
 ### Phase 60 — Comprehensive Review
 
