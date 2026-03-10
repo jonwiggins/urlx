@@ -468,9 +468,9 @@ fn parse_headers(data: &[u8]) -> Result<(u16, HashMap<String, String>), Error> {
     let status =
         parsed.code.ok_or_else(|| Error::Http("response has no status code".to_string()))?;
 
-    let mut headers = HashMap::new();
+    let mut headers = HashMap::with_capacity(parsed.headers.len());
     for header in parsed.headers.iter() {
-        let name = header.name.to_lowercase();
+        let name = header.name.to_ascii_lowercase();
         let value = String::from_utf8_lossy(header.value).to_string();
         // For set-cookie, append with newline to preserve multiple values
         if name == "set-cookie" {
@@ -851,9 +851,9 @@ pub fn parse_response(data: &[u8], effective_url: &str, is_head: bool) -> Result
     let status =
         parsed.code.ok_or_else(|| Error::Http("response has no status code".to_string()))?;
 
-    let mut headers = HashMap::new();
+    let mut headers = HashMap::with_capacity(parsed.headers.len());
     for header in parsed.headers.iter() {
-        let name = header.name.to_lowercase();
+        let name = header.name.to_ascii_lowercase();
         let value = String::from_utf8_lossy(header.value).to_string();
         if name == "set-cookie" {
             let _entry = headers
