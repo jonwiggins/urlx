@@ -15,9 +15,9 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 ## Current Status
 
 **Version:** v0.1.0 published (crates.io + GitHub Releases + Homebrew)
-**Last completed:** Phase 60 — Comprehensive Review — 2026-03-10
-**Total tests:** 2,491
-**In progress:** Phase 61
+**Last completed:** Phase 61 — WS Dispatch & Protocol Auth — 2026-03-10
+**Total tests:** 2,495
+**In progress:** Phase 62
 **Blockers:** None
 
 ### Completeness Summary (post-v0.1.0 audit)
@@ -34,7 +34,7 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 | DNS | 85% | Cache, Happy Eyeballs, shuffle, custom servers, DoH, DoT, hickory-dns |
 | FTP | 90% | Full session API, FTPS, active mode, FtpMethod, resume via REST, MLST/MLSD |
 | SSH/SFTP/SCP | 72% | Download/upload, password + pubkey auth, known_hosts, SHA-256 fingerprint, symlink following, permission preservation |
-| WebSocket | 90% | RFC 6455, CloseCode, fragmentation, permessage-deflate (RFC 7692) |
+| WebSocket | 92% | RFC 6455, CloseCode, fragmentation, permessage-deflate (RFC 7692), ws:// wss:// dispatch |
 | Multi API | 75% | Connection limiting, share, pipelining, FFI event loop stubs |
 | FFI (libcurl C ABI) | ~65% | 145 CURLOPT, 45 CURLINFO, 32 CURLcode, 56 functions, blob certs, protocol restriction |
 | CLI | ~70% | ~180 flags, --help, --version, combined short flags, conditional requests, retry logic |
@@ -44,7 +44,6 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ### Known Issues
 
-- WebSocket (ws://, wss://) not dispatched from Easy API (needs high-level handler)
 - HTTP/3 untested (needs quinn test server)
 - SCRAM-SHA-256 implemented but not yet wired to SMTP/IMAP/POP3 (pending dispatch)
 - Some integration tests hang/timeout (pre-existing, not affecting lib tests)
@@ -91,21 +90,18 @@ Milestone review phase. Audit results:
 - LDAP, RTSP, Kerberos/Negotiate not implemented
 - PAC proxy auto-configuration not implemented
 
-### Phase 61 — HTTP/3 Testing & WS Dispatch
+### Phase 61 — WS Dispatch & Protocol Auth (Completed 2026-03-10)
 
-- Set up quinn-based test server for HTTP/3 integration tests
-- Wire ws:// and wss:// dispatch from Easy API
-- Fix WebSocket scheme handling in `do_single_request`
-- Add integration tests for WebSocket transfers
-- Wire SCRAM-SHA-256 to SMTP/IMAP/POP3 auth
+Wired ws:// and wss:// scheme dispatch in `do_single_request` via new `ws::connect()` function. The connect handler performs TCP connection (plain for ws://, TLS via `TlsConnector::new_no_alpn` for wss://), sends HTTP upgrade request with Sec-WebSocket-Key, validates Sec-WebSocket-Accept in response, returns Response with 101 status. Added `parse_upgrade_response()` helper. 4 new tests (parse_upgrade_response 101/403/invalid_accept, ws_connect_mock_server). HTTP/3 testing and SCRAM-SHA-256 wiring deferred to Phase 62.
 
 ### Phase 62 — FFI Parity Push
 
 - Create C test harness (compile and link C programs against liburlx-ffi)
-- Add 30+ missing CURLOPT options (prioritized by usage frequency)
+- Add 20+ missing CURLOPT options (prioritized by usage frequency)
 - Implement `curl_easy_pause()` with async channel signaling
 - Add missing CURLcode error variants
 - Add missing CURLINFO getters
+- Wire SCRAM-SHA-256 to SMTP AUTH (multi-step AUTHENTICATE exchange)
 
 ### Phase 63 — CLI Flag Parity
 

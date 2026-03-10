@@ -937,18 +937,7 @@ fn sha1_hash(data: &[u8]) -> [u8; 20] {
 /// Perform a WebSocket handshake and return the upgrade response.
 ///
 /// Connects to the server at the given URL (ws:// or wss://), sends an HTTP
-/// upgrade request, and returns a [`Response`] with the server's handshake reply.
-/// The response body is empty; the connection status is reported via the HTTP
-/// status code (101 = success).
-///
-/// # Errors
-///
-/// Returns an error if the connection fails, TLS negotiation fails, or the
-/// server rejects the upgrade.
-/// Perform a WebSocket handshake and return the upgrade response.
-///
-/// Connects to the server at the given URL (ws:// or wss://), sends an HTTP
-/// upgrade request, and returns a [`Response`] with the server's handshake reply.
+/// upgrade request, and returns a response with the server's handshake reply.
 /// The response body is empty; the connection status is reported via the HTTP
 /// status code (101 = success).
 ///
