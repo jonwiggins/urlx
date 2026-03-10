@@ -15,9 +15,9 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 ## Current Status
 
 **Version:** v0.1.0 published (crates.io + GitHub Releases + Homebrew)
-**Last completed:** Phase 61 — WS Dispatch & Protocol Auth — 2026-03-10
-**Total tests:** 2,495
-**In progress:** Phase 62
+**Last completed:** Phase 62 — FFI Parity Push — 2026-03-10
+**Total tests:** 2,515
+**In progress:** Phase 63
 **Blockers:** None
 
 ### Completeness Summary (post-v0.1.0 audit)
@@ -36,11 +36,11 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 | SSH/SFTP/SCP | 72% | Download/upload, password + pubkey auth, known_hosts, SHA-256 fingerprint, symlink following, permission preservation |
 | WebSocket | 92% | RFC 6455, CloseCode, fragmentation, permessage-deflate (RFC 7692), ws:// wss:// dispatch |
 | Multi API | 75% | Connection limiting, share, pipelining, FFI event loop stubs |
-| FFI (libcurl C ABI) | ~65% | 145 CURLOPT, 45 CURLINFO, 32 CURLcode, 56 functions, blob certs, protocol restriction |
+| FFI (libcurl C ABI) | ~70% | 119 CURLOPT, 47 CURLINFO, 42 CURLcode, 56 functions, C test harness |
 | CLI | ~70% | ~180 flags, --help, --version, combined short flags, conditional requests, retry logic |
 | Connection | 80% | Pool, TCP_NODELAY, keepalive, Unix sockets, interface/port binding |
 | Transfer control | 80% | Rate limiting enforced (max recv/send speed, low speed timeout) |
-| Overall | ~72% | ~94% for basic HTTP/HTTPS use cases |
+| Overall | ~73% | ~94% for basic HTTP/HTTPS use cases |
 
 ### Known Issues
 
@@ -57,9 +57,9 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 **What has been built:** A functional curl replacement covering HTTP/1.0-1.1, HTTP/2 (with ALPN, multiplexing, connection pooling, server push), HTTP/3 (QUIC via quinn), TLS (rustls + native-tls), FTP/FTPS (full session, active mode, MLST/MLSD, resume), SSH/SFTP/SCP, WebSocket (RFC 6455 + permessage-deflate), MQTT (QoS 0/1/2), SMTP, IMAP, POP3, DICT, TFTP, file://, DNS (system + hickory + DoH + DoT + Happy Eyeballs), cookies (Netscape format, domain-indexed, PSL, SameSite), HSTS (persistence), proxies (HTTP/SOCKS4/SOCKS4a/SOCKS5/HTTPS tunnel), authentication (Basic, Digest, Bearer, AWS SigV4, NTLMv2, SCRAM-SHA-256), connection pooling, rate limiting, multipart form upload, decompression (gzip, deflate, br, zstd), and a C ABI compatibility layer (liburlx-ffi).
 
 **Key stats (Phase 60 audit):**
-- Tests: 2,491
+- Tests: 2,515
 - CLI flags: ~199 long + 36 short (curl has ~250 long flags)
-- FFI: 145 unique CURLOPT, 45 CURLINFO, 32 CURLcode, 56 exported functions
+- FFI: 119 unique CURLOPT, 47 CURLINFO, 42 CURLcode, 56 exported functions, C test harness
 - Benchmark suite: 9 groups (URL parsing, cookies, HSTS, DNS, headers, HTTP parsing, multipart)
 - Feature flags: 20+ (http, http2, http3, ftp, ssh, ws, mqtt, smtp, imap, pop3, etc.)
 - 4 fuzz harnesses (URL, HTTP, cookie, HSTS)
@@ -71,10 +71,11 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 Milestone review phase. Audit results:
 
 **FFI Coverage:**
-- 145 unique CURLOPT options handled (curl has ~300)
-- 45 unique CURLINFO options (curl has ~60)
-- 32 CURLcode error codes (curl has ~99)
+- 119 unique CURLOPT options in enum (curl has ~300)
+- 47 unique CURLINFO options (curl has ~60)
+- 42 CURLcode error codes (curl has ~99)
 - 56 no_mangle exported functions (curl has ~80)
+- C test harness: 11 tests
 
 **CLI Coverage:**
 - 199 unique long flags + 36 short flags
@@ -94,14 +95,9 @@ Milestone review phase. Audit results:
 
 Wired ws:// and wss:// scheme dispatch in `do_single_request` via new `ws::connect()` function. The connect handler performs TCP connection (plain for ws://, TLS via `TlsConnector::new_no_alpn` for wss://), sends HTTP upgrade request with Sec-WebSocket-Key, validates Sec-WebSocket-Accept in response, returns Response with 101 status. Added `parse_upgrade_response()` helper. 4 new tests (parse_upgrade_response 101/403/invalid_accept, ws_connect_mock_server). HTTP/3 testing and SCRAM-SHA-256 wiring deferred to Phase 62.
 
-### Phase 62 — FFI Parity Push
+### Phase 62 — FFI Parity Push (Completed 2026-03-10)
 
-- Create C test harness (compile and link C programs against liburlx-ffi)
-- Add 20+ missing CURLOPT options (prioritized by usage frequency)
-- Implement `curl_easy_pause()` with async channel signaling
-- Add missing CURLcode error variants
-- Add missing CURLINFO getters
-- Wire SCRAM-SHA-256 to SMTP AUTH (multi-step AUTHENTICATE exchange)
+Added 17 new CURLOPT options (PORT, INFILESIZE, RESUME_FROM, PROXYPORT, FILETIME, BUFFERSIZE, PROXYTYPE, IPRESOLVE, FTP_FILEMETHOD, SOCKS5_AUTH, POSTFIELDSIZE_LARGE, CAPATH, MAXCONNECTS, PIPEWAIT, STREAM_WEIGHT, TCP_FASTOPEN, HTTP09_ALLOWED), 4 CURLINFO getters (REQUEST_SIZE, HTTP_CONNECTCODE, HTTPAUTH_AVAIL, PROXYAUTH_AVAIL), 10 CURLcode error variants. Created C test harness (11 tests covering init/cleanup, setopt, duphandle, reset, strerror, version, pause, slist, URL API, getinfo). 20 new Rust tests. SCRAM-SHA-256 SMTP wiring deferred to Phase 64.
 
 ### Phase 63 — CLI Flag Parity
 
@@ -112,6 +108,7 @@ Wired ws:// and wss:// scheme dispatch in `do_single_request` via new `ws::conne
 
 ### Phase 64 — Error Handling & Diagnostics
 
+- Wire SCRAM-SHA-256 to SMTP AUTH (multi-step AUTHENTICATE exchange)
 - Improve error messages to match curl's format
 - Add --trace/--trace-ascii output formatting parity
 - Verbose output parity with curl's connection info
