@@ -15,9 +15,9 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 ## Current Status
 
 **Version:** v0.1.0 published (crates.io + GitHub Releases + Homebrew)
-**Last completed:** Phase 58 — Performance & Benchmarking — 2026-03-09
-**Total tests:** 2,454
-**In progress:** Phase 59
+**Last completed:** Phase 59 — CLI Completeness — 2026-03-10
+**Total tests:** 2,491
+**In progress:** Phase 60
 **Blockers:** None
 
 ### Completeness Summary (post-v0.1.0 audit)
@@ -37,10 +37,10 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 | WebSocket | 90% | RFC 6455, CloseCode, fragmentation, permessage-deflate (RFC 7692) |
 | Multi API | 75% | Connection limiting, share, pipelining, FFI event loop stubs |
 | FFI (libcurl C ABI) | ~65% | 130+ CURLOPT, 43 CURLINFO, 32 CURLcode, 56 functions, blob certs, protocol restriction |
-| CLI | ~65% | ~150 flags, --help, --version, combined short flags (-sSfL) |
+| CLI | ~70% | ~180 flags, --help, --version, combined short flags, conditional requests, retry logic |
 | Connection | 80% | Pool, TCP_NODELAY, keepalive, Unix sockets, interface/port binding |
 | Transfer control | 80% | Rate limiting enforced (max recv/send speed, low speed timeout) |
-| Overall | ~70% | ~93% for basic HTTP/HTTPS use cases |
+| Overall | ~72% | ~94% for basic HTTP/HTTPS use cases |
 
 ### Known Issues
 
@@ -81,38 +81,22 @@ WebSocket permessage-deflate (RFC 7692): `DeflateConfig` parsing, `DeflateCodec`
 
 Criterion benchmark suite with 9 benchmark groups: URL parsing (5 variants), cookie jar (store/lookup with 10/100 cookies), HSTS cache, DNS cache, response header lookup (lowercase/mixed-case), cookie domain matching (exact/subdomain/1000-cookie miss), HTTP response parsing (simple 200, many headers, 301 redirect), and multipart form encoding. Optimized HTTP/1.1 response parsing: `HashMap::with_capacity` pre-allocation and `to_ascii_lowercase` (~10% faster on responses with many headers).
 
-### Phase 59 — CLI Completeness
+### Phase 59 — CLI Completeness (Completed 2026-03-10)
 
-Push CLI toward full curl flag parity.
-
-- High-frequency missing flags
-  - `--fail-with-body` / `-f` fail on HTTP errors
-  - `--retry` / `--retry-delay` / `--retry-max-time` automatic retry
-  - `--create-dirs` create output directory structure
-  - `--ciphers` / `--tls13-ciphers` TLS cipher suite selection
-  - `--compressed` request compression (Accept-Encoding)
-  - `--connect-to` HOST:PORT:CONNECT-HOST:CONNECT-PORT mapping
-  - `--resolve` HOST:PORT:ADDRESS custom DNS resolution
-  - `--path-as-is` do not normalize ../ in URL paths
-  - `--proto` / `--proto-redir` protocol restriction
-- Medium-frequency flags
-  - `--dns-servers` / `--doh-url` DNS over HTTPS/TLS
-  - `--interface` bind to specific network interface
-  - `--local-port` bind to local port range
-  - `--limit-rate` transfer speed limiting (already implemented in core)
-  - `--max-filesize` abort if response exceeds size
-  - `--tcp-nodelay` / `--tcp-fastopen` TCP tuning
-- Man page generation from CLI flag definitions
-- Audit remaining curl flags and categorize by priority
+Added `--fail-with-body`, `--retry-all-errors`, `--no-progress-meter`, `--location-trusted`, `--time-cond`/`-z` (conditional requests with If-Modified-Since/If-Unmodified-Since), `--capath`, `format_http_date()`. Added `--basic`, `--anyauth`, `--proxy-basic`, `--proxy-anyauth`, `--http2-prior-knowledge` (with new `Http2PriorKnowledge` variant), `--ftp-skip-pasv-ip`, `--ftp-account`, `--preproxy`, `--data-ascii`, `--keepalive-time`. Added no-op compat flags: `--xattr`, `--disable`, `--metalink`, `--crlfile`, `--proxy-crlfile`, `--proxy-pinnedpubkey`, `--cert-type`, `--key-type`, `--pass`. Wired `CURL_HTTP_VERSION_2TLS` (4) and `CURL_HTTP_VERSION_2_PRIOR_KNOWLEDGE` (5) in FFI. ~180 CLI flags total. Man page generation deferred.
 
 ### Phase 60 — Comprehensive Review
 
-Milestone review phase (every 10th phase).
+Milestone review phase (every 10th phase). Compact phases 52-59 into Phase 0 summary.
 
 - Audit full codebase against curl for completeness
+  - Count CURLOPT, CURLINFO, CURLcode coverage in FFI
+  - Count CLI flags vs curl flags
+  - List missing protocol features
 - Differential testing against curl with real-world URLs
-- FFI coverage measurement
-- Performance profiling
+  - Compare output of `urlx` vs `curl` for top 20 common use cases
+  - Identify and fix discrepancies
+- Compact completed phases (52-59) into Phase 0 cumulative summary
 - Plan phases 61-70
 
 ---
