@@ -57,6 +57,10 @@ pub enum Error {
     /// An SSH protocol error occurred.
     #[error("SSH error: {0}")]
     Ssh(String),
+
+    /// An authentication error occurred.
+    #[error("authentication error: {0}")]
+    Auth(String),
 }
 
 #[cfg(test)]
@@ -99,6 +103,12 @@ mod tests {
     fn error_display_ssh() {
         let err = Error::Ssh("authentication failed".to_string());
         assert_eq!(err.to_string(), "SSH error: authentication failed");
+    }
+
+    #[test]
+    fn error_display_auth() {
+        let err = Error::Auth("SCRAM nonce mismatch".to_string());
+        assert_eq!(err.to_string(), "authentication error: SCRAM nonce mismatch");
     }
 
     #[test]

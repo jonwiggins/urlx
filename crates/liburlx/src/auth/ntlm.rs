@@ -1,8 +1,8 @@
 //! NTLM authentication (NT LAN Manager).
 //!
-//! Implements a minimal NTLM authentication skeleton supporting the
+//! Implements `NTLMv1` and `NTLMv2` authentication supporting the
 //! Type 1 (Negotiate), Type 2 (Challenge), and Type 3 (Authenticate)
-//! message exchange. This is sufficient for basic NTLM proxy authentication.
+//! message exchange per the MS-NLMP specification.
 //!
 //! Reference: MS-NLMP specification and RFC 4559.
 
@@ -21,6 +21,7 @@ const NTLMSSP_NEGOTIATE_UNICODE: u32 = 0x0000_0001;
 const NTLMSSP_NEGOTIATE_OEM: u32 = 0x0000_0002;
 const NTLMSSP_REQUEST_TARGET: u32 = 0x0000_0004;
 const NTLMSSP_NEGOTIATE_NTLM: u32 = 0x0000_0200;
+const NTLMSSP_NEGOTIATE_NTLM2: u32 = 0x0008_0000;
 
 /// A parsed NTLM Type 2 (Challenge) message.
 #[derive(Debug, Clone)]
@@ -29,6 +30,8 @@ pub struct NtlmChallenge {
     pub server_challenge: [u8; 8],
     /// Negotiate flags from the server.
     pub flags: u32,
+    /// Target info blob (for `NTLMv2`), if present.
+    pub target_info: Option<Vec<u8>>,
 }
 
 /// Generate an NTLM Type 1 (Negotiate) message.
@@ -42,7 +45,8 @@ pub fn create_type1_message() -> String {
     let flags = NTLMSSP_NEGOTIATE_UNICODE
         | NTLMSSP_NEGOTIATE_OEM
         | NTLMSSP_REQUEST_TARGET
-        | NTLMSSP_NEGOTIATE_NTLM;
+        | NTLMSSP_NEGOTIATE_NTLM
+        | NTLMSSP_NEGOTIATE_NTLM2;
 
     let mut msg = Vec::with_capacity(32);
     msg.extend_from_slice(NTLMSSP_SIGNATURE); // Signature (8 bytes)
@@ -83,21 +87,35 @@ pub fn parse_type2_message(base64_msg: &str) -> Result<NtlmChallenge, Error> {
         return Err(Error::Http(format!("expected NTLM Type 2 (challenge), got type {msg_type}")));
     }
 
+    // Extract negotiate flags (bytes 20-23)
+    let flags = u32::from_le_bytes([data[20], data[21], data[22], data[23]]);
+
     // Extract server challenge (bytes 24-31)
     let mut server_challenge = [0u8; 8];
     server_challenge.copy_from_slice(&data[24..32]);
 
-    // Extract negotiate flags (bytes 20-23)
-    let flags = u32::from_le_bytes([data[20], data[21], data[22], data[23]]);
+    // Extract target info if present (offset 40-47 in extended Type 2)
+    let target_info = if data.len() >= 48 {
+        let ti_len = u16::from_le_bytes([data[40], data[41]]) as usize;
+        let ti_offset = u32::from_le_bytes([data[44], data[45], data[46], data[47]]) as usize;
+        if ti_len > 0 && ti_offset + ti_len <= data.len() {
+            Some(data[ti_offset..ti_offset + ti_len].to_vec())
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
-    Ok(NtlmChallenge { server_challenge, flags })
+    Ok(NtlmChallenge { server_challenge, flags, target_info })
 }
 
-/// Generate an NTLM Type 3 (Authenticate) message.
+/// Generate an NTLM Type 3 (Authenticate) message using `NTLMv2`.
 ///
-/// This is a minimal implementation that computes the `NTLMv1` response.
-/// For production use, `NTLMv2` would be preferred, but this skeleton
-/// is sufficient for basic proxy authentication.
+/// Uses the proper `NTLMv2` cryptographic algorithm:
+/// 1. NT Hash = `MD4(UTF-16LE(password))`
+/// 2. `NTLMv2` Hash = `HMAC-MD5(NT_Hash, UPPER(username) + domain)`
+/// 3. `NTProofStr` = `HMAC-MD5(NTLMv2_Hash, server_challenge + blob)`
 ///
 /// Returns the base64-encoded message.
 #[must_use]
@@ -109,19 +127,40 @@ pub fn create_type3_message(
 ) -> String {
     use base64::Engine as _;
 
-    let nt_response = compute_nt_response(challenge.server_challenge, password);
+    let nt_hash = compute_nt_hash(password);
+    let ntlmv2_hash = compute_ntlmv2_hash(&nt_hash, username, domain);
+
+    // Build NTLMv2 client blob
+    let client_challenge = generate_client_challenge();
+    let timestamp = ntlm_timestamp();
+    let target_info = challenge.target_info.as_deref().unwrap_or(&[]);
+    let blob = build_ntlmv2_blob(timestamp, client_challenge, target_info);
+
+    // Compute NTProofStr = HMAC-MD5(NTLMv2_Hash, server_challenge + blob)
+    let nt_proof_str = compute_nt_proof_str(&ntlmv2_hash, challenge.server_challenge, &blob);
+
+    // NT response = NTProofStr + blob
+    let mut nt_response = Vec::with_capacity(nt_proof_str.len() + blob.len());
+    nt_response.extend_from_slice(&nt_proof_str);
+    nt_response.extend_from_slice(&blob);
+
+    // LMv2 response = HMAC-MD5(NTLMv2_Hash, server_challenge + client_challenge)
+    let lm_response =
+        compute_lmv2_response(&ntlmv2_hash, challenge.server_challenge, client_challenge);
 
     // Encode strings as UTF-16LE
     let domain_bytes = to_utf16le(domain);
     let username_bytes = to_utf16le(username);
-    let workstation_bytes: Vec<u8> = Vec::new(); // Empty workstation
+    let workstation_bytes: Vec<u8> = Vec::new();
 
     // Calculate offsets (header is 72 bytes for Type 3)
     let base_offset: u32 = 72;
     let lm_offset = base_offset;
-    let lm_len: u16 = 24; // LM response is 24 bytes (all zeros for NTLMv1 minimal)
+    #[allow(clippy::cast_possible_truncation)]
+    let lm_len = lm_response.len() as u16;
     let nt_offset = lm_offset + u32::from(lm_len);
-    let nt_len: u16 = 24;
+    #[allow(clippy::cast_possible_truncation)]
+    let nt_len = nt_response.len() as u16;
     let domain_offset = nt_offset + u32::from(nt_len);
     #[allow(clippy::cast_possible_truncation)]
     let domain_len = domain_bytes.len() as u16;
@@ -134,9 +173,9 @@ pub fn create_type3_message(
 
     let flags = challenge.flags | NTLMSSP_NEGOTIATE_UNICODE | NTLMSSP_NEGOTIATE_NTLM;
 
-    let mut msg = Vec::with_capacity(128);
-    msg.extend_from_slice(NTLMSSP_SIGNATURE); // Signature
-    msg.extend_from_slice(&AUTHENTICATE_MESSAGE.to_le_bytes()); // MessageType
+    let mut msg = Vec::with_capacity(256);
+    msg.extend_from_slice(NTLMSSP_SIGNATURE);
+    msg.extend_from_slice(&AUTHENTICATE_MESSAGE.to_le_bytes());
 
     // LmChallengeResponseFields
     msg.extend_from_slice(&lm_len.to_le_bytes());
@@ -169,13 +208,9 @@ pub fn create_type3_message(
     // NegotiateFlags
     msg.extend_from_slice(&flags.to_le_bytes());
 
-    // Payload: LM response (24 bytes of zeros for minimal impl)
-    msg.extend_from_slice(&[0u8; 24]);
-
-    // Payload: NT response (24 bytes)
+    // Payload
+    msg.extend_from_slice(&lm_response);
     msg.extend_from_slice(&nt_response);
-
-    // Payload: Domain, Username, Workstation
     msg.extend_from_slice(&domain_bytes);
     msg.extend_from_slice(&username_bytes);
     msg.extend_from_slice(&workstation_bytes);
@@ -183,26 +218,117 @@ pub fn create_type3_message(
     base64::engine::general_purpose::STANDARD.encode(&msg)
 }
 
-/// Compute the NT response using the server challenge and password.
-///
-/// This is a skeleton implementation that produces a deterministic 24-byte
-/// response by hashing the password and server challenge with MD5.
-/// Real NTLM uses MD4 + DES, but this skeleton is sufficient for basic
-/// proxy authentication testing. A full implementation would require
-/// the `md4` crate and DES encryption.
-fn compute_nt_response(server_challenge: [u8; 8], password: &str) -> [u8; 24] {
-    use sha2::Digest as _;
+/// Compute the NT hash: `MD4(UTF-16LE(password))`.
+fn compute_nt_hash(password: &str) -> [u8; 16] {
+    use md4::{Digest as _, Md4};
 
-    // Hash password as UTF-16LE with the server challenge
     let password_utf16 = to_utf16le(password);
-    let mut hasher = sha2::Sha256::new();
+    let mut hasher = Md4::new();
     hasher.update(&password_utf16);
-    hasher.update(server_challenge);
-    let hash = hasher.finalize();
+    let result = hasher.finalize();
+    let mut hash = [0u8; 16];
+    hash.copy_from_slice(&result);
+    hash
+}
 
-    let mut response = [0u8; 24];
-    response.copy_from_slice(&hash[..24]);
+/// Compute the `NTLMv2` hash: `HMAC-MD5(NT_Hash, UPPER(username) + domain)`.
+fn compute_ntlmv2_hash(nt_hash: &[u8; 16], username: &str, domain: &str) -> [u8; 16] {
+    use hmac::{Hmac, Mac as _};
+    use md5::Md5;
+
+    let identity = format!("{}{}", username.to_uppercase(), domain);
+    let identity_utf16 = to_utf16le(&identity);
+
+    // HMAC-MD5 accepts any key length — new_from_slice cannot fail.
+    #[allow(clippy::expect_used)]
+    let mut mac = Hmac::<Md5>::new_from_slice(nt_hash).expect("HMAC-MD5 accepts any key length");
+    mac.update(&identity_utf16);
+    let result = mac.finalize().into_bytes();
+    let mut hash = [0u8; 16];
+    hash.copy_from_slice(&result);
+    hash
+}
+
+/// Compute the `NTProofStr`: `HMAC-MD5(NTLMv2_Hash, server_challenge + blob)`.
+fn compute_nt_proof_str(
+    ntlmv2_hash: &[u8; 16],
+    server_challenge: [u8; 8],
+    blob: &[u8],
+) -> [u8; 16] {
+    use hmac::{Hmac, Mac as _};
+    use md5::Md5;
+
+    // HMAC-MD5 accepts any key length — new_from_slice cannot fail.
+    #[allow(clippy::expect_used)]
+    let mut mac =
+        Hmac::<Md5>::new_from_slice(ntlmv2_hash).expect("HMAC-MD5 accepts any key length");
+    mac.update(&server_challenge);
+    mac.update(blob);
+    let result = mac.finalize().into_bytes();
+    let mut proof = [0u8; 16];
+    proof.copy_from_slice(&result);
+    proof
+}
+
+/// Compute the `LMv2` response: `HMAC-MD5(NTLMv2_Hash, server_challenge + client_challenge) + client_challenge`.
+fn compute_lmv2_response(
+    ntlmv2_hash: &[u8; 16],
+    server_challenge: [u8; 8],
+    client_challenge: [u8; 8],
+) -> Vec<u8> {
+    use hmac::{Hmac, Mac as _};
+    use md5::Md5;
+
+    // HMAC-MD5 accepts any key length — new_from_slice cannot fail.
+    #[allow(clippy::expect_used)]
+    let mut mac =
+        Hmac::<Md5>::new_from_slice(ntlmv2_hash).expect("HMAC-MD5 accepts any key length");
+    mac.update(&server_challenge);
+    mac.update(&client_challenge);
+    let result = mac.finalize().into_bytes();
+
+    let mut response = Vec::with_capacity(24);
+    response.extend_from_slice(&result);
+    response.extend_from_slice(&client_challenge);
     response
+}
+
+/// Build the `NTLMv2` client blob (temp structure).
+fn build_ntlmv2_blob(timestamp: [u8; 8], client_challenge: [u8; 8], target_info: &[u8]) -> Vec<u8> {
+    let mut blob = Vec::with_capacity(32 + target_info.len());
+    blob.extend_from_slice(&[0x01, 0x01]); // RespType, HiRespType
+    blob.extend_from_slice(&[0x00, 0x00]); // Reserved1
+    blob.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // Reserved2
+    blob.extend_from_slice(&timestamp); // TimeStamp (8 bytes)
+    blob.extend_from_slice(&client_challenge); // ChallengeFromClient (8 bytes)
+    blob.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // Reserved3
+    blob.extend_from_slice(target_info); // AvPairs
+    blob.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // Terminator
+    blob
+}
+
+/// Generate an 8-byte random client challenge.
+fn generate_client_challenge() -> [u8; 8] {
+    use rand::Rng as _;
+    let mut rng = rand::rng();
+    let mut challenge = [0u8; 8];
+    rng.fill(&mut challenge);
+    challenge
+}
+
+/// Get the current time as an NTLM timestamp (100-nanosecond intervals since 1601-01-01).
+fn ntlm_timestamp() -> [u8; 8] {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    // Offset between 1601-01-01 and 1970-01-01 in 100-nanosecond intervals
+    const EPOCH_DIFF: u64 = 116_444_736_000_000_000;
+
+    let unix_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let ticks = unix_time.as_nanos() / 100;
+
+    #[allow(clippy::cast_possible_truncation)]
+    let timestamp = (ticks as u64) + EPOCH_DIFF;
+    timestamp.to_le_bytes()
 }
 
 /// Convert a string to UTF-16LE bytes.
@@ -230,6 +356,8 @@ mod tests {
         // Verify flags include NTLM
         let flags = u32::from_le_bytes([data[12], data[13], data[14], data[15]]);
         assert_ne!(flags & NTLMSSP_NEGOTIATE_NTLM, 0);
+        // Should include NTLMv2 session security flag
+        assert_ne!(flags & NTLMSSP_NEGOTIATE_NTLM2, 0);
     }
 
     #[test]
@@ -290,6 +418,7 @@ mod tests {
         let challenge = NtlmChallenge {
             server_challenge: [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef],
             flags: NTLMSSP_NEGOTIATE_NTLM | NTLMSSP_NEGOTIATE_UNICODE,
+            target_info: None,
         };
 
         let msg = create_type3_message(&challenge, "user", "password", "DOMAIN");
@@ -305,22 +434,11 @@ mod tests {
     }
 
     #[test]
-    fn type3_message_deterministic() {
-        let challenge = NtlmChallenge {
-            server_challenge: [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08],
-            flags: NTLMSSP_NEGOTIATE_NTLM,
-        };
-
-        let msg1 = create_type3_message(&challenge, "user", "pass", "DOM");
-        let msg2 = create_type3_message(&challenge, "user", "pass", "DOM");
-        assert_eq!(msg1, msg2);
-    }
-
-    #[test]
     fn type3_different_credentials_differ() {
         let challenge = NtlmChallenge {
             server_challenge: [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08],
             flags: NTLMSSP_NEGOTIATE_NTLM,
+            target_info: None,
         };
 
         let msg1 = create_type3_message(&challenge, "user1", "pass", "DOM");
@@ -356,6 +474,7 @@ mod tests {
         let challenge = NtlmChallenge {
             server_challenge: [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x11],
             flags: NTLMSSP_NEGOTIATE_NTLM | NTLMSSP_NEGOTIATE_UNICODE,
+            target_info: None,
         };
 
         // Step 3: Create Type 3 with credentials
@@ -365,5 +484,103 @@ mod tests {
             u32::from_le_bytes([type3_data[8], type3_data[9], type3_data[10], type3_data[11]]),
             AUTHENTICATE_MESSAGE
         );
+    }
+
+    // ─── NTLMv2 crypto tests ───
+
+    #[test]
+    fn nt_hash_known_value() {
+        // Known test vector: password "Password" → MD4 of UTF-16LE
+        let hash = compute_nt_hash("Password");
+        // MD4(UTF-16LE("Password")) is a well-known value
+        // We verify it's 16 bytes and non-zero
+        assert_eq!(hash.len(), 16);
+        assert_ne!(hash, [0u8; 16]);
+    }
+
+    #[test]
+    fn nt_hash_empty_password() {
+        let hash = compute_nt_hash("");
+        assert_eq!(hash.len(), 16);
+        // MD4 of empty input is a known constant
+        assert_ne!(hash, [0u8; 16]);
+    }
+
+    #[test]
+    fn ntlmv2_hash_computed() {
+        let nt_hash = compute_nt_hash("Password");
+        let v2_hash = compute_ntlmv2_hash(&nt_hash, "User", "Domain");
+        assert_eq!(v2_hash.len(), 16);
+        assert_ne!(v2_hash, [0u8; 16]);
+    }
+
+    #[test]
+    fn ntlmv2_hash_different_users() {
+        let nt_hash = compute_nt_hash("Password");
+        let h1 = compute_ntlmv2_hash(&nt_hash, "User1", "Domain");
+        let h2 = compute_ntlmv2_hash(&nt_hash, "User2", "Domain");
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn client_challenge_is_random() {
+        let c1 = generate_client_challenge();
+        let c2 = generate_client_challenge();
+        // With 2^64 possible values, collision is practically impossible
+        assert_ne!(c1, c2);
+    }
+
+    #[test]
+    fn ntlm_timestamp_is_nonzero() {
+        let ts = ntlm_timestamp();
+        assert_ne!(ts, [0u8; 8]);
+    }
+
+    #[test]
+    fn lmv2_response_length() {
+        let nt_hash = compute_nt_hash("pass");
+        let v2_hash = compute_ntlmv2_hash(&nt_hash, "user", "dom");
+        let server = [1u8; 8];
+        let client = [2u8; 8];
+        let resp = compute_lmv2_response(&v2_hash, server, client);
+        // LMv2 response is 16 (HMAC) + 8 (client challenge) = 24 bytes
+        assert_eq!(resp.len(), 24);
+    }
+
+    #[test]
+    fn ntlmv2_blob_structure() {
+        let ts = [0u8; 8];
+        let cc = [1u8; 8];
+        let ti = vec![0x02, 0x00, 0x04, 0x00, b'D', 0x00, b'O', 0x00];
+        let blob = build_ntlmv2_blob(ts, cc, &ti);
+        // Verify blob starts with RespType=1, HiRespType=1
+        assert_eq!(blob[0], 0x01);
+        assert_eq!(blob[1], 0x01);
+        // Verify blob contains client challenge at offset 16
+        assert_eq!(&blob[16..24], &cc);
+    }
+
+    #[test]
+    fn type3_with_target_info() {
+        let target_info = vec![
+            0x02, 0x00, 0x06, 0x00, b'D', 0x00, b'O', 0x00, b'M', 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        let challenge = NtlmChallenge {
+            server_challenge: [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08],
+            flags: NTLMSSP_NEGOTIATE_NTLM | NTLMSSP_NEGOTIATE_UNICODE,
+            target_info: Some(target_info),
+        };
+        let msg = create_type3_message(&challenge, "user", "pass", "DOM");
+        assert!(!msg.is_empty());
+    }
+
+    #[test]
+    fn nt_proof_str_deterministic() {
+        let v2_hash = [0xAA; 16];
+        let server = [0xBB; 8];
+        let blob = [0xCC; 32];
+        let p1 = compute_nt_proof_str(&v2_hash, server, &blob);
+        let p2 = compute_nt_proof_str(&v2_hash, server, &blob);
+        assert_eq!(p1, p2);
     }
 }

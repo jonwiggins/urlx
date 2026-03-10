@@ -40,6 +40,8 @@ tokio = { workspace = true, features = ["net", "io-util", "rt", "time", "sync", 
 base64 = "0.22"
 h2 = { version = "0.4", optional = true }
 md-5 = "0.10"
+md4 = "0.10"
+hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
 rand = "0.9"

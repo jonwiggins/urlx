@@ -1,10 +1,11 @@
 //! HTTP authentication mechanisms.
 //!
-//! Supports Basic, Bearer, Digest (RFC 7616), NTLM, and AWS `SigV4` authentication.
+//! Supports Basic, Bearer, Digest (RFC 7616), NTLM, SCRAM-SHA-256, and AWS `SigV4` authentication.
 
 pub mod aws_sigv4;
 pub mod digest;
 pub mod ntlm;
+pub mod scram;
 
 /// The HTTP authentication method to use.
 #[derive(Debug, Clone, PartialEq, Eq)]
