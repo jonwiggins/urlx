@@ -15,9 +15,9 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 ## Current Status
 
 **Version:** v0.1.0 published (crates.io + GitHub Releases + Homebrew)
-**Last completed:** Phase 63 — CLI Flag Parity — 2026-03-10
-**Total tests:** 2,526
-**In progress:** Phase 64
+**Last completed:** Phase 64 — Error Handling & Diagnostics — 2026-03-10
+**Total tests:** 2,533
+**In progress:** Phase 65
 **Blockers:** None
 
 ### Completeness Summary (post-v0.1.0 audit)
@@ -103,13 +103,9 @@ Added 17 new CURLOPT options (PORT, INFILESIZE, RESUME_FROM, PROXYPORT, FILETIME
 
 Added ~40 curl flags: -4/--ipv4, -6/--ipv6, -j/--junk-session-cookies, -l/--list-only, -Q/--quote, --http3-only, --oauth2-bearer, --pubkey, --tcp-fastopen, --no-clobber, --suppress-connect-headers, --http0.9, --trace-ids, --disallow-username-in-url, --curves, --engine, --dns-interface, and 25+ more as no-ops. CLI now at 246 long + 40 short flags (~98% of curl's ~250 long flags). Man page generation and config file improvements deferred.
 
-### Phase 64 — Error Handling & Diagnostics
+### Phase 64 — Error Handling & Diagnostics (Completed 2026-03-10)
 
-- Wire SCRAM-SHA-256 to SMTP AUTH (multi-step AUTHENTICATE exchange)
-- Improve error messages to match curl's format
-- Add --trace/--trace-ascii output formatting parity
-- Verbose output parity with curl's connection info
-- Better error codes (map to CURLcode values)
+Added curl-style verbose output: `* Trying <addr>...` and `* Connected to <host> (<ip>) port <port>`. Improved error-to-exit-code mapping with codes for unsupported protocol (1), partial file (18), upload failed (25), and send error (55). Added 7 tests for exit code mapping. SCRAM-SHA-256 SMTP wiring and trace output parity deferred.
 
 ### Phase 65 — Connection & Transfer Polish
 
