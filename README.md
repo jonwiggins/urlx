@@ -1,170 +1,110 @@
-# urlx
+<p align="center">
+  <b>urlx</b>
+</p>
 
-[![CI](https://github.com/jonwiggins/urlx/actions/workflows/ci.yml/badge.svg)](https://github.com/jonwiggins/urlx/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![MSRV](https://img.shields.io/badge/MSRV-1.85-orange.svg)](https://blog.rust-lang.org/2025/02/20/Rust-1.85.0.html)
+<p align="center">
+  <i>A memory-safe Rust reimplementation of curl and libcurl.</i>
+</p>
 
-A memory-safe Rust reimplementation of **curl** and **libcurl**.
+<p align="center">
+  <a href="https://github.com/jonwiggins/urlx/actions/workflows/ci.yml"><img src="https://github.com/jonwiggins/urlx/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://crates.io/crates/liburlx"><img src="https://img.shields.io/crates/v/liburlx.svg" alt="crates.io"></a>
+  <a href="https://docs.rs/liburlx"><img src="https://img.shields.io/docsrs/liburlx" alt="docs.rs"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
+</p>
 
-**urlx** is a from-scratch rewrite with zero `unsafe` code outside the FFI boundary, built on [tokio](https://tokio.rs/) and [rustls](https://github.com/rustls/rustls) — no OpenSSL dependency. It aims for behavioral compatibility with curl while providing an idiomatic Rust API.
+---
 
-## Components
+urlx is a from-scratch rewrite of [curl](https://curl.se/) in Rust. Zero `unsafe` outside the FFI boundary. Built on [tokio](https://tokio.rs/) and [rustls](https://github.com/rustls/rustls) — no OpenSSL. Behavioral compatibility with curl is the goal.
 
-| Crate | Description |
-|-------|-------------|
-| **`liburlx`** | Idiomatic Rust transfer library (the core) |
-| **`liburlx-ffi`** | C ABI compatibility layer — drop-in replacement for libcurl |
-| **`urlx`** | Command-line tool — drop-in replacement for the `curl` command |
+## Highlights
+
+- **Memory-safe** — zero `unsafe` in the core library and CLI; all unsafe confined to the FFI crate with safety documentation
+- **No OpenSSL** — TLS 1.2/1.3 via rustls, with cert pinning, custom CAs, and client certificates
+- **Drop-in CLI** — `urlx` aims to accept the same flags and produce the same output as `curl`
+- **Drop-in C library** — `liburlx-ffi` exposes the libcurl C ABI so existing C/C++ programs can link against it
+- **Idiomatic Rust API** — `liburlx` provides a clean async/sync API modeled on curl's Easy/Multi handles
+- **Broad protocol support** — HTTP/1.1, HTTP/2, HTTP/3 (QUIC), FTP/FTPS, SFTP/SCP, WebSocket, SMTP, IMAP, POP3, MQTT
+- **2,200+ tests** — unit, integration (against real servers), property-based, and fuzz harnesses
+- **Async core** — tokio runtime with a blocking `Easy` wrapper and native async `Multi` API
 
 ## Quick Start
 
-### As a library
-
-```rust
-use liburlx::Easy;
-
-fn main() -> Result<(), liburlx::Error> {
-    let mut easy = Easy::new();
-    easy.url("https://httpbin.org/get")?;
-    let response = easy.perform()?;
-
-    println!("Status: {}", response.status());
-    println!("Body: {}", response.body_str()?);
-    Ok(())
-}
-```
-
-### As a CLI
+### CLI
 
 ```sh
-# Simple GET
-urlx https://example.com
-
-# POST JSON
-urlx -X POST -H 'Content-Type: application/json' \
-     -d '{"key": "value"}' https://api.example.com/data
-
-# Download a file with progress bar
-urlx -# -o archive.tar.gz https://example.com/archive.tar.gz
-
-# Follow redirects, show response headers
-urlx -L -i https://example.com
-
-# Silent health check — exit 22 on HTTP error
-urlx -sf https://api.example.com/health
-
-# HTTP Basic auth
-urlx -u admin:secret https://api.example.com/admin
-
-# Upload a file
-urlx -T report.pdf https://example.com/upload
-
-# Multiple URLs in parallel
-urlx -Z https://example.com https://example.org
-
-# Use a SOCKS5 proxy
-urlx --socks5-hostname 127.0.0.1:1080 https://example.com
-
-# POST form with file upload
-urlx -F "photo=@image.jpg" -F "caption=sunset" https://example.com/upload
+urlx https://example.com                                    # GET a URL
+urlx -d '{"key":"val"}' -H 'Content-Type: application/json' # POST JSON
+urlx -Lo archive.tar.gz https://example.com/archive.tar.gz  # Download file
+urlx -u user:pass https://api.example.com/admin              # Basic auth
+urlx -F "file=@photo.jpg" https://example.com/upload         # Multipart upload
+urlx -Z https://a.com https://b.com https://c.com            # Parallel transfers
 ```
 
-### As a C library (libcurl-compatible)
+### Rust Library
+
+```rust
+let mut easy = liburlx::Easy::new();
+easy.url("https://httpbin.org/get")?;
+let response = easy.perform()?;
+
+println!("{}", response.status());       // 200
+println!("{}", response.body_str()?);    // {"origin": "..."}
+```
+
+```toml
+[dependencies]
+liburlx = "0.1"
+```
+
+### C Library (libcurl-compatible)
 
 ```c
 #include "urlx.h"
 
-int main(void) {
-    CURL *curl = curl_easy_init();
-    curl_easy_setopt(curl, CURLOPT_URL, "https://example.com");
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-    CURLcode res = curl_easy_perform(curl);
-    curl_easy_cleanup(curl);
-    return (int)res;
-}
+CURL *curl = curl_easy_init();
+curl_easy_setopt(curl, CURLOPT_URL, "https://example.com");
+curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+CURLcode res = curl_easy_perform(curl);
+curl_easy_cleanup(curl);
 ```
 
-## Features
-
-### Protocols
-
-| Protocol | Status | Notes |
-|----------|--------|-------|
-| HTTP/1.0, HTTP/1.1 | Full | Chunked encoding, trailers, decompression |
-| HTTP/2 | Working | ALPN negotiation, multiplexing |
-| HTTPS | Full | rustls, TLS 1.2/1.3, cert pinning |
-| FTP | Working | Upload, resume, directory ops, FEAT |
-| WebSocket | Working | RFC 6455 frames |
-| SMTP, IMAP, POP3 | Basic | Send/receive/list |
-| MQTT | Basic | 3.1.1 publish/subscribe |
-| DICT, TFTP, file:// | Working | |
-
-### Security & TLS
-
-- TLS 1.2 and 1.3 via **rustls** (no OpenSSL)
-- Custom CA certificates, client certificates
-- Certificate pinning (SHA-256)
-- Cipher suite selection
-- Insecure mode (`-k`) for development
-
-### Authentication
-
-- HTTP Basic and Bearer
-- HTTP Digest (MD5, SHA-256)
-- AWS Signature V4
-- Proxy auth (Basic, Digest, NTLM)
-
-### Transfer
-
-- Redirect following (301/302/303/307/308)
-- Cookie engine with Netscape file persistence
-- Content-Encoding decompression (gzip, deflate, brotli, zstd)
-- Byte range requests and download resume
-- Multipart form-data uploads
-- Connection pooling with keep-alive
-- HSTS (HTTP Strict Transport Security)
-- Retry logic with backoff (408/429/5xx)
-- Transfer timing and speed metrics
-
-### Proxy
-
-- HTTP forward proxy and CONNECT tunneling
-- SOCKS4/4a/5 with authentication
-- Proxy TLS configuration
-- `http_proxy` / `https_proxy` / `no_proxy` environment variables
-
-### DNS
-
-- Caching with configurable TTL
-- Happy Eyeballs (RFC 6555)
-- Custom DNS servers
-- DNS-over-HTTPS URL configuration
-- DNS shuffle for load distribution
-
-## Building
+## Installation
 
 ```sh
-# Build everything
-cargo build --workspace
-
-# Run the full test suite (2,282 tests)
-cargo test --workspace
-
-# Build the CLI in release mode
-cargo build -p urlx-cli --release
-
-# Install the CLI
-cargo install --path crates/urlx-cli
+cargo install --path crates/urlx-cli   # from source
 ```
 
-### Feature flags (liburlx)
+```sh
+cargo build --workspace --release      # build everything
+cargo test --workspace                 # run the test suite
+```
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `http` | Yes | HTTP/1.x protocol support |
-| `http2` | Yes | HTTP/2 via the `h2` crate |
-| `rustls` | Yes | TLS via rustls |
-| `decompression` | Yes | gzip, deflate, brotli, zstd |
+## Components
+
+| Crate | Role | Cargo Feature Flags |
+|---|---|---|
+| [`liburlx`](crates/liburlx) | Core transfer library (pure Rust, idiomatic API) | `http` `http2` `http3` `rustls` `ftp` `ssh` `ws` `decompression` ... |
+| [`liburlx-ffi`](crates/liburlx-ffi) | C ABI compatibility layer — drop-in for libcurl | — |
+| [`urlx-cli`](crates/urlx-cli) | Command-line tool — drop-in for `curl` | — |
+
+## Protocol & Feature Parity
+
+| Area | Coverage | Details |
+|---|---|---|
+| HTTP/1.1 | ~97% | Chunked encoding, trailers, `Expect: 100-continue`, decompression (gzip/br/zstd) |
+| HTTP/2 | ~80% | ALPN negotiation, multiplexing, flow control, PING keep-alive |
+| HTTP/3 | ~55% | QUIC via quinn, Alt-Svc upgrade, 0-RTT |
+| TLS | ~85% | rustls, TLS 1.2/1.3, cert pinning, cipher selection, session cache |
+| Authentication | ~60% | Basic, Bearer, Digest (MD5/SHA-256), AWS SigV4, NTLM skeleton |
+| Cookies | ~95% | Netscape file format, domain-indexed jar, public suffix list |
+| Proxy | ~90% | HTTP CONNECT, SOCKS4/4a/5, HTTPS tunnels (TLS-in-TLS), proxy auth |
+| DNS | ~85% | Cache, Happy Eyeballs, DoH, DoT, custom servers, hickory-dns |
+| FTP/FTPS | ~87% | Upload, resume, directory ops, explicit/implicit TLS, active mode |
+| SSH/SFTP/SCP | ~60% | Download, upload, password + pubkey auth |
+| WebSocket | ~85% | RFC 6455, close codes, fragmentation |
+| CLI flags | ~55% | ~150 of ~250 curl flags implemented |
+| FFI (libcurl C ABI) | ~60% | 116 `CURLOPT`, 43 `CURLINFO`, 32 `CURLcode`, 56 functions |
 
 ## Architecture
 
@@ -174,7 +114,7 @@ cargo install --path crates/urlx-cli
                     └──────┬──────┘
                            │
 ┌──────────────┐    ┌──────┴──────┐
-│ liburlx-ffi  │────│   liburlx   │  Core transfer library
+│ liburlx-ffi  │────│   liburlx   │  Core Rust library
 │  (C ABI)     │    │  (Rust API) │
 └──────────────┘    └──────┬──────┘
                            │
@@ -190,9 +130,39 @@ cargo install --path crates/urlx-cli
 - **Zero `unsafe` outside FFI** — `liburlx` and `urlx-cli` are 100% safe Rust
 - **Async core** — tokio runtime with blocking `Easy` wrapper and native async `Multi` API
 - **No OpenSSL** — TLS entirely via rustls
-- **Strict linting** — clippy deny-all, no unwrap in library code, no panics
+- **Strict linting** — `clippy::all` denied, `unwrap_used` denied in library code, no panics
+
+## Feature Flags
+
+Default features: `http`, `http2`, `rustls`, `decompression`.
+
+| Flag | Description |
+|---|---|
+| `http` | HTTP/1.x protocol support |
+| `http2` | HTTP/2 via the `h2` crate |
+| `http3` | HTTP/3 via `quinn` (QUIC) |
+| `rustls` | TLS via rustls (no OpenSSL) |
+| `ftp` | FTP/FTPS protocol |
+| `ssh` | SFTP/SCP via `russh` |
+| `ws` | WebSocket (RFC 6455) |
+| `decompression` | gzip, deflate, brotli, zstd |
+| `hickory-dns` | Async DNS resolver with DoH/DoT |
+| `cookies` | Cookie engine with public suffix list |
+
+## Contributing
+
+urlx follows strict test-driven development — every feature starts with a failing test. The full guardrail suite (fmt, clippy, test, deny, doc) runs on every commit via pre-commit hooks and CI.
+
+```sh
+cargo fmt && cargo clippy --all-targets && cargo test --workspace
+```
+
+## Acknowledgements
+
+urlx would not exist without [curl](https://curl.se/) by Daniel Stenberg. curl's behavior is our specification, and its decades of real-world testing inform every design decision.
+
+Built with [tokio](https://tokio.rs/), [rustls](https://github.com/rustls/rustls), [h2](https://github.com/hyperium/h2), [quinn](https://github.com/quinn-rs/quinn), and [hyper](https://hyper.rs/) (test infrastructure).
 
 ## License
 
 MIT
-
