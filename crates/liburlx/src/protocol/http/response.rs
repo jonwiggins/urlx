@@ -1,7 +1,40 @@
 //! HTTP response representation.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::time::Duration;
+
+/// The HTTP version actually used in a response.
+///
+/// Unlike [`HttpVersion`](crate::HttpVersion) which represents the *requested*
+/// protocol version, this enum represents the version that was actually
+/// negotiated and used for the transfer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ResponseHttpVersion {
+    /// HTTP version unknown or not applicable (e.g., non-HTTP protocols).
+    #[default]
+    Unknown,
+    /// HTTP/1.0
+    Http10,
+    /// HTTP/1.1
+    Http11,
+    /// HTTP/2
+    Http2,
+    /// HTTP/3
+    Http3,
+}
+
+impl fmt::Display for ResponseHttpVersion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unknown => write!(f, "0"),
+            Self::Http10 => write!(f, "1.0"),
+            Self::Http11 => write!(f, "1.1"),
+            Self::Http2 => write!(f, "2"),
+            Self::Http3 => write!(f, "3"),
+        }
+    }
+}
 
 /// Transfer timing and metadata information.
 ///
@@ -41,6 +74,8 @@ pub struct TransferInfo {
 pub struct Response {
     /// HTTP status code (e.g., 200, 404).
     status: u16,
+    /// The HTTP version used in the response.
+    http_version: ResponseHttpVersion,
     /// Response headers.
     headers: HashMap<String, String>,
     /// Trailer headers from chunked transfer encoding.
@@ -82,6 +117,7 @@ impl Response {
     ) -> Self {
         Self {
             status,
+            http_version: ResponseHttpVersion::default(),
             headers,
             trailers: HashMap::new(),
             body,
@@ -102,6 +138,7 @@ impl Response {
     ) -> Self {
         Self {
             status,
+            http_version: ResponseHttpVersion::default(),
             headers,
             trailers: HashMap::new(),
             body,
@@ -120,6 +157,17 @@ impl Response {
     #[must_use]
     pub const fn status(&self) -> u16 {
         self.status
+    }
+
+    /// Returns the HTTP version used in the response.
+    #[must_use]
+    pub const fn http_version(&self) -> ResponseHttpVersion {
+        self.http_version
+    }
+
+    /// Set the HTTP version used in the response.
+    pub const fn set_http_version(&mut self, version: ResponseHttpVersion) {
+        self.http_version = version;
     }
 
     /// Returns the response headers.
@@ -308,6 +356,28 @@ mod tests {
         assert_eq!(resp.trailer("X-Custom"), Some("value"));
         assert_eq!(resp.trailer("x-custom"), Some("value"));
         assert_eq!(resp.trailer("X-CUSTOM"), Some("value"));
+    }
+
+    #[test]
+    fn response_http_version_default() {
+        let resp = Response::new(200, HashMap::new(), Vec::new(), String::new());
+        assert_eq!(resp.http_version(), ResponseHttpVersion::Unknown);
+    }
+
+    #[test]
+    fn response_http_version_set_and_get() {
+        let mut resp = Response::new(200, HashMap::new(), Vec::new(), String::new());
+        resp.set_http_version(ResponseHttpVersion::Http2);
+        assert_eq!(resp.http_version(), ResponseHttpVersion::Http2);
+    }
+
+    #[test]
+    fn response_http_version_display() {
+        assert_eq!(ResponseHttpVersion::Unknown.to_string(), "0");
+        assert_eq!(ResponseHttpVersion::Http10.to_string(), "1.0");
+        assert_eq!(ResponseHttpVersion::Http11.to_string(), "1.1");
+        assert_eq!(ResponseHttpVersion::Http2.to_string(), "2");
+        assert_eq!(ResponseHttpVersion::Http3.to_string(), "3");
     }
 
     #[test]

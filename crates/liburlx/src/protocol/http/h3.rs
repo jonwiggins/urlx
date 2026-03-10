@@ -11,7 +11,7 @@ use std::sync::Arc;
 use bytes::Buf;
 
 use crate::error::Error;
-use crate::protocol::http::response::Response;
+use crate::protocol::http::response::{Response, ResponseHttpVersion};
 use crate::throttle::{RateLimiter, SpeedLimits, THROTTLE_CHUNK_SIZE};
 
 /// Create a QUIC client configuration using rustls.
@@ -168,7 +168,8 @@ pub async fn request(
 
     let mut builder = http::Request::builder().method(method).uri(uri);
 
-    builder = builder.header("host", server_name);
+    // In HTTP/3, :authority pseudo-header is derived from the URI by the h3 crate.
+    // Do NOT send a Host header — strict servers reject requests with both.
 
     let has_user_agent = custom_headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("user-agent"));
     if !has_user_agent {
@@ -236,7 +237,9 @@ pub async fn request(
 
     // HEAD responses have no body
     if is_head {
-        return Ok(Response::new(status, headers, Vec::new(), url.to_string()));
+        let mut resp = Response::new(status, headers, Vec::new(), url.to_string());
+        resp.set_http_version(ResponseHttpVersion::Http3);
+        return Ok(resp);
     }
 
     // Read body with optional rate limiting
@@ -252,7 +255,9 @@ pub async fn request(
         }
     }
 
-    Ok(Response::new(status, headers, body_bytes, url.to_string()))
+    let mut resp = Response::new(status, headers, body_bytes, url.to_string());
+    resp.set_http_version(ResponseHttpVersion::Http3);
+    Ok(resp)
 }
 
 #[cfg(test)]

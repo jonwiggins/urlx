@@ -15,7 +15,7 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::error::Error;
-use crate::protocol::http::response::Response;
+use crate::protocol::http::response::{Response, ResponseHttpVersion};
 use crate::throttle::{RateLimiter, SpeedLimits, THROTTLE_CHUNK_SIZE};
 
 /// Maximum response header size (64 KB, same as curl's default).
@@ -164,6 +164,11 @@ where
                         keep_alive && !use_http10 && !server_wants_close && !body_read_to_eof;
                     let mut resp =
                         Response::new(final_status, final_headers, response_body, url.to_string());
+                    resp.set_http_version(if use_http10 {
+                        ResponseHttpVersion::Http10
+                    } else {
+                        ResponseHttpVersion::Http11
+                    });
                     if !trailers.is_empty() {
                         resp.set_trailers(trailers);
                     }
@@ -229,10 +234,25 @@ where
     let can_reuse = keep_alive && !use_http10 && !server_wants_close && !body_read_to_eof;
 
     let mut resp = Response::new(status, headers, response_body, url.to_string());
+    resp.set_http_version(if use_http10 {
+        ResponseHttpVersion::Http10
+    } else {
+        ResponseHttpVersion::Http11
+    });
     if !trailers.is_empty() {
         resp.set_trailers(trailers);
     }
     Ok((resp, can_reuse))
+}
+
+/// Check if an I/O error is a TLS `close_notify` error that should be treated as EOF.
+///
+/// Many real-world servers close TLS connections without sending a `close_notify`
+/// alert. Rustls treats this as an error, but curl (OpenSSL) treats it as a
+/// normal EOF. We match curl's behavior for compatibility.
+fn is_close_notify_error(e: &std::io::Error) -> bool {
+    let msg = e.to_string();
+    msg.contains("close_notify") || msg.contains("CloseNotify")
 }
 
 /// Read response headers incrementally from a stream.
@@ -247,8 +267,11 @@ where
     let mut tmp = [0u8; 4096];
 
     loop {
-        let n =
-            stream.read(&mut tmp).await.map_err(|e| Error::Http(format!("read failed: {e}")))?;
+        let n = match stream.read(&mut tmp).await {
+            Ok(n) => n,
+            Err(e) if is_close_notify_error(&e) => 0, // Treat as EOF
+            Err(e) => return Err(Error::Http(format!("read failed: {e}"))),
+        };
 
         if n == 0 {
             if buf.is_empty() {
@@ -299,8 +322,11 @@ where
     }
 
     loop {
-        let n =
-            stream.read(&mut tmp).await.map_err(|e| Error::Http(format!("read failed: {e}")))?;
+        let n = match stream.read(&mut tmp).await {
+            Ok(n) => n,
+            Err(e) if is_close_notify_error(&e) => 0, // Treat as EOF
+            Err(e) => return Err(Error::Http(format!("read failed: {e}"))),
+        };
 
         if n == 0 {
             if buf.is_empty() {
@@ -429,10 +455,14 @@ where
         // Fast path: read all remaining bytes at once
         let remaining = content_length - body.len();
         let mut remaining_buf = vec![0u8; remaining];
-        let _n = stream
-            .read_exact(&mut remaining_buf)
-            .await
-            .map_err(|e| Error::Http(format!("body read failed: {e}")))?;
+        match stream.read_exact(&mut remaining_buf).await {
+            Ok(_) => {}
+            Err(e) if is_close_notify_error(&e) => {
+                // Treat as truncated — return what we have
+                return Ok(body);
+            }
+            Err(e) => return Err(Error::Http(format!("body read failed: {e}"))),
+        }
         body.extend_from_slice(&remaining_buf);
         return Ok(body);
     }
@@ -447,10 +477,11 @@ where
         let remaining = content_length - body.len();
         let chunk_size = remaining.min(THROTTLE_CHUNK_SIZE);
         let mut chunk_buf = vec![0u8; chunk_size];
-        let _n = stream
-            .read_exact(&mut chunk_buf)
-            .await
-            .map_err(|e| Error::Http(format!("body read failed: {e}")))?;
+        match stream.read_exact(&mut chunk_buf).await {
+            Ok(_) => {}
+            Err(e) if is_close_notify_error(&e) => break,
+            Err(e) => return Err(Error::Http(format!("body read failed: {e}"))),
+        }
         body.extend_from_slice(&chunk_buf);
         limiter.record(chunk_size).await?;
     }
@@ -510,6 +541,7 @@ where
         match stream.read_to_end(&mut body).await {
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof && !body.is_empty() => {}
+            Err(e) if is_close_notify_error(&e) => {} // Treat as EOF (curl compat)
             Err(e) => return Err(Error::Http(format!("read failed: {e}"))),
         }
         return Ok(body);
@@ -530,6 +562,7 @@ where
                 limiter.record(n).await?;
             }
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof && !body.is_empty() => break,
+            Err(e) if is_close_notify_error(&e) => break, // Treat as EOF (curl compat)
             Err(e) => return Err(Error::Http(format!("read failed: {e}"))),
         }
     }
@@ -556,10 +589,11 @@ where
         // Ensure we have a complete chunk size line
         while find_crlf(&buf, pos).is_none() {
             let mut tmp = [0u8; 4096];
-            let n = stream
-                .read(&mut tmp)
-                .await
-                .map_err(|e| Error::Http(format!("chunked read failed: {e}")))?;
+            let n = match stream.read(&mut tmp).await {
+                Ok(n) => n,
+                Err(e) if is_close_notify_error(&e) => 0,
+                Err(e) => return Err(Error::Http(format!("chunked read failed: {e}"))),
+            };
             if n == 0 {
                 return Ok((decoded, HashMap::new()));
             }
@@ -585,10 +619,13 @@ where
                 // Ensure we have at least one line
                 while find_crlf(&buf, pos).is_none() {
                     let mut tmp = [0u8; 256];
-                    let n = stream
-                        .read(&mut tmp)
-                        .await
-                        .map_err(|e| Error::Http(format!("chunked trailer read failed: {e}")))?;
+                    let n = match stream.read(&mut tmp).await {
+                        Ok(n) => n,
+                        Err(e) if is_close_notify_error(&e) => 0,
+                        Err(e) => {
+                            return Err(Error::Http(format!("chunked trailer read failed: {e}")));
+                        }
+                    };
                     if n == 0 {
                         return Ok((decoded, trailers));
                     }
@@ -615,10 +652,11 @@ where
         let needed = pos + chunk_size + 2;
         while buf.len() < needed {
             let mut tmp = [0u8; 4096];
-            let n = stream
-                .read(&mut tmp)
-                .await
-                .map_err(|e| Error::Http(format!("chunk data read failed: {e}")))?;
+            let n = match stream.read(&mut tmp).await {
+                Ok(n) => n,
+                Err(e) if is_close_notify_error(&e) => 0,
+                Err(e) => return Err(Error::Http(format!("chunk data read failed: {e}"))),
+            };
             if n == 0 {
                 // Partial chunk — take what we have
                 let available = buf.len().saturating_sub(pos).min(chunk_size);
@@ -739,8 +777,15 @@ pub fn parse_response(data: &[u8], effective_url: &str, is_head: bool) -> Result
         }
     }
 
+    let version = match parsed.version {
+        Some(0) => ResponseHttpVersion::Http10,
+        _ => ResponseHttpVersion::Http11,
+    };
+
     if is_head {
-        return Ok(Response::new(status, headers, Vec::new(), effective_url.to_string()));
+        let mut resp = Response::new(status, headers, Vec::new(), effective_url.to_string());
+        resp.set_http_version(version);
+        return Ok(resp);
     }
 
     let body_data = &data[header_len..];
@@ -762,7 +807,9 @@ pub fn parse_response(data: &[u8], effective_url: &str, is_head: bool) -> Result
         body_data.to_vec()
     };
 
-    Ok(Response::new(status, headers, body, effective_url.to_string()))
+    let mut resp = Response::new(status, headers, body, effective_url.to_string());
+    resp.set_http_version(version);
+    Ok(resp)
 }
 
 #[cfg(test)]

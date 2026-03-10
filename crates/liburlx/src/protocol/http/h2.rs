@@ -9,7 +9,7 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::error::Error;
-use crate::protocol::http::response::{PushedResponse, Response};
+use crate::protocol::http::response::{PushedResponse, Response, ResponseHttpVersion};
 use crate::throttle::{RateLimiter, SpeedLimits, THROTTLE_CHUNK_SIZE};
 
 /// HTTP/2-specific configuration options.
@@ -106,7 +106,7 @@ where
     }
 
     // Perform h2 client handshake with configured builder
-    let (mut client, mut h2_conn): (
+    let (client, mut h2_conn): (
         h2::client::SendRequest<bytes::Bytes>,
         h2::client::Connection<S, bytes::Bytes>,
     ) = builder
@@ -135,8 +135,9 @@ where
 
     let mut builder = http::Request::builder().method(method).uri(uri);
 
-    // Add headers
-    builder = builder.header("host", host);
+    // In HTTP/2, :authority pseudo-header is derived from the URI by the h2 crate.
+    // Do NOT send a Host header — strict servers (Google, nginx) reject requests
+    // that contain both :authority and Host. Curl also omits Host in HTTP/2.
 
     let has_user_agent = custom_headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("user-agent"));
     if !has_user_agent {
@@ -157,6 +158,10 @@ where
     let has_body = body.is_some();
     let req =
         builder.body(()).map_err(|e| Error::Http(format!("failed to build h2 request: {e}")))?;
+
+    // Wait for the h2 connection to be ready (server SETTINGS processed)
+    let mut client =
+        client.ready().await.map_err(|e| Error::Http(format!("h2 connection not ready: {e}")))?;
 
     // Send the request
     let (mut response_fut, mut send_stream): (
@@ -267,6 +272,7 @@ where
             task.abort();
         }
         let mut resp = Response::new(status, headers, Vec::new(), url.to_string());
+        resp.set_http_version(ResponseHttpVersion::Http2);
         if !pushed.is_empty() {
             resp.set_pushed_responses(pushed);
         }
@@ -302,6 +308,7 @@ where
     }
 
     let mut resp = Response::new(status, headers, body_bytes, url.to_string());
+    resp.set_http_version(ResponseHttpVersion::Http2);
     if !pushed.is_empty() {
         resp.set_pushed_responses(pushed);
     }
