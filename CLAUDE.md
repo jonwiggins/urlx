@@ -15,9 +15,9 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 ## Current Status
 
 **Version:** v0.1.0 published (crates.io + GitHub Releases + Homebrew)
-**Last completed:** Phase 62 — FFI Parity Push — 2026-03-10
-**Total tests:** 2,515
-**In progress:** Phase 63
+**Last completed:** Phase 63 — CLI Flag Parity — 2026-03-10
+**Total tests:** 2,526
+**In progress:** Phase 64
 **Blockers:** None
 
 ### Completeness Summary (post-v0.1.0 audit)
@@ -37,10 +37,10 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 | WebSocket | 92% | RFC 6455, CloseCode, fragmentation, permessage-deflate (RFC 7692), ws:// wss:// dispatch |
 | Multi API | 75% | Connection limiting, share, pipelining, FFI event loop stubs |
 | FFI (libcurl C ABI) | ~70% | 119 CURLOPT, 47 CURLINFO, 42 CURLcode, 56 functions, C test harness |
-| CLI | ~70% | ~180 flags, --help, --version, combined short flags, conditional requests, retry logic |
+| CLI | ~85% | 246 long + 40 short flags (~98% of curl's ~250), --help, --version, combined short flags |
 | Connection | 80% | Pool, TCP_NODELAY, keepalive, Unix sockets, interface/port binding |
 | Transfer control | 80% | Rate limiting enforced (max recv/send speed, low speed timeout) |
-| Overall | ~73% | ~94% for basic HTTP/HTTPS use cases |
+| Overall | ~75% | ~95% for basic HTTP/HTTPS use cases |
 
 ### Known Issues
 
@@ -58,7 +58,7 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 **Key stats (Phase 60 audit):**
 - Tests: 2,515
-- CLI flags: ~199 long + 36 short (curl has ~250 long flags)
+- CLI flags: 246 long + 40 short (curl has ~250 long flags)
 - FFI: 119 unique CURLOPT, 47 CURLINFO, 42 CURLcode, 56 exported functions, C test harness
 - Benchmark suite: 9 groups (URL parsing, cookies, HSTS, DNS, headers, HTTP parsing, multipart)
 - Feature flags: 20+ (http, http2, http3, ftp, ssh, ws, mqtt, smtp, imap, pop3, etc.)
@@ -80,7 +80,7 @@ Milestone review phase. Audit results:
 **CLI Coverage:**
 - 199 unique long flags + 36 short flags
 - curl has ~250 long flags → ~80% coverage
-- Missing: man page generation, ~50 low-frequency flags
+- Missing: man page generation, ~4 low-frequency flags
 
 **Known Gaps:**
 - WebSocket not dispatched from Easy API (needs high-level handler)
@@ -99,12 +99,9 @@ Wired ws:// and wss:// scheme dispatch in `do_single_request` via new `ws::conne
 
 Added 17 new CURLOPT options (PORT, INFILESIZE, RESUME_FROM, PROXYPORT, FILETIME, BUFFERSIZE, PROXYTYPE, IPRESOLVE, FTP_FILEMETHOD, SOCKS5_AUTH, POSTFIELDSIZE_LARGE, CAPATH, MAXCONNECTS, PIPEWAIT, STREAM_WEIGHT, TCP_FASTOPEN, HTTP09_ALLOWED), 4 CURLINFO getters (REQUEST_SIZE, HTTP_CONNECTCODE, HTTPAUTH_AVAIL, PROXYAUTH_AVAIL), 10 CURLcode error variants. Created C test harness (11 tests covering init/cleanup, setopt, duphandle, reset, strerror, version, pause, slist, URL API, getinfo). 20 new Rust tests. SCRAM-SHA-256 SMTP wiring deferred to Phase 64.
 
-### Phase 63 — CLI Flag Parity
+### Phase 63 — CLI Flag Parity (Completed 2026-03-10)
 
-- Implement remaining ~50 curl flags (prioritized by usage frequency)
-- Man page generation from CLI flag definitions
-- Combined short flags edge cases
-- Config file improvements (support for all flags)
+Added ~40 curl flags: -4/--ipv4, -6/--ipv6, -j/--junk-session-cookies, -l/--list-only, -Q/--quote, --http3-only, --oauth2-bearer, --pubkey, --tcp-fastopen, --no-clobber, --suppress-connect-headers, --http0.9, --trace-ids, --disallow-username-in-url, --curves, --engine, --dns-interface, and 25+ more as no-ops. CLI now at 246 long + 40 short flags (~98% of curl's ~250 long flags). Man page generation and config file improvements deferred.
 
 ### Phase 64 — Error Handling & Diagnostics
 
