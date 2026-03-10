@@ -603,6 +603,14 @@ pub fn error_to_exit_code(err: &liburlx::Error) -> ExitCode {
                 ExitCode::from(47) // CURLE_TOO_MANY_REDIRECTS
             } else if msg.contains("fail_on_error") {
                 ExitCode::from(22) // CURLE_HTTP_RETURNED_ERROR
+            } else if msg.contains("unsupported protocol") || msg.contains("Unsupported protocol") {
+                ExitCode::from(1) // CURLE_UNSUPPORTED_PROTOCOL
+            } else if msg.contains("partial") || msg.contains("Partial") {
+                ExitCode::from(18) // CURLE_PARTIAL_FILE
+            } else if msg.contains("upload") || msg.contains("Upload") {
+                ExitCode::from(25) // CURLE_UPLOAD_FAILED
+            } else if msg.contains("send") || msg.contains("Send") {
+                ExitCode::from(55) // CURLE_SEND_ERROR
             } else {
                 ExitCode::from(56) // CURLE_RECV_ERROR
             }
@@ -860,5 +868,51 @@ mod tests {
         assert!(is_leap_year(2024));
         assert!(!is_leap_year(1900));
         assert!(!is_leap_year(2023));
+    }
+
+    #[test]
+    fn error_to_exit_code_url_parse() {
+        let err = liburlx::Error::UrlParse("bad url".to_string());
+        assert_eq!(error_to_exit_code(&err), ExitCode::from(3));
+    }
+
+    #[test]
+    fn error_to_exit_code_timeout() {
+        let err = liburlx::Error::Timeout(std::time::Duration::from_secs(30));
+        assert_eq!(error_to_exit_code(&err), ExitCode::from(28));
+    }
+
+    #[test]
+    fn error_to_exit_code_tls_verify() {
+        let err = liburlx::Error::Tls(Box::<dyn std::error::Error + Send + Sync>::from(
+            "certificate verify failed",
+        ));
+        assert_eq!(error_to_exit_code(&err), ExitCode::from(60));
+    }
+
+    #[test]
+    fn error_to_exit_code_tls_connect() {
+        let err = liburlx::Error::Tls(Box::<dyn std::error::Error + Send + Sync>::from(
+            "handshake failed",
+        ));
+        assert_eq!(error_to_exit_code(&err), ExitCode::from(35));
+    }
+
+    #[test]
+    fn error_to_exit_code_http_too_many_redirects() {
+        let err = liburlx::Error::Http("too many redirects".to_string());
+        assert_eq!(error_to_exit_code(&err), ExitCode::from(47));
+    }
+
+    #[test]
+    fn error_to_exit_code_http_unsupported_protocol() {
+        let err = liburlx::Error::Http("unsupported protocol".to_string());
+        assert_eq!(error_to_exit_code(&err), ExitCode::from(1));
+    }
+
+    #[test]
+    fn error_to_exit_code_http_recv() {
+        let err = liburlx::Error::Http("connection reset".to_string());
+        assert_eq!(error_to_exit_code(&err), ExitCode::from(56));
     }
 }
