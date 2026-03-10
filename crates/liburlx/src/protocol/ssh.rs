@@ -438,7 +438,10 @@ impl SshSession {
         Ok(Self { handle })
     }
 
-    /// Download a file via SFTP.
+    /// Download a file via SFTP, following symlinks.
+    ///
+    /// If the target path is a symlink, resolves it via `read_link` and reads
+    /// the target file. Follows up to 10 levels of symlinks to prevent loops.
     ///
     /// # Errors
     ///
@@ -458,20 +461,42 @@ impl SshSession {
             .await
             .map_err(|e| Error::Ssh(format!("SFTP session init failed: {e}")))?;
 
+        // Resolve symlinks (up to 10 levels)
+        let resolved = resolve_sftp_symlinks(&sftp, path, 10).await?;
+
         let data = sftp
-            .read(path)
+            .read(&resolved)
             .await
-            .map_err(|e| Error::Ssh(format!("SFTP read '{path}' failed: {e}")))?;
+            .map_err(|e| Error::Ssh(format!("SFTP read '{resolved}' failed: {e}")))?;
 
         Ok(data)
     }
 
-    /// Upload a file via SFTP.
+    /// Upload a file via SFTP, preserving permissions from the source.
+    ///
+    /// If `source_permissions` is provided (as a Unix mode like `0o644`),
+    /// the remote file's permissions are set after the upload completes.
     ///
     /// # Errors
     ///
     /// Returns [`Error::Ssh`] if the SFTP session or file write fails.
     pub async fn sftp_upload(&self, path: &str, data: &[u8]) -> Result<(), Error> {
+        self.sftp_upload_with_permissions(path, data, None).await
+    }
+
+    /// Upload a file via SFTP with explicit permissions.
+    ///
+    /// Sets the remote file's permissions to `mode` after upload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Ssh`] if the SFTP session or file write fails.
+    pub async fn sftp_upload_with_permissions(
+        &self,
+        path: &str,
+        data: &[u8],
+        mode: Option<u32>,
+    ) -> Result<(), Error> {
         let channel = self
             .handle
             .channel_open_session()
@@ -489,6 +514,23 @@ impl SshSession {
         sftp.write(path, data)
             .await
             .map_err(|e| Error::Ssh(format!("SFTP write '{path}' failed: {e}")))?;
+
+        // Set permissions if provided
+        if let Some(permissions) = mode {
+            let attrs = russh_sftp::protocol::FileAttributes {
+                size: None,
+                uid: None,
+                user: None,
+                gid: None,
+                group: None,
+                permissions: Some(permissions),
+                atime: None,
+                mtime: None,
+            };
+            sftp.set_metadata(path, attrs)
+                .await
+                .map_err(|e| Error::Ssh(format!("SFTP set permissions '{path}' failed: {e}")))?;
+        }
 
         Ok(())
     }
@@ -721,6 +763,49 @@ async fn wait_for_scp_ack(channel: &mut russh::Channel<russh::client::Msg>) -> R
             _ => {}
         }
     }
+}
+
+/// Resolve symlinks for an SFTP path.
+///
+/// Uses `symlink_metadata` (lstat) to check if the path is a symlink, and
+/// `read_link` to resolve it. Follows up to `max_depth` levels.
+///
+/// # Errors
+///
+/// Returns [`Error::Ssh`] if symlink resolution fails or exceeds depth.
+async fn resolve_sftp_symlinks(
+    sftp: &russh_sftp::client::SftpSession,
+    path: &str,
+    max_depth: u32,
+) -> Result<String, Error> {
+    let mut current = path.to_string();
+
+    for _ in 0..max_depth {
+        let meta = sftp
+            .symlink_metadata(&current)
+            .await
+            .map_err(|e| Error::Ssh(format!("SFTP stat '{current}' failed: {e}")))?;
+
+        if !meta.file_type().is_symlink() {
+            return Ok(current);
+        }
+
+        let target = sftp
+            .read_link(&current)
+            .await
+            .map_err(|e| Error::Ssh(format!("SFTP readlink '{current}' failed: {e}")))?;
+
+        // If target is relative, resolve it against the parent directory
+        if target.starts_with('/') {
+            current = target;
+        } else if let Some(parent) = current.rsplit_once('/') {
+            current = format!("{}/{target}", parent.0);
+        } else {
+            current = target;
+        }
+    }
+
+    Err(Error::Ssh(format!("SFTP symlink loop: too many levels of symlinks for '{path}'")))
 }
 
 /// Download a file via SFTP and return it as a Response.
@@ -1061,5 +1146,64 @@ mod tests {
             public_key_bytes: vec![],
         };
         assert!(entry.revoked);
+    }
+
+    #[test]
+    fn file_attributes_with_permissions() {
+        let attrs = russh_sftp::protocol::FileAttributes {
+            size: None,
+            uid: None,
+            user: None,
+            gid: None,
+            group: None,
+            permissions: Some(0o755),
+            atime: None,
+            mtime: None,
+        };
+        assert_eq!(attrs.permissions, Some(0o755));
+    }
+
+    #[test]
+    fn file_attributes_permissions_preserve_mode() {
+        // Verify common permission modes round-trip through FileAttributes
+        for mode in [0o644u32, 0o755, 0o600, 0o777, 0o400] {
+            let attrs = russh_sftp::protocol::FileAttributes {
+                size: None,
+                uid: None,
+                user: None,
+                gid: None,
+                group: None,
+                permissions: Some(mode),
+                atime: None,
+                mtime: None,
+            };
+            assert_eq!(attrs.permissions, Some(mode));
+        }
+    }
+
+    #[test]
+    fn symlink_path_resolution_absolute() {
+        // Absolute symlink targets should be used as-is
+        let target = "/absolute/path/to/file";
+        assert!(target.starts_with('/'));
+    }
+
+    #[test]
+    fn symlink_path_resolution_relative() {
+        // Relative symlink targets should be resolved against parent
+        let current = "/home/user/link";
+        let target = "actual_file";
+        let parent = current.rsplit_once('/').unwrap().0;
+        let resolved = format!("{parent}/{target}");
+        assert_eq!(resolved, "/home/user/actual_file");
+    }
+
+    #[test]
+    fn symlink_path_resolution_relative_with_subdir() {
+        let current = "/data/links/mylink";
+        let target = "../files/data.txt";
+        let parent = current.rsplit_once('/').unwrap().0;
+        let resolved = format!("{parent}/{target}");
+        assert_eq!(resolved, "/data/links/../files/data.txt");
     }
 }

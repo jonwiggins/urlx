@@ -24,6 +24,60 @@ pub enum Opcode {
     TftpError = 5,
 }
 
+/// TFTP error codes (RFC 1350, Section 5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u16)]
+pub enum TftpErrorCode {
+    /// Not defined, see error message.
+    NotDefined = 0,
+    /// File not found.
+    FileNotFound = 1,
+    /// Access violation.
+    AccessViolation = 2,
+    /// Disk full or allocation exceeded.
+    DiskFull = 3,
+    /// Illegal TFTP operation.
+    IllegalOperation = 4,
+    /// Unknown transfer ID.
+    UnknownTransferId = 5,
+    /// File already exists.
+    FileAlreadyExists = 6,
+    /// No such user.
+    NoSuchUser = 7,
+}
+
+impl TftpErrorCode {
+    /// Convert a raw error code to a `TftpErrorCode`.
+    #[must_use]
+    pub const fn from_code(code: u16) -> Self {
+        match code {
+            1 => Self::FileNotFound,
+            2 => Self::AccessViolation,
+            3 => Self::DiskFull,
+            4 => Self::IllegalOperation,
+            5 => Self::UnknownTransferId,
+            6 => Self::FileAlreadyExists,
+            7 => Self::NoSuchUser,
+            _ => Self::NotDefined,
+        }
+    }
+
+    /// Human-readable description of the error code.
+    #[must_use]
+    pub const fn description(self) -> &'static str {
+        match self {
+            Self::NotDefined => "not defined",
+            Self::FileNotFound => "file not found",
+            Self::AccessViolation => "access violation",
+            Self::DiskFull => "disk full or allocation exceeded",
+            Self::IllegalOperation => "illegal TFTP operation",
+            Self::UnknownTransferId => "unknown transfer ID",
+            Self::FileAlreadyExists => "file already exists",
+            Self::NoSuchUser => "no such user",
+        }
+    }
+}
+
 /// Default TFTP block size.
 const DEFAULT_BLOCK_SIZE: usize = 512;
 
@@ -151,13 +205,21 @@ pub async fn download(
                 }
             }
             5 => {
-                // ERROR
+                // ERROR — parse error code (bytes 2-3) and message (bytes 4+)
+                let error_code = if packet.len() >= 4 {
+                    TftpErrorCode::from_code(u16::from_be_bytes([packet[2], packet[3]]))
+                } else {
+                    TftpErrorCode::NotDefined
+                };
                 let msg = if packet.len() > 4 {
                     String::from_utf8_lossy(&packet[4..packet.len().saturating_sub(1)]).to_string()
                 } else {
-                    "unknown error".to_string()
+                    error_code.description().to_string()
                 };
-                return Err(Error::Http(format!("TFTP error: {msg}")));
+                return Err(Error::Http(format!(
+                    "TFTP error (code {}): {}",
+                    error_code as u16, msg
+                )));
             }
             o if o == OACK_OPCODE => {
                 // OACK — parse negotiated options
@@ -247,5 +309,42 @@ mod tests {
     #[test]
     fn parse_opcode_too_short() {
         assert!(parse_opcode(&[0x00]).is_err());
+    }
+
+    #[test]
+    fn error_code_from_code_known() {
+        assert_eq!(TftpErrorCode::from_code(0), TftpErrorCode::NotDefined);
+        assert_eq!(TftpErrorCode::from_code(1), TftpErrorCode::FileNotFound);
+        assert_eq!(TftpErrorCode::from_code(2), TftpErrorCode::AccessViolation);
+        assert_eq!(TftpErrorCode::from_code(3), TftpErrorCode::DiskFull);
+        assert_eq!(TftpErrorCode::from_code(4), TftpErrorCode::IllegalOperation);
+        assert_eq!(TftpErrorCode::from_code(5), TftpErrorCode::UnknownTransferId);
+        assert_eq!(TftpErrorCode::from_code(6), TftpErrorCode::FileAlreadyExists);
+        assert_eq!(TftpErrorCode::from_code(7), TftpErrorCode::NoSuchUser);
+    }
+
+    #[test]
+    fn error_code_from_code_unknown() {
+        assert_eq!(TftpErrorCode::from_code(99), TftpErrorCode::NotDefined);
+        assert_eq!(TftpErrorCode::from_code(255), TftpErrorCode::NotDefined);
+    }
+
+    #[test]
+    fn error_code_descriptions() {
+        assert_eq!(TftpErrorCode::FileNotFound.description(), "file not found");
+        assert_eq!(TftpErrorCode::AccessViolation.description(), "access violation");
+        assert_eq!(TftpErrorCode::DiskFull.description(), "disk full or allocation exceeded");
+        assert_eq!(TftpErrorCode::IllegalOperation.description(), "illegal TFTP operation");
+        assert_eq!(TftpErrorCode::UnknownTransferId.description(), "unknown transfer ID");
+        assert_eq!(TftpErrorCode::FileAlreadyExists.description(), "file already exists");
+        assert_eq!(TftpErrorCode::NoSuchUser.description(), "no such user");
+        assert_eq!(TftpErrorCode::NotDefined.description(), "not defined");
+    }
+
+    #[test]
+    fn error_code_repr_values() {
+        assert_eq!(TftpErrorCode::NotDefined as u16, 0);
+        assert_eq!(TftpErrorCode::FileNotFound as u16, 1);
+        assert_eq!(TftpErrorCode::NoSuchUser as u16, 7);
     }
 }
