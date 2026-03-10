@@ -16,216 +16,232 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 **Version:** v0.1.0 published (crates.io + GitHub Releases + Homebrew)
 **Last completed:** Phase 66 — Wire Unwired Easy API Fields — 2026-03-10
-**Total tests:** 2,605
-**In progress:** Phase 67
+**Total tests:** ~2,596
+**In progress:** Phase 65
 **Blockers:** None
 
-### Completeness Summary (post-Phase 66)
+### Audit Results (2026-03-10)
 
-| Feature Area | Parity | Notes |
-|---|---|---|
-| HTTP/1.1 | 98% | Expect, HTTP/1.0, trailer headers, chunked upload |
-| HTTP/2 | 75% | ALPN, multiplexing, flow control, connection pooling, server push work; **all 7 tuning options stored but not wired to h2 crate** |
-| HTTP/3 | 55% | QUIC via quinn, Alt-Svc, 0-RTT; no pooling/push; **untested** |
-| TLS | 88% | rustls, insecure mode, CA/client certs, pinning, version selection, cipher list, blob cert options |
-| Authentication | 65% | Basic, Bearer, Digest, AWS SigV4 fully wired; **NTLMv2 proxy-only (not wired for HTTP 401)**; **SCRAM-SHA-256 implemented but wired to nothing** |
-| Cookie engine | 97% | Netscape file format, domain-indexed jar, PSL validation, SameSite enforcement |
-| Proxy | 85% | HTTP + SOCKS + HTTPS tunnel (TLS-in-TLS), proxy NTLM auth, proxy_port, proxy_type, proxy_headers wired; **pre_proxy not wired**; no PAC |
-| DNS | 86% | Cache, Happy Eyeballs (RFC 8305), shuffle, custom servers, DoH, DoT, hickory-dns; doh_insecure accepted |
-| FTP | 85% | Session API, FTPS, active/passive mode, resume, MLST/MLSD; EPSV/EPRT, skip_pasv_ip, ACCT, create_dirs, FtpMethod all wired via FtpConfig |
-| SSH/SFTP/SCP | 72% | Download/upload, password + pubkey auth, known_hosts, SHA-256 fingerprint, symlink following; ssh_auth_types filtering wired |
-| WebSocket | 92% | RFC 6455, CloseCode, fragmentation, permessage-deflate (RFC 7692), ws:// wss:// dispatch |
-| Multi API | 40% | Connection limiting, share; **curl_multi_fdset, curl_multi_socket_action, curl_multi_wakeup are no-ops**; event loop incompatible with tokio architecture |
-| FFI (libcurl C ABI) | ~60% | 119 CURLOPT, 47 CURLINFO, 42 CURLcode, 56 functions, C test harness; **~15 options return OK but do nothing; curl_easy_pause is a no-op** |
-| CLI | ~70% | 246 long + 39 short flags; **87 flags (30%) are silent no-ops**; ~159 functional flags |
-| Connection | 90% | Pool (TTL, max-per-host, max-total, cleanup), TCP_NODELAY, keepalive, Unix sockets, Happy Eyeballs; fresh_connect, forbid_reuse, connect_to, haproxy_protocol wired |
-| Transfer control | 80% | Rate limiting enforced; path_as_is wired; **curl_easy_pause is a no-op; abstract_unix_socket returns error** |
-| Overall | ~68% | ~92% for basic HTTP/HTTPS use cases |
+An independent audit ran curl's own test suite (`runtests.pl`) and differential tests against the urlx binary. Results:
 
-### Known Issues (post-Phase 66)
+- **curl test harness:** 0/13 HTTP tests passed (tests 1-13). 2/12 file:// tests passed (200, 202).
+- **Differential testing (real endpoints):** ~74% functional parity after discounting User-Agent differences.
+- **Hangs:** Tests involving HEAD requests or Connection: close responses hang indefinitely.
+- **Test count verified:** ~2,596 (via `cargo test -- --list`), not 2,605 as previously claimed.
+- **CLI flags verified:** 238 long (not 246), 40 short (not 39), ~89 no-ops (not 87).
+- **FFI:** 56 exported functions confirmed. Only 1/56 has catch_unwind (CLAUDE.md requires all 56).
 
-- **~15 remaining unwired fields** — pre_proxy (complex two-hop chain), abstract_unix_socket (needs OS-specific API), doh_insecure (accepted but not enforced by hickory)
-- **NTLMv2 not wired for HTTP 401** — only works for proxy 407 (see Phase 67)
-- **SCRAM-SHA-256 fully implemented but wired to no protocol** — dead code (see Phase 67)
-- **FFI returns CURLE_OK for ~15 unimplemented options** — silent compatibility hazard (see Phase 67)
-- **87 of 285 CLI flags are no-ops** — no warning emitted (see Phase 68)
-- **All 7 HTTP/2 tuning options stored but not passed to h2** (see Phase 68)
-- **curl_easy_pause() returns OK but does nothing** (see Phase 69)
-- **Multi API event loop functions are no-ops** — tokio architecture mismatch (see Phase 69)
+### Failure Categories from curl Test Suite
+
+| Category | Severity | Tests Affected | Root Cause |
+|---|---|---|---|
+| Header ordering | High (blocks all harness tests) | 1-13 | urlx sends Accept before User-Agent; curl sends Host, User-Agent, Accept |
+| Hangs | Critical | 14, 31+ | HEAD and Connection: close responses never complete |
+| Cookie `-b` parsing | High | 6, 7, 8 | Multi-cookie syntax only sends last cookie; cookie file parsing broken |
+| Redirect following | High | 11 | Follows wrong URL (sends to /verifiedserver instead of Location target) |
+| Missing auto Content-Type | Medium | 3 | POST with `-d` doesn't add `Content-Type: application/x-www-form-urlencoded` |
+| Proxy behavior | Medium | 5 | Fragment leaks into proxy URL; `Connection: close` instead of `Proxy-Connection: Keep-Alive` |
+| Multipart Content-Length | Medium | 9 | Wrong size (471 vs expected 431) |
+| Exit codes | Medium | 19, 20 | Wrong codes for unsupported protocol (returns 3, expected 1) and bad URL |
+| Header casing (`-i`) | Low | 15 | urlx lowercases response headers; curl preserves original case |
+| FTP command sequence | Medium | 100-105 | Missing PWD, different command ordering, wrong default password |
+
+### Known Issues (carried forward)
+
 - HTTP/3 untested (needs quinn test server)
-- Some integration tests hang/timeout (pre-existing, not affecting lib tests)
+- FFI returns CURLE_OK for ~15 unimplemented options
+- 55/56 FFI functions lack catch_unwind wrappers
+- curl_easy_pause() returns OK but does nothing
+- Multi API event loop functions are no-ops (tokio architecture mismatch)
 
 ---
 
 ## Implementation Phases
 
-### Phase 0 — Cumulative Summary (Phases 1-59)
+### Phase 0 — Cumulative Summary (Phases 1-66)
 
-**What has been built:** A functional curl replacement covering HTTP/1.0-1.1, HTTP/2 (with ALPN, multiplexing, connection pooling, server push), HTTP/3 (QUIC via quinn), TLS (rustls + native-tls), FTP/FTPS (full session, active mode, MLST/MLSD, resume), SSH/SFTP/SCP, WebSocket (RFC 6455 + permessage-deflate), MQTT (QoS 0/1/2), SMTP, IMAP, POP3, DICT, TFTP, file://, DNS (system + hickory + DoH + DoT + Happy Eyeballs), cookies (Netscape format, domain-indexed, PSL, SameSite), HSTS (persistence), proxies (HTTP/SOCKS4/SOCKS4a/SOCKS5/HTTPS tunnel), authentication (Basic, Digest, Bearer, AWS SigV4, NTLMv2, SCRAM-SHA-256), connection pooling, rate limiting, multipart form upload, decompression (gzip, deflate, br, zstd), and a C ABI compatibility layer (liburlx-ffi).
+**What has been built:** A functional curl replacement covering HTTP/1.0-1.1, HTTP/2 (with ALPN, multiplexing, connection pooling, server push), HTTP/3 (QUIC via quinn), TLS (rustls + native-tls), FTP/FTPS (full session, active/passive mode, MLST/MLSD, resume, EPSV/EPRT, FtpConfig with 7 options), SSH/SFTP/SCP (password + pubkey auth, known_hosts, SHA-256 fingerprint), WebSocket (RFC 6455 + permessage-deflate, ws:// wss:// dispatch), MQTT (QoS 0/1/2), SMTP (AUTH PLAIN/LOGIN, mail_auth, sasl_authzid), IMAP, POP3, DICT, TFTP, file://, DNS (system + hickory + DoH + DoT + Happy Eyeballs RFC 8305), cookies (Netscape format, domain-indexed, PSL, SameSite), HSTS (persistence), proxies (HTTP/SOCKS4/SOCKS4a/SOCKS5/HTTPS tunnel, proxy_port/proxy_type/proxy_headers wired), authentication (Basic, Digest, Bearer, AWS SigV4, NTLMv2, SCRAM-SHA-256), connection pooling (TTL 118s, per-host limit 5, max-total 25, FIFO eviction), rate limiting, multipart form upload, decompression (gzip, deflate, br, zstd), and a C ABI compatibility layer (liburlx-ffi with 56 exported functions).
 
-**Key stats (Phase 60 audit):**
-- Tests: 2,515
-- CLI flags: 246 long + 40 short (curl has ~250 long flags)
-- FFI: 119 unique CURLOPT, 47 CURLINFO, 42 CURLcode, 56 exported functions, C test harness
+**Key stats (verified by independent audit):**
+- Tests: ~2,596 (819 liburlx lib + 278 FFI lib + 309 CLI + ~1,187 integration/proptest + 3 doc)
+- CLI flags: 238 long + 40 short (curl has ~250 long flags); ~89 are no-ops
+- FFI: 119 unique CURLOPT, 47 CURLINFO, 42 CURLcode, 56 exported functions, C test harness (11 tests)
 - Benchmark suite: 9 groups (URL parsing, cookies, HSTS, DNS, headers, HTTP parsing, multipart)
 - Feature flags: 20+ (http, http2, http3, ftp, ssh, ws, mqtt, smtp, imap, pop3, etc.)
 - 4 fuzz harnesses (URL, HTTP, cookie, HSTS)
+- 141 Rust source files, ~59,000 lines of code
 
-**Phases 52-59 summary:** CLI drop-in essentials (--help, --version, combined short flags, h2 stream fix), protocol dispatch for all schemes, HTTP/2 robustness (pooling, chunked upload, push), FFI hardening (145 CURLOPT, blob certs, protocol restriction), authentication completeness (NTLMv2, SCRAM-SHA-256, SameSite), protocol polish (WS deflate, MQTT QoS, SFTP symlinks, TFTP errors), Criterion benchmarks with optimization, and CLI completeness (~199 long flags, conditional requests, retry logic).
+**Phases 60-66 summary:** Comprehensive review (Phase 60), WS dispatch + protocol auth (Phase 61), FFI parity push with 17 new CURLOPT + C test harness (Phase 62), CLI flag parity ~238 long flags (Phase 63), error handling + exit code mapping (Phase 64), connection pool TTL + Happy Eyeballs RFC 8305 (Phase 65), wiring ~20 Easy API fields including FtpConfig, proxy, connect_to, haproxy_protocol, ssh_auth_types, SMTP SASL options (Phase 66).
 
-### Phase 60 — Comprehensive Review (In Progress)
+### Phase 65 — HTTP Header Ordering & Connection Handling
 
-Milestone review phase. Audit results:
+**Goal:** Pass curl test harness tests 1-14 by fixing the two most impactful issues: header ordering and connection close handling.
 
-**FFI Coverage:**
-- 119 unique CURLOPT options in enum (curl has ~300)
-- 47 unique CURLINFO options (curl has ~60)
-- 42 CURLcode error codes (curl has ~99)
-- 56 no_mangle exported functions (curl has ~80)
-- C test harness: 11 tests
+**Validated by:** curl's `runtests.pl` tests 1, 2, 10, 12, 13, 14 (pure header ordering + HEAD hang).
 
-**CLI Coverage:**
-- 199 unique long flags + 36 short flags
-- curl has ~250 long flags → ~80% coverage
-- Missing: man page generation, ~4 low-frequency flags
+#### Header ordering (protocol/http/h1.rs)
+- curl sends headers in this order: Host, User-Agent, Accept, then remaining headers
+- urlx currently sends Accept before User-Agent — every curl test fails on this diff
+- Fix `build_request()` or equivalent in h1.rs to match curl's header order: Host first, then User-Agent, then Accept, then any auth/cookie/content headers, then custom headers
+- Ensure `-H "User-Agent: custom"` replaces rather than appends (curl behavior)
+- Write unit tests that assert exact header order for GET, POST, PUT, DELETE, HEAD
 
-**Known Gaps:**
-- WebSocket not dispatched from Easy API (needs high-level handler)
-- HTTP/3 untested (needs quinn test server)
-- SCRAM-SHA-256 not wired to SMTP/IMAP/POP3
-- `curl_easy_pause()` is a no-op stub
-- No C test harness for FFI
-- LDAP, RTSP, Kerberos/Negotiate not implemented
-- PAC proxy auto-configuration not implemented
+#### HEAD / Connection: close hang (protocol/http/h1.rs, easy.rs)
+- Test 14 (HTTP HEAD) hangs indefinitely — urlx waits for a body that will never arrive
+- Must detect HEAD responses (or `Content-Length: 0` + `Connection: close`) and stop reading
+- Also fix any response where the server closes the connection — urlx must treat TCP close as end-of-response, not hang
+- Test with mock server: HEAD request, 200 + Connection: close, empty-body response
 
-### Phase 61 — WS Dispatch & Protocol Auth (Completed 2026-03-10)
+#### Default User-Agent
+- urlx should send `User-Agent: urlx/VERSION` by default (it does), but verify `-A` flag fully replaces it (not appends)
 
-Wired ws:// and wss:// scheme dispatch in `do_single_request` via new `ws::connect()` function. The connect handler performs TCP connection (plain for ws://, TLS via `TlsConnector::new_no_alpn` for wss://), sends HTTP upgrade request with Sec-WebSocket-Key, validates Sec-WebSocket-Accept in response, returns Response with 101 status. Added `parse_upgrade_response()` helper. 4 new tests (parse_upgrade_response 101/403/invalid_accept, ws_connect_mock_server). HTTP/3 testing and SCRAM-SHA-256 wiring deferred to Phase 62.
+### Phase 66 — Cookie Engine & POST Conformance
 
-### Phase 62 — FFI Parity Push (Completed 2026-03-10)
+**Goal:** Pass curl test harness tests 3, 6, 7, 8, 9 by fixing cookie parsing and POST content-type behavior.
 
-Added 17 new CURLOPT options (PORT, INFILESIZE, RESUME_FROM, PROXYPORT, FILETIME, BUFFERSIZE, PROXYTYPE, IPRESOLVE, FTP_FILEMETHOD, SOCKS5_AUTH, POSTFIELDSIZE_LARGE, CAPATH, MAXCONNECTS, PIPEWAIT, STREAM_WEIGHT, TCP_FASTOPEN, HTTP09_ALLOWED), 4 CURLINFO getters (REQUEST_SIZE, HTTP_CONNECTCODE, HTTPAUTH_AVAIL, PROXYAUTH_AVAIL), 10 CURLcode error variants. Created C test harness (11 tests covering init/cleanup, setopt, duphandle, reset, strerror, version, pause, slist, URL API, getinfo). 20 new Rust tests. SCRAM-SHA-256 SMTP wiring deferred to Phase 64.
+**Validated by:** curl's `runtests.pl` tests 3, 6, 7, 8, 9.
 
-### Phase 63 — CLI Flag Parity (Completed 2026-03-10)
+#### Cookie `-b` multi-cookie parsing (cookie.rs, easy.rs)
+- `curl -b "name=contents;name2=content2; name3=content3"` should send ALL cookies
+- urlx currently only sends the last one (`name3=content3`)
+- Fix the inline cookie parser to split on `;` and send all cookies in a single `Cookie:` header
+- Test: `-b "a=1;b=2;c=3"` must produce `Cookie: a=1; b=2; c=3`
 
-Added ~40 curl flags: -4/--ipv4, -6/--ipv6, -j/--junk-session-cookies, -l/--list-only, -Q/--quote, --http3-only, --oauth2-bearer, --pubkey, --tcp-fastopen, --no-clobber, --suppress-connect-headers, --http0.9, --trace-ids, --disallow-username-in-url, --curves, --engine, --dns-interface, and 25+ more as no-ops. CLI now at 246 long + 40 short flags (~98% of curl's ~250 long flags). Man page generation and config file improvements deferred.
+#### Cookie file parsing (`-b filename`)
+- `curl -b cookiefile.txt` reads cookies from a Netscape cookie file and sends matching ones
+- Test 8 sends 7 cookies from a file; urlx sends none
+- Verify the cookie jar file loading path works and domain-matches properly
+- Test with curl's test fixture data
 
-### Phase 64 — Error Handling & Diagnostics (Completed 2026-03-10)
+#### Cookie `-c` / `-b` jar interaction
+- Test 7 uses `-b` + `-c` (read initial cookies + save new ones from Set-Cookie)
+- urlx sends `Cookie: none` (wrong) and makes an extra request to `/verifiedserver`
+- Debug the cookie jar → request flow to ensure Set-Cookie headers are consumed and re-sent
 
-Added curl-style verbose output: `* Trying <addr>...` and `* Connected to <host> (<ip>) port <port>`. Improved error-to-exit-code mapping with codes for unsupported protocol (1), partial file (18), upload failed (25), and send error (55). Added 7 tests for exit code mapping. SCRAM-SHA-256 SMTP wiring and trace output parity deferred.
+#### Auto Content-Type for POST (easy.rs)
+- `curl -d "data"` automatically adds `Content-Type: application/x-www-form-urlencoded`
+- urlx omits this header (test 3)
+- Add the header when `-d`/`--data` is used and no explicit Content-Type is set
 
-### Phase 65 — Connection & Transfer Polish (Completed 2026-03-10)
+#### Multipart Content-Length (protocol/http/multipart.rs)
+- Test 9: urlx calculates Content-Length as 471, expected 431
+- Debug the multipart encoder — likely extra CRLF or boundary padding
+- Fix and add a unit test asserting exact byte count for a known multipart body
 
-Connection pool now has TTL-based expiry (118s default matching curl), per-host limit (5), total limit (25), FIFO eviction, and proactive cleanup. Happy Eyeballs upgraded to RFC 8305 with address interleaving. CURLOPT_MAXCONNECTS wired to Easy::max_pool_connections(). 23 new tests. HTTP/2 stream priority not wired (deprecated by RFC 9113).
+### Phase 67 — Redirect, Proxy & Exit Code Correctness
 
-### Phase 66 — Wire Unwired Easy API Fields (Completed 2026-03-10)
+**Goal:** Pass curl test harness tests 5, 11, 19, 20 and fix incorrect behavior in redirects, proxies, and exit codes.
 
-Wired ~20 previously stored-but-unused Easy API fields to their consumption points. Created FtpConfig struct bundling 7 FTP options (use_epsv, use_eprt, skip_pasv_ip, account, create_dirs, method, active_port) with EPSV/PASV fallback, ACCT command, MKD directory creation, and FtpMethod CWD strategies. Wired fresh_connect/forbid_reuse to connection pool get/put. Wired proxy_port, proxy_type (scheme rewriting), proxy_headers (CONNECT request injection). Added connect_to host:port remapping, path_as_is raw URL path preservation, haproxy_protocol PROXY v1 header. Wired ssh_auth_types bitmask filtering and ssh_public_keyfile passthrough. Added mail_auth (AUTH= in MAIL FROM), sasl_authzid, sasl_ir to SMTP. Passed doh_insecure to DoH resolver. Added Url::set_port/set_scheme helpers. Deferred: pre_proxy (complex two-hop), abstract_unix_socket (needs OS API). ~49 new tests.
+**Validated by:** curl's `runtests.pl` tests 5, 11, 19, 20; differential exit code tests.
 
-### Phase 67 — Wire Authentication & Fix FFI Honesty
+#### Redirect following (easy.rs)
+- Test 11: urlx follows a redirect to `/verifiedserver` instead of the correct Location URL
+- Debug the 3xx handling path — likely misparses the Location header or has a URL resolution bug
+- Verify relative URL resolution (RFC 3986) works: `Location: /path` relative to the request URL
+- Test with chain of redirects (301 → 302 → 200) and verify each hop goes to the right URL
 
-**Problem:** NTLMv2 only works for proxy auth, not HTTP 401. SCRAM-SHA-256 is fully implemented but wired to nothing. FFI returns CURLE_OK for ~15 options it doesn't implement.
+#### Proxy request format (proxy/http.rs, easy.rs)
+- Test 5 (HTTP over proxy) has three issues:
+  1. Fragment `#5` leaks into the proxy request URL — must strip fragments before sending to proxy
+  2. Uses `Connection: close` instead of `Proxy-Connection: Keep-Alive`
+  3. Header ordering (fixed in Phase 65)
+- Fix fragment stripping for proxy requests
+- Add `Proxy-Connection: Keep-Alive` header for HTTP proxy requests (curl's default behavior)
 
-#### NTLMv2 for HTTP server auth (easy.rs)
-- In the 401-response handling path (~line 2075), add NTLM challenge-response alongside existing Digest handling
-- Implement Type 1 → Type 2 → Type 3 message exchange over HTTP (two round trips)
-- Test with mock server returning 401 + WWW-Authenticate: NTLM
+#### Exit codes (error.rs, easy.rs)
+- Unsupported protocol (`gopher://...`) should return exit code 1 (CURLE_UNSUPPORTED_PROTOCOL), currently returns 3
+- Non-existent hostname should return exit code 6 (CURLE_COULDNT_RESOLVE_HOST), currently returns 7
+- Connection refused should return exit code 7 (CURLE_COULDNT_CONNECT) — this already works
+- Bad/missing URL should return exit code 3 (CURLE_URL_MALFORMAT), currently returns 7
+- Audit all error-to-exit-code mappings against curl's CURLcode enum
 
-#### SCRAM-SHA-256 wiring (protocol/smtp.rs, protocol/imap.rs, protocol/pop3.rs)
-- Wire `auth/scram.rs` into SMTP AUTH command (after EHLO, check for AUTH SCRAM-SHA-256 capability)
-- Wire into IMAP AUTHENTICATE command
-- Wire into POP3 AUTH command
-- Test each with mock server exercising the full SASL exchange
+#### Response header casing (protocol/http/response.rs)
+- urlx lowercases response headers in `-i` output; curl preserves original case from server
+- Preserve original header name casing when outputting with `--include` / `-i`
+- Internal lookups can remain case-insensitive
 
-#### FFI honesty — return CURLE_NOT_BUILT_IN instead of CURLE_OK for unimplemented options
-- Proxy TLS options: PROXY_CAPATH, PROXY_CRLFILE, PROXY_PINNEDPUBLICKEY, PROXY_SSLVERSION, PROXY_SSL_CIPHER_LIST, PROXY_TLS13_CIPHERS, SOCKS5_AUTH
-- Other no-ops that claim success: auto-referer, TCP Fast Open, HTTP/0.9, HSTS file I/O, FTP clear command channel, FTP PRET, FTP compression
-- Add CURLE_NOT_BUILT_IN variant to CURLcode if not present
+### Phase 68 — FTP Conformance & Integration Test Harness
+
+**Goal:** Pass curl FTP tests 100, 102, 104 and establish a permanent integration test harness using curl's test infrastructure.
+
+**Validated by:** curl's `runtests.pl` tests 100, 102, 104; new Rust integration tests.
+
+#### FTP protocol sequence (protocol/ftp.rs)
+- Test 100 (FTP LIST): urlx sends `RETR` instead of `LIST`; missing `PWD` after login; sends `TYPE I` instead of `TYPE A` for directory listing
+- Test 102 (FTP RETR): missing `PWD` and `SIZE` commands; different command order
+- Test 104 (FTP HEAD/size-only): urlx sends RETR when it should just do MDTM+SIZE+REST for `--head`
+- Fix: after USER/PASS, send `PWD` to establish working directory (curl always does this)
+- Fix: use `TYPE A` for LIST operations, `TYPE I` for binary RETR
+- Fix: `--head` on FTP should run MDTM+SIZE without downloading the file
+- Fix: default anonymous password should be `ftp@example.com` (curl's default), not `urlx@`
+
+#### Integration test harness (tests/)
+- Create a Rust integration test file (`tests/curl_compat.rs`) that:
+  - Starts a mock HTTP server (hyper on a random port)
+  - Runs urlx as a subprocess against it
+  - Asserts on: response body, exit code, and request headers the server received
+- Port at least the following curl tests as permanent Rust tests:
+  - Test 1: basic HTTP GET (header order)
+  - Test 3: POST with auth + Content-Type
+  - Test 6: cookie sending
+  - Test 10: PUT from file
+  - Test 11: redirect following
+  - Test 13: custom HTTP method
+  - Test 14: HEAD request
+- These tests become the regression suite — they must pass before any future release
+
+### Phase 69 — FFI Safety & Remaining Polish
+
+**Goal:** Fix the FFI catch_unwind gap and clean up remaining audit findings before release.
+
+#### FFI catch_unwind (liburlx-ffi/src/lib.rs)
+- Only 1 of 56 exported functions (`curl_easy_perform`) has `catch_unwind`
+- CLAUDE.md requires all exported functions to have it — this is a real safety bug
+- Add `std::panic::catch_unwind(AssertUnwindSafe(|| { ... }))` to all 55 remaining exported functions
+- Functions that return CURLcode should return CURLE_UNKNOWN_OPTION or similar on panic
+- Functions that return pointers should return null on panic
+- Add 4 missing `// SAFETY:` comments (curl_mime_free, curl_multi_add_handle, curl_slist_append, curl_slist_free_all)
+
+#### FFI honesty — return CURLE_NOT_BUILT_IN for unimplemented options
+- ~15 CURLOPT options currently return CURLE_OK but do nothing
+- Change these to return CURLE_NOT_BUILT_IN so callers know the option isn't supported
 - Document which options are accepted-but-ignored vs truly unimplemented
 
-### Phase 68 — HTTP/2 Settings & CLI Honesty
-
-**Problem:** All 7 HTTP/2 tuning options are stored but never passed to the h2 crate. 87 of 285 CLI flags are silent no-ops.
-
-#### HTTP/2 settings wiring (easy.rs → protocol/http/h2.rs)
-- `http2_window_size` → pass to h2::client::Builder::initial_window_size()
-- `http2_connection_window_size` → pass to h2::client::Builder::initial_connection_window_size()
-- `http2_max_frame_size` → pass to h2::client::Builder::max_frame_size()
-- `http2_max_header_list_size` → pass to h2::client::Builder::max_header_list_size()
-- `http2_enable_push` → pass to h2::client::Builder::enable_push()
-- `http2_ping_interval` → spawn keepalive ping task on the h2 connection
-- Skip `http2_stream_weight` — stream priority is deprecated in RFC 9113, document why
-
-#### CLI flag audit (urlx-cli/src/args.rs)
-- For each of the 87 no-op flags, categorize:
-  - **Can implement now:** flags where the underlying Easy API supports it (e.g., `--ipv4`/`--ipv6` → `ip_resolve`, `--junk-session-cookies` → cookie jar clear, `--tcp-fastopen` if wired)
-  - **Needs underlying work:** flags where the Easy API doesn't support it yet
-  - **Genuinely unnecessary:** flags for features urlx will never support (e.g., `--metalink`, `--ntlm-wb`)
-- Wire flags in the first category to their Easy API equivalents
-- For genuinely unnecessary flags, emit a warning to stderr when used: `urlx: warning: --flag is not supported and has no effect`
-- Fix short flag count: verify 39 vs 40, correct CLAUDE.md
-
-### Phase 69 — curl_easy_pause, Multi API, & Transfer Control
-
-**Problem:** `curl_easy_pause()` returns OK but does nothing. Multi API event loop functions are no-ops. Several transfer control features are stubs.
-
-#### curl_easy_pause (liburlx-ffi)
-- Implement actual pause/resume for transfers using tokio channel or flag
-- Pause should stop reading from the socket (backpressure via not polling the read future)
-- Resume should re-poll the read future
-- CURLPAUSE_RECV, CURLPAUSE_SEND, CURLPAUSE_ALL, CURLPAUSE_CONT
-- Test with FFI C test and Rust unit test
-
-#### curl_easy_upkeep (liburlx-ffi)
-- Implement connection keepalive check (ping pooled connections, evict dead ones)
-- Useful for long-lived applications that hold a curl handle
-
-#### Multi API improvements (liburlx-ffi)
-- `curl_multi_fdset()` — Expose underlying tokio socket FDs if possible, or document why not
-- `curl_multi_socket_action()` — Bridge to tokio reactor, or return CURLE_NOT_BUILT_IN
-- Document architectural mismatch: tokio owns the event loop, libcurl's Multi expects the caller to own it
+#### Final verification
+- Run full `cargo test`, `cargo clippy --all-targets`, `cargo fmt --check`, `cargo doc`
+- Run curl test harness tests 1-20, 100-105, 200-205 and record pass rate
+- Run differential test suite against real endpoints and record pass rate
+- Update test count and completeness metrics in CLAUDE.md
 
 ### Phase 70 — v0.2.0 Release
 
-**Milestone release.** All audit remediation from Phases 66-69 is complete. Ship v0.2.0 with honest metrics.
+**Milestone release.** All audit-driven fixes from Phases 65-69 are complete. Ship v0.2.0.
 
-#### Pre-release audit
-- Compact phases 60-69 into Phase 0 summary
-- Re-count all metrics (tests, flags, FFI options) and update Completeness Summary
-- Verify all previously-unwired Easy API fields are now consumed or removed
-- Verify FFI no longer returns CURLE_OK for unimplemented options
-- Run full test suite (`cargo test --all`), clippy, fmt, doc — zero warnings
-- Differential testing against curl for top-20 use cases (GET, POST, upload, redirect, auth, proxy, FTP, cookies, HEAD, PUT, multipart, range, resume, compressed, HTTP/2, verbose, headers, timeout, retry, cert)
+#### Pre-release verification
+- All curl harness tests targeted in Phases 65-68 must pass
+- Differential test suite against real endpoints must show >90% parity (excluding User-Agent)
+- `cargo test --all`, clippy, fmt, doc — zero errors
+- Run the Rust integration tests from Phase 68
 
 #### Version bump
 - Bump version to `0.2.0` in all Cargo.toml files (workspace root, liburlx, liburlx-ffi, urlx-cli)
-- Update CHANGELOG.md with all changes since v0.1.0, organized by category:
-  - **Fixed:** Unwired fields, FFI honesty, NTLMv2 HTTP auth, CLI no-op warnings
-  - **Added:** SCRAM-SHA-256 for SMTP/IMAP/POP3, HTTP/2 tuning, curl_easy_pause, pool improvements
-  - **Changed:** Completeness percentages now reflect actual wired functionality
+- Update CHANGELOG.md with changes since v0.1.0:
+  - **Fixed:** Header ordering, HEAD hang, cookie parsing, redirect following, proxy fragment leak, POST Content-Type, multipart Content-Length, exit codes, header casing, FTP sequence, FFI safety
+  - **Added:** Permanent curl-compat integration test suite, catch_unwind on all FFI functions
 
 #### Documentation
-- Update README.md:
-  - Revised completeness table, new features since v0.1.0, honest "what works" section
-  - Add `brew install urlx` to installation section (Homebrew is already set up)
-  - Add a Quick Start section with example commands showing common usage (GET request, POST JSON, download file, upload, follow redirects, custom headers, verbose output, auth, etc.) — make it easy for someone to start using urlx immediately
-- Update API docs (`cargo doc`): ensure all newly-wired options have accurate doc comments
-- Remove any doc comments that claim functionality that doesn't exist
+- Update README.md with revised completeness table and Quick Start examples
+- Update API docs (`cargo doc`)
 
 #### Publish
 - `cargo publish -p liburlx` → crates.io
 - `cargo publish -p liburlx-ffi` → crates.io
 - `cargo publish -p urlx-cli` → crates.io
-- Create GitHub Release v0.2.0 with release notes from CHANGELOG.md
-- Update Homebrew formula with new version and SHA
+- Create GitHub Release v0.2.0
+- Update Homebrew formula
 
 #### Post-release
-- **STOP and report to the agent's driver.** Provide a summary of:
-  - What was accomplished in Phases 66-70
-  - Updated completeness percentages (before vs after)
-  - Total test count
-  - Remaining known gaps and recommended next phases (71-80)
-  - Any decisions that need human input before proceeding
+- **STOP and report.** Provide summary of what was fixed, updated pass rates, test count, and recommended next phases
 
 ---
 
