@@ -250,12 +250,189 @@ impl Frame {
     }
 }
 
+/// Configuration for the `permessage-deflate` WebSocket extension (RFC 7692).
+#[cfg(feature = "decompression")]
+#[derive(Debug, Clone)]
+pub struct DeflateConfig {
+    /// Whether compression is enabled.
+    pub enabled: bool,
+    /// Whether to take over the client compression context between messages.
+    /// When true, the deflate state persists across messages for better compression.
+    /// When false, each message is compressed independently.
+    pub client_no_context_takeover: bool,
+    /// Whether to take over the server compression context between messages.
+    pub server_no_context_takeover: bool,
+    /// Maximum server window bits (9-15). Default is 15.
+    pub server_max_window_bits: u8,
+    /// Maximum client window bits (9-15). Default is 15.
+    pub client_max_window_bits: u8,
+}
+
+#[cfg(feature = "decompression")]
+impl Default for DeflateConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            client_no_context_takeover: false,
+            server_no_context_takeover: false,
+            server_max_window_bits: 15,
+            client_max_window_bits: 15,
+        }
+    }
+}
+
+#[cfg(feature = "decompression")]
+impl DeflateConfig {
+    /// Parse a `permessage-deflate` extension offer from a `Sec-WebSocket-Extensions` header.
+    ///
+    /// Returns `None` if the header does not contain a `permessage-deflate` offer.
+    #[must_use]
+    pub fn from_header(header: &str) -> Option<Self> {
+        let mut config = Self { enabled: true, ..Self::default() };
+
+        let parts: Vec<&str> = header.split(';').map(str::trim).collect();
+        if parts.is_empty() || !parts[0].eq_ignore_ascii_case("permessage-deflate") {
+            return None;
+        }
+
+        for param in &parts[1..] {
+            let param = param.trim();
+            if param.eq_ignore_ascii_case("client_no_context_takeover") {
+                config.client_no_context_takeover = true;
+            } else if param.eq_ignore_ascii_case("server_no_context_takeover") {
+                config.server_no_context_takeover = true;
+            } else if let Some(val) = param.strip_prefix("server_max_window_bits=") {
+                if let Ok(bits) = val.trim().parse::<u8>() {
+                    if (9..=15).contains(&bits) {
+                        config.server_max_window_bits = bits;
+                    }
+                }
+            } else if let Some(val) = param.strip_prefix("client_max_window_bits=") {
+                if let Ok(bits) = val.trim().parse::<u8>() {
+                    if (9..=15).contains(&bits) {
+                        config.client_max_window_bits = bits;
+                    }
+                }
+            }
+        }
+
+        Some(config)
+    }
+
+    /// Format this config as a `Sec-WebSocket-Extensions` header value for an offer.
+    #[must_use]
+    pub fn to_header(&self) -> String {
+        let mut s = String::from("permessage-deflate");
+        if self.client_no_context_takeover {
+            s.push_str("; client_no_context_takeover");
+        }
+        if self.server_no_context_takeover {
+            s.push_str("; server_no_context_takeover");
+        }
+        if self.server_max_window_bits != 15 {
+            use std::fmt::Write as _;
+            let _ = write!(s, "; server_max_window_bits={}", self.server_max_window_bits);
+        }
+        if self.client_max_window_bits != 15 {
+            use std::fmt::Write as _;
+            let _ = write!(s, "; client_max_window_bits={}", self.client_max_window_bits);
+        }
+        s
+    }
+}
+
+#[cfg(feature = "decompression")]
+/// Compressor/decompressor for `permessage-deflate`.
+///
+/// Handles the raw DEFLATE compression with the trailing 4-byte sync marker
+/// stripping required by RFC 7692. Each compress/decompress call creates a
+/// fresh context (equivalent to `no_context_takeover` mode).
+struct DeflateCodec;
+
+#[cfg(feature = "decompression")]
+impl DeflateCodec {
+    const fn new(_config: &DeflateConfig, _is_client: bool) -> Self {
+        Self
+    }
+
+    fn compress(data: &[u8]) -> Result<Vec<u8>, Error> {
+        let mut compress = flate2::Compress::new(flate2::Compression::default(), false);
+        // Allocate generous output buffer
+        let mut output = vec![0u8; data.len() + 64];
+        let status = compress
+            .compress(data, &mut output, flate2::FlushCompress::Sync)
+            .map_err(|e| Error::Http(format!("WebSocket deflate compress error: {e}")))?;
+
+        // If output buffer was too small, grow and retry
+        if status == flate2::Status::BufError {
+            output.resize(data.len() * 2 + 256, 0);
+            compress.reset();
+            let _status = compress
+                .compress(data, &mut output, flate2::FlushCompress::Sync)
+                .map_err(|e| Error::Http(format!("WebSocket deflate compress error: {e}")))?;
+        }
+
+        #[allow(clippy::cast_possible_truncation)]
+        let written = compress.total_out() as usize;
+        output.truncate(written);
+
+        // RFC 7692: Remove trailing 0x00 0x00 0xFF 0xFF sync marker
+        if output.len() >= 4 && output[output.len() - 4..] == [0x00, 0x00, 0xFF, 0xFF] {
+            output.truncate(output.len() - 4);
+        }
+
+        Ok(output)
+    }
+
+    fn decompress(data: &[u8]) -> Result<Vec<u8>, Error> {
+        // RFC 7692: Append 0x00 0x00 0xFF 0xFF before decompressing
+        let mut input = Vec::with_capacity(data.len() + 4);
+        input.extend_from_slice(data);
+        input.extend_from_slice(&[0x00, 0x00, 0xFF, 0xFF]);
+
+        let mut decompress = flate2::Decompress::new(false);
+        let mut output = Vec::with_capacity(data.len() * 3);
+        let mut buf = [0u8; 4096];
+        let mut input_pos = 0;
+
+        loop {
+            #[allow(clippy::cast_possible_truncation)]
+            let before_out = decompress.total_out() as usize;
+
+            let status = decompress
+                .decompress(&input[input_pos..], &mut buf, flate2::FlushDecompress::Sync)
+                .map_err(|e| Error::Http(format!("WebSocket deflate decompress error: {e}")))?;
+
+            #[allow(clippy::cast_possible_truncation)]
+            let produced = decompress.total_out() as usize - before_out;
+            #[allow(clippy::cast_possible_truncation)]
+            {
+                input_pos = decompress.total_in() as usize;
+            }
+
+            output.extend_from_slice(&buf[..produced]);
+
+            match status {
+                flate2::Status::Ok => {
+                    if produced == 0 && input_pos >= input.len() {
+                        break;
+                    }
+                }
+                flate2::Status::StreamEnd | flate2::Status::BufError => break,
+            }
+        }
+
+        Ok(output)
+    }
+}
+
 /// A WebSocket stream that handles control frames and message reassembly.
 ///
 /// Wraps a raw `AsyncRead + AsyncWrite` stream and provides:
 /// - Automatic pong responses to ping frames
 /// - Close frame status code handling
 /// - Fragmented message reassembly (continuation frames)
+/// - Optional `permessage-deflate` compression (RFC 7692)
 pub struct WebSocketStream<S> {
     stream: S,
     /// Whether we have sent a close frame.
@@ -268,6 +445,9 @@ pub struct WebSocketStream<S> {
     fragment_buf: Vec<u8>,
     /// Opcode of the first fragment in a fragmented message.
     fragment_opcode: Option<Opcode>,
+    /// Deflate codec for permessage-deflate, if negotiated.
+    #[cfg(feature = "decompression")]
+    deflate: Option<DeflateCodec>,
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> WebSocketStream<S> {
@@ -281,6 +461,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WebSocketStream<S> {
             is_client: true,
             fragment_buf: Vec::new(),
             fragment_opcode: None,
+            #[cfg(feature = "decompression")]
+            deflate: None,
         }
     }
 
@@ -294,6 +476,38 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WebSocketStream<S> {
             is_client: false,
             fragment_buf: Vec::new(),
             fragment_opcode: None,
+            #[cfg(feature = "decompression")]
+            deflate: None,
+        }
+    }
+
+    /// Create a new client-side WebSocket stream with `permessage-deflate` enabled.
+    #[cfg(feature = "decompression")]
+    #[allow(clippy::missing_const_for_fn)]
+    pub fn new_client_deflate(stream: S, config: &DeflateConfig) -> Self {
+        Self {
+            stream,
+            close_sent: false,
+            close_received: false,
+            is_client: true,
+            fragment_buf: Vec::new(),
+            fragment_opcode: None,
+            deflate: Some(DeflateCodec::new(config, true)),
+        }
+    }
+
+    /// Create a new server-side WebSocket stream with `permessage-deflate` enabled.
+    #[cfg(feature = "decompression")]
+    #[allow(clippy::missing_const_for_fn)]
+    pub fn new_server_deflate(stream: S, config: &DeflateConfig) -> Self {
+        Self {
+            stream,
+            close_sent: false,
+            close_received: false,
+            is_client: false,
+            fragment_buf: Vec::new(),
+            fragment_opcode: None,
+            deflate: Some(DeflateCodec::new(config, false)),
         }
     }
 
@@ -357,14 +571,27 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WebSocketStream<S> {
                 }
                 Opcode::Text | Opcode::Binary => {
                     if frame.fin {
+                        // Decompress if RSV1 is set (permessage-deflate)
+                        #[cfg(feature = "decompression")]
+                        let payload = if frame.rsv1 {
+                            if self.deflate.is_some() {
+                                DeflateCodec::decompress(&frame.payload)?
+                            } else {
+                                frame.payload
+                            }
+                        } else {
+                            frame.payload
+                        };
+                        #[cfg(not(feature = "decompression"))]
+                        let payload = frame.payload;
                         // Complete single-frame message
                         return if frame.opcode == Opcode::Text {
-                            let text = String::from_utf8(frame.payload).map_err(|e| {
+                            let text = String::from_utf8(payload).map_err(|e| {
                                 Error::Http(format!("invalid UTF-8 in WebSocket text frame: {e}"))
                             })?;
                             Ok(Message::Text(text))
                         } else {
-                            Ok(Message::Binary(frame.payload))
+                            Ok(Message::Binary(payload))
                         };
                     }
                     // Start of a fragmented message
@@ -403,20 +630,42 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WebSocketStream<S> {
 
     /// Send a text message.
     ///
+    /// If `permessage-deflate` is negotiated, the payload is compressed
+    /// and the RSV1 bit is set on the frame.
+    ///
     /// # Errors
     ///
-    /// Returns an error on I/O failure.
+    /// Returns an error on I/O failure or compression failure.
     pub async fn send_text(&mut self, data: &str) -> Result<(), Error> {
+        #[cfg(feature = "decompression")]
+        let frame = if self.deflate.is_some() {
+            let compressed = DeflateCodec::compress(data.as_bytes())?;
+            Frame { fin: true, rsv1: true, opcode: Opcode::Text, payload: compressed }
+        } else {
+            Frame::text(data)
+        };
+        #[cfg(not(feature = "decompression"))]
         let frame = Frame::text(data);
         write_frame_masked(&mut self.stream, &frame, self.is_client).await
     }
 
     /// Send a binary message.
     ///
+    /// If `permessage-deflate` is negotiated, the payload is compressed
+    /// and the RSV1 bit is set on the frame.
+    ///
     /// # Errors
     ///
-    /// Returns an error on I/O failure.
+    /// Returns an error on I/O failure or compression failure.
     pub async fn send_binary(&mut self, data: &[u8]) -> Result<(), Error> {
+        #[cfg(feature = "decompression")]
+        let frame = if self.deflate.is_some() {
+            let compressed = DeflateCodec::compress(data)?;
+            Frame { fin: true, rsv1: true, opcode: Opcode::Binary, payload: compressed }
+        } else {
+            Frame::binary(data)
+        };
+        #[cfg(not(feature = "decompression"))]
         let frame = Frame::binary(data);
         write_frame_masked(&mut self.stream, &frame, self.is_client).await
     }
@@ -1005,5 +1254,144 @@ mod tests {
         client.send_close(None, "").await.unwrap();
         let msg = server.read_message().await.unwrap();
         assert_eq!(msg, Message::Close(None, None));
+    }
+
+    // ─── permessage-deflate tests ───
+
+    #[cfg(feature = "decompression")]
+    mod deflate_tests {
+        use super::*;
+
+        #[test]
+        fn deflate_config_default() {
+            let config = DeflateConfig::default();
+            assert!(!config.enabled);
+            assert!(!config.client_no_context_takeover);
+            assert!(!config.server_no_context_takeover);
+            assert_eq!(config.server_max_window_bits, 15);
+            assert_eq!(config.client_max_window_bits, 15);
+        }
+
+        #[test]
+        fn deflate_config_from_header_basic() {
+            let config = DeflateConfig::from_header("permessage-deflate").unwrap();
+            assert!(config.enabled);
+            assert!(!config.client_no_context_takeover);
+        }
+
+        #[test]
+        fn deflate_config_from_header_with_params() {
+            let config = DeflateConfig::from_header(
+                "permessage-deflate; client_no_context_takeover; server_max_window_bits=12",
+            )
+            .unwrap();
+            assert!(config.enabled);
+            assert!(config.client_no_context_takeover);
+            assert!(!config.server_no_context_takeover);
+            assert_eq!(config.server_max_window_bits, 12);
+        }
+
+        #[test]
+        fn deflate_config_from_header_wrong_extension() {
+            assert!(DeflateConfig::from_header("x-webkit-deflate-frame").is_none());
+        }
+
+        #[test]
+        fn deflate_config_to_header_default() {
+            let config = DeflateConfig { enabled: true, ..DeflateConfig::default() };
+            assert_eq!(config.to_header(), "permessage-deflate");
+        }
+
+        #[test]
+        fn deflate_config_to_header_with_params() {
+            let config = DeflateConfig {
+                enabled: true,
+                client_no_context_takeover: true,
+                server_no_context_takeover: false,
+                server_max_window_bits: 10,
+                client_max_window_bits: 15,
+            };
+            let header = config.to_header();
+            assert!(header.contains("client_no_context_takeover"));
+            assert!(header.contains("server_max_window_bits=10"));
+            assert!(!header.contains("server_no_context_takeover"));
+        }
+
+        #[test]
+        fn deflate_codec_roundtrip() {
+            let original = b"Hello, World! This is a test of WebSocket compression.";
+            let compressed = DeflateCodec::compress(original).unwrap();
+            let decompressed = DeflateCodec::decompress(&compressed).unwrap();
+            assert_eq!(decompressed, original);
+        }
+
+        #[test]
+        fn deflate_codec_compresses_data() {
+            // Repetitive data should compress well
+            let original = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".as_bytes();
+            let compressed = DeflateCodec::compress(original).unwrap();
+            assert!(compressed.len() < original.len());
+        }
+
+        #[test]
+        fn deflate_codec_empty_input() {
+            let compressed = DeflateCodec::compress(b"").unwrap();
+            let decompressed = DeflateCodec::decompress(&compressed).unwrap();
+            assert!(decompressed.is_empty());
+        }
+
+        #[tokio::test]
+        async fn ws_stream_deflate_text_roundtrip() {
+            let config = DeflateConfig { enabled: true, ..DeflateConfig::default() };
+            let (client_stream, server_stream) = tokio::io::duplex(4096);
+            let mut client = WebSocketStream::new_client_deflate(client_stream, &config);
+            let mut server = WebSocketStream::new_server_deflate(server_stream, &config);
+
+            client.send_text("Hello, compressed world!").await.unwrap();
+            let msg = server.read_message().await.unwrap();
+            assert_eq!(msg, Message::Text("Hello, compressed world!".to_string()));
+        }
+
+        #[tokio::test]
+        async fn ws_stream_deflate_binary_roundtrip() {
+            let config = DeflateConfig { enabled: true, ..DeflateConfig::default() };
+            let (client_stream, server_stream) = tokio::io::duplex(4096);
+            let mut client = WebSocketStream::new_client_deflate(client_stream, &config);
+            let mut server = WebSocketStream::new_server_deflate(server_stream, &config);
+
+            let data = vec![1, 2, 3, 4, 5, 6, 7, 8];
+            client.send_binary(&data).await.unwrap();
+            let msg = server.read_message().await.unwrap();
+            assert_eq!(msg, Message::Binary(data));
+        }
+
+        #[tokio::test]
+        async fn ws_stream_deflate_rsv1_set() {
+            let config = DeflateConfig { enabled: true, ..DeflateConfig::default() };
+            let (client_stream, server_stream) = tokio::io::duplex(4096);
+            let mut client = WebSocketStream::new_client_deflate(client_stream, &config);
+
+            client.send_text("test").await.unwrap();
+
+            // Read the raw frame from the server side to verify RSV1 is set
+            let mut server_raw = server_stream;
+            let frame = read_frame(&mut server_raw).await.unwrap();
+            assert!(frame.rsv1, "RSV1 bit should be set for compressed frames");
+        }
+
+        #[tokio::test]
+        async fn ws_stream_deflate_multiple_messages() {
+            let config = DeflateConfig { enabled: true, ..DeflateConfig::default() };
+            let (client_stream, server_stream) = tokio::io::duplex(8192);
+            let mut client = WebSocketStream::new_client_deflate(client_stream, &config);
+            let mut server = WebSocketStream::new_server_deflate(server_stream, &config);
+
+            for i in 0..5 {
+                let msg = format!("message number {i}");
+                client.send_text(&msg).await.unwrap();
+                let received = server.read_message().await.unwrap();
+                assert_eq!(received, Message::Text(msg));
+            }
+        }
     }
 }
