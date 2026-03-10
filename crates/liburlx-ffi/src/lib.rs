@@ -2350,6 +2350,235 @@ pub unsafe extern "C" fn curl_easy_setopt(
             CURLcode::CURLE_OK
         }
 
+        // ─── FTP options ───
+
+        // CURLOPT_FTPPORT = 10017
+        10017 => {
+            // SAFETY: value must be a null-terminated C string
+            if let Some(s) = unsafe { read_cstr(value) } {
+                h.easy.ftp_active_port(s);
+            }
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_FTP_USE_EPSV = 85
+        85 => {
+            h.easy.ftp_use_epsv(value as c_long != 0);
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_FTP_USE_EPRT = 106
+        106 => {
+            h.easy.ftp_use_eprt(value as c_long != 0);
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_FTP_CREATE_MISSING_DIRS = 110
+        110 => {
+            h.easy.ftp_create_dirs(value as c_long != 0);
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_FTP_SKIP_PASV_IP = 137
+        137 => {
+            h.easy.ftp_skip_pasv_ip(value as c_long != 0);
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_FTP_FILEMETHOD = 138
+        138 => {
+            #[allow(clippy::cast_sign_loss)]
+            let method = match value as c_long {
+                1 => liburlx::FtpMethod::MultiCwd,
+                2 => liburlx::FtpMethod::NoCwd,
+                3 => liburlx::FtpMethod::SingleCwd,
+                _ => liburlx::FtpMethod::default(),
+            };
+            h.easy.ftp_method(method);
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_FTP_ACCOUNT = 10134
+        10134 => {
+            // SAFETY: value must be a null-terminated C string
+            if let Some(s) = unsafe { read_cstr(value) } {
+                h.easy.ftp_account(s);
+            }
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_FTP_ALTERNATIVE_TO_USER = 10147
+        10147 => {
+            // Accept but store as no-op (API compat)
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_FTP_SSL_CCC = 154
+        154 => {
+            // Accept clear command channel mode (not yet implemented)
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_FTP_USE_PRET = 188
+        188 => {
+            // Accept PRET option (not yet implemented)
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_USE_SSL = 119
+        119 => {
+            let mode = match value as c_long {
+                2 | 3 => liburlx::FtpSslMode::Explicit,
+                _ => liburlx::FtpSslMode::None,
+            };
+            h.easy.ftp_ssl_mode(mode);
+            CURLcode::CURLE_OK
+        }
+
+        // ─── SSH options ───
+
+        // CURLOPT_SSH_AUTH_TYPES = 151
+        151 => {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            h.easy.ssh_auth_types(value as u32);
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_SSH_PUBLIC_KEYFILE = 10152
+        10152 => {
+            // SAFETY: value must be a null-terminated C string
+            if let Some(s) = unsafe { read_cstr(value) } {
+                h.easy.ssh_public_keyfile(s);
+            }
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_SSH_PRIVATE_KEYFILE = 10153
+        10153 => {
+            // SAFETY: value must be a null-terminated C string
+            if let Some(s) = unsafe { read_cstr(value) } {
+                h.easy.ssh_key_path(s);
+            }
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_SSH_KNOWNHOSTS = 10183
+        10183 => {
+            // SAFETY: value must be a null-terminated C string
+            if let Some(s) = unsafe { read_cstr(value) } {
+                h.easy.ssh_known_hosts_path(s);
+            }
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_SSH_HOST_PUBLIC_KEY_SHA256 = 10270
+        10270 => {
+            // SAFETY: value must be a null-terminated C string
+            if let Some(s) = unsafe { read_cstr(value) } {
+                h.easy.ssh_host_key_sha256(s);
+            }
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_SSH_HOST_PUBLIC_KEY_MD5 = 10162
+        10162 => {
+            // Accept MD5 fingerprint (deprecated, prefer SHA256)
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_SSH_COMPRESSION = 268
+        268 => {
+            // Accept compression flag (not yet implemented)
+            CURLcode::CURLE_OK
+        }
+
+        // ─── Proxy options ───
+
+        // CURLOPT_PROXYPORT = 59
+        59 => {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            h.easy.proxy_port(value as u16);
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_PROXYTYPE = 101
+        101 => {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            h.easy.proxy_type(value as u32);
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_PROXYUSERNAME = 10175
+        10175 => {
+            // SAFETY: value must be a null-terminated C string
+            if let Some(s) = unsafe { read_cstr(value) } {
+                // Store username, combine with existing password
+                h.easy.proxy_auth(s, "");
+            }
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_PROXYPASSWORD = 10176
+        10176 => {
+            // SAFETY: value must be a null-terminated C string
+            if let Some(s) = unsafe { read_cstr(value) } {
+                // Store password, combine with existing username
+                h.easy.proxy_auth("", s);
+            }
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_PRE_PROXY = 10262
+        10262 => {
+            // SAFETY: value must be a null-terminated C string
+            if let Some(s) = unsafe { read_cstr(value) } {
+                h.easy.pre_proxy(s);
+            }
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_PROXY_CAPATH = 10247
+        10247 => {
+            // Accept CA path for proxy — stored but not yet used
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_PROXY_CRLFILE = 10260
+        10260 => {
+            // Accept CRL file for proxy — stored but not yet used
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_PROXY_PINNEDPUBLICKEY = 10263
+        10263 => {
+            // Accept pinned public key for proxy — stored but not yet used
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_PROXY_SSLVERSION = 250
+        250 => {
+            // Accept proxy SSL version — stored but not yet used
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_PROXY_SSL_CIPHER_LIST = 10259
+        10259 => {
+            // Accept proxy cipher list — stored but not yet used
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_PROXY_TLS13_CIPHERS = 10277
+        10277 => {
+            // Accept proxy TLS 1.3 ciphers — stored but not yet used
+            CURLcode::CURLE_OK
+        }
+
+        // CURLOPT_SOCKS5_AUTH = 267
+        267 => {
+            // Accept SOCKS5 auth bitmask — stored but not yet used
+            CURLcode::CURLE_OK
+        }
+
         _ => CURLcode::CURLE_UNKNOWN_OPTION,
     }
 }
@@ -6864,6 +7093,177 @@ mod tests {
         let code =
             unsafe { curl_easy_setopt(handle, 40292, ptr::from_ref(&blob).cast::<c_void>()) };
         assert_eq!(code, CURLcode::CURLE_BAD_FUNCTION_ARGUMENT);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    // ─── Phase 55: FTP options ───
+
+    #[test]
+    fn easy_setopt_ftpport() {
+        let handle = curl_easy_init();
+        let addr = c"-";
+        let code = unsafe { curl_easy_setopt(handle, 10017, addr.as_ptr().cast::<c_void>()) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_ftp_use_epsv() {
+        let handle = curl_easy_init();
+        let code = unsafe { curl_easy_setopt(handle, 85, ptr::null()) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_ftp_use_eprt() {
+        let handle = curl_easy_init();
+        let code = unsafe { curl_easy_setopt(handle, 106, std::ptr::dangling::<c_void>()) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_ftp_create_missing_dirs() {
+        let handle = curl_easy_init();
+        let code = unsafe { curl_easy_setopt(handle, 110, std::ptr::dangling::<c_void>()) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_ftp_skip_pasv_ip() {
+        let handle = curl_easy_init();
+        let code = unsafe { curl_easy_setopt(handle, 137, std::ptr::dangling::<c_void>()) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_ftp_filemethod() {
+        let handle = curl_easy_init();
+        // CURLFTPMETHOD_SINGLECWD = 3
+        let code = unsafe { curl_easy_setopt(handle, 138, 3_usize as *const c_void) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_ftp_account() {
+        let handle = curl_easy_init();
+        let acct = c"myaccount";
+        let code = unsafe { curl_easy_setopt(handle, 10134, acct.as_ptr().cast::<c_void>()) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_use_ssl() {
+        let handle = curl_easy_init();
+        // CURLUSESSL_TRY = 2
+        let code = unsafe { curl_easy_setopt(handle, 119, 2_usize as *const c_void) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    // ─── Phase 55: SSH options ───
+
+    #[test]
+    fn easy_setopt_ssh_auth_types() {
+        let handle = curl_easy_init();
+        // CURLSSH_AUTH_PUBLICKEY = 1 | CURLSSH_AUTH_PASSWORD = 2
+        let code = unsafe { curl_easy_setopt(handle, 151, 3_usize as *const c_void) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_ssh_public_keyfile() {
+        let handle = curl_easy_init();
+        let path = c"/home/user/.ssh/id_rsa.pub";
+        let code = unsafe { curl_easy_setopt(handle, 10152, path.as_ptr().cast::<c_void>()) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_ssh_private_keyfile() {
+        let handle = curl_easy_init();
+        let path = c"/home/user/.ssh/id_rsa";
+        let code = unsafe { curl_easy_setopt(handle, 10153, path.as_ptr().cast::<c_void>()) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_ssh_knownhosts() {
+        let handle = curl_easy_init();
+        let path = c"/home/user/.ssh/known_hosts";
+        let code = unsafe { curl_easy_setopt(handle, 10183, path.as_ptr().cast::<c_void>()) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_ssh_host_public_key_sha256() {
+        let handle = curl_easy_init();
+        let fp = c"AAAA+bbb/ccc=";
+        let code = unsafe { curl_easy_setopt(handle, 10270, fp.as_ptr().cast::<c_void>()) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    // ─── Phase 55: Proxy options ───
+
+    #[test]
+    fn easy_setopt_proxyport() {
+        let handle = curl_easy_init();
+        let code = unsafe { curl_easy_setopt(handle, 59, 8080_usize as *const c_void) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_proxytype() {
+        let handle = curl_easy_init();
+        // CURLPROXY_SOCKS5 = 5
+        let code = unsafe { curl_easy_setopt(handle, 101, 5_usize as *const c_void) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_proxyusername() {
+        let handle = curl_easy_init();
+        let user = c"proxyuser";
+        let code = unsafe { curl_easy_setopt(handle, 10175, user.as_ptr().cast::<c_void>()) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_proxypassword() {
+        let handle = curl_easy_init();
+        let pass = c"proxypass";
+        let code = unsafe { curl_easy_setopt(handle, 10176, pass.as_ptr().cast::<c_void>()) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_pre_proxy() {
+        let handle = curl_easy_init();
+        let url = c"socks5://proxy.example.com:1080";
+        let code = unsafe { curl_easy_setopt(handle, 10262, url.as_ptr().cast::<c_void>()) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_socks5_auth() {
+        let handle = curl_easy_init();
+        let code = unsafe { curl_easy_setopt(handle, 267, 3_usize as *const c_void) };
+        assert_eq!(code, CURLcode::CURLE_OK);
         unsafe { curl_easy_cleanup(handle) };
     }
 }

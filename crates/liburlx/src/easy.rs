@@ -111,12 +111,24 @@ pub struct Easy {
     ftp_ssl_mode: crate::protocol::ftp::FtpSslMode,
     /// FTP active mode address (None = passive mode).
     ftp_active_port: Option<String>,
+    /// Use EPSV (extended passive) mode for FTP (default true).
+    ftp_use_epsv: bool,
+    /// Use EPRT (extended active) mode for FTP (default true).
+    ftp_use_eprt: bool,
+    /// Skip the IP address from the server's PASV response.
+    ftp_skip_pasv_ip: bool,
+    /// FTP account string (sent via ACCT command).
+    ftp_account: Option<String>,
     /// Path to SSH private key for SFTP/SCP authentication.
     ssh_key_path: Option<String>,
+    /// Path to SSH public key file for SFTP/SCP authentication.
+    ssh_public_keyfile: Option<String>,
     /// SSH host key SHA-256 fingerprint for verification (base64, no prefix).
     ssh_host_key_sha256: Option<String>,
     /// Path to SSH `known_hosts` file for host key verification.
     ssh_known_hosts_path: Option<String>,
+    /// Allowed SSH auth types bitmask (1=publickey, 2=password, 4=keyboard-interactive, 8=host).
+    ssh_auth_types: Option<u32>,
     /// Don't normalize `..` and `.` in URL paths (curl --path-as-is).
     path_as_is: bool,
     /// Disable all HTTP content decoding (curl --raw).
@@ -165,6 +177,12 @@ pub struct Easy {
     /// Allowed protocols for redirects.
     /// When `None`, all protocols are allowed.
     redir_protocols: Option<Vec<String>>,
+    /// Explicit proxy port (overrides port in proxy URL).
+    proxy_port: Option<u16>,
+    /// Proxy type (0=HTTP, 1=HTTP 1.0, 2=HTTPS, 4=SOCKS4, 5=SOCKS5, 6=SOCKS4a, 7=SOCKS5h).
+    proxy_type: Option<u32>,
+    /// SOCKS5 pre-proxy URL.
+    pre_proxy: Option<String>,
     /// TFTP block size (curl `--tftp-blksize`).
     tftp_blksize: Option<u16>,
     /// Disable TFTP options negotiation (curl `--tftp-no-options`).
@@ -235,9 +253,15 @@ impl std::fmt::Debug for Easy {
             .field("proxy_headers", &self.proxy_headers)
             .field("ftp_ssl_mode", &self.ftp_ssl_mode)
             .field("ftp_active_port", &self.ftp_active_port)
+            .field("ftp_use_epsv", &self.ftp_use_epsv)
+            .field("ftp_use_eprt", &self.ftp_use_eprt)
+            .field("ftp_skip_pasv_ip", &self.ftp_skip_pasv_ip)
+            .field("ftp_account", &self.ftp_account)
             .field("ssh_key_path", &self.ssh_key_path)
+            .field("ssh_public_keyfile", &self.ssh_public_keyfile)
             .field("ssh_host_key_sha256", &self.ssh_host_key_sha256)
             .field("ssh_known_hosts_path", &self.ssh_known_hosts_path)
+            .field("ssh_auth_types", &self.ssh_auth_types)
             .field("path_as_is", &self.path_as_is)
             .field("raw", &self.raw)
             .field("mail_from", &self.mail_from)
@@ -261,6 +285,9 @@ impl std::fmt::Debug for Easy {
             .field("custom_request_target", &self.custom_request_target)
             .field("allowed_protocols", &self.allowed_protocols)
             .field("redir_protocols", &self.redir_protocols)
+            .field("proxy_port", &self.proxy_port)
+            .field("proxy_type", &self.proxy_type)
+            .field("pre_proxy", &self.pre_proxy)
             .field("tftp_blksize", &self.tftp_blksize)
             .field("tftp_no_options", &self.tftp_no_options)
             .finish()
@@ -329,9 +356,15 @@ impl Clone for Easy {
             proxy_headers: self.proxy_headers.clone(),
             ftp_ssl_mode: self.ftp_ssl_mode,
             ftp_active_port: self.ftp_active_port.clone(),
+            ftp_use_epsv: self.ftp_use_epsv,
+            ftp_use_eprt: self.ftp_use_eprt,
+            ftp_skip_pasv_ip: self.ftp_skip_pasv_ip,
+            ftp_account: self.ftp_account.clone(),
             ssh_key_path: self.ssh_key_path.clone(),
+            ssh_public_keyfile: self.ssh_public_keyfile.clone(),
             ssh_host_key_sha256: self.ssh_host_key_sha256.clone(),
             ssh_known_hosts_path: self.ssh_known_hosts_path.clone(),
+            ssh_auth_types: self.ssh_auth_types,
             path_as_is: self.path_as_is,
             raw: self.raw,
             mail_from: self.mail_from.clone(),
@@ -355,6 +388,9 @@ impl Clone for Easy {
             custom_request_target: self.custom_request_target.clone(),
             allowed_protocols: self.allowed_protocols.clone(),
             redir_protocols: self.redir_protocols.clone(),
+            proxy_port: self.proxy_port,
+            proxy_type: self.proxy_type,
+            pre_proxy: self.pre_proxy.clone(),
             tftp_blksize: self.tftp_blksize,
             tftp_no_options: self.tftp_no_options,
         }
@@ -425,9 +461,15 @@ impl Easy {
             proxy_headers: Vec::new(),
             ftp_ssl_mode: crate::protocol::ftp::FtpSslMode::None,
             ftp_active_port: None,
+            ftp_use_epsv: true,
+            ftp_use_eprt: true,
+            ftp_skip_pasv_ip: false,
+            ftp_account: None,
             ssh_key_path: None,
+            ssh_public_keyfile: None,
             ssh_host_key_sha256: None,
             ssh_known_hosts_path: None,
+            ssh_auth_types: None,
             path_as_is: false,
             raw: false,
             mail_from: None,
@@ -451,6 +493,9 @@ impl Easy {
             custom_request_target: None,
             allowed_protocols: None,
             redir_protocols: None,
+            proxy_port: None,
+            proxy_type: None,
+            pre_proxy: None,
             tftp_blksize: None,
             tftp_no_options: false,
         }
@@ -1274,14 +1319,50 @@ impl Easy {
         self.ftp_active_port = Some(addr.to_string());
     }
 
+    /// Enable/disable FTP extended passive mode (EPSV).
+    ///
+    /// Enabled by default. Equivalent to `CURLOPT_FTP_USE_EPSV`.
+    pub const fn ftp_use_epsv(&mut self, enable: bool) {
+        self.ftp_use_epsv = enable;
+    }
+
+    /// Enable/disable FTP extended active mode (EPRT).
+    ///
+    /// Enabled by default. Equivalent to `CURLOPT_FTP_USE_EPRT`.
+    pub const fn ftp_use_eprt(&mut self, enable: bool) {
+        self.ftp_use_eprt = enable;
+    }
+
+    /// Skip the IP address from the server's PASV response.
+    ///
+    /// When enabled, use the control connection's IP for data connections.
+    /// Equivalent to `CURLOPT_FTP_SKIP_PASV_IP`.
+    pub const fn ftp_skip_pasv_ip(&mut self, skip: bool) {
+        self.ftp_skip_pasv_ip = skip;
+    }
+
+    /// Set the FTP account string (sent via ACCT command).
+    ///
+    /// Equivalent to `CURLOPT_FTP_ACCOUNT`.
+    pub fn ftp_account(&mut self, account: &str) {
+        self.ftp_account = Some(account.to_string());
+    }
+
     /// Set the path to an SSH private key for SFTP/SCP authentication.
     ///
     /// When set, public key authentication is used instead of password.
     /// Supports OpenSSH key formats (ed25519, RSA, ECDSA).
     ///
-    /// Equivalent to curl's `--key`.
+    /// Equivalent to curl's `--key` / `CURLOPT_SSH_PRIVATE_KEYFILE`.
     pub fn ssh_key_path(&mut self, path: &str) {
         self.ssh_key_path = Some(path.to_string());
+    }
+
+    /// Set the path to an SSH public key file.
+    ///
+    /// Equivalent to `CURLOPT_SSH_PUBLIC_KEYFILE`.
+    pub fn ssh_public_keyfile(&mut self, path: &str) {
+        self.ssh_public_keyfile = Some(path.to_string());
     }
 
     /// Set the expected SSH host key SHA-256 fingerprint for verification.
@@ -1299,9 +1380,39 @@ impl Easy {
     /// When set, the server's host key is verified against entries in the file.
     /// Supports both plain and hashed hostname formats.
     ///
-    /// Equivalent to curl's `--known-hosts`.
+    /// Equivalent to curl's `--known-hosts` / `CURLOPT_SSH_KNOWNHOSTS`.
     pub fn ssh_known_hosts_path(&mut self, path: &str) {
         self.ssh_known_hosts_path = Some(path.to_string());
+    }
+
+    /// Set the allowed SSH authentication types bitmask.
+    ///
+    /// Bitmask: 1=publickey, 2=password, 4=keyboard-interactive, 8=host.
+    /// Equivalent to `CURLOPT_SSH_AUTH_TYPES`.
+    pub const fn ssh_auth_types(&mut self, types: u32) {
+        self.ssh_auth_types = Some(types);
+    }
+
+    /// Set explicit proxy port (overrides port in proxy URL).
+    ///
+    /// Equivalent to `CURLOPT_PROXYPORT`.
+    pub const fn proxy_port(&mut self, port: u16) {
+        self.proxy_port = Some(port);
+    }
+
+    /// Set proxy type.
+    ///
+    /// 0=HTTP, 1=HTTP 1.0, 2=HTTPS, 4=SOCKS4, 5=SOCKS5, 6=SOCKS4a, 7=SOCKS5h.
+    /// Equivalent to `CURLOPT_PROXYTYPE`.
+    pub const fn proxy_type(&mut self, ptype: u32) {
+        self.proxy_type = Some(ptype);
+    }
+
+    /// Set SOCKS pre-proxy URL.
+    ///
+    /// Equivalent to `CURLOPT_PRE_PROXY`.
+    pub fn pre_proxy(&mut self, url: &str) {
+        self.pre_proxy = Some(url.to_string());
     }
 
     /// Don't normalize `..` and `.` path segments in the URL.
@@ -4956,5 +5067,71 @@ mod tests {
         let mut easy = Easy::new();
         easy.set_redir_protocols_str("http,https");
         assert_eq!(easy.redir_protocols, Some(vec!["http".to_string(), "https".to_string()]));
+    }
+
+    #[test]
+    fn ftp_use_epsv_default_true() {
+        let easy = Easy::new();
+        assert!(easy.ftp_use_epsv);
+    }
+
+    #[test]
+    fn ftp_use_eprt_default_true() {
+        let easy = Easy::new();
+        assert!(easy.ftp_use_eprt);
+    }
+
+    #[test]
+    fn ftp_skip_pasv_ip_default_false() {
+        let easy = Easy::new();
+        assert!(!easy.ftp_skip_pasv_ip);
+    }
+
+    #[test]
+    fn ftp_account_set() {
+        let mut easy = Easy::new();
+        assert!(easy.ftp_account.is_none());
+        easy.ftp_account("myaccount");
+        assert_eq!(easy.ftp_account.as_deref(), Some("myaccount"));
+    }
+
+    #[test]
+    fn ssh_public_keyfile_set() {
+        let mut easy = Easy::new();
+        assert!(easy.ssh_public_keyfile.is_none());
+        easy.ssh_public_keyfile("/home/user/.ssh/id_rsa.pub");
+        assert_eq!(easy.ssh_public_keyfile.as_deref(), Some("/home/user/.ssh/id_rsa.pub"));
+    }
+
+    #[test]
+    fn ssh_auth_types_set() {
+        let mut easy = Easy::new();
+        assert!(easy.ssh_auth_types.is_none());
+        easy.ssh_auth_types(3); // publickey | password
+        assert_eq!(easy.ssh_auth_types, Some(3));
+    }
+
+    #[test]
+    fn proxy_port_set() {
+        let mut easy = Easy::new();
+        assert!(easy.proxy_port.is_none());
+        easy.proxy_port(8080);
+        assert_eq!(easy.proxy_port, Some(8080));
+    }
+
+    #[test]
+    fn proxy_type_set() {
+        let mut easy = Easy::new();
+        assert!(easy.proxy_type.is_none());
+        easy.proxy_type(5); // SOCKS5
+        assert_eq!(easy.proxy_type, Some(5));
+    }
+
+    #[test]
+    fn pre_proxy_set() {
+        let mut easy = Easy::new();
+        assert!(easy.pre_proxy.is_none());
+        easy.pre_proxy("socks5://proxy:1080");
+        assert_eq!(easy.pre_proxy.as_deref(), Some("socks5://proxy:1080"));
     }
 }
