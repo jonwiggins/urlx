@@ -4,7 +4,8 @@
 //! of HSTS-enabled hosts to auto-upgrade HTTP to HTTPS.
 
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::path::Path;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// An HSTS cache that tracks which hosts require HTTPS.
 #[derive(Debug, Clone)]
@@ -15,8 +16,10 @@ pub struct HstsCache {
 /// A single HSTS entry for a host.
 #[derive(Debug, Clone)]
 struct HstsEntry {
-    /// When this entry expires.
+    /// When this entry expires (monotonic, for runtime checks).
     expires: Instant,
+    /// When this entry expires (wall clock, for file persistence).
+    expire_timestamp: u64,
     /// Whether subdomains are also covered.
     include_subdomains: bool,
 }
@@ -46,10 +49,12 @@ impl HstsCache {
             return;
         }
 
+        let now_secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
         let _old = self.entries.insert(
             host.to_lowercase(),
             HstsEntry {
                 expires: Instant::now() + Duration::from_secs(max_age),
+                expire_timestamp: now_secs + max_age,
                 include_subdomains,
             },
         );
@@ -85,6 +90,99 @@ impl HstsCache {
     pub fn purge_expired(&mut self) {
         let now = Instant::now();
         self.entries.retain(|_, entry| entry.expires > now);
+    }
+
+    /// Load HSTS entries from a file.
+    ///
+    /// Each line has the format: `host\ttimestamp\tinclude_subdomains`
+    /// where `timestamp` is a Unix epoch second and `include_subdomains` is `0` or `1`.
+    /// Lines starting with `#` are comments. Invalid lines are silently skipped.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be read.
+    pub fn load_from_file(path: &Path) -> Result<Self, crate::Error> {
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| crate::Error::Http(format!("failed to read HSTS file: {e}")))?;
+
+        let mut cache = Self::new();
+        let now_secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+
+            let parts: Vec<&str> = line.split('\t').collect();
+            if parts.len() < 2 {
+                continue;
+            }
+
+            let host = parts[0].to_lowercase();
+            let Ok(expire_ts) = parts[1].parse::<u64>() else {
+                continue;
+            };
+            let include_subdomains = parts.get(2).is_some_and(|v| *v == "1");
+
+            // Skip already-expired entries
+            if expire_ts <= now_secs {
+                continue;
+            }
+
+            let remaining_secs = expire_ts - now_secs;
+            let _old = cache.entries.insert(
+                host,
+                HstsEntry {
+                    expires: Instant::now() + Duration::from_secs(remaining_secs),
+                    expire_timestamp: expire_ts,
+                    include_subdomains,
+                },
+            );
+        }
+
+        Ok(cache)
+    }
+
+    /// Save HSTS entries to a file.
+    ///
+    /// Writes one entry per line in the format: `host\ttimestamp\tinclude_subdomains`.
+    /// Expired entries are not written.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be written.
+    pub fn save_to_file(&self, path: &Path) -> Result<(), crate::Error> {
+        use std::fmt::Write;
+
+        let now = Instant::now();
+        let mut output =
+            String::from("# HSTS cache — urlx\n# host\texpire_timestamp\tinclude_subdomains\n");
+
+        for (host, entry) in &self.entries {
+            if entry.expires <= now {
+                continue;
+            }
+            let subdomains = if entry.include_subdomains { "1" } else { "0" };
+            let _ = writeln!(output, "{host}\t{}\t{subdomains}", entry.expire_timestamp);
+        }
+
+        std::fs::write(path, output)
+            .map_err(|e| crate::Error::Http(format!("failed to write HSTS file: {e}")))?;
+
+        Ok(())
+    }
+
+    /// Returns the number of entries in the cache.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Returns true if the cache is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 }
 
@@ -194,6 +292,7 @@ mod tests {
             "expired.com".to_string(),
             HstsEntry {
                 expires: Instant::now().checked_sub(Duration::from_secs(1)).unwrap(),
+                expire_timestamp: 0,
                 include_subdomains: false,
             },
         );
@@ -201,6 +300,8 @@ mod tests {
             "valid.com".to_string(),
             HstsEntry {
                 expires: Instant::now() + Duration::from_secs(3600),
+                expire_timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+                    + 3600,
                 include_subdomains: false,
             },
         );
@@ -210,5 +311,67 @@ mod tests {
         assert_eq!(cache.entries.len(), 1);
         assert!(!cache.should_upgrade("expired.com"));
         assert!(cache.should_upgrade("valid.com"));
+    }
+
+    #[test]
+    fn save_and_load_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hsts.txt");
+
+        let mut cache = HstsCache::new();
+        cache.store("example.com", "max-age=31536000");
+        cache.store("secure.org", "max-age=86400; includeSubDomains");
+        cache.save_to_file(&path).unwrap();
+
+        let loaded = HstsCache::load_from_file(&path).unwrap();
+        assert!(loaded.should_upgrade("example.com"));
+        assert!(loaded.should_upgrade("secure.org"));
+        assert!(loaded.should_upgrade("sub.secure.org"));
+        assert!(!loaded.should_upgrade("other.com"));
+    }
+
+    #[test]
+    fn load_skips_expired_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hsts.txt");
+
+        // Write a file with an expired entry (timestamp 1 = 1970)
+        std::fs::write(&path, "expired.com\t1\t0\n").unwrap();
+
+        let cache = HstsCache::load_from_file(&path).unwrap();
+        assert!(!cache.should_upgrade("expired.com"));
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn load_skips_comments_and_blank_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hsts.txt");
+
+        let future_ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() + 86400;
+        let content = format!("# comment\n\nexample.com\t{future_ts}\t1\n");
+        std::fs::write(&path, content).unwrap();
+
+        let cache = HstsCache::load_from_file(&path).unwrap();
+        assert!(cache.should_upgrade("example.com"));
+        assert!(cache.should_upgrade("sub.example.com"));
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn load_nonexistent_file_returns_error() {
+        let result = HstsCache::load_from_file(Path::new("/nonexistent/hsts.txt"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn len_and_is_empty() {
+        let mut cache = HstsCache::new();
+        assert!(cache.is_empty());
+        assert_eq!(cache.len(), 0);
+
+        cache.store("example.com", "max-age=3600");
+        assert!(!cache.is_empty());
+        assert_eq!(cache.len(), 1);
     }
 }
