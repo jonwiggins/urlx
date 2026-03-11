@@ -81,6 +81,8 @@ pub struct CliOptions {
     pub(crate) no_progress_meter: bool,
     pub(crate) location_trusted: bool,
     pub(crate) time_cond: Option<String>,
+    /// `-G` / `--get`: convert POST data to GET query string.
+    pub(crate) get_mode: bool,
 }
 
 /// Print version information to stdout.
@@ -381,6 +383,7 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
         no_progress_meter: false,
         location_trusted: false,
         time_cond: None,
+        get_mode: false,
     };
 
     let mut i = 1;
@@ -475,7 +478,7 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
                 opts.easy.header("Referer", val);
             }
             "-G" | "--get" => {
-                opts.easy.method("GET");
+                opts.get_mode = true;
             }
             "--create-dirs" => {
                 opts.create_dirs = true;

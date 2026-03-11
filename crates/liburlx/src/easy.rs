@@ -545,6 +545,18 @@ impl Easy {
         self.body = Some(data.to_vec());
     }
 
+    /// Take the request body, removing it from the easy handle.
+    ///
+    /// Returns `None` if no body was set.
+    pub const fn take_body(&mut self) -> Option<Vec<u8>> {
+        self.body.take()
+    }
+
+    /// Remove all headers with the given name (case-insensitive).
+    pub fn remove_header(&mut self, name: &str) {
+        self.headers.retain(|(k, _)| !k.eq_ignore_ascii_case(name));
+    }
+
     /// Set the expected upload size in bytes.
     ///
     /// This is used as a hint for progress reporting and for setting

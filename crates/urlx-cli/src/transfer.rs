@@ -296,6 +296,22 @@ pub fn run(args: &[String]) -> ExitCode {
         );
     }
 
+    // -G/--get: move POST body data into URL query string
+    if opts.get_mode {
+        if let Some(body_data) = opts.easy.take_body() {
+            let query = String::from_utf8_lossy(&body_data);
+            // Append data directly to each URL as query string
+            for url in &mut opts.urls {
+                let sep = if url.contains('?') { '&' } else { '?' };
+                url.push(sep);
+                url.push_str(&query);
+            }
+        }
+        opts.easy.method("GET");
+        // Remove auto-added Content-Type for form data
+        opts.easy.remove_header("Content-Type");
+    }
+
     // Single URL: use Easy API
     if let Some(url) = opts.urls.first() {
         // --url-query: append query parameters to URL
