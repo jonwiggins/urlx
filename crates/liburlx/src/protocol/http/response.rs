@@ -76,8 +76,10 @@ pub struct Response {
     status: u16,
     /// The HTTP version used in the response.
     http_version: ResponseHttpVersion,
-    /// Response headers.
+    /// Response headers (lowercase keys for lookup).
     headers: HashMap<String, String>,
+    /// Original header names preserving server casing (lowercase → original).
+    header_original_names: HashMap<String, String>,
     /// Trailer headers from chunked transfer encoding.
     trailers: HashMap<String, String>,
     /// Response body bytes.
@@ -119,6 +121,7 @@ impl Response {
             status,
             http_version: ResponseHttpVersion::default(),
             headers,
+            header_original_names: HashMap::new(),
             trailers: HashMap::new(),
             body,
             effective_url,
@@ -140,12 +143,24 @@ impl Response {
             status,
             http_version: ResponseHttpVersion::default(),
             headers,
+            header_original_names: HashMap::new(),
             trailers: HashMap::new(),
             body,
             effective_url,
             info,
             pushed_responses: Vec::new(),
         }
+    }
+
+    /// Set the original header name casing map (lowercase → original).
+    pub fn set_header_original_names(&mut self, names: HashMap<String, String>) {
+        self.header_original_names = names;
+    }
+
+    /// Returns the original header names map (lowercase → original casing).
+    #[must_use]
+    pub const fn header_original_names(&self) -> &HashMap<String, String> {
+        &self.header_original_names
     }
 
     /// Set trailer headers on this response.

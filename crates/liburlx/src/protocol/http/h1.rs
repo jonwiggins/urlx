@@ -136,7 +136,7 @@ where
         let timeout_dur = expect_100_timeout.unwrap_or(Duration::from_secs(1));
         match tokio::time::timeout(timeout_dur, read_response_headers(stream)).await {
             Ok(Ok((header_bytes, body_prefix))) => {
-                let (status, _headers) = parse_headers(&header_bytes)?;
+                let (status, _headers, _original_names) = parse_headers(&header_bytes)?;
                 if status == 100 {
                     // Server said continue — send body
                     if let Some(body_data) = body {
@@ -149,7 +149,8 @@ where
                 } else {
                     // Server responded with final status — don't send body
                     // Re-parse the full response from what we already have
-                    let (final_status, final_headers) = parse_headers(&header_bytes)?;
+                    let (final_status, final_headers, final_original_names) =
+                        parse_headers(&header_bytes)?;
                     let is_head = method.eq_ignore_ascii_case("HEAD");
                     let no_body = is_head
                         || final_status == 204
@@ -176,6 +177,7 @@ where
                         keep_alive && !use_http10 && !server_wants_close && !body_read_to_eof;
                     let mut resp =
                         Response::new(final_status, final_headers, response_body, url.to_string());
+                    resp.set_header_original_names(final_original_names);
                     resp.set_http_version(if use_http10 {
                         ResponseHttpVersion::Http10
                     } else {
@@ -216,7 +218,7 @@ where
 
     // Read response headers, skipping 1xx informational responses
     let (mut header_bytes, mut body_prefix) = read_response_headers(stream).await?;
-    let (mut status, mut headers) = parse_headers(&header_bytes)?;
+    let (mut status, mut headers, mut original_names) = parse_headers(&header_bytes)?;
 
     // Skip 1xx informational responses (100 Continue, 103 Early Hints, etc.)
     while (100..200).contains(&status) {
@@ -227,6 +229,7 @@ where
         let parsed = parse_headers(&header_bytes)?;
         status = parsed.0;
         headers = parsed.1;
+        original_names = parsed.2;
     }
 
     // 204 and 304 responses have no body per HTTP spec
@@ -254,6 +257,7 @@ where
     let can_reuse = keep_alive && !use_http10 && !server_wants_close && !body_read_to_eof;
 
     let mut resp = Response::new(status, headers, response_body, url.to_string());
+    resp.set_header_original_names(original_names);
     resp.set_http_version(if use_http10 {
         ResponseHttpVersion::Http10
     } else {
@@ -444,8 +448,11 @@ where
     }
 }
 
-/// Parse raw header bytes into a status code and header map.
-fn parse_headers(data: &[u8]) -> Result<(u16, HashMap<String, String>), Error> {
+/// Parse raw header bytes into a status code, header map, and original name casing map.
+#[allow(clippy::type_complexity)]
+fn parse_headers(
+    data: &[u8],
+) -> Result<(u16, HashMap<String, String>, HashMap<String, String>), Error> {
     let mut headers_buf = [httparse::EMPTY_HEADER; 64];
     let mut parsed = httparse::Response::new(&mut headers_buf);
 
@@ -469,9 +476,12 @@ fn parse_headers(data: &[u8]) -> Result<(u16, HashMap<String, String>), Error> {
         parsed.code.ok_or_else(|| Error::Http("response has no status code".to_string()))?;
 
     let mut headers = HashMap::with_capacity(parsed.headers.len());
+    let mut original_names = HashMap::with_capacity(parsed.headers.len());
     for header in parsed.headers.iter() {
         let name = header.name.to_ascii_lowercase();
         let value = String::from_utf8_lossy(header.value).to_string();
+        // Preserve the first occurrence of the original header name casing
+        let _old = original_names.entry(name.clone()).or_insert_with(|| header.name.to_string());
         // For set-cookie, append with newline to preserve multiple values
         if name == "set-cookie" {
             let _entry = headers
@@ -486,7 +496,7 @@ fn parse_headers(data: &[u8]) -> Result<(u16, HashMap<String, String>), Error> {
         }
     }
 
-    Ok((status, headers))
+    Ok((status, headers, original_names))
 }
 
 /// Write body data with optional rate limiting.
@@ -852,9 +862,11 @@ pub fn parse_response(data: &[u8], effective_url: &str, is_head: bool) -> Result
         parsed.code.ok_or_else(|| Error::Http("response has no status code".to_string()))?;
 
     let mut headers = HashMap::with_capacity(parsed.headers.len());
+    let mut original_names = HashMap::with_capacity(parsed.headers.len());
     for header in parsed.headers.iter() {
         let name = header.name.to_ascii_lowercase();
         let value = String::from_utf8_lossy(header.value).to_string();
+        let _old = original_names.entry(name.clone()).or_insert_with(|| header.name.to_string());
         if name == "set-cookie" {
             let _entry = headers
                 .entry(name)
@@ -875,6 +887,7 @@ pub fn parse_response(data: &[u8], effective_url: &str, is_head: bool) -> Result
 
     if is_head {
         let mut resp = Response::new(status, headers, Vec::new(), effective_url.to_string());
+        resp.set_header_original_names(original_names);
         resp.set_http_version(version);
         return Ok(resp);
     }
@@ -899,12 +912,13 @@ pub fn parse_response(data: &[u8], effective_url: &str, is_head: bool) -> Result
     };
 
     let mut resp = Response::new(status, headers, body, effective_url.to_string());
+    resp.set_header_original_names(original_names);
     resp.set_http_version(version);
     Ok(resp)
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::large_futures)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::similar_names, clippy::large_futures)]
 mod tests {
     use super::*;
 
@@ -1761,6 +1775,252 @@ mod tests {
             &[],
             Some(b"hello"),
             "http://example.com/upload",
+            false,
+            false,
+            None,
+            false,
+            &SpeedLimits::default(),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 200);
+
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn request_header_order_matches_curl() {
+        use tokio::io::duplex;
+
+        let (mut client, mut server) = duplex(4096);
+
+        let server_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            let n = server.read(&mut buf).await.unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+
+            // curl sends: Host, User-Agent, Accept (in that order)
+            let host_pos = req.find("Host:").unwrap();
+            let ua_pos = req.find("User-Agent:").unwrap();
+            let accept_pos = req.find("Accept:").unwrap();
+            assert!(host_pos < ua_pos, "Host must come before User-Agent: {req}");
+            assert!(ua_pos < accept_pos, "User-Agent must come before Accept: {req}");
+
+            let response = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+            server.write_all(response).await.unwrap();
+            server.shutdown().await.unwrap();
+        });
+
+        let (resp, _) = request(
+            &mut client,
+            "GET",
+            "example.com",
+            "/test",
+            &[],
+            None,
+            "http://example.com/test",
+            false,
+            false,
+            None,
+            false,
+            &SpeedLimits::default(),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 200);
+
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn request_custom_user_agent_replaces_default() {
+        use tokio::io::duplex;
+
+        let (mut client, mut server) = duplex(4096);
+
+        let server_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            let n = server.read(&mut buf).await.unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+
+            // Custom User-Agent should replace default, not append
+            assert!(req.contains("User-Agent: MyAgent/1.0"), "custom User-Agent missing: {req}");
+            let ua_count = req.matches("User-Agent:").count();
+            assert_eq!(ua_count, 1, "should have exactly one User-Agent: {req}");
+
+            let response = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+            server.write_all(response).await.unwrap();
+            server.shutdown().await.unwrap();
+        });
+
+        let headers = vec![("User-Agent".to_string(), "MyAgent/1.0".to_string())];
+
+        let (resp, _) = request(
+            &mut client,
+            "GET",
+            "example.com",
+            "/test",
+            &headers,
+            None,
+            "http://example.com/test",
+            false,
+            false,
+            None,
+            false,
+            &SpeedLimits::default(),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 200);
+
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn request_head_no_hang() {
+        use tokio::io::duplex;
+
+        let (mut client, mut server) = duplex(4096);
+
+        let server_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            let _n = server.read(&mut buf).await.unwrap();
+
+            // HEAD response: has Content-Length but no body
+            let response = b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\nConnection: close\r\n\r\n";
+            server.write_all(response).await.unwrap();
+            server.shutdown().await.unwrap();
+        });
+
+        // This should complete without hanging
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            request(
+                &mut client,
+                "HEAD",
+                "example.com",
+                "/test",
+                &[],
+                None,
+                "http://example.com/test",
+                false,
+                false,
+                None,
+                false,
+                &SpeedLimits::default(),
+                false,
+            ),
+        )
+        .await;
+
+        let (resp, can_reuse) = result.expect("HEAD request should not hang").unwrap();
+        assert_eq!(resp.status(), 200);
+        assert!(resp.body().is_empty(), "HEAD response should have empty body");
+        assert!(!can_reuse, "Connection: close means no reuse");
+
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn request_connection_close_no_hang() {
+        use tokio::io::duplex;
+
+        let (mut client, mut server) = duplex(4096);
+
+        let server_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            let _n = server.read(&mut buf).await.unwrap();
+
+            // Response with Connection: close and no Content-Length
+            let response = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nhello";
+            server.write_all(response).await.unwrap();
+            server.shutdown().await.unwrap();
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            request(
+                &mut client,
+                "GET",
+                "example.com",
+                "/test",
+                &[],
+                None,
+                "http://example.com/test",
+                false,
+                false,
+                None,
+                false,
+                &SpeedLimits::default(),
+                false,
+            ),
+        )
+        .await;
+
+        let (resp, _) = result.expect("Connection: close response should not hang").unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.body_str().unwrap(), "hello");
+
+        server_task.await.unwrap();
+    }
+
+    #[test]
+    fn parse_response_preserves_header_casing() {
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nX-Custom-Header: value\r\nContent-Length: 2\r\n\r\nhi";
+        let resp = parse_response(raw, "http://example.com", false).unwrap();
+
+        // Internal lookup still works (case-insensitive)
+        assert_eq!(resp.header("content-type"), Some("text/html"));
+        assert_eq!(resp.header("Content-Type"), Some("text/html"));
+
+        // Original names are preserved
+        let names = resp.header_original_names();
+        assert_eq!(names.get("content-type"), Some(&"Content-Type".to_string()));
+        assert_eq!(names.get("x-custom-header"), Some(&"X-Custom-Header".to_string()));
+        assert_eq!(names.get("content-length"), Some(&"Content-Length".to_string()));
+    }
+
+    #[tokio::test]
+    async fn request_header_order_with_post() {
+        use tokio::io::duplex;
+
+        let (mut client, mut server) = duplex(4096);
+
+        let server_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            let n = server.read(&mut buf).await.unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+
+            // Verify exact order: Host, User-Agent, Accept, Content-Type, Content-Length
+            let host_pos = req.find("Host:").unwrap();
+            let ua_pos = req.find("User-Agent:").unwrap();
+            let accept_pos = req.find("Accept:").unwrap();
+            let ct_pos = req.find("Content-Type:").unwrap();
+            let cl_pos = req.find("Content-Length:").unwrap();
+            assert!(host_pos < ua_pos, "Host < User-Agent");
+            assert!(ua_pos < accept_pos, "User-Agent < Accept");
+            assert!(accept_pos < ct_pos, "Accept < Content-Type (custom)");
+            assert!(ct_pos < cl_pos, "Content-Type < Content-Length");
+
+            let response = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+            server.write_all(response).await.unwrap();
+            server.shutdown().await.unwrap();
+        });
+
+        let headers =
+            vec![("Content-Type".to_string(), "application/x-www-form-urlencoded".to_string())];
+
+        let (resp, _) = request(
+            &mut client,
+            "POST",
+            "example.com",
+            "/submit",
+            &headers,
+            Some(b"key=value"),
+            "http://example.com/submit",
             false,
             false,
             None,

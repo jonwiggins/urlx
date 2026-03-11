@@ -229,15 +229,18 @@ pub async fn request(
 
     // Convert headers
     let mut headers = HashMap::new();
+    let mut original_names = HashMap::new();
     for (name, value) in h3_response.headers() {
-        let name = name.as_str().to_lowercase();
+        let lower = name.as_str().to_lowercase();
         let value = String::from_utf8_lossy(value.as_bytes()).to_string();
-        let _old = headers.insert(name, value);
+        let _old = original_names.entry(lower.clone()).or_insert_with(|| name.as_str().to_string());
+        let _old = headers.insert(lower, value);
     }
 
     // HEAD responses have no body
     if is_head {
         let mut resp = Response::new(status, headers, Vec::new(), url.to_string());
+        resp.set_header_original_names(original_names);
         resp.set_http_version(ResponseHttpVersion::Http3);
         return Ok(resp);
     }
@@ -256,6 +259,7 @@ pub async fn request(
     }
 
     let mut resp = Response::new(status, headers, body_bytes, url.to_string());
+    resp.set_header_original_names(original_names);
     resp.set_http_version(ResponseHttpVersion::Http3);
     Ok(resp)
 }
