@@ -1,0 +1,40 @@
+#!/bin/bash
+# Wrapper that makes urlx look like curl to runtests.pl
+# 1. Translates --version output to curl-compatible format
+# 2. Strips flags that urlx doesn't support yet (e.g. -q)
+# 3. Overrides default User-Agent to match curl's format
+
+URLX="$(dirname "$0")/../target/release/urlx"
+VERSION="0.1.0"
+
+if [ "$1" = "--version" ]; then
+    # Get urlx version
+    version_output=$("$URLX" --version 2>&1)
+    protocols=$(echo "$version_output" | grep '^Protocols:' | sed 's/^Protocols: //')
+    features=$(echo "$version_output" | grep '^Features:' | sed 's/^Features: //')
+
+    # Output in curl's expected format
+    echo "curl ${VERSION} ($(uname -m)-apple-darwin) libcurl/${VERSION} urlx/${VERSION}"
+    echo "Release-Date: 2026-03-11"
+    echo "Protocols: ${protocols}"
+    echo "Features: ${features}"
+    exit 0
+fi
+
+# Filter out unsupported flags and check for explicit User-Agent
+args=()
+has_user_agent=false
+for arg in "$@"; do
+    case "$arg" in
+        -q) ;; # urlx has no .curlrc, -q is a no-op
+        -A|--user-agent) has_user_agent=true; args+=("$arg") ;;
+        *)  args+=("$arg") ;;
+    esac
+done
+
+# Inject curl-compatible User-Agent if not explicitly set
+if [ "$has_user_agent" = false ]; then
+    args=("-A" "curl/${VERSION}" "${args[@]}")
+fi
+
+exec "$URLX" "${args[@]}"
