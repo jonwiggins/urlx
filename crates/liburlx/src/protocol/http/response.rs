@@ -74,12 +74,17 @@ pub struct TransferInfo {
 pub struct Response {
     /// HTTP status code (e.g., 200, 404).
     status: u16,
+    /// The HTTP reason phrase from the status line (e.g., "OK", "Not Found").
+    /// Preserves the server's original text. `None` if no reason was sent.
+    status_reason: Option<String>,
     /// The HTTP version used in the response.
     http_version: ResponseHttpVersion,
     /// Response headers (lowercase keys for lookup).
     headers: HashMap<String, String>,
     /// Original header names preserving server casing (lowercase → original).
     header_original_names: HashMap<String, String>,
+    /// Headers in wire order with original casing. Preserves duplicates.
+    headers_ordered: Vec<(String, String)>,
     /// Trailer headers from chunked transfer encoding.
     trailers: HashMap<String, String>,
     /// Response body bytes.
@@ -119,9 +124,11 @@ impl Response {
     ) -> Self {
         Self {
             status,
+            status_reason: None,
             http_version: ResponseHttpVersion::default(),
             headers,
             header_original_names: HashMap::new(),
+            headers_ordered: Vec::new(),
             trailers: HashMap::new(),
             body,
             effective_url,
@@ -141,9 +148,11 @@ impl Response {
     ) -> Self {
         Self {
             status,
+            status_reason: None,
             http_version: ResponseHttpVersion::default(),
             headers,
             header_original_names: HashMap::new(),
+            headers_ordered: Vec::new(),
             trailers: HashMap::new(),
             body,
             effective_url,
@@ -163,6 +172,19 @@ impl Response {
         &self.header_original_names
     }
 
+    /// Set headers in wire order with original casing (preserves duplicates).
+    pub fn set_headers_ordered(&mut self, ordered: Vec<(String, String)>) {
+        self.headers_ordered = ordered;
+    }
+
+    /// Returns headers in wire order with original casing.
+    ///
+    /// Empty if not set (e.g., non-HTTP protocols).
+    #[must_use]
+    pub fn headers_ordered(&self) -> &[(String, String)] {
+        &self.headers_ordered
+    }
+
     /// Set trailer headers on this response.
     pub fn set_trailers(&mut self, trailers: HashMap<String, String>) {
         self.trailers = trailers;
@@ -172,6 +194,17 @@ impl Response {
     #[must_use]
     pub const fn status(&self) -> u16 {
         self.status
+    }
+
+    /// Returns the HTTP reason phrase from the status line (e.g., "OK").
+    #[must_use]
+    pub fn status_reason(&self) -> Option<&str> {
+        self.status_reason.as_deref()
+    }
+
+    /// Set the HTTP reason phrase from the status line.
+    pub fn set_status_reason(&mut self, reason: Option<String>) {
+        self.status_reason = reason;
     }
 
     /// Returns the HTTP version used in the response.

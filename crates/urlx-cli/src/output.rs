@@ -8,7 +8,8 @@ use std::process::ExitCode;
 
 /// Format response headers as HTTP status line + headers.
 ///
-/// Preserves original header name casing from the server when available.
+/// Preserves original header ordering, casing, and duplicates from the server.
+/// Uses the server's original reason phrase when available.
 pub fn format_headers(response: &liburlx::Response) -> String {
     let version = http_version_string(response);
     let version_label = match version.as_str() {
@@ -16,19 +17,33 @@ pub fn format_headers(response: &liburlx::Response) -> String {
         "3" => "3".to_string(),
         v => v.to_string(),
     };
-    let mut result = format!(
-        "HTTP/{version_label} {} {}\r\n",
-        response.status(),
-        http_status_text(response.status()),
-    );
-    let original_names = response.header_original_names();
-    for (name, value) in response.headers() {
-        // Use original casing if available, otherwise use the stored (lowercase) name
-        let display_name = original_names.get(name).map_or(name.as_str(), String::as_str);
-        result.push_str(display_name);
-        result.push_str(": ");
-        result.push_str(value);
-        result.push_str("\r\n");
+    // Use server's original reason phrase, fall back to standard text
+    let reason = response.status_reason().unwrap_or_else(|| http_status_text(response.status()));
+    let mut result = if reason.is_empty() {
+        format!("HTTP/{version_label} {}\r\n", response.status())
+    } else {
+        format!("HTTP/{version_label} {} {reason}\r\n", response.status())
+    };
+
+    let ordered = response.headers_ordered();
+    if ordered.is_empty() {
+        // Fallback for non-HTTP protocols or responses without ordered headers
+        let original_names = response.header_original_names();
+        for (name, value) in response.headers() {
+            let display_name = original_names.get(name).map_or(name.as_str(), String::as_str);
+            result.push_str(display_name);
+            result.push_str(": ");
+            result.push_str(value);
+            result.push_str("\r\n");
+        }
+    } else {
+        // Use wire-order headers (preserves order, casing, and duplicates)
+        for (name, value) in ordered {
+            result.push_str(name);
+            result.push_str(": ");
+            result.push_str(value);
+            result.push_str("\r\n");
+        }
     }
     result.push_str("\r\n");
     result
@@ -217,29 +232,36 @@ pub fn output_response(
     include_headers: bool,
     silent: bool,
 ) -> ExitCode {
-    // --include: prepend headers to output
-    if include_headers {
-        let header_text = format_headers(response);
-        if let Err(e) = std::io::stdout().write_all(header_text.as_bytes()) {
-            if !silent {
-                eprintln!("urlx: write error: {e}");
-            }
-            return ExitCode::FAILURE;
-        }
-    }
-
     if let Some(path) = output_file {
-        if let Err(e) = std::fs::write(path, response.body()) {
+        // When --output is set, everything (headers if --include, then body) goes to the file
+        let mut data = Vec::new();
+        if include_headers {
+            data.extend_from_slice(format_headers(response).as_bytes());
+        }
+        data.extend_from_slice(response.body());
+        if let Err(e) = std::fs::write(path, &data) {
             if !silent {
                 eprintln!("urlx: error writing to {path}: {e}");
             }
             return ExitCode::FAILURE;
         }
-    } else if let Err(e) = std::io::stdout().write_all(response.body()) {
-        if !silent {
-            eprintln!("urlx: write error: {e}");
+    } else {
+        // No --output: write to stdout
+        if include_headers {
+            let header_text = format_headers(response);
+            if let Err(e) = std::io::stdout().write_all(header_text.as_bytes()) {
+                if !silent {
+                    eprintln!("urlx: write error: {e}");
+                }
+                return ExitCode::FAILURE;
+            }
         }
-        return ExitCode::FAILURE;
+        if let Err(e) = std::io::stdout().write_all(response.body()) {
+            if !silent {
+                eprintln!("urlx: write error: {e}");
+            }
+            return ExitCode::FAILURE;
+        }
     }
 
     if let Some(fmt) = write_out {

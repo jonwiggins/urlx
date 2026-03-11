@@ -192,7 +192,7 @@ where
         let timeout_dur = expect_100_timeout.unwrap_or(Duration::from_secs(1));
         match tokio::time::timeout(timeout_dur, read_response_headers(stream)).await {
             Ok(Ok((header_bytes, body_prefix))) => {
-                let (status, _headers, _original_names) = parse_headers(&header_bytes)?;
+                let ParsedHeaders { status, .. } = parse_headers(&header_bytes)?;
                 if status == 100 {
                     // Server said continue — send body
                     if let Some(body_data) = body {
@@ -205,20 +205,19 @@ where
                 } else {
                     // Server responded with final status — don't send body
                     // Re-parse the full response from what we already have
-                    let (final_status, final_headers, final_original_names) =
-                        parse_headers(&header_bytes)?;
+                    let ph = parse_headers(&header_bytes)?;
                     let is_head = method.eq_ignore_ascii_case("HEAD");
                     let no_body = is_head
-                        || final_status == 204
-                        || final_status == 304
-                        || (100..200).contains(&final_status);
+                        || ph.status == 204
+                        || ph.status == 304
+                        || (100..200).contains(&ph.status);
                     let mut recv_limiter = RateLimiter::for_recv(speed_limits);
                     let (response_body, body_read_to_eof, trailers) = if no_body {
                         (Vec::new(), false, HashMap::new())
                     } else {
                         read_body_from_headers(
                             stream,
-                            &final_headers,
+                            &ph.headers,
                             body_prefix,
                             keep_alive,
                             ignore_content_length,
@@ -226,19 +225,18 @@ where
                         )
                         .await?
                     };
-                    let server_wants_close = final_headers
+                    let server_wants_close = ph
+                        .headers
                         .get("connection")
                         .is_some_and(|v| v.eq_ignore_ascii_case("close"));
                     let can_reuse =
                         keep_alive && !use_http10 && !server_wants_close && !body_read_to_eof;
                     let mut resp =
-                        Response::new(final_status, final_headers, response_body, url.to_string());
-                    resp.set_header_original_names(final_original_names);
-                    resp.set_http_version(if use_http10 {
-                        ResponseHttpVersion::Http10
-                    } else {
-                        ResponseHttpVersion::Http11
-                    });
+                        Response::new(ph.status, ph.headers, response_body, url.to_string());
+                    resp.set_header_original_names(ph.original_names);
+                    resp.set_headers_ordered(ph.headers_ordered);
+                    resp.set_status_reason(ph.reason);
+                    resp.set_http_version(ph.version);
                     if !trailers.is_empty() {
                         resp.set_trailers(trailers);
                     }
@@ -274,35 +272,33 @@ where
 
     // Read response headers, skipping 1xx informational responses
     let (mut header_bytes, mut body_prefix) = read_response_headers(stream).await?;
-    let (mut status, mut headers, mut original_names) = parse_headers(&header_bytes)?;
+    let mut ph = parse_headers(&header_bytes)?;
 
     // Skip 1xx informational responses (100 Continue, 103 Early Hints, etc.)
-    while (100..200).contains(&status) {
+    while (100..200).contains(&ph.status) {
         // The body_prefix may contain the start of the next response
         let next = read_response_headers_with_prefix(stream, body_prefix).await?;
         header_bytes = next.0;
         body_prefix = next.1;
-        let parsed = parse_headers(&header_bytes)?;
-        status = parsed.0;
-        headers = parsed.1;
-        original_names = parsed.2;
+        ph = parse_headers(&header_bytes)?;
     }
 
     // 204 and 304 responses have no body per HTTP spec
-    let no_body = is_head || status == 204 || status == 304;
+    let no_body = is_head || ph.status == 204 || ph.status == 304;
 
     // Read body with download rate limiting
     let mut recv_limiter = RateLimiter::for_recv(speed_limits);
     // If server says Connection: close, treat as non-keepalive for body reading
     // (read until EOF when no Content-Length, instead of assuming empty body)
-    let server_close = headers.get("connection").is_some_and(|v| v.eq_ignore_ascii_case("close"));
+    let server_close =
+        ph.headers.get("connection").is_some_and(|v| v.eq_ignore_ascii_case("close"));
     let effective_keepalive = keep_alive && !use_http10 && !server_close;
     let (response_body, body_read_to_eof, trailers) = if no_body {
         (Vec::new(), false, HashMap::new())
     } else {
         read_body_from_headers(
             stream,
-            &headers,
+            &ph.headers,
             body_prefix,
             effective_keepalive,
             ignore_content_length,
@@ -313,16 +309,14 @@ where
 
     // Determine if connection can be reused
     let server_wants_close =
-        headers.get("connection").is_some_and(|v| v.eq_ignore_ascii_case("close"));
+        ph.headers.get("connection").is_some_and(|v| v.eq_ignore_ascii_case("close"));
     let can_reuse = keep_alive && !use_http10 && !server_wants_close && !body_read_to_eof;
 
-    let mut resp = Response::new(status, headers, response_body, url.to_string());
-    resp.set_header_original_names(original_names);
-    resp.set_http_version(if use_http10 {
-        ResponseHttpVersion::Http10
-    } else {
-        ResponseHttpVersion::Http11
-    });
+    let mut resp = Response::new(ph.status, ph.headers, response_body, url.to_string());
+    resp.set_header_original_names(ph.original_names);
+    resp.set_headers_ordered(ph.headers_ordered);
+    resp.set_status_reason(ph.reason);
+    resp.set_http_version(ph.version);
     if !trailers.is_empty() {
         resp.set_trailers(trailers);
     }
@@ -508,11 +502,18 @@ where
     }
 }
 
-/// Parse raw header bytes into a status code, header map, and original name casing map.
-#[allow(clippy::type_complexity)]
-fn parse_headers(
-    data: &[u8],
-) -> Result<(u16, HashMap<String, String>, HashMap<String, String>), Error> {
+/// Parsed response headers.
+struct ParsedHeaders {
+    status: u16,
+    reason: Option<String>,
+    version: ResponseHttpVersion,
+    headers: HashMap<String, String>,
+    original_names: HashMap<String, String>,
+    headers_ordered: Vec<(String, String)>,
+}
+
+/// Parse raw header bytes into structured response headers.
+fn parse_headers(data: &[u8]) -> Result<ParsedHeaders, Error> {
     let mut headers_buf = [httparse::EMPTY_HEADER; 64];
     let mut parsed = httparse::Response::new(&mut headers_buf);
 
@@ -534,12 +535,21 @@ fn parse_headers(
 
     let status =
         parsed.code.ok_or_else(|| Error::Http("response has no status code".to_string()))?;
+    let reason = parsed.reason.map(str::to_string);
+    let version = if parsed.version == Some(0) {
+        ResponseHttpVersion::Http10
+    } else {
+        ResponseHttpVersion::Http11
+    };
 
     let mut headers = HashMap::with_capacity(parsed.headers.len());
     let mut original_names = HashMap::with_capacity(parsed.headers.len());
+    let mut headers_ordered = Vec::with_capacity(parsed.headers.len());
     for header in parsed.headers.iter() {
         let name = header.name.to_ascii_lowercase();
         let value = String::from_utf8_lossy(header.value).to_string();
+        // Wire-order list with original casing (preserves duplicates)
+        headers_ordered.push((header.name.to_string(), value.clone()));
         // Preserve the first occurrence of the original header name casing
         let _old = original_names.entry(name.clone()).or_insert_with(|| header.name.to_string());
         // For set-cookie, append with newline to preserve multiple values
@@ -556,7 +566,7 @@ fn parse_headers(
         }
     }
 
-    Ok((status, headers, original_names))
+    Ok(ParsedHeaders { status, reason, version, headers, original_names, headers_ordered })
 }
 
 /// Write body data with optional rate limiting.
@@ -923,9 +933,11 @@ pub fn parse_response(data: &[u8], effective_url: &str, is_head: bool) -> Result
 
     let mut headers = HashMap::with_capacity(parsed.headers.len());
     let mut original_names = HashMap::with_capacity(parsed.headers.len());
+    let mut headers_ordered = Vec::with_capacity(parsed.headers.len());
     for header in parsed.headers.iter() {
         let name = header.name.to_ascii_lowercase();
         let value = String::from_utf8_lossy(header.value).to_string();
+        headers_ordered.push((header.name.to_string(), value.clone()));
         let _old = original_names.entry(name.clone()).or_insert_with(|| header.name.to_string());
         if name == "set-cookie" {
             let _entry = headers
@@ -948,6 +960,7 @@ pub fn parse_response(data: &[u8], effective_url: &str, is_head: bool) -> Result
     if is_head {
         let mut resp = Response::new(status, headers, Vec::new(), effective_url.to_string());
         resp.set_header_original_names(original_names);
+        resp.set_headers_ordered(headers_ordered);
         resp.set_http_version(version);
         return Ok(resp);
     }
@@ -973,6 +986,7 @@ pub fn parse_response(data: &[u8], effective_url: &str, is_head: bool) -> Result
 
     let mut resp = Response::new(status, headers, body, effective_url.to_string());
     resp.set_header_original_names(original_names);
+    resp.set_headers_ordered(headers_ordered);
     resp.set_http_version(version);
     Ok(resp)
 }
