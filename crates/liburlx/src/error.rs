@@ -61,6 +61,14 @@ pub enum Error {
     /// An authentication error occurred.
     #[error("authentication error: {0}")]
     Auth(String),
+
+    /// The protocol scheme is not supported.
+    #[error("unsupported protocol: {0}")]
+    UnsupportedProtocol(String),
+
+    /// DNS name resolution failed.
+    #[error("could not resolve host: {0}")]
+    DnsResolve(String),
 }
 
 #[cfg(test)]
@@ -109,6 +117,18 @@ mod tests {
     fn error_display_auth() {
         let err = Error::Auth("SCRAM nonce mismatch".to_string());
         assert_eq!(err.to_string(), "authentication error: SCRAM nonce mismatch");
+    }
+
+    #[test]
+    fn error_display_unsupported_protocol() {
+        let err = Error::UnsupportedProtocol("gopher".to_string());
+        assert_eq!(err.to_string(), "unsupported protocol: gopher");
+    }
+
+    #[test]
+    fn error_display_dns_resolve() {
+        let err = Error::DnsResolve("nonexistent.example.com".to_string());
+        assert_eq!(err.to_string(), "could not resolve host: nonexistent.example.com");
     }
 
     #[test]
