@@ -119,6 +119,72 @@ pub const fn is_leap_year(year: i64) -> bool {
     (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
 }
 
+/// Parse a loose date string into a Unix timestamp.
+///
+/// Supports formats like `"dec 12 12:00:00 1999 GMT"`, `"12 Dec 1999 12:00:00"`,
+/// and other common curl-compatible date formats.
+pub fn parse_loose_date(s: &str) -> Option<i64> {
+    let month_names =
+        ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+    let parts: Vec<&str> = s.split_whitespace().collect();
+    if parts.len() < 4 {
+        return None;
+    }
+
+    let mut month: Option<u32> = None;
+    let mut day: Option<u32> = None;
+    let mut year: Option<i64> = None;
+    let mut hour: i64 = 0;
+    let mut minute: i64 = 0;
+    let mut second: i64 = 0;
+
+    for part in &parts {
+        let lower = part.to_lowercase();
+        // Check for month name
+        if let Some(pos) = month_names.iter().position(|&m| lower == m) {
+            month = Some(u32::try_from(pos).unwrap_or(0) + 1);
+        } else if part.contains(':') {
+            // Time component HH:MM:SS
+            let time_parts: Vec<&str> = part.split(':').collect();
+            if time_parts.len() >= 2 {
+                hour = time_parts[0].parse().unwrap_or(0);
+                minute = time_parts[1].parse().unwrap_or(0);
+                if time_parts.len() >= 3 {
+                    second = time_parts[2].parse().unwrap_or(0);
+                }
+            }
+        } else if lower == "gmt" || lower == "utc" {
+            // Timezone — ignore (we assume GMT)
+        } else if let Ok(num) = part.parse::<u32>() {
+            if num > 31 {
+                year = Some(i64::from(num));
+            } else if day.is_none() {
+                day = Some(num);
+            }
+        }
+    }
+
+    let month = month?;
+    let day = day?;
+    let year = year?;
+
+    // Convert to Unix timestamp
+    let mut days: i64 = 0;
+    for y in 1970..year {
+        days += if is_leap_year(y) { 366 } else { 365 };
+    }
+    let month_days = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    for m in 1..month {
+        days += i64::from(month_days[m as usize]);
+        if m == 2 && is_leap_year(year) {
+            days += 1;
+        }
+    }
+    days += i64::from(day) - 1;
+
+    Some(days * 86400 + hour * 3600 + minute * 60 + second)
+}
+
 /// Format a `SystemTime` as an HTTP date string (RFC 7231).
 ///
 /// Returns a string like `"Sun, 06 Nov 1994 08:49:37 GMT"`.
@@ -281,6 +347,26 @@ pub fn run(args: &[String]) -> ExitCode {
         opts.urls = expanded;
     }
 
+    // -G/--get: move POST body data into URL query string
+    if opts.get_mode {
+        if let Some(body_data) = opts.easy.take_body() {
+            let query = String::from_utf8_lossy(&body_data);
+            // Append data directly to each URL as query string
+            for url in &mut opts.urls {
+                let sep = if url.contains('?') { '&' } else { '?' };
+                url.push(sep);
+                url.push_str(&query);
+            }
+        }
+        // Only default to GET if no explicit method was set (e.g. -I sets HEAD)
+        if opts.easy.method_is_default() {
+            opts.easy.method("GET");
+        }
+        // Remove auto-added Content-Type for form data
+        opts.easy.remove_header("Content-Type");
+        opts.easy.set_form_data(false);
+    }
+
     // Multiple URLs: use Multi API for concurrent transfers
     if opts.urls.len() > 1 {
         return run_multi(
@@ -294,22 +380,6 @@ pub fn run(args: &[String]) -> ExitCode {
             opts.parallel,
             opts.parallel_max,
         );
-    }
-
-    // -G/--get: move POST body data into URL query string
-    if opts.get_mode {
-        if let Some(body_data) = opts.easy.take_body() {
-            let query = String::from_utf8_lossy(&body_data);
-            // Append data directly to each URL as query string
-            for url in &mut opts.urls {
-                let sep = if url.contains('?') { '&' } else { '?' };
-                url.push(sep);
-                url.push_str(&query);
-            }
-        }
-        opts.easy.method("GET");
-        // Remove auto-added Content-Type for form data
-        opts.easy.remove_header("Content-Type");
     }
 
     // Single URL: use Easy API
@@ -341,6 +411,27 @@ pub fn run(args: &[String]) -> ExitCode {
                 return ExitCode::FAILURE;
             }
         }
+
+        // -T filename: append filename to URL path if URL ends with /
+        let url = if let Some(ref filename) = opts.upload_filename {
+            if url.ends_with('/') {
+                // Percent-encode special chars in the filename for the URL path
+                let encoded: String = filename
+                    .chars()
+                    .map(|c| match c {
+                        '[' => "%5b".to_string(),
+                        ']' => "%5d".to_string(),
+                        ' ' => "%20".to_string(),
+                        _ => c.to_string(),
+                    })
+                    .collect();
+                format!("{url}{encoded}")
+            } else {
+                url
+            }
+        } else {
+            url
+        };
 
         if let Err(e) = opts.easy.url(&url) {
             if !opts.silent || opts.show_error {
@@ -399,6 +490,55 @@ pub fn run(args: &[String]) -> ExitCode {
         }
     }
 
+    // -C - auto-resume: determine offset from existing output file size
+    if opts.auto_resume {
+        if let Some(ref path) = opts.output_file {
+            if let Ok(meta) = std::fs::metadata(path) {
+                let size = meta.len();
+                if size > 0 {
+                    opts.easy.resume_from(size);
+                }
+            }
+            // If file doesn't exist, no resume offset (start from 0)
+        }
+    }
+
+    // PUT with -C offset: use Content-Range header instead of Range, and slice the body
+    if opts.is_upload {
+        if let Some(offset) = opts.resume_offset {
+            if offset > 0 {
+                // For PUT uploads, curl sends Content-Range instead of Range
+                if let Some(body_data) = opts.easy.take_body() {
+                    let total = body_data.len() as u64;
+                    let end = total.saturating_sub(1);
+                    if offset <= end {
+                        // Slice the body from offset onwards
+                        #[allow(clippy::cast_possible_truncation)]
+                        let start = offset as usize;
+                        let sliced = &body_data[start..];
+                        opts.easy.header("Content-Range", &format!("bytes {offset}-{end}/{total}"));
+                        opts.easy.body(sliced);
+                    } else {
+                        // Offset beyond file size — send empty body
+                        opts.easy.body(&[]);
+                    }
+                }
+                // Clear the Range setting that resume_from() set (it's for GET, not PUT)
+                opts.easy.clear_range();
+            }
+        }
+    }
+
+    // Stdin PUT: add chunked Transfer-Encoding and Expect: 100-continue (curl compat)
+    if opts.is_stdin_upload {
+        // Enable Expect: 100-continue via the timeout mechanism (h1.rs adds the header)
+        opts.easy.expect_100_timeout(std::time::Duration::from_secs(1));
+        // Enable chunked upload (unless user explicitly suppressed Transfer-Encoding)
+        if !opts.easy.has_header("Transfer-Encoding") {
+            opts.easy.set_chunked_upload(true);
+        }
+    }
+
     // -z/--time-cond: set If-Modified-Since or If-Unmodified-Since header
     if let Some(ref cond) = opts.time_cond {
         let (negate, date_str) =
@@ -407,7 +547,18 @@ pub fn run(args: &[String]) -> ExitCode {
         let date_val = if std::path::Path::new(date_str).exists() {
             std::fs::metadata(date_str).ok().and_then(|m| m.modified().ok()).map(format_http_date)
         } else {
-            Some(date_str.to_string())
+            // Try parsing as RFC 7231 first, then loose date format
+            if parse_http_date(date_str).is_some() {
+                Some(date_str.to_string())
+            } else {
+                parse_loose_date(date_str).and_then(|ts| {
+                    u64::try_from(ts).ok().map(|secs| {
+                        format_http_date(
+                            std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs),
+                        )
+                    })
+                })
+            }
         };
         if let Some(date) = date_val {
             if negate {
@@ -461,6 +612,18 @@ pub fn run(args: &[String]) -> ExitCode {
                             eprintln!("urlx: error saving ETag to '{path}': {e}");
                         }
                     }
+                }
+            }
+
+            // Check for failed resume: when -C was used and server returned non-206
+            // (curl returns CURLE_RANGE_ERROR = 33)
+            if opts.resume_check {
+                let status = response.status();
+                if status != 206 {
+                    if !opts.silent || opts.show_error {
+                        eprintln!("urlx: server returned {status} but resume was requested");
+                    }
+                    return ExitCode::from(33); // CURLE_RANGE_ERROR
                 }
             }
 
@@ -617,7 +780,11 @@ pub fn error_to_exit_code(err: &liburlx::Error) -> ExitCode {
             }
         }
         liburlx::Error::Http(msg) => {
-            if msg.contains("too many redirects") || msg.contains("Too many redirects") {
+            if msg.contains("range not satisfiable") || msg.contains("Range not satisfiable") {
+                ExitCode::from(33) // CURLE_RANGE_ERROR
+            } else if msg.contains("empty response") || msg.contains("Empty response") {
+                ExitCode::from(52) // CURLE_GOT_NOTHING
+            } else if msg.contains("too many redirects") || msg.contains("Too many redirects") {
                 ExitCode::from(47) // CURLE_TOO_MANY_REDIRECTS
             } else if msg.contains("fail_on_error") {
                 ExitCode::from(22) // CURLE_HTTP_RETURNED_ERROR

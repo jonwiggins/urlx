@@ -549,7 +549,7 @@ async fn dns_failure_returns_dns_resolve_error() {
 
 // --- curl compat: POST Content-Length before Content-Type (header order) ---
 
-/// curl: POST with `-d` sends Content-Length before Content-Type
+/// curl: POST with `-d` (no custom Content-Type) auto-adds Content-Type after Content-Length
 #[tokio::test]
 #[allow(clippy::similar_names)]
 async fn post_content_length_before_content_type() {
@@ -564,7 +564,7 @@ async fn post_content_length_before_content_type() {
     easy.url(&server.url("/")).unwrap();
     easy.method("POST");
     easy.body(b"key=value");
-    easy.header("Content-Type", "application/x-www-form-urlencoded");
+    // Don't set Content-Type — h1.rs auto-adds it after Content-Length for POST
     let response = easy.perform_async().await.unwrap();
 
     let body = std::str::from_utf8(response.body()).unwrap();
@@ -573,6 +573,6 @@ async fn post_content_length_before_content_type() {
     assert!(cl_pos.is_some() && ct_pos.is_some(), "both headers should be present: {body}");
     assert!(
         cl_pos < ct_pos,
-        "Content-Length should come before Content-Type (curl compat): {body}"
+        "Content-Length should come before auto Content-Type (curl compat): {body}"
     );
 }

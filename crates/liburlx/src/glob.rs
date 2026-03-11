@@ -228,6 +228,11 @@ fn parse_range_content(content: &str) -> Result<Segment, Error> {
         return Err(Error::Http("glob range step cannot be zero".to_string()));
     }
 
+    // Validate range direction matches step sign (curl compat: [2-1] is an error)
+    if (step > 0 && start > end) || (step < 0 && start < end) {
+        return Err(Error::Http(format!("bad range in URL position: [{content}]")));
+    }
+
     Ok(Segment::NumericRange { start, end, step, width })
 }
 

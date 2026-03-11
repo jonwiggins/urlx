@@ -133,11 +133,15 @@ impl Url {
     }
 
     /// Returns the path and query suitable for an HTTP request line.
+    ///
+    /// In the query portion, `%20` is replaced with `+` (curl-compatible
+    /// form-encoded spaces).
     #[must_use]
     pub fn request_target(&self) -> String {
-        self.inner
-            .query()
-            .map_or_else(|| self.inner.path().to_string(), |q| format!("{}?{q}", self.inner.path()))
+        self.inner.query().map_or_else(
+            || self.inner.path().to_string(),
+            |q| format!("{}?{}", self.inner.path(), q.replace("%20", "+")),
+        )
     }
 
     /// Set the port on the URL.

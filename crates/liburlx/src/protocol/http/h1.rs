@@ -63,53 +63,96 @@ where
     // Build the request line
     let mut req = format!("{method} {request_target} {http_ver}\r\nHost: {host}\r\n");
 
-    // Deduplicate custom headers (last header with same name wins)
-    let mut seen: Vec<String> = Vec::new();
+    // Deduplicate custom headers: among set-entries (non-empty values),
+    // last one wins per header name. Removal markers (empty in removed_headers)
+    // are separate and don't suppress custom set-entries.
+    let mut seen_set: Vec<String> = Vec::new();
     let mut keep = vec![true; custom_headers.len()];
     for i in (0..custom_headers.len()).rev() {
         let name_lower = custom_headers[i].0.to_lowercase();
-        if seen.iter().any(|s| s.eq_ignore_ascii_case(&name_lower)) {
+        if seen_set.contains(&name_lower) {
             keep[i] = false;
         } else {
-            seen.push(name_lower);
+            seen_set.push(name_lower);
         }
     }
 
     // Headers that curl emits before User-Agent (priority headers)
-    let priority_headers: &[&str] = &["authorization", "proxy-authorization", "range", "cookie"];
+    let priority_headers: &[&str] =
+        &["authorization", "proxy-authorization", "range", "content-range", "cookie"];
 
     // Emit priority custom headers right after Host (curl compat order)
     for (i, (name, value)) in custom_headers.iter().enumerate() {
         if keep[i] && priority_headers.iter().any(|p| name.eq_ignore_ascii_case(p)) {
-            let _ = write!(req, "{name}: {value}\r\n");
+            if value.is_empty() {
+                let _ = write!(req, "{name}:\r\n");
+            } else {
+                let _ = write!(req, "{name}: {value}\r\n");
+            }
         }
     }
 
-    // Add default headers if not overridden
-    let has_user_agent = custom_headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("user-agent"));
-    if !has_user_agent {
+    // Emit User-Agent in its fixed position: custom value from -A, or default
+    let custom_ua = custom_headers
+        .iter()
+        .enumerate()
+        .find(|(i, (k, _))| keep[*i] && k.eq_ignore_ascii_case("user-agent"));
+    if let Some((_, (name, value))) = custom_ua {
+        if value.is_empty() {
+            let _ = write!(req, "{name}:\r\n");
+        } else {
+            let _ = write!(req, "{name}: {value}\r\n");
+        }
+    } else {
         req.push_str("User-Agent: urlx/0.1.0\r\n");
     }
 
+    // Emit default Accept right after User-Agent (curl compat), or skip
+    // if Accept was explicitly set via -H (in which case it goes in command-line order).
     let has_accept = custom_headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("accept"));
     if !has_accept {
         req.push_str("Accept: */*\r\n");
     }
 
-    // Add Content-Length or Transfer-Encoding for bodies (before remaining custom headers,
-    // matching curl's header order: Content-Length comes before Content-Type)
+    // Compute chunked/TE state before emitting remaining headers.
     let has_content_length =
         custom_headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("content-length"));
     let has_transfer_encoding =
         custom_headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("transfer-encoding"));
-    // Use chunked encoding if requested and HTTP/1.1 (HTTP/1.0 doesn't support chunked)
-    let use_chunked =
-        chunked_upload && !use_http10 && !has_content_length && !has_transfer_encoding;
-    let use_expect = expect_100_timeout.is_some() && body.is_some_and(|b| !b.is_empty());
+    let explicit_chunked = custom_headers.iter().any(|(k, v)| {
+        k.eq_ignore_ascii_case("transfer-encoding") && v.eq_ignore_ascii_case("chunked")
+    });
+    let te_suppressed = custom_headers
+        .iter()
+        .any(|(k, v)| k.eq_ignore_ascii_case("transfer-encoding") && v.is_empty());
+    let use_chunked = !use_http10 && !te_suppressed && (chunked_upload || explicit_chunked);
+    let has_expect = custom_headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("expect"));
+    let use_expect =
+        expect_100_timeout.is_some() && body.is_some_and(|b| !b.is_empty()) && !has_expect;
+
+    // Emit auto Transfer-Encoding: chunked BEFORE custom headers (curl compat order).
+    if body.is_some() && use_chunked && !explicit_chunked {
+        req.push_str("Transfer-Encoding: chunked\r\n");
+    }
+
+    // Emit remaining custom headers (non-priority, non-user-agent) in command-line order.
+    for (i, (name, value)) in custom_headers.iter().enumerate() {
+        if keep[i]
+            && !priority_headers.iter().any(|p| name.eq_ignore_ascii_case(p))
+            && !name.eq_ignore_ascii_case("user-agent")
+        {
+            if value.is_empty() {
+                // Empty value from -H "Name;" → send header with no value
+                let _ = write!(req, "{name}:\r\n");
+            } else {
+                let _ = write!(req, "{name}: {value}\r\n");
+            }
+        }
+    }
+
+    // Add auto Content-Length for bodies (after custom headers).
     if let Some(body_data) = body {
-        if use_chunked {
-            req.push_str("Transfer-Encoding: chunked\r\n");
-        } else if !has_content_length {
+        if !use_chunked && !has_content_length && !has_transfer_encoding {
             let _ = write!(req, "Content-Length: {}\r\n", body_data.len());
         }
     }
@@ -117,11 +160,12 @@ where
         req.push_str("Expect: 100-continue\r\n");
     }
 
-    // Emit remaining custom headers (non-priority)
-    for (i, (name, value)) in custom_headers.iter().enumerate() {
-        if keep[i] && !priority_headers.iter().any(|p| name.eq_ignore_ascii_case(p)) {
-            let _ = write!(req, "{name}: {value}\r\n");
-        }
+    // Auto-add Content-Type for POST with body if not explicitly set (curl compat).
+    // This goes AFTER Content-Length, matching curl's header ordering for -d data.
+    let has_content_type =
+        custom_headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("content-type"));
+    if !has_content_type && method.eq_ignore_ascii_case("POST") && body.is_some() {
+        req.push_str("Content-Type: application/x-www-form-urlencoded\r\n");
     }
 
     // Connection management — only send Connection: close for HTTP/1.1 non-keepalive.
@@ -249,6 +293,10 @@ where
 
     // Read body with download rate limiting
     let mut recv_limiter = RateLimiter::for_recv(speed_limits);
+    // If server says Connection: close, treat as non-keepalive for body reading
+    // (read until EOF when no Content-Length, instead of assuming empty body)
+    let server_close = headers.get("connection").is_some_and(|v| v.eq_ignore_ascii_case("close"));
+    let effective_keepalive = keep_alive && !use_http10 && !server_close;
     let (response_body, body_read_to_eof, trailers) = if no_body {
         (Vec::new(), false, HashMap::new())
     } else {
@@ -256,7 +304,7 @@ where
             stream,
             &headers,
             body_prefix,
-            keep_alive && !use_http10,
+            effective_keepalive,
             ignore_content_length,
             &mut recv_limiter,
         )
@@ -2010,8 +2058,9 @@ mod tests {
             let n = server.read(&mut buf).await.unwrap();
             let req = String::from_utf8_lossy(&buf[..n]).to_string();
 
-            // Verify exact order: Host, User-Agent, Accept, Content-Length, Content-Type
-            // (curl sends Content-Length before Content-Type)
+            // For POST with body and no custom Content-Type, h1.rs auto-adds
+            // Content-Type after Content-Length (matching curl -d behavior):
+            // Host, User-Agent, Accept, Content-Length, Content-Type
             let host_pos = req.find("Host:").unwrap();
             let ua_pos = req.find("User-Agent:").unwrap();
             let accept_pos = req.find("Accept:").unwrap();
@@ -2020,15 +2069,15 @@ mod tests {
             assert!(host_pos < ua_pos, "Host < User-Agent");
             assert!(ua_pos < accept_pos, "User-Agent < Accept");
             assert!(accept_pos < cl_pos, "Accept < Content-Length");
-            assert!(cl_pos < ct_pos, "Content-Length < Content-Type (custom)");
+            assert!(cl_pos < ct_pos, "Content-Length < auto Content-Type");
 
             let response = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
             server.write_all(response).await.unwrap();
             server.shutdown().await.unwrap();
         });
 
-        let headers =
-            vec![("Content-Type".to_string(), "application/x-www-form-urlencoded".to_string())];
+        // No custom Content-Type — let h1.rs auto-add it for POST
+        let headers = vec![];
 
         let (resp, _) = request(
             &mut client,

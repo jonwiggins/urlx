@@ -84,6 +84,22 @@ impl MultipartForm {
         });
     }
 
+    /// Add file data with explicit content type and filename.
+    pub fn file_data_with_type(
+        &mut self,
+        name: &str,
+        filename: &str,
+        content_type: &str,
+        data: &[u8],
+    ) {
+        self.parts.push(Part {
+            name: name.to_string(),
+            filename: Some(filename.to_string()),
+            content_type: Some(content_type.to_string()),
+            data: data.to_vec(),
+        });
+    }
+
     /// Get the `Content-Type` header value including the boundary.
     #[must_use]
     pub fn content_type(&self) -> String {
@@ -108,7 +124,9 @@ impl MultipartForm {
 
             if let Some(ref filename) = part.filename {
                 body.extend_from_slice(b"; filename=\"");
-                body.extend_from_slice(filename.as_bytes());
+                // Percent-encode double quotes in filename (curl compat)
+                let encoded = filename.replace('"', "%22");
+                body.extend_from_slice(encoded.as_bytes());
                 body.push(b'"');
             }
             body.extend_from_slice(b"\r\n");
@@ -144,17 +162,31 @@ impl Default for MultipartForm {
 }
 
 /// Generate a random boundary string.
+///
+/// Matches curl's format: 24 dashes followed by 22 random alphanumeric
+/// characters, for a total of 46 characters.
 fn generate_boundary() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    const CHARS: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
     let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
 
-    // Use a combination of dashes and hex timestamp for uniqueness
-    format!("------------------------{timestamp:032x}")
+    // Use the timestamp bits to generate 22 alphanumeric characters (matching curl's boundary length)
+    let mut rand_part = String::with_capacity(22);
+    let mut state = timestamp;
+    for _ in 0..22 {
+        let idx = (state % CHARS.len() as u128) as usize;
+        rand_part.push(CHARS[idx] as char);
+        // Simple mixing: rotate and XOR
+        state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+    }
+
+    format!("------------------------{rand_part}")
 }
 
 /// Guess content type from filename extension.
-fn guess_content_type(filename: &str) -> String {
+#[must_use]
+pub fn guess_content_type(filename: &str) -> String {
     let ext = filename.rsplit('.').next().unwrap_or("");
     // Use case-insensitive comparison without allocating a lowercased string
     let mime = if ext.eq_ignore_ascii_case("txt") {

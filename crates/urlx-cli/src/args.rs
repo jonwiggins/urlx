@@ -83,6 +83,18 @@ pub struct CliOptions {
     pub(crate) time_cond: Option<String>,
     /// `-G` / `--get`: convert POST data to GET query string.
     pub(crate) get_mode: bool,
+    /// `-C -` auto-resume: determine offset from output file size.
+    pub(crate) auto_resume: bool,
+    /// Whether -C was used (triggers `CURLE_RANGE_ERROR` on non-206 response).
+    pub(crate) resume_check: bool,
+    /// Explicit resume offset from `-C <offset>` (not `-C -`).
+    pub(crate) resume_offset: Option<u64>,
+    /// Whether `-T` upload was used (PUT).
+    pub(crate) is_upload: bool,
+    /// Whether `-T -` (stdin upload) was used.
+    pub(crate) is_stdin_upload: bool,
+    /// Filename from `-T` for appending to URL path.
+    pub(crate) upload_filename: Option<String>,
 }
 
 /// Print version information to stdout.
@@ -384,6 +396,12 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
         location_trusted: false,
         time_cond: None,
         get_mode: false,
+        auto_resume: false,
+        resume_check: false,
+        resume_offset: None,
+        is_upload: false,
+        is_stdin_upload: false,
+        upload_filename: None,
     };
 
     let mut i = 1;
@@ -398,10 +416,22 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
                 i += 1;
                 let val = require_arg(args, i, "-H")?;
                 if let Some((name, value)) = val.split_once(':') {
-                    opts.easy.header(name.trim(), value.trim());
+                    let name = name.trim();
+                    let value_trimmed = value.trim();
+                    if value_trimmed.is_empty() {
+                        // "Name:" or "Name:  " → removal marker (suppress built-in)
+                        opts.easy.header_remove(name);
+                    } else {
+                        // "Name: value" → set header (trim leading whitespace only)
+                        opts.easy.header(name, value.trim_start());
+                    }
+                } else if let Some(name_part) = val.strip_suffix(';') {
+                    // "Name;" → send header with empty value (Name:\r\n)
+                    let name = name_part.trim();
+                    opts.easy.header(name, "");
                 } else {
-                    eprintln!("urlx: invalid header format: {val}");
-                    return None;
+                    // No colon, doesn't end with ';' → ignore (curl compat)
+                    // Covers "Name;stuff", "Name;  ", etc.
                 }
             }
             "-d" | "--data" => {
@@ -422,8 +452,7 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
                 if opts.easy.method_is_default() {
                     opts.easy.method("POST");
                 }
-                // Auto-add Content-Type for form data (curl behavior)
-                opts.easy.header("Content-Type", "application/x-www-form-urlencoded");
+                opts.easy.set_form_data(true);
             }
             "--data-raw" => {
                 i += 1;
@@ -432,7 +461,7 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
                 if opts.easy.method_is_default() {
                     opts.easy.method("POST");
                 }
-                opts.easy.header("Content-Type", "application/x-www-form-urlencoded");
+                opts.easy.set_form_data(true);
             }
             "--data-ascii" => {
                 i += 1;
@@ -441,7 +470,7 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
                 if opts.easy.method_is_default() {
                     opts.easy.method("POST");
                 }
-                opts.easy.header("Content-Type", "application/x-www-form-urlencoded");
+                opts.easy.set_form_data(true);
             }
             "-L" | "--location" => {
                 opts.easy.follow_redirects(true);
@@ -490,6 +519,9 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
             }
             "-i" | "--include" => {
                 opts.include_headers = true;
+            }
+            "--no-include" => {
+                opts.include_headers = false;
             }
             "-v" | "--verbose" => {
                 opts.easy.verbose(true);
@@ -569,18 +601,8 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
             "-F" | "--form" => {
                 i += 1;
                 let val = require_arg(args, i, "-F")?;
-                if let Some((name, value)) = val.split_once('=') {
-                    if let Some(path) = value.strip_prefix('@') {
-                        if let Err(e) = opts.easy.form_file(name, std::path::Path::new(path)) {
-                            eprintln!("urlx: error reading form file: {e}");
-                            return None;
-                        }
-                    } else {
-                        opts.easy.form_field(name, value);
-                    }
-                } else {
-                    eprintln!("urlx: invalid form field format: {val}");
-                    eprintln!("  Use: -F name=value or -F name=@filename");
+                if let Err(msg) = parse_form_field(&mut opts.easy, val) {
+                    eprintln!("urlx: {msg}");
                     return None;
                 }
             }
@@ -592,7 +614,12 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
             "-C" | "--continue-at" => {
                 i += 1;
                 let val = require_arg(args, i, "-C")?;
-                if let Ok(offset) = val.parse::<u64>() {
+                opts.resume_check = true;
+                if val == "-" {
+                    // Auto-resume: determine offset from output file size at transfer time
+                    opts.auto_resume = true;
+                } else if let Ok(offset) = val.parse::<u64>() {
+                    opts.resume_offset = Some(offset);
                     opts.easy.resume_from(offset);
                 } else {
                     eprintln!("urlx: invalid offset value: {val}");
@@ -739,16 +766,41 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
             "-T" | "--upload-file" => {
                 i += 1;
                 let val = require_arg(args, i, "-T")?;
-                match std::fs::read(val) {
-                    Ok(data) => {
-                        opts.easy.body(&data);
-                        if opts.easy.method_is_default() {
-                            opts.easy.method("PUT");
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("urlx: can't read file '{val}': {e}");
+                if val == "-" {
+                    // Read from stdin
+                    use std::io::Read;
+                    let mut data = Vec::new();
+                    if let Err(e) = std::io::stdin().read_to_end(&mut data) {
+                        eprintln!("urlx: can't read from stdin: {e}");
                         return None;
+                    }
+                    opts.easy.body(&data);
+                    opts.is_upload = true;
+                    opts.is_stdin_upload = true;
+                    if opts.easy.method_is_default() {
+                        opts.easy.method("PUT");
+                    }
+                } else {
+                    // Append filename to URL path if URL ends with /
+                    let filename = std::path::Path::new(val)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    if !filename.is_empty() {
+                        opts.upload_filename = Some(filename);
+                    }
+                    match std::fs::read(val) {
+                        Ok(data) => {
+                            opts.easy.body(&data);
+                            opts.is_upload = true;
+                            if opts.easy.method_is_default() {
+                                opts.easy.method("PUT");
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("urlx: can't read file '{val}': {e}");
+                            return None;
+                        }
                     }
                 }
             }
@@ -797,7 +849,7 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
                 if opts.easy.method_is_default() {
                     opts.easy.method("POST");
                 }
-                opts.easy.header("Content-Type", "application/x-www-form-urlencoded");
+                opts.easy.set_form_data(true);
             }
             "--resolve" => {
                 i += 1;
@@ -987,7 +1039,15 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
             "-K" | "--config" => {
                 i += 1;
                 let val = require_arg(args, i, "-K")?;
-                match std::fs::read_to_string(val) {
+                let contents_result = if val == "-" {
+                    // Read config from stdin
+                    use std::io::Read as _;
+                    let mut buf = String::new();
+                    std::io::stdin().read_to_string(&mut buf).map(|_| buf)
+                } else {
+                    std::fs::read_to_string(val)
+                };
+                match contents_result {
                     Ok(contents) => {
                         let config_args = parse_config_file(&contents);
                         let mut full_args = vec!["urlx".to_string()];
@@ -1070,7 +1130,7 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
             "--remote-time" | "-R" => {
                 opts.remote_time = true;
             }
-            "--globoff" => {
+            "-g" | "--globoff" => {
                 opts.globoff = true;
             }
             // FTPS: explicit mode (AUTH TLS)
@@ -1455,7 +1515,8 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
             | "--ftp-pret"
             | "--ftp-ssl-ccc-mode"
             | "--proxy1.0"
-            | "--mail-rcpt-allowfails" => {
+            | "--mail-rcpt-allowfails"
+            | "--trace-config" => {
                 i += 1;
                 let _val = require_arg(args, i, &args[i - 1].clone())?;
                 // Accepted for compatibility; not implemented
@@ -1587,13 +1648,36 @@ pub fn parse_config_file(contents: &str) -> Vec<String> {
                 let value = rest[eq_pos + 1..].trim();
                 args.push(format!("--{flag}"));
                 args.push(unquote(value));
-                continue;
+            } else {
+                // --flag or --flag value
+                let parts: Vec<&str> = rest.splitn(2, char::is_whitespace).collect();
+                args.push(format!("--{}", parts[0]));
+                if parts.len() > 1 {
+                    let value = parts[1].trim();
+                    if !value.is_empty() {
+                        args.push(unquote(value));
+                    }
+                }
             }
+            continue;
         }
 
-        // Split on first whitespace: flag + optional value
+        // Handle -f syntax (short flags)
+        if trimmed.starts_with('-') {
+            let parts: Vec<&str> = trimmed.splitn(2, char::is_whitespace).collect();
+            args.push(parts[0].to_string());
+            if parts.len() > 1 {
+                let value = parts[1].trim();
+                if !value.is_empty() {
+                    args.push(unquote(value));
+                }
+            }
+            continue;
+        }
+
+        // Bare word (no leading dash) → treat as --longflag (curl config convention)
         let parts: Vec<&str> = trimmed.splitn(2, char::is_whitespace).collect();
-        args.push(parts[0].to_string());
+        args.push(format!("--{}", parts[0]));
         if parts.len() > 1 {
             let value = parts[1].trim();
             if !value.is_empty() {
@@ -1617,6 +1701,164 @@ pub fn unquote(s: &str) -> String {
 }
 
 /// Helper to require an argument value for an option flag.
+/// Parse a `-F name=value` form field with full curl syntax.
+///
+/// Supports:
+/// - `name=value` — text field
+/// - `name=@filepath` — file upload
+/// - `name=@filepath;type=mime` — file with custom Content-Type
+/// - `name=@filepath;filename=custom` — file with custom filename
+/// - `name=@"filepath"` — quoted file path
+/// - Complex backslash escaping in filenames
+fn parse_form_field(easy: &mut liburlx::Easy, val: &str) -> Result<(), String> {
+    let (name, value) =
+        val.split_once('=').ok_or_else(|| format!("invalid form field format: {val}"))?;
+
+    if let Some(rest) = value.strip_prefix('@') {
+        // File upload — parse filepath and optional ;type= ;filename= modifiers
+        let (filepath, modifiers) = parse_form_file_spec(rest);
+
+        let mut custom_type: Option<&str> = None;
+        let mut custom_filename: Option<String> = None;
+
+        // Parse semicolon-separated modifiers
+        for modifier in modifiers {
+            if let Some(t) = modifier.strip_prefix("type=") {
+                custom_type = Some(t);
+            } else if let Some(f) = modifier.strip_prefix("filename=") {
+                custom_filename = Some(unescape_form_filename(f));
+            }
+        }
+
+        // Read the file
+        let data = std::fs::read(&filepath).map_err(|e| format!("error reading form file: {e}"))?;
+
+        let original_filename = std::path::Path::new(&filepath)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let display_filename = custom_filename.unwrap_or_else(|| original_filename.clone());
+
+        if let Some(ct) = custom_type {
+            easy.form_file_with_type(name, &display_filename, ct, &data);
+        } else {
+            // Guess content type from the original filepath, not the custom filename
+            easy.form_file_with_type(
+                name,
+                &display_filename,
+                &liburlx::guess_form_content_type(&original_filename),
+                &data,
+            );
+        }
+    } else {
+        easy.form_field(name, value);
+    }
+
+    Ok(())
+}
+
+/// Split a modifier string on `;` while respecting quoted values.
+///
+/// For example: `type=foo;filename="a;b"` → `["type=foo", "filename=\"a;b\""]`
+fn split_modifiers(s: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut in_quote = false;
+    let mut i = 0;
+    let bytes = s.as_bytes();
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && in_quote && i + 1 < bytes.len() {
+            i += 2; // skip escaped char
+        } else if bytes[i] == b'"' {
+            in_quote = !in_quote;
+            i += 1;
+        } else if bytes[i] == b';' && !in_quote {
+            let part = s[start..i].trim();
+            if !part.is_empty() {
+                parts.push(part);
+            }
+            start = i + 1;
+            i += 1;
+        } else {
+            i += 1;
+        }
+    }
+    let part = s[start..].trim();
+    if !part.is_empty() {
+        parts.push(part);
+    }
+    parts
+}
+
+/// Parse a form file spec, extracting filepath and modifiers.
+///
+/// Handles quoted paths: `"path";type=foo` and unquoted: `path;type=foo`.
+#[allow(clippy::option_if_let_else)] // if-let is clearer here
+fn parse_form_file_spec(spec: &str) -> (String, Vec<&str>) {
+    if let Some(inner) = spec.strip_prefix('"') {
+        // Quoted path — find the closing quote (handling escaped quotes)
+        let mut end = 0;
+        let mut chars = inner.chars();
+        while let Some(c) = chars.next() {
+            if c == '\\' {
+                end += c.len_utf8();
+                if let Some(next) = chars.next() {
+                    end += next.len_utf8();
+                }
+            } else if c == '"' {
+                break;
+            } else {
+                end += c.len_utf8();
+            }
+        }
+        let path = &inner[..end];
+        // Unescape backslashes in the path
+        let unescaped_path = path.replace("\\\"", "\"").replace("\\\\", "\\");
+        let rest = &inner[end..];
+        // Skip closing quote
+        let rest = rest.strip_prefix('"').unwrap_or(rest);
+        let modifiers = split_modifiers(rest);
+        (unescaped_path, modifiers)
+    } else {
+        // Unquoted — split on first ; to get filepath
+        let parts: Vec<&str> = spec.splitn(2, ';').collect();
+        let filepath = parts[0].to_string();
+        let modifiers = if parts.len() > 1 { split_modifiers(parts[1]) } else { vec![] };
+        (filepath, modifiers)
+    }
+}
+
+/// Unescape backslash sequences in form filenames per curl's rules.
+fn unescape_form_filename(s: &str) -> String {
+    // Handle quoted filenames
+    let s =
+        if s.starts_with('"') && s.ends_with('"') && s.len() >= 2 { &s[1..s.len() - 1] } else { s };
+
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(&next) = chars.peek() {
+                match next {
+                    '\\' | '"' => {
+                        result.push(next);
+                        let _ = chars.next();
+                    }
+                    _ => {
+                        // Keep the backslash — curl keeps literal backslash for unknown escapes
+                        result.push('\\');
+                    }
+                }
+            } else {
+                result.push('\\');
+            }
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
 pub fn require_arg<'a>(args: &'a [String], i: usize, flag: &str) -> Option<&'a str> {
     if i >= args.len() {
         eprintln!("urlx: option {flag} requires an argument");
@@ -1873,13 +2115,14 @@ mod tests {
 
     #[test]
     fn parse_args_header_invalid_format() {
+        // curl silently ignores headers without colon or semicolon
         let args = vec![
             "urlx".to_string(),
             "-H".to_string(),
             "NoColonHere".to_string(),
             "http://x.com".to_string(),
         ];
-        assert!(is_error(&parse_args(&args)));
+        assert!(matches!(parse_args(&args), ParseResult::Options(_)));
     }
 
     #[test]

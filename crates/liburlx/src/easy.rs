@@ -51,6 +51,10 @@ pub struct Easy {
     url: Option<Url>,
     method: Option<String>,
     headers: Vec<(String, String)>,
+    /// Header names that are suppressed (from `-H "Name:"` removal syntax).
+    removed_headers: Vec<String>,
+    /// Whether form data was set via `-d`/`--data` (controls auto Content-Type).
+    form_data: bool,
     body: Option<Vec<u8>>,
     follow_redirects: bool,
     max_redirects: u32,
@@ -85,6 +89,7 @@ pub struct Easy {
     share: Option<crate::share::Share>,
     http_version: HttpVersion,
     expect_100_timeout: Option<Duration>,
+    chunked_upload: bool,
     max_recv_speed: Option<u64>,
     max_send_speed: Option<u64>,
     low_speed_limit: Option<u32>,
@@ -191,13 +196,15 @@ pub struct Easy {
     tftp_no_options: bool,
 }
 
-#[allow(clippy::missing_fields_in_debug)] // h2_pool is cfg-gated and opaque
+#[allow(clippy::missing_fields_in_debug, clippy::too_many_lines)] // h2_pool is cfg-gated and opaque
 impl std::fmt::Debug for Easy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Easy")
             .field("url", &self.url)
             .field("method", &self.method)
             .field("headers", &self.headers)
+            .field("removed_headers", &self.removed_headers)
+            .field("form_data", &self.form_data)
             .field("body", &self.body.as_ref().map(|b| format!("<{} bytes>", b.len())))
             .field("follow_redirects", &self.follow_redirects)
             .field("max_redirects", &self.max_redirects)
@@ -297,11 +304,14 @@ impl std::fmt::Debug for Easy {
 }
 
 impl Clone for Easy {
+    #[allow(clippy::too_many_lines)]
     fn clone(&self) -> Self {
         Self {
             url: self.url.clone(),
             method: self.method.clone(),
             headers: self.headers.clone(),
+            removed_headers: self.removed_headers.clone(),
+            form_data: self.form_data,
             body: self.body.clone(),
             follow_redirects: self.follow_redirects,
             max_redirects: self.max_redirects,
@@ -336,6 +346,7 @@ impl Clone for Easy {
             share: self.share.clone(),
             http_version: self.http_version,
             expect_100_timeout: self.expect_100_timeout,
+            chunked_upload: self.chunked_upload,
             max_recv_speed: self.max_recv_speed,
             max_send_speed: self.max_send_speed,
             low_speed_limit: self.low_speed_limit,
@@ -402,11 +413,14 @@ impl Clone for Easy {
 impl Easy {
     /// Create a new transfer handle.
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn new() -> Self {
         Self {
             url: None,
             method: None,
             headers: Vec::new(),
+            removed_headers: Vec::new(),
+            form_data: false,
             body: None,
             follow_redirects: false,
             max_redirects: 50,
@@ -441,6 +455,7 @@ impl Easy {
             share: None,
             http_version: HttpVersion::None,
             expect_100_timeout: None,
+            chunked_upload: false,
             max_recv_speed: None,
             max_send_speed: None,
             low_speed_limit: None,
@@ -552,9 +567,45 @@ impl Easy {
         self.body.take()
     }
 
+    /// Mark a header name for removal (suppresses built-in defaults).
+    ///
+    /// Used by the `-H "Name:"` syntax to suppress a built-in header
+    /// without adding a new one. Unlike `remove_header()`, this does not
+    /// remove previously-set custom headers — it only prevents the built-in
+    /// default (e.g., `User-Agent`, `Accept`) from being emitted.
+    pub fn header_remove(&mut self, name: &str) {
+        self.removed_headers.push(name.to_lowercase());
+    }
+
+    /// Mark that form data was set (from `-d`, `--data-raw`, etc.).
+    ///
+    /// Controls auto-generation of `Content-Type: application/x-www-form-urlencoded`.
+    pub const fn set_form_data(&mut self, enabled: bool) {
+        self.form_data = enabled;
+    }
+
+    /// Returns whether form data was set.
+    #[must_use]
+    pub const fn is_form_data(&self) -> bool {
+        self.form_data
+    }
+
+    /// Returns the list of removed header names (lowercase).
+    #[must_use]
+    pub fn removed_headers(&self) -> &[String] {
+        &self.removed_headers
+    }
+
     /// Remove all headers with the given name (case-insensitive).
     pub fn remove_header(&mut self, name: &str) {
         self.headers.retain(|(k, _)| !k.eq_ignore_ascii_case(name));
+    }
+
+    /// Check if a custom header with the given name exists.
+    #[must_use]
+    pub fn has_header(&self, name: &str) -> bool {
+        self.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case(name))
+            || self.removed_headers.iter().any(|k| k.eq_ignore_ascii_case(name))
     }
 
     /// Set the expected upload size in bytes.
@@ -773,6 +824,27 @@ impl Easy {
         self.multipart.get_or_insert_with(MultipartForm::new).file(name, path)
     }
 
+    /// Add file data directly to the multipart form.
+    pub fn form_file_data(&mut self, name: &str, filename: &str, data: &[u8]) {
+        self.multipart.get_or_insert_with(MultipartForm::new).file_data(name, filename, data);
+    }
+
+    /// Add file data with explicit content type to the multipart form.
+    pub fn form_file_with_type(
+        &mut self,
+        name: &str,
+        filename: &str,
+        content_type: &str,
+        data: &[u8],
+    ) {
+        self.multipart.get_or_insert_with(MultipartForm::new).file_data_with_type(
+            name,
+            filename,
+            content_type,
+            data,
+        );
+    }
+
     /// Set a byte range for the request.
     ///
     /// Sends a `Range: bytes=<range>` header. Format examples:
@@ -788,6 +860,17 @@ impl Easy {
     /// Equivalent to `range("<offset>-")`.
     pub fn resume_from(&mut self, offset: u64) {
         self.range = Some(format!("{offset}-"));
+    }
+
+    /// Returns true if a range (resume) has been set with a non-zero offset.
+    #[must_use]
+    pub fn has_range(&self) -> bool {
+        self.range.as_ref().is_some_and(|r| r != "0-")
+    }
+
+    /// Clear the resume/range setting.
+    pub fn clear_range(&mut self) {
+        self.range = None;
     }
 
     /// Set a progress callback for transfer monitoring.
@@ -1224,6 +1307,15 @@ impl Easy {
     /// Equivalent to `CURLOPT_EXPECT_100_TIMEOUT_MS`.
     pub const fn expect_100_timeout(&mut self, timeout: Duration) {
         self.expect_100_timeout = Some(timeout);
+    }
+
+    /// Enable chunked transfer encoding for uploads.
+    ///
+    /// When enabled, the request body is sent using chunked transfer encoding.
+    /// This is typically used for stdin uploads where the size isn't known
+    /// in advance.
+    pub const fn set_chunked_upload(&mut self, enable: bool) {
+        self.chunked_upload = enable;
     }
 
     /// Set the maximum download speed in bytes per second.
@@ -1930,6 +2022,7 @@ impl Easy {
             self.sasl_ir,
             self.haproxy_protocol,
             self.abstract_unix_socket.as_deref(),
+            self.chunked_upload,
         );
 
         // Apply total transfer timeout if set.
@@ -2056,6 +2149,7 @@ async fn perform_transfer(
     sasl_ir: bool,
     haproxy_protocol: bool,
     abstract_unix_socket: Option<&str>,
+    chunked_upload: bool,
 ) -> Result<Response, Error> {
     let transfer_start = Instant::now();
     let original_url = url.clone();
@@ -2149,6 +2243,7 @@ async fn perform_transfer(
             sasl_ir,
             haproxy_protocol,
             abstract_unix_socket,
+            chunked_upload,
         ))
         .await?;
 
@@ -2247,11 +2342,20 @@ async fn perform_transfer(
                                 sasl_ir,
                                 haproxy_protocol,
                                 abstract_unix_socket,
+                                chunked_upload,
                             ))
                             .await?;
                         }
                     }
                 }
+            }
+        }
+
+        // Check for failed resume: 416 Range Not Satisfiable means server rejected our range
+        if response.status() == 416 {
+            let has_range = headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("range"));
+            if has_range {
+                return Err(Error::Http("range not satisfiable".to_string()));
             }
         }
 
@@ -2420,6 +2524,7 @@ async fn do_single_request(
     sasl_ir: bool,
     haproxy_protocol: bool,
     #[cfg_attr(not(unix), allow(unused_variables))] abstract_unix_socket: Option<&str>,
+    chunked_upload: bool,
 ) -> Result<Response, Error> {
     // Handle non-HTTP schemes directly
     match url.scheme() {
@@ -2617,7 +2722,7 @@ async fn do_single_request(
                 expect_100_timeout,
                 ignore_content_length,
                 speed_limits,
-                false,
+                chunked_upload,
             )
             .await;
 
@@ -2732,7 +2837,7 @@ async fn do_single_request(
             expect_100_timeout,
             ignore_content_length,
             speed_limits,
-            false,
+            chunked_upload,
         )
         .await?;
         let time_starttransfer = request_start.elapsed();
@@ -3006,7 +3111,7 @@ async fn do_single_request(
                         expect_100_timeout,
                         ignore_content_length,
                         speed_limits,
-                        false,
+                        chunked_upload,
                     )
                     .await?;
                     let time_starttransfer = request_start.elapsed();
@@ -3107,7 +3212,7 @@ async fn do_single_request(
                     expect_100_timeout,
                     ignore_content_length,
                     speed_limits,
-                    false,
+                    chunked_upload,
                 )
                 .await?;
                 let time_starttransfer = request_start.elapsed();
@@ -3168,7 +3273,7 @@ async fn do_single_request(
                 expect_100_timeout,
                 ignore_content_length,
                 speed_limits,
-                false,
+                chunked_upload,
             )
             .await?;
             let time_starttransfer = request_start.elapsed();

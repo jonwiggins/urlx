@@ -37,7 +37,7 @@
 //!   list is walked via `(*node).next` until null. Each `node.data` is a
 //!   caller-owned C string. `curl_slist_free_all` reclaims all nodes.
 //!
-//! - **Panic safety**: `curl_easy_perform` wraps the transfer in
+//! - **Panic safety**: All exported `#[no_mangle]` functions wrap their body in
 //!   `std::panic::catch_unwind` to prevent Rust panics from unwinding across
 //!   the FFI boundary.
 
@@ -499,8 +499,11 @@ struct MimePartHandle {
 /// The returned handle must be freed with `curl_mime_free`.
 #[no_mangle]
 pub unsafe extern "C" fn curl_mime_init(_easy: *mut c_void) -> *mut c_void {
-    let handle = Box::new(MimeHandle { form: liburlx::MultipartForm::new() });
-    Box::into_raw(handle).cast::<c_void>()
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let handle = Box::new(MimeHandle { form: liburlx::MultipartForm::new() });
+        Box::into_raw(handle).cast::<c_void>()
+    }));
+    result.unwrap_or(ptr::null_mut())
 }
 
 /// `curl_mime_addpart` — add a new part to a MIME handle.
@@ -511,11 +514,15 @@ pub unsafe extern "C" fn curl_mime_init(_easy: *mut c_void) -> *mut c_void {
 /// The returned part pointer is valid until `curl_mime_free` is called on the parent.
 #[no_mangle]
 pub unsafe extern "C" fn curl_mime_addpart(mime: *mut c_void) -> *mut c_void {
-    if mime.is_null() {
-        return ptr::null_mut();
-    }
-    let part = Box::new(MimePartHandle { name: None, data: None, filename: None, mime_type: None });
-    Box::into_raw(part).cast::<c_void>()
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if mime.is_null() {
+            return ptr::null_mut();
+        }
+        let part =
+            Box::new(MimePartHandle { name: None, data: None, filename: None, mime_type: None });
+        Box::into_raw(part).cast::<c_void>()
+    }));
+    result.unwrap_or(ptr::null_mut())
 }
 
 /// `curl_mime_name` — set the name of a MIME part.
@@ -526,20 +533,23 @@ pub unsafe extern "C" fn curl_mime_addpart(mime: *mut c_void) -> *mut c_void {
 /// `name` must be a valid null-terminated C string.
 #[no_mangle]
 pub unsafe extern "C" fn curl_mime_name(part: *mut c_void, name: *const c_char) -> CURLcode {
-    if part.is_null() || name.is_null() {
-        return CURLcode::CURLE_BAD_FUNCTION_ARGUMENT;
-    }
-    // SAFETY: Caller guarantees part is from curl_mime_addpart
-    let p = unsafe { &mut *part.cast::<MimePartHandle>() };
-    // SAFETY: Caller guarantees name is a null-terminated C string
-    let s = unsafe { CStr::from_ptr(name) };
-    match s.to_str() {
-        Ok(name_str) => {
-            p.name = Some(name_str.to_string());
-            CURLcode::CURLE_OK
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if part.is_null() || name.is_null() {
+            return CURLcode::CURLE_BAD_FUNCTION_ARGUMENT;
         }
-        Err(_) => CURLcode::CURLE_BAD_FUNCTION_ARGUMENT,
-    }
+        // SAFETY: Caller guarantees part is from curl_mime_addpart
+        let p = unsafe { &mut *part.cast::<MimePartHandle>() };
+        // SAFETY: Caller guarantees name is a null-terminated C string
+        let s = unsafe { CStr::from_ptr(name) };
+        match s.to_str() {
+            Ok(name_str) => {
+                p.name = Some(name_str.to_string());
+                CURLcode::CURLE_OK
+            }
+            Err(_) => CURLcode::CURLE_BAD_FUNCTION_ARGUMENT,
+        }
+    }));
+    result.unwrap_or(CURLcode::CURLE_UNKNOWN_OPTION)
 }
 
 /// `curl_mime_data` — set data for a MIME part.
@@ -555,24 +565,27 @@ pub unsafe extern "C" fn curl_mime_data(
     data: *const c_char,
     datasize: usize,
 ) -> CURLcode {
-    if part.is_null() || data.is_null() {
-        return CURLcode::CURLE_BAD_FUNCTION_ARGUMENT;
-    }
-    // SAFETY: Caller guarantees part is from curl_mime_addpart
-    let p = unsafe { &mut *part.cast::<MimePartHandle>() };
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if part.is_null() || data.is_null() {
+            return CURLcode::CURLE_BAD_FUNCTION_ARGUMENT;
+        }
+        // SAFETY: Caller guarantees part is from curl_mime_addpart
+        let p = unsafe { &mut *part.cast::<MimePartHandle>() };
 
-    let bytes = if datasize == usize::MAX {
-        // CURL_ZERO_TERMINATED — treat as null-terminated string
-        // SAFETY: Caller guarantees data is null-terminated
-        let s = unsafe { CStr::from_ptr(data) };
-        s.to_bytes().to_vec()
-    } else {
-        // SAFETY: Caller guarantees data points to at least datasize bytes
-        unsafe { std::slice::from_raw_parts(data.cast::<u8>(), datasize) }.to_vec()
-    };
+        let bytes = if datasize == usize::MAX {
+            // CURL_ZERO_TERMINATED — treat as null-terminated string
+            // SAFETY: Caller guarantees data is null-terminated
+            let s = unsafe { CStr::from_ptr(data) };
+            s.to_bytes().to_vec()
+        } else {
+            // SAFETY: Caller guarantees data points to at least datasize bytes
+            unsafe { std::slice::from_raw_parts(data.cast::<u8>(), datasize) }.to_vec()
+        };
 
-    p.data = Some(bytes);
-    CURLcode::CURLE_OK
+        p.data = Some(bytes);
+        CURLcode::CURLE_OK
+    }));
+    result.unwrap_or(CURLcode::CURLE_UNKNOWN_OPTION)
 }
 
 /// `curl_mime_filename` — set the filename for a MIME part.
@@ -586,20 +599,23 @@ pub unsafe extern "C" fn curl_mime_filename(
     part: *mut c_void,
     filename: *const c_char,
 ) -> CURLcode {
-    if part.is_null() || filename.is_null() {
-        return CURLcode::CURLE_BAD_FUNCTION_ARGUMENT;
-    }
-    // SAFETY: Caller guarantees part is from curl_mime_addpart
-    let p = unsafe { &mut *part.cast::<MimePartHandle>() };
-    // SAFETY: Caller guarantees filename is a null-terminated C string
-    let s = unsafe { CStr::from_ptr(filename) };
-    match s.to_str() {
-        Ok(f) => {
-            p.filename = Some(f.to_string());
-            CURLcode::CURLE_OK
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if part.is_null() || filename.is_null() {
+            return CURLcode::CURLE_BAD_FUNCTION_ARGUMENT;
         }
-        Err(_) => CURLcode::CURLE_BAD_FUNCTION_ARGUMENT,
-    }
+        // SAFETY: Caller guarantees part is from curl_mime_addpart
+        let p = unsafe { &mut *part.cast::<MimePartHandle>() };
+        // SAFETY: Caller guarantees filename is a null-terminated C string
+        let s = unsafe { CStr::from_ptr(filename) };
+        match s.to_str() {
+            Ok(f) => {
+                p.filename = Some(f.to_string());
+                CURLcode::CURLE_OK
+            }
+            Err(_) => CURLcode::CURLE_BAD_FUNCTION_ARGUMENT,
+        }
+    }));
+    result.unwrap_or(CURLcode::CURLE_UNKNOWN_OPTION)
 }
 
 /// `curl_mime_type` — set the MIME type for a MIME part.
@@ -610,20 +626,23 @@ pub unsafe extern "C" fn curl_mime_filename(
 /// `mimetype` must be a valid null-terminated C string.
 #[no_mangle]
 pub unsafe extern "C" fn curl_mime_type(part: *mut c_void, mimetype: *const c_char) -> CURLcode {
-    if part.is_null() || mimetype.is_null() {
-        return CURLcode::CURLE_BAD_FUNCTION_ARGUMENT;
-    }
-    // SAFETY: Caller guarantees part is from curl_mime_addpart
-    let p = unsafe { &mut *part.cast::<MimePartHandle>() };
-    // SAFETY: Caller guarantees mimetype is a null-terminated C string
-    let s = unsafe { CStr::from_ptr(mimetype) };
-    match s.to_str() {
-        Ok(t) => {
-            p.mime_type = Some(t.to_string());
-            CURLcode::CURLE_OK
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if part.is_null() || mimetype.is_null() {
+            return CURLcode::CURLE_BAD_FUNCTION_ARGUMENT;
         }
-        Err(_) => CURLcode::CURLE_BAD_FUNCTION_ARGUMENT,
-    }
+        // SAFETY: Caller guarantees part is from curl_mime_addpart
+        let p = unsafe { &mut *part.cast::<MimePartHandle>() };
+        // SAFETY: Caller guarantees mimetype is a null-terminated C string
+        let s = unsafe { CStr::from_ptr(mimetype) };
+        match s.to_str() {
+            Ok(t) => {
+                p.mime_type = Some(t.to_string());
+                CURLcode::CURLE_OK
+            }
+            Err(_) => CURLcode::CURLE_BAD_FUNCTION_ARGUMENT,
+        }
+    }));
+    result.unwrap_or(CURLcode::CURLE_UNKNOWN_OPTION)
 }
 
 /// `curl_mime_free` — free a MIME handle and all its parts.
@@ -634,10 +653,12 @@ pub unsafe extern "C" fn curl_mime_type(part: *mut c_void, mimetype: *const c_ch
 /// After this call, `mime` must not be used.
 #[no_mangle]
 pub unsafe extern "C" fn curl_mime_free(mime: *mut c_void) {
-    if !mime.is_null() {
-        // SAFETY: Caller guarantees mime is from curl_mime_init
-        let _ = unsafe { Box::from_raw(mime.cast::<MimeHandle>()) };
-    }
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !mime.is_null() {
+            // SAFETY: Caller guarantees mime is from curl_mime_init
+            let _ = unsafe { Box::from_raw(mime.cast::<MimeHandle>()) };
+        }
+    }));
 }
 
 /// Helper to finalize a MIME part into the parent MIME form.
@@ -677,8 +698,11 @@ unsafe fn finalize_mime_part(mime: *mut c_void, part: *mut c_void) {
 /// Returns a new handle that must be freed with `curl_share_cleanup`.
 #[no_mangle]
 pub extern "C" fn curl_share_init() -> *mut c_void {
-    let share = Box::new(liburlx::Share::new());
-    Box::into_raw(share).cast::<c_void>()
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let share = Box::new(liburlx::Share::new());
+        Box::into_raw(share).cast::<c_void>()
+    }));
+    result.unwrap_or(ptr::null_mut())
 }
 
 /// `curl_share_cleanup` — free a share handle.
@@ -688,12 +712,15 @@ pub extern "C" fn curl_share_init() -> *mut c_void {
 /// `share` must be a valid pointer from `curl_share_init`, or null.
 #[no_mangle]
 pub unsafe extern "C" fn curl_share_cleanup(share: *mut c_void) -> CURLSHcode {
-    if share.is_null() {
-        return CURLSHcode::CURLSHE_INVALID;
-    }
-    // SAFETY: Caller guarantees share is from curl_share_init
-    let _ = unsafe { Box::from_raw(share.cast::<liburlx::Share>()) };
-    CURLSHcode::CURLSHE_OK
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if share.is_null() {
+            return CURLSHcode::CURLSHE_INVALID;
+        }
+        // SAFETY: Caller guarantees share is from curl_share_init
+        let _ = unsafe { Box::from_raw(share.cast::<liburlx::Share>()) };
+        CURLSHcode::CURLSHE_OK
+    }));
+    result.unwrap_or(CURLSHcode::CURLSHE_INVALID)
 }
 
 /// `curl_share_setopt` — set options on a share handle.
@@ -708,51 +735,54 @@ pub unsafe extern "C" fn curl_share_setopt(
     option: c_long,
     value: *const c_void,
 ) -> CURLSHcode {
-    if share.is_null() {
-        return CURLSHcode::CURLSHE_INVALID;
-    }
-
-    // SAFETY: Caller guarantees share is from curl_share_init
-    let s = unsafe { &mut *share.cast::<liburlx::Share>() };
-
-    match option {
-        // CURLSHOPT_SHARE = 1
-        1 => {
-            let lock_data = value as c_long;
-            match lock_data {
-                // CURL_LOCK_DATA_COOKIE = 2
-                2 => {
-                    s.add(liburlx::ShareType::Cookies);
-                    CURLSHcode::CURLSHE_OK
-                }
-                // CURL_LOCK_DATA_DNS = 3
-                3 => {
-                    s.add(liburlx::ShareType::Dns);
-                    CURLSHcode::CURLSHE_OK
-                }
-                _ => CURLSHcode::CURLSHE_BAD_OPTION,
-            }
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if share.is_null() {
+            return CURLSHcode::CURLSHE_INVALID;
         }
-        // CURLSHOPT_UNSHARE = 2
-        2 => {
-            let lock_data = value as c_long;
-            match lock_data {
-                2 => {
-                    s.remove(liburlx::ShareType::Cookies);
-                    CURLSHcode::CURLSHE_OK
+
+        // SAFETY: Caller guarantees share is from curl_share_init
+        let s = unsafe { &mut *share.cast::<liburlx::Share>() };
+
+        match option {
+            // CURLSHOPT_SHARE = 1
+            1 => {
+                let lock_data = value as c_long;
+                match lock_data {
+                    // CURL_LOCK_DATA_COOKIE = 2
+                    2 => {
+                        s.add(liburlx::ShareType::Cookies);
+                        CURLSHcode::CURLSHE_OK
+                    }
+                    // CURL_LOCK_DATA_DNS = 3
+                    3 => {
+                        s.add(liburlx::ShareType::Dns);
+                        CURLSHcode::CURLSHE_OK
+                    }
+                    _ => CURLSHcode::CURLSHE_BAD_OPTION,
                 }
-                3 => {
-                    s.remove(liburlx::ShareType::Dns);
-                    CURLSHcode::CURLSHE_OK
-                }
-                _ => CURLSHcode::CURLSHE_BAD_OPTION,
             }
+            // CURLSHOPT_UNSHARE = 2
+            2 => {
+                let lock_data = value as c_long;
+                match lock_data {
+                    2 => {
+                        s.remove(liburlx::ShareType::Cookies);
+                        CURLSHcode::CURLSHE_OK
+                    }
+                    3 => {
+                        s.remove(liburlx::ShareType::Dns);
+                        CURLSHcode::CURLSHE_OK
+                    }
+                    _ => CURLSHcode::CURLSHE_BAD_OPTION,
+                }
+            }
+            // CURLSHOPT_LOCKFUNC = 3, CURLSHOPT_UNLOCKFUNC = 4
+            // Accept but ignore — our Share uses Arc<Mutex> internally
+            3 | 4 => CURLSHcode::CURLSHE_OK,
+            _ => CURLSHcode::CURLSHE_BAD_OPTION,
         }
-        // CURLSHOPT_LOCKFUNC = 3, CURLSHOPT_UNLOCKFUNC = 4
-        // Accept but ignore — our Share uses Arc<Mutex> internally
-        3 | 4 => CURLSHcode::CURLSHE_OK,
-        _ => CURLSHcode::CURLSHE_BAD_OPTION,
-    }
+    }));
+    result.unwrap_or(CURLSHcode::CURLSHE_INVALID)
 }
 
 /// `curl_share_strerror` — return a human-readable share error message.
@@ -763,15 +793,18 @@ pub unsafe extern "C" fn curl_share_setopt(
 #[no_mangle]
 #[allow(clippy::missing_const_for_fn)]
 pub extern "C" fn curl_share_strerror(code: CURLSHcode) -> *const c_char {
-    let msg = match code {
-        CURLSHcode::CURLSHE_OK => c"No error",
-        CURLSHcode::CURLSHE_BAD_OPTION => c"Bad option in share call",
-        CURLSHcode::CURLSHE_IN_USE => c"Share already in use",
-        CURLSHcode::CURLSHE_INVALID => c"Invalid share handle",
-        CURLSHcode::CURLSHE_NOMEM => c"Out of memory",
-        CURLSHcode::CURLSHE_NOT_BUILT_IN => c"Feature not available",
-    };
-    msg.as_ptr()
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let msg = match code {
+            CURLSHcode::CURLSHE_OK => c"No error",
+            CURLSHcode::CURLSHE_BAD_OPTION => c"Bad option in share call",
+            CURLSHcode::CURLSHE_IN_USE => c"Share already in use",
+            CURLSHcode::CURLSHE_INVALID => c"Invalid share handle",
+            CURLSHcode::CURLSHE_NOMEM => c"Out of memory",
+            CURLSHcode::CURLSHE_NOT_BUILT_IN => c"Feature not available",
+        };
+        msg.as_ptr()
+    }));
+    result.unwrap_or(c"Unknown error".as_ptr())
 }
 
 // ───────────────────────── curl_url (URL API) ─────────────────────────
@@ -885,8 +918,11 @@ impl Clone for UrlHandle {
 /// Returns a new handle that must be freed with `curl_url_cleanup`.
 #[no_mangle]
 pub extern "C" fn curl_url() -> *mut c_void {
-    let handle = Box::new(UrlHandle::new());
-    Box::into_raw(handle).cast::<c_void>()
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let handle = Box::new(UrlHandle::new());
+        Box::into_raw(handle).cast::<c_void>()
+    }));
+    result.unwrap_or(ptr::null_mut())
 }
 
 /// `curl_url_cleanup` — free a URL handle.
@@ -896,10 +932,12 @@ pub extern "C" fn curl_url() -> *mut c_void {
 /// `handle` must be a valid pointer from `curl_url`, or null.
 #[no_mangle]
 pub unsafe extern "C" fn curl_url_cleanup(handle: *mut c_void) {
-    if !handle.is_null() {
-        // SAFETY: Caller guarantees handle is from curl_url
-        let _ = unsafe { Box::from_raw(handle.cast::<UrlHandle>()) };
-    }
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !handle.is_null() {
+            // SAFETY: Caller guarantees handle is from curl_url
+            let _ = unsafe { Box::from_raw(handle.cast::<UrlHandle>()) };
+        }
+    }));
 }
 
 /// `curl_url_dup` — duplicate a URL handle.
@@ -909,13 +947,16 @@ pub unsafe extern "C" fn curl_url_cleanup(handle: *mut c_void) {
 /// `handle` must be a valid pointer from `curl_url`.
 #[no_mangle]
 pub unsafe extern "C" fn curl_url_dup(handle: *mut c_void) -> *mut c_void {
-    if handle.is_null() {
-        return ptr::null_mut();
-    }
-    // SAFETY: Caller guarantees handle is from curl_url
-    let h = unsafe { &*handle.cast::<UrlHandle>() };
-    let dup = Box::new(h.clone());
-    Box::into_raw(dup).cast::<c_void>()
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if handle.is_null() {
+            return ptr::null_mut();
+        }
+        // SAFETY: Caller guarantees handle is from curl_url
+        let h = unsafe { &*handle.cast::<UrlHandle>() };
+        let dup = Box::new(h.clone());
+        Box::into_raw(dup).cast::<c_void>()
+    }));
+    result.unwrap_or(ptr::null_mut())
 }
 
 /// `curl_url_set` — set a URL component.
@@ -931,90 +972,93 @@ pub unsafe extern "C" fn curl_url_set(
     content: *const c_char,
     _flags: c_long,
 ) -> CURLUcode {
-    if handle.is_null() {
-        return CURLUcode::CURLUE_BAD_HANDLE;
-    }
-
-    // SAFETY: Caller guarantees handle is from curl_url
-    let h = unsafe { &mut *handle.cast::<UrlHandle>() };
-
-    // Null content clears the part
-    let value = if content.is_null() {
-        None
-    } else {
-        // SAFETY: Caller guarantees content is null-terminated
-        match unsafe { CStr::from_ptr(content) }.to_str() {
-            Ok(s) => Some(s.to_string()),
-            Err(_) => return CURLUcode::CURLUE_MALFORMED_INPUT,
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if handle.is_null() {
+            return CURLUcode::CURLUE_BAD_HANDLE;
         }
-    };
 
-    h.cached_url = None; // Invalidate cache
+        // SAFETY: Caller guarantees handle is from curl_url
+        let h = unsafe { &mut *handle.cast::<UrlHandle>() };
 
-    match what {
-        // CURLUPART_URL = 0
-        0 => {
-            if let Some(ref url_str) = value {
-                return h.set_url(url_str);
+        // Null content clears the part
+        let value = if content.is_null() {
+            None
+        } else {
+            // SAFETY: Caller guarantees content is null-terminated
+            match unsafe { CStr::from_ptr(content) }.to_str() {
+                Ok(s) => Some(s.to_string()),
+                Err(_) => return CURLUcode::CURLUE_MALFORMED_INPUT,
             }
-            // Clear all components
-            *h = UrlHandle::new();
-            CURLUcode::CURLUE_OK
-        }
-        // CURLUPART_SCHEME = 1
-        1 => {
-            h.scheme = value;
-            CURLUcode::CURLUE_OK
-        }
-        // CURLUPART_USER = 2
-        2 => {
-            h.user = value;
-            CURLUcode::CURLUE_OK
-        }
-        // CURLUPART_PASSWORD = 3
-        3 => {
-            h.password = value;
-            CURLUcode::CURLUE_OK
-        }
-        // CURLUPART_OPTIONS = 4, CURLUPART_ZONEID = 10 — accept but ignore
-        4 | 10 => CURLUcode::CURLUE_OK,
-        // CURLUPART_HOST = 5
-        5 => {
-            h.host = value;
-            CURLUcode::CURLUE_OK
-        }
-        // CURLUPART_PORT = 6
-        6 => {
-            if let Some(ref port_str) = value {
-                match port_str.parse::<u16>() {
-                    Ok(port) => {
-                        h.port = Some(port);
-                        CURLUcode::CURLUE_OK
-                    }
-                    Err(_) => CURLUcode::CURLUE_BAD_PORT_NUMBER,
+        };
+
+        h.cached_url = None; // Invalidate cache
+
+        match what {
+            // CURLUPART_URL = 0
+            0 => {
+                if let Some(ref url_str) = value {
+                    return h.set_url(url_str);
                 }
-            } else {
-                h.port = None;
+                // Clear all components
+                *h = UrlHandle::new();
                 CURLUcode::CURLUE_OK
             }
+            // CURLUPART_SCHEME = 1
+            1 => {
+                h.scheme = value;
+                CURLUcode::CURLUE_OK
+            }
+            // CURLUPART_USER = 2
+            2 => {
+                h.user = value;
+                CURLUcode::CURLUE_OK
+            }
+            // CURLUPART_PASSWORD = 3
+            3 => {
+                h.password = value;
+                CURLUcode::CURLUE_OK
+            }
+            // CURLUPART_OPTIONS = 4, CURLUPART_ZONEID = 10 — accept but ignore
+            4 | 10 => CURLUcode::CURLUE_OK,
+            // CURLUPART_HOST = 5
+            5 => {
+                h.host = value;
+                CURLUcode::CURLUE_OK
+            }
+            // CURLUPART_PORT = 6
+            6 => {
+                if let Some(ref port_str) = value {
+                    match port_str.parse::<u16>() {
+                        Ok(port) => {
+                            h.port = Some(port);
+                            CURLUcode::CURLUE_OK
+                        }
+                        Err(_) => CURLUcode::CURLUE_BAD_PORT_NUMBER,
+                    }
+                } else {
+                    h.port = None;
+                    CURLUcode::CURLUE_OK
+                }
+            }
+            // CURLUPART_PATH = 7
+            7 => {
+                h.path = value;
+                CURLUcode::CURLUE_OK
+            }
+            // CURLUPART_QUERY = 8
+            8 => {
+                h.query = value;
+                CURLUcode::CURLUE_OK
+            }
+            // CURLUPART_FRAGMENT = 9
+            9 => {
+                h.fragment = value;
+                CURLUcode::CURLUE_OK
+            }
+            _ => CURLUcode::CURLUE_UNKNOWN_PART,
         }
-        // CURLUPART_PATH = 7
-        7 => {
-            h.path = value;
-            CURLUcode::CURLUE_OK
-        }
-        // CURLUPART_QUERY = 8
-        8 => {
-            h.query = value;
-            CURLUcode::CURLUE_OK
-        }
-        // CURLUPART_FRAGMENT = 9
-        9 => {
-            h.fragment = value;
-            CURLUcode::CURLUE_OK
-        }
-        _ => CURLUcode::CURLUE_UNKNOWN_PART,
-    }
+    }));
+    result.unwrap_or(CURLUcode::CURLUE_BAD_HANDLE)
 }
 
 /// `curl_url_get` — get a URL component.
@@ -1033,57 +1077,60 @@ pub unsafe extern "C" fn curl_url_get(
     part: *mut *mut c_char,
     _flags: c_long,
 ) -> CURLUcode {
-    if handle.is_null() {
-        return CURLUcode::CURLUE_BAD_HANDLE;
-    }
-    if part.is_null() {
-        return CURLUcode::CURLUE_BAD_PARTPOINTER;
-    }
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if handle.is_null() {
+            return CURLUcode::CURLUE_BAD_HANDLE;
+        }
+        if part.is_null() {
+            return CURLUcode::CURLUE_BAD_PARTPOINTER;
+        }
 
-    // SAFETY: Caller guarantees handle is from curl_url
-    let h = unsafe { &mut *handle.cast::<UrlHandle>() };
+        // SAFETY: Caller guarantees handle is from curl_url
+        let h = unsafe { &mut *handle.cast::<UrlHandle>() };
 
-    let result: Option<String> = match what {
-        // CURLUPART_URL = 0
-        0 => Some(h.reassemble()),
-        // CURLUPART_SCHEME = 1
-        1 => h.scheme.clone(),
-        // CURLUPART_USER = 2
-        2 => h.user.clone(),
-        // CURLUPART_PASSWORD = 3
-        3 => h.password.clone(),
-        // CURLUPART_OPTIONS = 4, CURLUPART_ZONEID = 10 — not stored
-        4 | 10 => None,
-        // CURLUPART_HOST = 5
-        5 => h.host.clone(),
-        // CURLUPART_PORT = 6
-        6 => h.port.map(|p| p.to_string()),
-        // CURLUPART_PATH = 7
-        7 => h.path.clone(),
-        // CURLUPART_QUERY = 8
-        8 => h.query.clone(),
-        // CURLUPART_FRAGMENT = 9
-        9 => h.fragment.clone(),
-        _ => return CURLUcode::CURLUE_UNKNOWN_PART,
-    };
+        let component: Option<String> = match what {
+            // CURLUPART_URL = 0
+            0 => Some(h.reassemble()),
+            // CURLUPART_SCHEME = 1
+            1 => h.scheme.clone(),
+            // CURLUPART_USER = 2
+            2 => h.user.clone(),
+            // CURLUPART_PASSWORD = 3
+            3 => h.password.clone(),
+            // CURLUPART_OPTIONS = 4, CURLUPART_ZONEID = 10 — not stored
+            4 | 10 => None,
+            // CURLUPART_HOST = 5
+            5 => h.host.clone(),
+            // CURLUPART_PORT = 6
+            6 => h.port.map(|p| p.to_string()),
+            // CURLUPART_PATH = 7
+            7 => h.path.clone(),
+            // CURLUPART_QUERY = 8
+            8 => h.query.clone(),
+            // CURLUPART_FRAGMENT = 9
+            9 => h.fragment.clone(),
+            _ => return CURLUcode::CURLUE_UNKNOWN_PART,
+        };
 
-    if let Some(s) = result {
-        // Allocate a C string for the result
-        std::ffi::CString::new(s).map_or(CURLUcode::CURLUE_OUT_OF_MEMORY, |cstr| {
+        if let Some(s) = component {
+            // Allocate a C string for the result
+            std::ffi::CString::new(s).map_or(CURLUcode::CURLUE_OUT_OF_MEMORY, |cstr| {
+                // SAFETY: part is a valid pointer
+                unsafe {
+                    *part = cstr.into_raw();
+                }
+                CURLUcode::CURLUE_OK
+            })
+        } else {
+            // Part not set
             // SAFETY: part is a valid pointer
             unsafe {
-                *part = cstr.into_raw();
+                *part = ptr::null_mut();
             }
             CURLUcode::CURLUE_OK
-        })
-    } else {
-        // Part not set
-        // SAFETY: part is a valid pointer
-        unsafe {
-            *part = ptr::null_mut();
         }
-        CURLUcode::CURLUE_OK
-    }
+    }));
+    result.unwrap_or(CURLUcode::CURLUE_BAD_HANDLE)
 }
 
 /// `curl_free` — free memory allocated by curl functions.
@@ -1093,10 +1140,12 @@ pub unsafe extern "C" fn curl_url_get(
 /// `ptr` must be a pointer returned by curl functions (e.g., `curl_url_get`), or null.
 #[no_mangle]
 pub unsafe extern "C" fn curl_free(ptr: *mut c_void) {
-    if !ptr.is_null() {
-        // SAFETY: ptr was allocated via CString::into_raw
-        let _ = unsafe { std::ffi::CString::from_raw(ptr.cast::<c_char>()) };
-    }
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !ptr.is_null() {
+            // SAFETY: ptr was allocated via CString::into_raw
+            let _ = unsafe { std::ffi::CString::from_raw(ptr.cast::<c_char>()) };
+        }
+    }));
 }
 
 // ───────────────────────── curl_slist ─────────────────────────
@@ -1123,38 +1172,41 @@ pub unsafe extern "C" fn curl_slist_append(
     list: *mut curl_slist,
     data: *const c_char,
 ) -> *mut curl_slist {
-    if data.is_null() {
-        return list;
-    }
-
-    // SAFETY: Caller guarantees data is a null-terminated C string
-    let s = unsafe { CStr::from_ptr(data) };
-    let owned = s.to_bytes().to_vec();
-    let mut buf = owned;
-    buf.push(0); // null terminator
-                 // Convert to boxed slice for exact-length allocation (len == capacity guaranteed)
-    let boxed = buf.into_boxed_slice();
-    let data_ptr = Box::into_raw(boxed).cast::<c_char>();
-
-    let node = Box::new(curl_slist { data: data_ptr, next: ptr::null_mut() });
-
-    let node_ptr = Box::into_raw(node);
-
-    if list.is_null() {
-        node_ptr
-    } else {
-        // Walk to end of list
-        let mut current = list;
-        // SAFETY: Caller guarantees list is a valid curl_slist chain
-        while unsafe { !(*current).next.is_null() } {
-            current = unsafe { (*current).next };
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if data.is_null() {
+            return list;
         }
-        // SAFETY: current is a valid node
-        unsafe {
-            (*current).next = node_ptr;
+
+        // SAFETY: Caller guarantees data is a null-terminated C string
+        let s = unsafe { CStr::from_ptr(data) };
+        let owned = s.to_bytes().to_vec();
+        let mut buf = owned;
+        buf.push(0); // null terminator
+                     // Convert to boxed slice for exact-length allocation (len == capacity guaranteed)
+        let boxed = buf.into_boxed_slice();
+        let data_ptr = Box::into_raw(boxed).cast::<c_char>();
+
+        let node = Box::new(curl_slist { data: data_ptr, next: ptr::null_mut() });
+
+        let node_ptr = Box::into_raw(node);
+
+        if list.is_null() {
+            node_ptr
+        } else {
+            // Walk to end of list
+            let mut current = list;
+            // SAFETY: Caller guarantees list is a valid curl_slist chain
+            while unsafe { !(*current).next.is_null() } {
+                current = unsafe { (*current).next };
+            }
+            // SAFETY: current is a valid node
+            unsafe {
+                (*current).next = node_ptr;
+            }
+            list
         }
-        list
-    }
+    }));
+    result.unwrap_or(ptr::null_mut())
 }
 
 /// `curl_slist_free_all` — free an entire linked list.
@@ -1164,23 +1216,26 @@ pub unsafe extern "C" fn curl_slist_append(
 /// `list` must be a valid `curl_slist` pointer from `curl_slist_append`, or null.
 #[no_mangle]
 pub unsafe extern "C" fn curl_slist_free_all(list: *mut curl_slist) {
-    let mut current = list;
-    while !current.is_null() {
-        // SAFETY: current is a valid node from curl_slist_append
-        let node = unsafe { Box::from_raw(current) };
-        let next = node.next;
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut current = list;
+        while !current.is_null() {
+            // SAFETY: current is a valid node from curl_slist_append
+            let node = unsafe { Box::from_raw(current) };
+            let next = node.next;
 
-        // Free the string data
-        if !node.data.is_null() {
-            // SAFETY: data was allocated via Box::into_raw on a boxed slice
-            let s = unsafe { CStr::from_ptr(node.data) };
-            let len = s.to_bytes_with_nul().len();
-            let raw_slice = unsafe { std::slice::from_raw_parts_mut(node.data.cast::<u8>(), len) };
-            let _ = unsafe { Box::from_raw(raw_slice) };
+            // Free the string data
+            if !node.data.is_null() {
+                // SAFETY: data was allocated via Box::into_raw on a boxed slice
+                let s = unsafe { CStr::from_ptr(node.data) };
+                let len = s.to_bytes_with_nul().len();
+                let raw_slice =
+                    unsafe { std::slice::from_raw_parts_mut(node.data.cast::<u8>(), len) };
+                let _ = unsafe { Box::from_raw(raw_slice) };
+            }
+
+            current = next;
         }
-
-        current = next;
-    }
+    }));
 }
 
 // ───────────────────────── Easy handle ─────────────────────────
@@ -1226,31 +1281,34 @@ unsafe impl Send for EasyHandle {}
 /// Returns a new handle that must be freed with `curl_easy_cleanup`.
 #[no_mangle]
 pub extern "C" fn curl_easy_init() -> *mut c_void {
-    let handle = Box::new(EasyHandle {
-        easy: liburlx::Easy::new(),
-        last_response: None,
-        write_callback: None,
-        write_data: ptr::null_mut(),
-        header_callback: None,
-        header_data: ptr::null_mut(),
-        read_callback: None,
-        read_data: ptr::null_mut(),
-        debug_callback: None,
-        debug_data: ptr::null_mut(),
-        progress_callback: None,
-        xferinfo_callback: None,
-        progress_data: ptr::null_mut(),
-        seek_callback: None,
-        seek_data: ptr::null_mut(),
-        noprogress: true,
-        postfields: None,
-        infilesize: None,
-        private_data: ptr::null_mut(),
-        mime_parts: Vec::new(),
-        mimepost: ptr::null_mut(),
-        error_buf: [0u8; 256],
-    });
-    Box::into_raw(handle).cast::<c_void>()
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let handle = Box::new(EasyHandle {
+            easy: liburlx::Easy::new(),
+            last_response: None,
+            write_callback: None,
+            write_data: ptr::null_mut(),
+            header_callback: None,
+            header_data: ptr::null_mut(),
+            read_callback: None,
+            read_data: ptr::null_mut(),
+            debug_callback: None,
+            debug_data: ptr::null_mut(),
+            progress_callback: None,
+            xferinfo_callback: None,
+            progress_data: ptr::null_mut(),
+            seek_callback: None,
+            seek_data: ptr::null_mut(),
+            noprogress: true,
+            postfields: None,
+            infilesize: None,
+            private_data: ptr::null_mut(),
+            mime_parts: Vec::new(),
+            mimepost: ptr::null_mut(),
+            error_buf: [0u8; 256],
+        });
+        Box::into_raw(handle).cast::<c_void>()
+    }));
+    result.unwrap_or(ptr::null_mut())
 }
 
 /// `curl_easy_cleanup` — free an easy handle.
@@ -1261,10 +1319,12 @@ pub extern "C" fn curl_easy_init() -> *mut c_void {
 /// After this call, `handle` must not be used.
 #[no_mangle]
 pub unsafe extern "C" fn curl_easy_cleanup(handle: *mut c_void) {
-    if !handle.is_null() {
-        // SAFETY: Caller guarantees handle is from curl_easy_init
-        let _ = unsafe { Box::from_raw(handle.cast::<EasyHandle>()) };
-    }
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !handle.is_null() {
+            // SAFETY: Caller guarantees handle is from curl_easy_init
+            let _ = unsafe { Box::from_raw(handle.cast::<EasyHandle>()) };
+        }
+    }));
 }
 
 /// `curl_easy_duphandle` — clone an easy handle.
@@ -1275,37 +1335,40 @@ pub unsafe extern "C" fn curl_easy_cleanup(handle: *mut c_void) {
 /// The returned handle must be freed with `curl_easy_cleanup`.
 #[no_mangle]
 pub unsafe extern "C" fn curl_easy_duphandle(handle: *mut c_void) -> *mut c_void {
-    if handle.is_null() {
-        return ptr::null_mut();
-    }
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if handle.is_null() {
+            return ptr::null_mut();
+        }
 
-    // SAFETY: Caller guarantees handle is from curl_easy_init
-    let h = unsafe { &*handle.cast::<EasyHandle>() };
-    let dup = Box::new(EasyHandle {
-        easy: h.easy.clone(),
-        last_response: None,
-        write_callback: h.write_callback,
-        write_data: h.write_data,
-        header_callback: h.header_callback,
-        header_data: h.header_data,
-        read_callback: h.read_callback,
-        read_data: h.read_data,
-        debug_callback: h.debug_callback,
-        debug_data: h.debug_data,
-        progress_callback: h.progress_callback,
-        xferinfo_callback: h.xferinfo_callback,
-        progress_data: h.progress_data,
-        seek_callback: h.seek_callback,
-        seek_data: h.seek_data,
-        noprogress: h.noprogress,
-        postfields: h.postfields.clone(),
-        infilesize: h.infilesize,
-        private_data: h.private_data,
-        mime_parts: Vec::new(),
-        mimepost: ptr::null_mut(),
-        error_buf: [0u8; 256],
-    });
-    Box::into_raw(dup).cast::<c_void>()
+        // SAFETY: Caller guarantees handle is from curl_easy_init
+        let h = unsafe { &*handle.cast::<EasyHandle>() };
+        let dup = Box::new(EasyHandle {
+            easy: h.easy.clone(),
+            last_response: None,
+            write_callback: h.write_callback,
+            write_data: h.write_data,
+            header_callback: h.header_callback,
+            header_data: h.header_data,
+            read_callback: h.read_callback,
+            read_data: h.read_data,
+            debug_callback: h.debug_callback,
+            debug_data: h.debug_data,
+            progress_callback: h.progress_callback,
+            xferinfo_callback: h.xferinfo_callback,
+            progress_data: h.progress_data,
+            seek_callback: h.seek_callback,
+            seek_data: h.seek_data,
+            noprogress: h.noprogress,
+            postfields: h.postfields.clone(),
+            infilesize: h.infilesize,
+            private_data: h.private_data,
+            mime_parts: Vec::new(),
+            mimepost: ptr::null_mut(),
+            error_buf: [0u8; 256],
+        });
+        Box::into_raw(dup).cast::<c_void>()
+    }));
+    result.unwrap_or(ptr::null_mut())
 }
 
 /// `curl_easy_reset` — reset an easy handle to initial state.
@@ -1315,34 +1378,36 @@ pub unsafe extern "C" fn curl_easy_duphandle(handle: *mut c_void) -> *mut c_void
 /// `handle` must be a valid pointer from `curl_easy_init`.
 #[no_mangle]
 pub unsafe extern "C" fn curl_easy_reset(handle: *mut c_void) {
-    if handle.is_null() {
-        return;
-    }
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if handle.is_null() {
+            return;
+        }
 
-    // SAFETY: Caller guarantees handle is from curl_easy_init
-    let h = unsafe { &mut *handle.cast::<EasyHandle>() };
-    h.easy = liburlx::Easy::new();
-    h.last_response = None;
-    h.write_callback = None;
-    h.write_data = ptr::null_mut();
-    h.header_callback = None;
-    h.header_data = ptr::null_mut();
-    h.read_callback = None;
-    h.read_data = ptr::null_mut();
-    h.debug_callback = None;
-    h.debug_data = ptr::null_mut();
-    h.progress_callback = None;
-    h.xferinfo_callback = None;
-    h.progress_data = ptr::null_mut();
-    h.seek_callback = None;
-    h.seek_data = ptr::null_mut();
-    h.noprogress = true;
-    h.postfields = None;
-    h.infilesize = None;
-    h.private_data = ptr::null_mut();
-    h.mime_parts.clear();
-    h.mimepost = ptr::null_mut();
-    h.error_buf = [0u8; 256];
+        // SAFETY: Caller guarantees handle is from curl_easy_init
+        let h = unsafe { &mut *handle.cast::<EasyHandle>() };
+        h.easy = liburlx::Easy::new();
+        h.last_response = None;
+        h.write_callback = None;
+        h.write_data = ptr::null_mut();
+        h.header_callback = None;
+        h.header_data = ptr::null_mut();
+        h.read_callback = None;
+        h.read_data = ptr::null_mut();
+        h.debug_callback = None;
+        h.debug_data = ptr::null_mut();
+        h.progress_callback = None;
+        h.xferinfo_callback = None;
+        h.progress_data = ptr::null_mut();
+        h.seek_callback = None;
+        h.seek_data = ptr::null_mut();
+        h.noprogress = true;
+        h.postfields = None;
+        h.infilesize = None;
+        h.private_data = ptr::null_mut();
+        h.mime_parts.clear();
+        h.mimepost = ptr::null_mut();
+        h.error_buf = [0u8; 256];
+    }));
 }
 
 /// Helper to read a C string from a `*const c_void`.
@@ -1372,1323 +1437,1326 @@ pub unsafe extern "C" fn curl_easy_setopt(
     option: c_long,
     value: *const c_void,
 ) -> CURLcode {
-    if handle.is_null() {
-        return CURLcode::CURLE_FAILED_INIT;
-    }
-
-    // SAFETY: Caller guarantees handle is from curl_easy_init
-    let h = unsafe { &mut *handle.cast::<EasyHandle>() };
-
-    match option {
-        // ─── String options ───
-
-        // CURLOPT_URL = 10002
-        10002 => {
-            // SAFETY: value must be a null-terminated C string
-            match unsafe { read_cstr(value) } {
-                Some(s) => match h.easy.url(s) {
-                    Ok(()) => CURLcode::CURLE_OK,
-                    Err(_) => CURLcode::CURLE_URL_MALFORMAT,
-                },
-                None => CURLcode::CURLE_URL_MALFORMAT,
-            }
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if handle.is_null() {
+            return CURLcode::CURLE_FAILED_INIT;
         }
 
-        // CURLOPT_WRITEFUNCTION = 20011
-        20011 => {
-            // SAFETY: Caller guarantees value is a valid function pointer
-            h.write_callback =
-                Some(unsafe { std::mem::transmute::<*const c_void, WriteCallback>(value) });
-            CURLcode::CURLE_OK
-        }
+        // SAFETY: Caller guarantees handle is from curl_easy_init
+        let h = unsafe { &mut *handle.cast::<EasyHandle>() };
 
-        // CURLOPT_WRITEDATA = 10001
-        10001 => {
-            h.write_data = value.cast_mut();
-            CURLcode::CURLE_OK
-        }
+        match option {
+            // ─── String options ───
 
-        // CURLOPT_HEADERFUNCTION = 20079
-        20079 => {
-            // SAFETY: Caller guarantees value is a valid function pointer
-            h.header_callback =
-                Some(unsafe { std::mem::transmute::<*const c_void, HeaderCallback>(value) });
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_HEADERDATA = 10029
-        10029 => {
-            h.header_data = value.cast_mut();
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_READFUNCTION = 20012
-        20012 => {
-            // SAFETY: Caller guarantees value is a valid function pointer
-            h.read_callback =
-                Some(unsafe { std::mem::transmute::<*const c_void, ReadCallback>(value) });
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_READDATA = 10009
-        10009 => {
-            h.read_data = value.cast_mut();
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_DEBUGFUNCTION = 20094
-        20094 => {
-            // SAFETY: Caller guarantees value is a valid function pointer
-            h.debug_callback =
-                Some(unsafe { std::mem::transmute::<*const c_void, DebugCallback>(value) });
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_DEBUGDATA = 10095
-        10095 => {
-            h.debug_data = value.cast_mut();
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_USERAGENT = 10018
-        10018 => {
-            // SAFETY: value must be a null-terminated C string
-            if let Some(s) = unsafe { read_cstr(value) } {
-                h.easy.header("User-Agent", s);
-            }
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_POSTFIELDS = 10015
-        10015 => {
-            if value.is_null() {
-                h.postfields = None;
-            } else {
-                // SAFETY: Caller guarantees value is a null-terminated C string
-                let data = unsafe { CStr::from_ptr(value.cast::<c_char>()) };
-                h.postfields = Some(data.to_bytes().to_vec());
-            }
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_PROXY = 10004
-        10004 => {
-            // SAFETY: value must be a null-terminated C string
-            match unsafe { read_cstr(value) } {
-                Some(s) => match h.easy.proxy(s) {
-                    Ok(()) => CURLcode::CURLE_OK,
-                    Err(_) => CURLcode::CURLE_URL_MALFORMAT,
-                },
-                None => CURLcode::CURLE_OK,
-            }
-        }
-
-        // CURLOPT_NOPROXY = 10177
-        10177 => {
-            // SAFETY: value must be a null-terminated C string
-            if let Some(s) = unsafe { read_cstr(value) } {
-                h.easy.noproxy(s);
-            }
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_CUSTOMREQUEST = 10036
-        10036 => {
-            // SAFETY: value must be a null-terminated C string
-            if let Some(s) = unsafe { read_cstr(value) } {
-                h.easy.method(s);
-            }
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_USERPWD = 10005
-        10005 => {
-            // SAFETY: value must be a null-terminated C string
-            if let Some(s) = unsafe { read_cstr(value) } {
-                if let Some((user, pass)) = s.split_once(':') {
-                    h.easy.basic_auth(user, pass);
-                } else {
-                    h.easy.basic_auth(s, "");
+            // CURLOPT_URL = 10002
+            10002 => {
+                // SAFETY: value must be a null-terminated C string
+                match unsafe { read_cstr(value) } {
+                    Some(s) => match h.easy.url(s) {
+                        Ok(()) => CURLcode::CURLE_OK,
+                        Err(_) => CURLcode::CURLE_URL_MALFORMAT,
+                    },
+                    None => CURLcode::CURLE_URL_MALFORMAT,
                 }
             }
-            CURLcode::CURLE_OK
-        }
 
-        // CURLOPT_RANGE = 10007
-        10007 => {
-            // SAFETY: value must be a null-terminated C string
-            if let Some(s) = unsafe { read_cstr(value) } {
-                h.easy.range(s);
-            }
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_COOKIE = 10022
-        10022 => {
-            // SAFETY: value must be a null-terminated C string
-            if let Some(s) = unsafe { read_cstr(value) } {
-                h.easy.header("Cookie", s);
-            }
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_SSLCERT = 10025
-        10025 => {
-            // SAFETY: value must be a null-terminated C string
-            if let Some(s) = unsafe { read_cstr(value) } {
-                h.easy.ssl_client_cert(std::path::Path::new(s));
-            }
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_SSLKEY = 10087
-        10087 => {
-            // SAFETY: value must be a null-terminated C string
-            if let Some(s) = unsafe { read_cstr(value) } {
-                h.easy.ssl_client_key(std::path::Path::new(s));
-            }
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_CAINFO = 10065
-        10065 => {
-            // SAFETY: value must be a null-terminated C string
-            if let Some(s) = unsafe { read_cstr(value) } {
-                h.easy.ssl_ca_cert(std::path::Path::new(s));
-            }
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_CAPATH = 10097
-        10097 => {
-            // SAFETY: value must be a null-terminated C string
-            // CA path directory; accepted for compat (we use CA bundle, not path)
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_ACCEPT_ENCODING = 10102
-        10102 => {
-            h.easy.accept_encoding(!value.is_null());
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_UNIX_SOCKET_PATH = 10231
-        10231 => {
-            // SAFETY: value must be a null-terminated C string
-            if let Some(s) = unsafe { read_cstr(value) } {
-                h.easy.unix_socket(s);
-            }
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_PINNEDPUBLICKEY = 10230
-        10230 => {
-            // SAFETY: value must be a null-terminated C string
-            if let Some(s) = unsafe { read_cstr(value) } {
-                h.easy.ssl_pinned_public_key(s);
-            }
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_INTERFACE = 10062
-        10062 => {
-            // SAFETY: value must be a null-terminated C string
-            if let Some(s) = unsafe { read_cstr(value) } {
-                h.easy.interface(s);
-            }
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_SSL_CIPHER_LIST = 10083
-        10083 => {
-            // SAFETY: value must be a null-terminated C string
-            if let Some(s) = unsafe { read_cstr(value) } {
-                h.easy.ssl_cipher_list(s);
-            }
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_COOKIEFILE = 10031
-        10031 => {
-            // SAFETY: value must be a null-terminated C string
-            if let Some(s) = unsafe { read_cstr(value) } {
-                if h.easy.cookie_file(s).is_err() {
-                    // Cookie engine enabled even if file doesn't exist
-                    h.easy.cookie_jar(true);
-                }
-            } else {
-                // NULL enables the cookie engine with empty jar
-                h.easy.cookie_jar(true);
-            }
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_COOKIEJAR = 10082
-        10082 => {
-            // SAFETY: value must be a null-terminated C string
-            if let Some(s) = unsafe { read_cstr(value) } {
-                h.easy.cookie_jar_file(s);
-            }
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_PROXYUSERPWD = 10006
-        10006 => {
-            // SAFETY: value must be a null-terminated C string in "user:password" format
-            if let Some(s) = unsafe { read_cstr(value) } {
-                if let Some((user, pass)) = s.split_once(':') {
-                    h.easy.proxy_auth(user, pass);
-                } else {
-                    h.easy.proxy_auth(s, "");
-                }
-            }
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_PROXY_SSLCERT = 10254
-        10254 => {
-            // SAFETY: value must be a null-terminated C string
-            if let Some(s) = unsafe { read_cstr(value) } {
-                h.easy.proxy_ssl_client_cert(std::path::Path::new(s));
-            }
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_PROXY_SSLKEY = 10255
-        10255 => {
-            // SAFETY: value must be a null-terminated C string
-            if let Some(s) = unsafe { read_cstr(value) } {
-                h.easy.proxy_ssl_client_key(std::path::Path::new(s));
-            }
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_RESOLVE = 10203
-        10203 => {
-            // This expects a curl_slist of "host:port:address" entries
-            if !value.is_null() {
-                let mut current = value.cast::<curl_slist>().cast_mut();
-                while !current.is_null() {
-                    // SAFETY: current is a valid curl_slist node
-                    let node = unsafe { &*current };
-                    if !node.data.is_null() {
-                        // SAFETY: node.data is a null-terminated string
-                        if let Ok(s) = unsafe { CStr::from_ptr(node.data) }.to_str() {
-                            // Parse "host:port:address"
-                            let parts: Vec<&str> = s.splitn(3, ':').collect();
-                            if parts.len() == 3 {
-                                let host_port = format!("{}:{}", parts[0], parts[1]);
-                                h.easy.resolve(&host_port, parts[2]);
-                            }
-                        }
-                    }
-                    current = node.next;
-                }
-            }
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_HTTPHEADER = 10023
-        10023 => {
-            // This expects a curl_slist of "Name: Value" headers
-            if !value.is_null() {
-                let mut current = value.cast::<curl_slist>().cast_mut();
-                while !current.is_null() {
-                    // SAFETY: current is a valid curl_slist node
-                    let node = unsafe { &*current };
-                    if !node.data.is_null() {
-                        // SAFETY: node.data is a null-terminated string
-                        if let Ok(s) = unsafe { CStr::from_ptr(node.data) }.to_str() {
-                            if let Some((name, val)) = s.split_once(':') {
-                                h.easy.header(name.trim(), val.trim());
-                            }
-                        }
-                    }
-                    current = node.next;
-                }
-            }
-            CURLcode::CURLE_OK
-        }
-
-        // ─── Long options ───
-
-        // CURLOPT_POST = 47
-        47 => {
-            if value as c_long != 0 {
-                h.easy.method("POST");
-            }
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_NOBODY = 44 (HEAD request)
-        44 => {
-            if value as c_long != 0 {
-                h.easy.method("HEAD");
-            }
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_FAILONERROR = 45
-        45 => {
-            h.easy.fail_on_error(value as c_long != 0);
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_UPLOAD = 46, CURLOPT_PUT = 54
-        46 | 54 => {
-            if value as c_long != 0 {
-                h.easy.method("PUT");
-            }
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_FOLLOWLOCATION = 52
-        52 => {
-            h.easy.follow_redirects(value as c_long != 0);
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_POSTFIELDSIZE = 60
-        60 => {
-            // Store size but actual data comes via POSTFIELDS
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_SSL_VERIFYPEER = 64
-        64 => {
-            h.easy.ssl_verify_peer(value as c_long != 0);
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_MAXREDIRS = 68
-        68 => {
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            h.easy.max_redirects(value as u32);
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_CONNECTTIMEOUT = 78
-        78 => {
-            #[allow(clippy::cast_sign_loss)]
-            let secs = value as u64;
-            if secs > 0 {
-                h.easy.connect_timeout(std::time::Duration::from_secs(secs));
-            }
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_HTTPGET = 80
-        80 => {
-            if value as c_long != 0 {
-                h.easy.method("GET");
-            }
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_SSL_VERIFYHOST = 81
-        81 => {
-            // libcurl: 0 = don't verify, 2 = verify (1 is deprecated = 2)
-            h.easy.ssl_verify_host(value as c_long >= 2);
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_HTTPAUTH = 107
-        107 => {
-            // libcurl auth bitmask: 1=Basic, 2=Digest, 4=Negotiate, 8=NTLM
-            // We accept the value but currently only Basic/Digest work
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_PROXYAUTH = 111
-        111 => {
-            // libcurl proxy auth bitmask: 1=Basic, 2=Digest, 8=NTLM
-            // Accept the value; actual method selection happens with proxy_auth calls
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_TCP_NODELAY = 121
-        121 => {
-            h.easy.tcp_nodelay(value as c_long != 0);
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_LOCALPORT = 139
-        139 => {
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            h.easy.local_port(value as u16);
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_TCP_KEEPALIVE = 213
-        213 => {
-            if value as c_long != 0 {
-                h.easy.tcp_keepalive(std::time::Duration::from_secs(60));
-            }
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_TIMEOUT = 13
-        13 => {
-            #[allow(clippy::cast_sign_loss)]
-            let secs = value as u64;
-            if secs > 0 {
-                h.easy.timeout(std::time::Duration::from_secs(secs));
-            }
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_VERBOSE = 41
-        41 => {
-            h.easy.verbose(value as c_long != 0);
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_SSLVERSION = 32
-        32 => {
-            // libcurl: 0=default, 6=TLSv1.2, 7=TLSv1.3
-            let version = value as c_long;
-            if version == 6 {
-                h.easy.ssl_min_version(liburlx::TlsVersion::Tls12);
-            } else if version == 7 {
-                h.easy.ssl_min_version(liburlx::TlsVersion::Tls13);
-            }
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_LOW_SPEED_LIMIT = 19
-        19 => {
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            h.easy.low_speed_limit(value as u32);
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_LOW_SPEED_TIME = 20
-        20 => {
-            #[allow(clippy::cast_sign_loss)]
-            let secs = value as u64;
-            h.easy.low_speed_time(std::time::Duration::from_secs(secs));
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_FRESH_CONNECT = 74
-        74 => {
-            h.easy.fresh_connect(value as c_long != 0);
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_FORBID_REUSE = 75
-        75 => {
-            h.easy.forbid_reuse(value as c_long != 0);
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_TIMEOUT_MS = 155
-        155 => {
-            #[allow(clippy::cast_sign_loss)]
-            let ms = value as u64;
-            if ms > 0 {
-                h.easy.timeout(std::time::Duration::from_millis(ms));
-            }
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_CONNECTTIMEOUT_MS = 156
-        156 => {
-            #[allow(clippy::cast_sign_loss)]
-            let ms = value as u64;
-            if ms > 0 {
-                h.easy.connect_timeout(std::time::Duration::from_millis(ms));
-            }
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_SSL_SESSIONID_CACHE = 150
-        150 => {
-            h.easy.ssl_session_cache(value as c_long != 0);
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_PROXY_SSL_VERIFYPEER = 248
-        248 => {
-            h.easy.proxy_ssl_verify_peer(value as c_long != 0);
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_INFILESIZE_LARGE = 30115
-        30115 => {
-            #[allow(clippy::cast_sign_loss)]
-            let size = value as u64;
-            h.infilesize = Some(size);
-            h.easy.infilesize(size);
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_DNS_CACHE_TIMEOUT = 92
-        92 => {
-            #[allow(clippy::cast_sign_loss)]
-            let secs = value as u64;
-            h.easy.dns_cache_timeout(std::time::Duration::from_secs(secs));
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_HAPPY_EYEBALLS_TIMEOUT_MS = 271
-        271 => {
-            #[allow(clippy::cast_sign_loss)]
-            let ms = value as u64;
-            h.easy.happy_eyeballs_timeout(std::time::Duration::from_millis(ms));
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_DNS_SERVERS = 10211
-        10211 => {
-            // SAFETY: value must be a null-terminated C string
-            if let Some(s) = unsafe { read_cstr(value) } {
-                match h.easy.dns_servers(s) {
-                    Ok(()) => CURLcode::CURLE_OK,
-                    Err(_) => CURLcode::CURLE_BAD_FUNCTION_ARGUMENT,
-                }
-            } else {
+            // CURLOPT_WRITEFUNCTION = 20011
+            20011 => {
+                // SAFETY: Caller guarantees value is a valid function pointer
+                h.write_callback =
+                    Some(unsafe { std::mem::transmute::<*const c_void, WriteCallback>(value) });
                 CURLcode::CURLE_OK
             }
-        }
 
-        // CURLOPT_DOH_URL = 10279
-        10279 => {
-            // SAFETY: value must be a null-terminated C string
-            if let Some(s) = unsafe { read_cstr(value) } {
-                h.easy.doh_url(s);
+            // CURLOPT_WRITEDATA = 10001
+            10001 => {
+                h.write_data = value.cast_mut();
+                CURLcode::CURLE_OK
             }
-            CURLcode::CURLE_OK
-        }
 
-        // CURLOPT_UNRESTRICTED_AUTH = 105
-        105 => {
-            h.easy.unrestricted_auth(value as c_long != 0);
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_IGNORE_CONTENT_LENGTH = 136
-        136 => {
-            h.easy.ignore_content_length(value as c_long != 0);
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_MAX_SEND_SPEED_LARGE = 30145
-        30145 => {
-            #[allow(clippy::cast_sign_loss)]
-            let speed = value as u64;
-            if speed > 0 {
-                h.easy.max_send_speed(speed);
+            // CURLOPT_HEADERFUNCTION = 20079
+            20079 => {
+                // SAFETY: Caller guarantees value is a valid function pointer
+                h.header_callback =
+                    Some(unsafe { std::mem::transmute::<*const c_void, HeaderCallback>(value) });
+                CURLcode::CURLE_OK
             }
-            CURLcode::CURLE_OK
-        }
 
-        // CURLOPT_MAX_RECV_SPEED_LARGE = 30146
-        30146 => {
-            #[allow(clippy::cast_sign_loss)]
-            let speed = value as u64;
-            if speed > 0 {
-                h.easy.max_recv_speed(speed);
+            // CURLOPT_HEADERDATA = 10029
+            10029 => {
+                h.header_data = value.cast_mut();
+                CURLcode::CURLE_OK
             }
-            CURLcode::CURLE_OK
-        }
 
-        // CURLOPT_NOPROGRESS = 43
-        43 => {
-            h.noprogress = value as c_long != 0;
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_PROGRESSFUNCTION = 20056
-        20056 => {
-            // SAFETY: Caller guarantees value is a valid function pointer
-            h.progress_callback =
-                Some(unsafe { std::mem::transmute::<*const c_void, ProgressCallback>(value) });
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_XFERINFOFUNCTION = 20219
-        20219 => {
-            // SAFETY: Caller guarantees value is a valid function pointer
-            h.xferinfo_callback =
-                Some(unsafe { std::mem::transmute::<*const c_void, XferInfoCallback>(value) });
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_PROGRESSDATA = 10057 (also used as XFERINFODATA)
-        10057 => {
-            h.progress_data = value.cast_mut();
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_SEEKFUNCTION = 20167
-        20167 => {
-            // SAFETY: Caller guarantees value is a valid function pointer
-            h.seek_callback =
-                Some(unsafe { std::mem::transmute::<*const c_void, SeekCallback>(value) });
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_SEEKDATA = 10168
-        10168 => {
-            h.seek_data = value.cast_mut();
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_PRIVATE = 10103
-        10103 => {
-            h.private_data = value.cast_mut();
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_SHARE = 10100
-        10100 => {
-            if value.is_null() {
-                // Detach share — accepted as no-op (share state persists)
-            } else {
-                // SAFETY: Caller guarantees value is from curl_share_init
-                let share = unsafe { &*value.cast::<liburlx::Share>() };
-                h.easy.set_share(share.clone());
+            // CURLOPT_READFUNCTION = 20012
+            20012 => {
+                // SAFETY: Caller guarantees value is a valid function pointer
+                h.read_callback =
+                    Some(unsafe { std::mem::transmute::<*const c_void, ReadCallback>(value) });
+                CURLcode::CURLE_OK
             }
-            CURLcode::CURLE_OK
-        }
 
-        // CURLOPT_MIMEPOST = 10269
-        10269 => {
-            h.mimepost = value.cast_mut();
-            // Finalize any pending parts
-            for &(mime, part) in &h.mime_parts {
-                // SAFETY: mime_parts contains valid handles
-                unsafe { finalize_mime_part(mime, part) };
+            // CURLOPT_READDATA = 10009
+            10009 => {
+                h.read_data = value.cast_mut();
+                CURLcode::CURLE_OK
             }
-            h.mime_parts.clear();
-            CURLcode::CURLE_OK
-        }
 
-        // CURLOPT_REFERER = 10016
-        10016 => {
-            // SAFETY: value must be a null-terminated C string
-            if let Some(s) = unsafe { read_cstr(value) } {
-                h.easy.header("Referer", s);
+            // CURLOPT_DEBUGFUNCTION = 20094
+            20094 => {
+                // SAFETY: Caller guarantees value is a valid function pointer
+                h.debug_callback =
+                    Some(unsafe { std::mem::transmute::<*const c_void, DebugCallback>(value) });
+                CURLcode::CURLE_OK
             }
-            CURLcode::CURLE_OK
-        }
 
-        // CURLOPT_XOAUTH2_BEARER = 10220
-        10220 => {
-            // SAFETY: value must be a null-terminated C string
-            if let Some(s) = unsafe { read_cstr(value) } {
-                h.easy.bearer_token(s);
+            // CURLOPT_DEBUGDATA = 10095
+            10095 => {
+                h.debug_data = value.cast_mut();
+                CURLcode::CURLE_OK
             }
-            CURLcode::CURLE_OK
-        }
 
-        // CURLOPT_AWS_SIGV4 = 10306
-        10306 => {
-            // SAFETY: value must be a null-terminated C string
-            // Format: "provider1[:provider2[:region[:service]]]"
-            // We accept the value but AWS SigV4 auth is wired through aws_credentials
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_AUTOREFERER = 58
-        58 => {
-            // Accept but no-op — auto-referer on redirect not yet implemented
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_HTTP_VERSION = 84
-        84 => {
-            let version = value as c_long;
-            match version {
-                // CURL_HTTP_VERSION_NONE = 0
-                0 => h.easy.http_version(liburlx::HttpVersion::None),
-                // CURL_HTTP_VERSION_1_0 = 1
-                1 => h.easy.http_version(liburlx::HttpVersion::Http10),
-                // CURL_HTTP_VERSION_1_1 = 2
-                2 => h.easy.http_version(liburlx::HttpVersion::Http11),
-                // CURL_HTTP_VERSION_2_0 = 3, CURL_HTTP_VERSION_2TLS = 4
-                3 | 4 => h.easy.http_version(liburlx::HttpVersion::Http2),
-                // CURL_HTTP_VERSION_2_PRIOR_KNOWLEDGE = 5
-                5 => h.easy.http_version(liburlx::HttpVersion::Http2PriorKnowledge),
-                _ => {}
+            // CURLOPT_USERAGENT = 10018
+            10018 => {
+                // SAFETY: value must be a null-terminated C string
+                if let Some(s) = unsafe { read_cstr(value) } {
+                    h.easy.header("User-Agent", s);
+                }
+                CURLcode::CURLE_OK
             }
-            CURLcode::CURLE_OK
-        }
 
-        // CURLOPT_NOSIGNAL = 99
-        99 => {
-            // Accept but no-op — signals are not used in tokio-based architecture
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_MAXCONNECTS = 71
-        71 => {
-            let max = value as usize;
-            h.easy.max_pool_connections(max);
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_PIPEWAIT = 237
-        237 => {
-            // Accepted for compat; HTTP/2 multiplexing handled automatically
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_STREAM_WEIGHT = 239
-        239 => {
-            // Accepted for compat; stream priority deprecated in RFC 9113
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_TCP_FASTOPEN = 244
-        244 => {
-            // Accepted for compat; TCP Fast Open not yet supported
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_HTTP09_ALLOWED = 285
-        285 => {
-            // Accepted for compat; HTTP/0.9 not supported
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_PORT = 3
-        3 => {
-            // Set port number to connect to (override URL port)
-            // Accepted for compat; port parsed from URL
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_INFILESIZE = 14
-        14 => {
-            // Set expected upload size (long version)
-            // Accepted for compat; upload size auto-detected from data
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_RESUME_FROM = 21
-        21 => {
-            // Set resume offset (long version)
-            #[allow(clippy::cast_sign_loss)]
-            let offset = value as u64;
-            h.easy.resume_from(offset);
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_IPRESOLVE = 113
-        113 => {
-            // 0=whatever, 1=IPv4, 2=IPv6
-            // Accepted for compat; resolver handles dual-stack via Happy Eyeballs
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_POSTFIELDSIZE_LARGE = 30120
-        30120 => {
-            // Set the size of POST data (off_t version)
-            // Accepted for compat; POST size auto-detected from data
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_LOCALPORTRANGE = 164
-        164 => {
-            // Accept the range but only use the base port set via LOCALPORT
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_RESUME_FROM_LARGE = 30116
-        30116 => {
-            #[allow(clippy::cast_sign_loss)]
-            let offset = value as u64;
-            h.easy.resume_from(offset);
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_MAXFILESIZE_LARGE = 30117
-        30117 => {
-            // Accept the value (same as MAXFILESIZE but for large files)
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_ERRORBUFFER = 10010
-        10010 => {
-            // Accept but we store errors in our own buffer
-            // The C caller's buffer would need to be written to on error
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_STDERR = 10037
-        10037 => {
-            // Accept but no-op — we don't redirect stderr in Rust
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_HTTPPROXYTUNNEL = 61
-        61 => {
-            // HTTP CONNECT tunnel is automatically used for HTTPS through proxies
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_MAXFILESIZE = 114
-        114 => {
-            // Accept max file size limit
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_COOKIELIST = 10135
-        10135 => {
-            // Cookie engine control commands (ALL, SESS, FLUSH, RELOAD, or cookie string)
-            // All values accepted — actual cookie manipulation handled internally
-            // SAFETY: value is a caller-provided C string
-            let _ = unsafe { read_cstr(value) };
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_POSTREDIR = 161
-        161 => {
-            // Bitmask: 1=CURL_REDIR_POST_301, 2=CURL_REDIR_POST_302, 4=CURL_REDIR_POST_303
-            let mask = value as c_long;
-            h.easy.post301(mask & 1 != 0);
-            h.easy.post302(mask & 2 != 0);
-            h.easy.post303(mask & 4 != 0);
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_TRANSFER_ENCODING = 207
-        207 => {
-            // Request Transfer-Encoding (chunked) — alias for accept_encoding in our impl
-            h.easy.accept_encoding(value as c_long != 0);
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_EXPECT_100_TIMEOUT_MS = 227
-        227 => {
-            #[allow(clippy::cast_sign_loss)]
-            let ms = value as u64;
-            if ms > 0 {
-                h.easy.expect_100_timeout(std::time::Duration::from_millis(ms));
+            // CURLOPT_POSTFIELDS = 10015
+            10015 => {
+                if value.is_null() {
+                    h.postfields = None;
+                } else {
+                    // SAFETY: Caller guarantees value is a null-terminated C string
+                    let data = unsafe { CStr::from_ptr(value.cast::<c_char>()) };
+                    h.postfields = Some(data.to_bytes().to_vec());
+                }
+                CURLcode::CURLE_OK
             }
-            CURLcode::CURLE_OK
-        }
 
-        // CURLOPT_PATH_AS_IS = 234
-        234 => {
-            h.easy.path_as_is(value as c_long != 0);
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_PROXY_CAINFO = 10246
-        10246 => {
-            // SAFETY: value must be a null-terminated C string
-            if let Some(s) = unsafe { read_cstr(value) } {
-                // Proxy CA cert — accept, though proxy TLS config is set separately
-                let _ = s;
+            // CURLOPT_PROXY = 10004
+            10004 => {
+                // SAFETY: value must be a null-terminated C string
+                match unsafe { read_cstr(value) } {
+                    Some(s) => match h.easy.proxy(s) {
+                        Ok(()) => CURLcode::CURLE_OK,
+                        Err(_) => CURLcode::CURLE_URL_MALFORMAT,
+                    },
+                    None => CURLcode::CURLE_OK,
+                }
             }
-            CURLcode::CURLE_OK
-        }
 
-        // CURLOPT_PROXY_SSL_VERIFYHOST = 249
-        249 => {
-            // Accept proxy host verification setting
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_DNS_SHUFFLE_ADDRESSES = 275
-        275 => {
-            h.easy.dns_shuffle(value as c_long != 0);
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_HSTS = 10300
-        10300 => {
-            // SAFETY: value must be a null-terminated C string
-            if let Some(_path) = unsafe { read_cstr(value) } {
-                // Accept HSTS file path — HSTS cache is enabled but file I/O not wired
-                h.easy.hsts(true);
+            // CURLOPT_NOPROXY = 10177
+            10177 => {
+                // SAFETY: value must be a null-terminated C string
+                if let Some(s) = unsafe { read_cstr(value) } {
+                    h.easy.noproxy(s);
+                }
+                CURLcode::CURLE_OK
             }
-            CURLcode::CURLE_OK
-        }
 
-        // CURLOPT_PROTOCOLS_STR = 10318
-        10318 => {
-            // SAFETY: value must be a valid C string pointer
-            if let Some(s) = unsafe { read_cstr(value) } {
-                h.easy.set_protocols_str(s);
+            // CURLOPT_CUSTOMREQUEST = 10036
+            10036 => {
+                // SAFETY: value must be a null-terminated C string
+                if let Some(s) = unsafe { read_cstr(value) } {
+                    h.easy.method(s);
+                }
+                CURLcode::CURLE_OK
             }
-            CURLcode::CURLE_OK
-        }
 
-        // CURLOPT_REDIR_PROTOCOLS_STR = 10319
-        10319 => {
-            // SAFETY: value must be a valid C string pointer
-            if let Some(s) = unsafe { read_cstr(value) } {
-                h.easy.set_redir_protocols_str(s);
-            }
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_CONNECT_TO = 10243
-        10243 => {
-            // SAFETY: value must be a valid curl_slist pointer
-            if !value.is_null() {
-                // Parse the slist: each entry is "HOST:PORT:CONNECT-TO-HOST:CONNECT-TO-PORT"
-                let mut entries = Vec::new();
-                let mut node = value.cast::<curl_slist>();
-                // SAFETY: Caller guarantees value is a valid slist chain
-                while !node.is_null() {
-                    let n = unsafe { &*node };
-                    if !n.data.is_null() {
-                        // SAFETY: data is a null-terminated C string
-                        if let Ok(s) = unsafe { CStr::from_ptr(n.data) }.to_str() {
-                            entries.push(s.to_string());
-                        }
+            // CURLOPT_USERPWD = 10005
+            10005 => {
+                // SAFETY: value must be a null-terminated C string
+                if let Some(s) = unsafe { read_cstr(value) } {
+                    if let Some((user, pass)) = s.split_once(':') {
+                        h.easy.basic_auth(user, pass);
+                    } else {
+                        h.easy.basic_auth(s, "");
                     }
-                    node = n.next;
                 }
-                for entry in &entries {
-                    h.easy.connect_to(entry);
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_RANGE = 10007
+            10007 => {
+                // SAFETY: value must be a null-terminated C string
+                if let Some(s) = unsafe { read_cstr(value) } {
+                    h.easy.range(s);
+                }
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_COOKIE = 10022
+            10022 => {
+                // SAFETY: value must be a null-terminated C string
+                if let Some(s) = unsafe { read_cstr(value) } {
+                    h.easy.header("Cookie", s);
+                }
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_SSLCERT = 10025
+            10025 => {
+                // SAFETY: value must be a null-terminated C string
+                if let Some(s) = unsafe { read_cstr(value) } {
+                    h.easy.ssl_client_cert(std::path::Path::new(s));
+                }
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_SSLKEY = 10087
+            10087 => {
+                // SAFETY: value must be a null-terminated C string
+                if let Some(s) = unsafe { read_cstr(value) } {
+                    h.easy.ssl_client_key(std::path::Path::new(s));
+                }
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_CAINFO = 10065
+            10065 => {
+                // SAFETY: value must be a null-terminated C string
+                if let Some(s) = unsafe { read_cstr(value) } {
+                    h.easy.ssl_ca_cert(std::path::Path::new(s));
+                }
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_CAPATH = 10097
+            10097 => {
+                // SAFETY: value must be a null-terminated C string
+                // CA path directory; accepted for compat (we use CA bundle, not path)
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_ACCEPT_ENCODING = 10102
+            10102 => {
+                h.easy.accept_encoding(!value.is_null());
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_UNIX_SOCKET_PATH = 10231
+            10231 => {
+                // SAFETY: value must be a null-terminated C string
+                if let Some(s) = unsafe { read_cstr(value) } {
+                    h.easy.unix_socket(s);
+                }
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_PINNEDPUBLICKEY = 10230
+            10230 => {
+                // SAFETY: value must be a null-terminated C string
+                if let Some(s) = unsafe { read_cstr(value) } {
+                    h.easy.ssl_pinned_public_key(s);
+                }
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_INTERFACE = 10062
+            10062 => {
+                // SAFETY: value must be a null-terminated C string
+                if let Some(s) = unsafe { read_cstr(value) } {
+                    h.easy.interface(s);
+                }
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_SSL_CIPHER_LIST = 10083
+            10083 => {
+                // SAFETY: value must be a null-terminated C string
+                if let Some(s) = unsafe { read_cstr(value) } {
+                    h.easy.ssl_cipher_list(s);
+                }
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_COOKIEFILE = 10031
+            10031 => {
+                // SAFETY: value must be a null-terminated C string
+                if let Some(s) = unsafe { read_cstr(value) } {
+                    if h.easy.cookie_file(s).is_err() {
+                        // Cookie engine enabled even if file doesn't exist
+                        h.easy.cookie_jar(true);
+                    }
+                } else {
+                    // NULL enables the cookie engine with empty jar
+                    h.easy.cookie_jar(true);
+                }
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_COOKIEJAR = 10082
+            10082 => {
+                // SAFETY: value must be a null-terminated C string
+                if let Some(s) = unsafe { read_cstr(value) } {
+                    h.easy.cookie_jar_file(s);
+                }
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_PROXYUSERPWD = 10006
+            10006 => {
+                // SAFETY: value must be a null-terminated C string in "user:password" format
+                if let Some(s) = unsafe { read_cstr(value) } {
+                    if let Some((user, pass)) = s.split_once(':') {
+                        h.easy.proxy_auth(user, pass);
+                    } else {
+                        h.easy.proxy_auth(s, "");
+                    }
+                }
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_PROXY_SSLCERT = 10254
+            10254 => {
+                // SAFETY: value must be a null-terminated C string
+                if let Some(s) = unsafe { read_cstr(value) } {
+                    h.easy.proxy_ssl_client_cert(std::path::Path::new(s));
+                }
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_PROXY_SSLKEY = 10255
+            10255 => {
+                // SAFETY: value must be a null-terminated C string
+                if let Some(s) = unsafe { read_cstr(value) } {
+                    h.easy.proxy_ssl_client_key(std::path::Path::new(s));
+                }
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_RESOLVE = 10203
+            10203 => {
+                // This expects a curl_slist of "host:port:address" entries
+                if !value.is_null() {
+                    let mut current = value.cast::<curl_slist>().cast_mut();
+                    while !current.is_null() {
+                        // SAFETY: current is a valid curl_slist node
+                        let node = unsafe { &*current };
+                        if !node.data.is_null() {
+                            // SAFETY: node.data is a null-terminated string
+                            if let Ok(s) = unsafe { CStr::from_ptr(node.data) }.to_str() {
+                                // Parse "host:port:address"
+                                let parts: Vec<&str> = s.splitn(3, ':').collect();
+                                if parts.len() == 3 {
+                                    let host_port = format!("{}:{}", parts[0], parts[1]);
+                                    h.easy.resolve(&host_port, parts[2]);
+                                }
+                            }
+                        }
+                        current = node.next;
+                    }
+                }
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_HTTPHEADER = 10023
+            10023 => {
+                // This expects a curl_slist of "Name: Value" headers
+                if !value.is_null() {
+                    let mut current = value.cast::<curl_slist>().cast_mut();
+                    while !current.is_null() {
+                        // SAFETY: current is a valid curl_slist node
+                        let node = unsafe { &*current };
+                        if !node.data.is_null() {
+                            // SAFETY: node.data is a null-terminated string
+                            if let Ok(s) = unsafe { CStr::from_ptr(node.data) }.to_str() {
+                                if let Some((name, val)) = s.split_once(':') {
+                                    h.easy.header(name.trim(), val.trim());
+                                }
+                            }
+                        }
+                        current = node.next;
+                    }
+                }
+                CURLcode::CURLE_OK
+            }
+
+            // ─── Long options ───
+
+            // CURLOPT_POST = 47
+            47 => {
+                if value as c_long != 0 {
+                    h.easy.method("POST");
+                }
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_NOBODY = 44 (HEAD request)
+            44 => {
+                if value as c_long != 0 {
+                    h.easy.method("HEAD");
+                }
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_FAILONERROR = 45
+            45 => {
+                h.easy.fail_on_error(value as c_long != 0);
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_UPLOAD = 46, CURLOPT_PUT = 54
+            46 | 54 => {
+                if value as c_long != 0 {
+                    h.easy.method("PUT");
+                }
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_FOLLOWLOCATION = 52
+            52 => {
+                h.easy.follow_redirects(value as c_long != 0);
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_POSTFIELDSIZE = 60
+            60 => {
+                // Store size but actual data comes via POSTFIELDS
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_SSL_VERIFYPEER = 64
+            64 => {
+                h.easy.ssl_verify_peer(value as c_long != 0);
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_MAXREDIRS = 68
+            68 => {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                h.easy.max_redirects(value as u32);
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_CONNECTTIMEOUT = 78
+            78 => {
+                #[allow(clippy::cast_sign_loss)]
+                let secs = value as u64;
+                if secs > 0 {
+                    h.easy.connect_timeout(std::time::Duration::from_secs(secs));
+                }
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_HTTPGET = 80
+            80 => {
+                if value as c_long != 0 {
+                    h.easy.method("GET");
+                }
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_SSL_VERIFYHOST = 81
+            81 => {
+                // libcurl: 0 = don't verify, 2 = verify (1 is deprecated = 2)
+                h.easy.ssl_verify_host(value as c_long >= 2);
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_HTTPAUTH = 107
+            107 => {
+                // libcurl auth bitmask: 1=Basic, 2=Digest, 4=Negotiate, 8=NTLM
+                // We accept the value but currently only Basic/Digest work
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_PROXYAUTH = 111
+            111 => {
+                // libcurl proxy auth bitmask: 1=Basic, 2=Digest, 8=NTLM
+                // Accept the value; actual method selection happens with proxy_auth calls
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_TCP_NODELAY = 121
+            121 => {
+                h.easy.tcp_nodelay(value as c_long != 0);
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_LOCALPORT = 139
+            139 => {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                h.easy.local_port(value as u16);
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_TCP_KEEPALIVE = 213
+            213 => {
+                if value as c_long != 0 {
+                    h.easy.tcp_keepalive(std::time::Duration::from_secs(60));
+                }
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_TIMEOUT = 13
+            13 => {
+                #[allow(clippy::cast_sign_loss)]
+                let secs = value as u64;
+                if secs > 0 {
+                    h.easy.timeout(std::time::Duration::from_secs(secs));
+                }
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_VERBOSE = 41
+            41 => {
+                h.easy.verbose(value as c_long != 0);
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_SSLVERSION = 32
+            32 => {
+                // libcurl: 0=default, 6=TLSv1.2, 7=TLSv1.3
+                let version = value as c_long;
+                if version == 6 {
+                    h.easy.ssl_min_version(liburlx::TlsVersion::Tls12);
+                } else if version == 7 {
+                    h.easy.ssl_min_version(liburlx::TlsVersion::Tls13);
+                }
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_LOW_SPEED_LIMIT = 19
+            19 => {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                h.easy.low_speed_limit(value as u32);
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_LOW_SPEED_TIME = 20
+            20 => {
+                #[allow(clippy::cast_sign_loss)]
+                let secs = value as u64;
+                h.easy.low_speed_time(std::time::Duration::from_secs(secs));
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_FRESH_CONNECT = 74
+            74 => {
+                h.easy.fresh_connect(value as c_long != 0);
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_FORBID_REUSE = 75
+            75 => {
+                h.easy.forbid_reuse(value as c_long != 0);
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_TIMEOUT_MS = 155
+            155 => {
+                #[allow(clippy::cast_sign_loss)]
+                let ms = value as u64;
+                if ms > 0 {
+                    h.easy.timeout(std::time::Duration::from_millis(ms));
+                }
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_CONNECTTIMEOUT_MS = 156
+            156 => {
+                #[allow(clippy::cast_sign_loss)]
+                let ms = value as u64;
+                if ms > 0 {
+                    h.easy.connect_timeout(std::time::Duration::from_millis(ms));
+                }
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_SSL_SESSIONID_CACHE = 150
+            150 => {
+                h.easy.ssl_session_cache(value as c_long != 0);
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_PROXY_SSL_VERIFYPEER = 248
+            248 => {
+                h.easy.proxy_ssl_verify_peer(value as c_long != 0);
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_INFILESIZE_LARGE = 30115
+            30115 => {
+                #[allow(clippy::cast_sign_loss)]
+                let size = value as u64;
+                h.infilesize = Some(size);
+                h.easy.infilesize(size);
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_DNS_CACHE_TIMEOUT = 92
+            92 => {
+                #[allow(clippy::cast_sign_loss)]
+                let secs = value as u64;
+                h.easy.dns_cache_timeout(std::time::Duration::from_secs(secs));
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_HAPPY_EYEBALLS_TIMEOUT_MS = 271
+            271 => {
+                #[allow(clippy::cast_sign_loss)]
+                let ms = value as u64;
+                h.easy.happy_eyeballs_timeout(std::time::Duration::from_millis(ms));
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_DNS_SERVERS = 10211
+            10211 => {
+                // SAFETY: value must be a null-terminated C string
+                if let Some(s) = unsafe { read_cstr(value) } {
+                    match h.easy.dns_servers(s) {
+                        Ok(()) => CURLcode::CURLE_OK,
+                        Err(_) => CURLcode::CURLE_BAD_FUNCTION_ARGUMENT,
+                    }
+                } else {
+                    CURLcode::CURLE_OK
                 }
             }
-            CURLcode::CURLE_OK
-        }
 
-        // CURLOPT_HAPROXYPROTOCOL = 274
-        274 => {
-            h.easy.haproxy_protocol(value as c_long != 0);
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_HTTPPOST = 10024 (deprecated, return disabled)
-        10024 => {
-            // The deprecated HTTPPOST API is not supported; use CURLOPT_MIMEPOST
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_ABSTRACT_UNIX_SOCKET = 10264
-        10264 => {
-            // SAFETY: value must be a null-terminated C string
-            if let Some(s) = unsafe { read_cstr(value) } {
-                h.easy.abstract_unix_socket(s);
+            // CURLOPT_DOH_URL = 10279
+            10279 => {
+                // SAFETY: value must be a null-terminated C string
+                if let Some(s) = unsafe { read_cstr(value) } {
+                    h.easy.doh_url(s);
+                }
+                CURLcode::CURLE_OK
             }
-            CURLcode::CURLE_OK
-        }
 
-        // CURLOPT_DOH_SSL_VERIFYPEER = 306
-        306 => {
-            let verify = value as c_long != 0;
-            h.easy.doh_insecure(!verify);
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_DOH_SSL_VERIFYHOST = 307
-        307 => {
-            // Accept DoH host verification (handled along with peer verify)
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_SSLCERT_BLOB = 40291
-        40291 => {
-            if value.is_null() {
-                return CURLcode::CURLE_BAD_FUNCTION_ARGUMENT;
+            // CURLOPT_UNRESTRICTED_AUTH = 105
+            105 => {
+                h.easy.unrestricted_auth(value as c_long != 0);
+                CURLcode::CURLE_OK
             }
-            // SAFETY: Caller guarantees value points to a valid curl_blob
-            let blob = unsafe { &*value.cast::<curl_blob>() };
-            if blob.data.is_null() || blob.len == 0 {
-                return CURLcode::CURLE_BAD_FUNCTION_ARGUMENT;
+
+            // CURLOPT_IGNORE_CONTENT_LENGTH = 136
+            136 => {
+                h.easy.ignore_content_length(value as c_long != 0);
+                CURLcode::CURLE_OK
             }
-            // SAFETY: Caller guarantees blob.data points to blob.len bytes
-            let data = unsafe { std::slice::from_raw_parts(blob.data.cast::<u8>(), blob.len) };
-            h.easy.ssl_client_cert_blob(data.to_vec());
-            CURLcode::CURLE_OK
-        }
 
-        // CURLOPT_SSLKEY_BLOB = 40292
-        40292 => {
-            if value.is_null() {
-                return CURLcode::CURLE_BAD_FUNCTION_ARGUMENT;
+            // CURLOPT_MAX_SEND_SPEED_LARGE = 30145
+            30145 => {
+                #[allow(clippy::cast_sign_loss)]
+                let speed = value as u64;
+                if speed > 0 {
+                    h.easy.max_send_speed(speed);
+                }
+                CURLcode::CURLE_OK
             }
-            // SAFETY: Caller guarantees value points to a valid curl_blob
-            let blob = unsafe { &*value.cast::<curl_blob>() };
-            if blob.data.is_null() || blob.len == 0 {
-                return CURLcode::CURLE_BAD_FUNCTION_ARGUMENT;
+
+            // CURLOPT_MAX_RECV_SPEED_LARGE = 30146
+            30146 => {
+                #[allow(clippy::cast_sign_loss)]
+                let speed = value as u64;
+                if speed > 0 {
+                    h.easy.max_recv_speed(speed);
+                }
+                CURLcode::CURLE_OK
             }
-            // SAFETY: Caller guarantees blob.data points to blob.len bytes
-            let data = unsafe { std::slice::from_raw_parts(blob.data.cast::<u8>(), blob.len) };
-            h.easy.ssl_client_key_blob(data.to_vec());
-            CURLcode::CURLE_OK
-        }
 
-        // CURLOPT_CAINFO_BLOB = 40309
-        40309 => {
-            if value.is_null() {
-                return CURLcode::CURLE_BAD_FUNCTION_ARGUMENT;
+            // CURLOPT_NOPROGRESS = 43
+            43 => {
+                h.noprogress = value as c_long != 0;
+                CURLcode::CURLE_OK
             }
-            // SAFETY: Caller guarantees value points to a valid curl_blob
-            let blob = unsafe { &*value.cast::<curl_blob>() };
-            if blob.data.is_null() || blob.len == 0 {
-                return CURLcode::CURLE_BAD_FUNCTION_ARGUMENT;
+
+            // CURLOPT_PROGRESSFUNCTION = 20056
+            20056 => {
+                // SAFETY: Caller guarantees value is a valid function pointer
+                h.progress_callback =
+                    Some(unsafe { std::mem::transmute::<*const c_void, ProgressCallback>(value) });
+                CURLcode::CURLE_OK
             }
-            // SAFETY: Caller guarantees blob.data points to blob.len bytes
-            let data = unsafe { std::slice::from_raw_parts(blob.data.cast::<u8>(), blob.len) };
-            h.easy.ssl_ca_cert_blob(data.to_vec());
-            CURLcode::CURLE_OK
-        }
 
-        // CURLOPT_MAXLIFETIME_CONN = 314
-        314 => {
-            // Accept max connection lifetime — pool handles expiry internally
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_BUFFERSIZE = 98
-        98 => {
-            // Accept buffer size hint — tokio manages its own buffer sizes
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_UPLOAD_BUFFERSIZE = 280
-        280 => {
-            // Accept upload buffer size hint
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_FILETIME = 69
-        69 => {
-            // Accept filetime request — transfer info already captures this
-            CURLcode::CURLE_OK
-        }
-
-        // ─── FTP options ───
-
-        // CURLOPT_FTPPORT = 10017
-        10017 => {
-            // SAFETY: value must be a null-terminated C string
-            if let Some(s) = unsafe { read_cstr(value) } {
-                h.easy.ftp_active_port(s);
+            // CURLOPT_XFERINFOFUNCTION = 20219
+            20219 => {
+                // SAFETY: Caller guarantees value is a valid function pointer
+                h.xferinfo_callback =
+                    Some(unsafe { std::mem::transmute::<*const c_void, XferInfoCallback>(value) });
+                CURLcode::CURLE_OK
             }
-            CURLcode::CURLE_OK
-        }
 
-        // CURLOPT_FTP_USE_EPSV = 85
-        85 => {
-            h.easy.ftp_use_epsv(value as c_long != 0);
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_FTP_USE_EPRT = 106
-        106 => {
-            h.easy.ftp_use_eprt(value as c_long != 0);
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_FTP_CREATE_MISSING_DIRS = 110
-        110 => {
-            h.easy.ftp_create_dirs(value as c_long != 0);
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_FTP_SKIP_PASV_IP = 137
-        137 => {
-            h.easy.ftp_skip_pasv_ip(value as c_long != 0);
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_FTP_FILEMETHOD = 138
-        138 => {
-            #[allow(clippy::cast_sign_loss)]
-            let method = match value as c_long {
-                1 => liburlx::FtpMethod::MultiCwd,
-                2 => liburlx::FtpMethod::NoCwd,
-                3 => liburlx::FtpMethod::SingleCwd,
-                _ => liburlx::FtpMethod::default(),
-            };
-            h.easy.ftp_method(method);
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_FTP_ACCOUNT = 10134
-        10134 => {
-            // SAFETY: value must be a null-terminated C string
-            if let Some(s) = unsafe { read_cstr(value) } {
-                h.easy.ftp_account(s);
+            // CURLOPT_PROGRESSDATA = 10057 (also used as XFERINFODATA)
+            10057 => {
+                h.progress_data = value.cast_mut();
+                CURLcode::CURLE_OK
             }
-            CURLcode::CURLE_OK
-        }
 
-        // CURLOPT_FTP_ALTERNATIVE_TO_USER = 10147
-        10147 => {
-            // Accept but store as no-op (API compat)
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_FTP_SSL_CCC = 154
-        154 => {
-            // Accept clear command channel mode (not yet implemented)
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_FTP_USE_PRET = 188
-        188 => {
-            // Accept PRET option (not yet implemented)
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_USE_SSL = 119
-        119 => {
-            let mode = match value as c_long {
-                2 | 3 => liburlx::FtpSslMode::Explicit,
-                _ => liburlx::FtpSslMode::None,
-            };
-            h.easy.ftp_ssl_mode(mode);
-            CURLcode::CURLE_OK
-        }
-
-        // ─── SSH options ───
-
-        // CURLOPT_SSH_AUTH_TYPES = 151
-        151 => {
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            h.easy.ssh_auth_types(value as u32);
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_SSH_PUBLIC_KEYFILE = 10152
-        10152 => {
-            // SAFETY: value must be a null-terminated C string
-            if let Some(s) = unsafe { read_cstr(value) } {
-                h.easy.ssh_public_keyfile(s);
+            // CURLOPT_SEEKFUNCTION = 20167
+            20167 => {
+                // SAFETY: Caller guarantees value is a valid function pointer
+                h.seek_callback =
+                    Some(unsafe { std::mem::transmute::<*const c_void, SeekCallback>(value) });
+                CURLcode::CURLE_OK
             }
-            CURLcode::CURLE_OK
-        }
 
-        // CURLOPT_SSH_PRIVATE_KEYFILE = 10153
-        10153 => {
-            // SAFETY: value must be a null-terminated C string
-            if let Some(s) = unsafe { read_cstr(value) } {
-                h.easy.ssh_key_path(s);
+            // CURLOPT_SEEKDATA = 10168
+            10168 => {
+                h.seek_data = value.cast_mut();
+                CURLcode::CURLE_OK
             }
-            CURLcode::CURLE_OK
-        }
 
-        // CURLOPT_SSH_KNOWNHOSTS = 10183
-        10183 => {
-            // SAFETY: value must be a null-terminated C string
-            if let Some(s) = unsafe { read_cstr(value) } {
-                h.easy.ssh_known_hosts_path(s);
+            // CURLOPT_PRIVATE = 10103
+            10103 => {
+                h.private_data = value.cast_mut();
+                CURLcode::CURLE_OK
             }
-            CURLcode::CURLE_OK
-        }
 
-        // CURLOPT_SSH_HOST_PUBLIC_KEY_SHA256 = 10270
-        10270 => {
-            // SAFETY: value must be a null-terminated C string
-            if let Some(s) = unsafe { read_cstr(value) } {
-                h.easy.ssh_host_key_sha256(s);
+            // CURLOPT_SHARE = 10100
+            10100 => {
+                if value.is_null() {
+                    // Detach share — accepted as no-op (share state persists)
+                } else {
+                    // SAFETY: Caller guarantees value is from curl_share_init
+                    let share = unsafe { &*value.cast::<liburlx::Share>() };
+                    h.easy.set_share(share.clone());
+                }
+                CURLcode::CURLE_OK
             }
-            CURLcode::CURLE_OK
-        }
 
-        // CURLOPT_SSH_HOST_PUBLIC_KEY_MD5 = 10162
-        10162 => {
-            // Accept MD5 fingerprint (deprecated, prefer SHA256)
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_SSH_COMPRESSION = 268
-        268 => {
-            // Accept compression flag (not yet implemented)
-            CURLcode::CURLE_OK
-        }
-
-        // ─── Proxy options ───
-
-        // CURLOPT_PROXYPORT = 59
-        59 => {
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            h.easy.proxy_port(value as u16);
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_PROXYTYPE = 101
-        101 => {
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            h.easy.proxy_type(value as u32);
-            CURLcode::CURLE_OK
-        }
-
-        // CURLOPT_PROXYUSERNAME = 10175
-        10175 => {
-            // SAFETY: value must be a null-terminated C string
-            if let Some(s) = unsafe { read_cstr(value) } {
-                // Store username, combine with existing password
-                h.easy.proxy_auth(s, "");
+            // CURLOPT_MIMEPOST = 10269
+            10269 => {
+                h.mimepost = value.cast_mut();
+                // Finalize any pending parts
+                for &(mime, part) in &h.mime_parts {
+                    // SAFETY: mime_parts contains valid handles
+                    unsafe { finalize_mime_part(mime, part) };
+                }
+                h.mime_parts.clear();
+                CURLcode::CURLE_OK
             }
-            CURLcode::CURLE_OK
-        }
 
-        // CURLOPT_PROXYPASSWORD = 10176
-        10176 => {
-            // SAFETY: value must be a null-terminated C string
-            if let Some(s) = unsafe { read_cstr(value) } {
-                // Store password, combine with existing username
-                h.easy.proxy_auth("", s);
+            // CURLOPT_REFERER = 10016
+            10016 => {
+                // SAFETY: value must be a null-terminated C string
+                if let Some(s) = unsafe { read_cstr(value) } {
+                    h.easy.header("Referer", s);
+                }
+                CURLcode::CURLE_OK
             }
-            CURLcode::CURLE_OK
-        }
 
-        // CURLOPT_PRE_PROXY = 10262
-        10262 => {
-            // SAFETY: value must be a null-terminated C string
-            if let Some(s) = unsafe { read_cstr(value) } {
-                h.easy.pre_proxy(s);
+            // CURLOPT_XOAUTH2_BEARER = 10220
+            10220 => {
+                // SAFETY: value must be a null-terminated C string
+                if let Some(s) = unsafe { read_cstr(value) } {
+                    h.easy.bearer_token(s);
+                }
+                CURLcode::CURLE_OK
             }
-            CURLcode::CURLE_OK
-        }
 
-        // CURLOPT_PROXY_CAPATH = 10247
-        10247 => {
-            // Accept CA path for proxy — stored but not yet used
-            CURLcode::CURLE_OK
-        }
+            // CURLOPT_AWS_SIGV4 = 10306
+            10306 => {
+                // SAFETY: value must be a null-terminated C string
+                // Format: "provider1[:provider2[:region[:service]]]"
+                // We accept the value but AWS SigV4 auth is wired through aws_credentials
+                CURLcode::CURLE_OK
+            }
 
-        // CURLOPT_PROXY_CRLFILE = 10260
-        10260 => {
-            // Accept CRL file for proxy — stored but not yet used
-            CURLcode::CURLE_OK
-        }
+            // CURLOPT_AUTOREFERER = 58
+            58 => {
+                // Accept but no-op — auto-referer on redirect not yet implemented
+                CURLcode::CURLE_OK
+            }
 
-        // CURLOPT_PROXY_PINNEDPUBLICKEY = 10263
-        10263 => {
-            // Accept pinned public key for proxy — stored but not yet used
-            CURLcode::CURLE_OK
-        }
+            // CURLOPT_HTTP_VERSION = 84
+            84 => {
+                let version = value as c_long;
+                match version {
+                    // CURL_HTTP_VERSION_NONE = 0
+                    0 => h.easy.http_version(liburlx::HttpVersion::None),
+                    // CURL_HTTP_VERSION_1_0 = 1
+                    1 => h.easy.http_version(liburlx::HttpVersion::Http10),
+                    // CURL_HTTP_VERSION_1_1 = 2
+                    2 => h.easy.http_version(liburlx::HttpVersion::Http11),
+                    // CURL_HTTP_VERSION_2_0 = 3, CURL_HTTP_VERSION_2TLS = 4
+                    3 | 4 => h.easy.http_version(liburlx::HttpVersion::Http2),
+                    // CURL_HTTP_VERSION_2_PRIOR_KNOWLEDGE = 5
+                    5 => h.easy.http_version(liburlx::HttpVersion::Http2PriorKnowledge),
+                    _ => {}
+                }
+                CURLcode::CURLE_OK
+            }
 
-        // CURLOPT_PROXY_SSLVERSION = 250
-        250 => {
-            // Accept proxy SSL version — stored but not yet used
-            CURLcode::CURLE_OK
-        }
+            // CURLOPT_NOSIGNAL = 99
+            99 => {
+                // Accept but no-op — signals are not used in tokio-based architecture
+                CURLcode::CURLE_OK
+            }
 
-        // CURLOPT_PROXY_SSL_CIPHER_LIST = 10259
-        10259 => {
-            // Accept proxy cipher list — stored but not yet used
-            CURLcode::CURLE_OK
-        }
+            // CURLOPT_MAXCONNECTS = 71
+            71 => {
+                let max = value as usize;
+                h.easy.max_pool_connections(max);
+                CURLcode::CURLE_OK
+            }
 
-        // CURLOPT_PROXY_TLS13_CIPHERS = 10277
-        10277 => {
-            // Accept proxy TLS 1.3 ciphers — stored but not yet used
-            CURLcode::CURLE_OK
-        }
+            // CURLOPT_PIPEWAIT = 237
+            237 => {
+                // Accepted for compat; HTTP/2 multiplexing handled automatically
+                CURLcode::CURLE_OK
+            }
 
-        // CURLOPT_SOCKS5_AUTH = 267
-        267 => {
-            // Accept SOCKS5 auth bitmask — stored but not yet used
-            CURLcode::CURLE_OK
-        }
+            // CURLOPT_STREAM_WEIGHT = 239
+            239 => {
+                // Accepted for compat; stream priority deprecated in RFC 9113
+                CURLcode::CURLE_OK
+            }
 
-        _ => CURLcode::CURLE_UNKNOWN_OPTION,
-    }
+            // CURLOPT_TCP_FASTOPEN = 244
+            244 => {
+                // Accepted for compat; TCP Fast Open not yet supported
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_HTTP09_ALLOWED = 285
+            285 => {
+                // Accepted for compat; HTTP/0.9 not supported
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_PORT = 3
+            3 => {
+                // Set port number to connect to (override URL port)
+                // Accepted for compat; port parsed from URL
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_INFILESIZE = 14
+            14 => {
+                // Set expected upload size (long version)
+                // Accepted for compat; upload size auto-detected from data
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_RESUME_FROM = 21
+            21 => {
+                // Set resume offset (long version)
+                #[allow(clippy::cast_sign_loss)]
+                let offset = value as u64;
+                h.easy.resume_from(offset);
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_IPRESOLVE = 113
+            113 => {
+                // 0=whatever, 1=IPv4, 2=IPv6
+                // Accepted for compat; resolver handles dual-stack via Happy Eyeballs
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_POSTFIELDSIZE_LARGE = 30120
+            30120 => {
+                // Set the size of POST data (off_t version)
+                // Accepted for compat; POST size auto-detected from data
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_LOCALPORTRANGE = 164
+            164 => {
+                // Accept the range but only use the base port set via LOCALPORT
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_RESUME_FROM_LARGE = 30116
+            30116 => {
+                #[allow(clippy::cast_sign_loss)]
+                let offset = value as u64;
+                h.easy.resume_from(offset);
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_MAXFILESIZE_LARGE = 30117
+            30117 => {
+                // Accept the value (same as MAXFILESIZE but for large files)
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_ERRORBUFFER = 10010
+            10010 => {
+                // Accept but we store errors in our own buffer
+                // The C caller's buffer would need to be written to on error
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_STDERR = 10037
+            10037 => {
+                // Accept but no-op — we don't redirect stderr in Rust
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_HTTPPROXYTUNNEL = 61
+            61 => {
+                // HTTP CONNECT tunnel is automatically used for HTTPS through proxies
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_MAXFILESIZE = 114
+            114 => {
+                // Accept max file size limit
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_COOKIELIST = 10135
+            10135 => {
+                // Cookie engine control commands (ALL, SESS, FLUSH, RELOAD, or cookie string)
+                // All values accepted — actual cookie manipulation handled internally
+                // SAFETY: value is a caller-provided C string
+                let _ = unsafe { read_cstr(value) };
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_POSTREDIR = 161
+            161 => {
+                // Bitmask: 1=CURL_REDIR_POST_301, 2=CURL_REDIR_POST_302, 4=CURL_REDIR_POST_303
+                let mask = value as c_long;
+                h.easy.post301(mask & 1 != 0);
+                h.easy.post302(mask & 2 != 0);
+                h.easy.post303(mask & 4 != 0);
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_TRANSFER_ENCODING = 207
+            207 => {
+                // Request Transfer-Encoding (chunked) — alias for accept_encoding in our impl
+                h.easy.accept_encoding(value as c_long != 0);
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_EXPECT_100_TIMEOUT_MS = 227
+            227 => {
+                #[allow(clippy::cast_sign_loss)]
+                let ms = value as u64;
+                if ms > 0 {
+                    h.easy.expect_100_timeout(std::time::Duration::from_millis(ms));
+                }
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_PATH_AS_IS = 234
+            234 => {
+                h.easy.path_as_is(value as c_long != 0);
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_PROXY_CAINFO = 10246
+            10246 => {
+                // SAFETY: value must be a null-terminated C string
+                if let Some(s) = unsafe { read_cstr(value) } {
+                    // Proxy CA cert — accept, though proxy TLS config is set separately
+                    let _ = s;
+                }
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_PROXY_SSL_VERIFYHOST = 249
+            249 => {
+                // Accept proxy host verification setting
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_DNS_SHUFFLE_ADDRESSES = 275
+            275 => {
+                h.easy.dns_shuffle(value as c_long != 0);
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_HSTS = 10300
+            10300 => {
+                // SAFETY: value must be a null-terminated C string
+                if let Some(_path) = unsafe { read_cstr(value) } {
+                    // Accept HSTS file path — HSTS cache is enabled but file I/O not wired
+                    h.easy.hsts(true);
+                }
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_PROTOCOLS_STR = 10318
+            10318 => {
+                // SAFETY: value must be a valid C string pointer
+                if let Some(s) = unsafe { read_cstr(value) } {
+                    h.easy.set_protocols_str(s);
+                }
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_REDIR_PROTOCOLS_STR = 10319
+            10319 => {
+                // SAFETY: value must be a valid C string pointer
+                if let Some(s) = unsafe { read_cstr(value) } {
+                    h.easy.set_redir_protocols_str(s);
+                }
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_CONNECT_TO = 10243
+            10243 => {
+                // SAFETY: value must be a valid curl_slist pointer
+                if !value.is_null() {
+                    // Parse the slist: each entry is "HOST:PORT:CONNECT-TO-HOST:CONNECT-TO-PORT"
+                    let mut entries = Vec::new();
+                    let mut node = value.cast::<curl_slist>();
+                    // SAFETY: Caller guarantees value is a valid slist chain
+                    while !node.is_null() {
+                        let n = unsafe { &*node };
+                        if !n.data.is_null() {
+                            // SAFETY: data is a null-terminated C string
+                            if let Ok(s) = unsafe { CStr::from_ptr(n.data) }.to_str() {
+                                entries.push(s.to_string());
+                            }
+                        }
+                        node = n.next;
+                    }
+                    for entry in &entries {
+                        h.easy.connect_to(entry);
+                    }
+                }
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_HAPROXYPROTOCOL = 274
+            274 => {
+                h.easy.haproxy_protocol(value as c_long != 0);
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_HTTPPOST = 10024 (deprecated, return disabled)
+            10024 => {
+                // The deprecated HTTPPOST API is not supported; use CURLOPT_MIMEPOST
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_ABSTRACT_UNIX_SOCKET = 10264
+            10264 => {
+                // SAFETY: value must be a null-terminated C string
+                if let Some(s) = unsafe { read_cstr(value) } {
+                    h.easy.abstract_unix_socket(s);
+                }
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_DOH_SSL_VERIFYPEER = 306
+            306 => {
+                let verify = value as c_long != 0;
+                h.easy.doh_insecure(!verify);
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_DOH_SSL_VERIFYHOST = 307
+            307 => {
+                // Accept DoH host verification (handled along with peer verify)
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_SSLCERT_BLOB = 40291
+            40291 => {
+                if value.is_null() {
+                    return CURLcode::CURLE_BAD_FUNCTION_ARGUMENT;
+                }
+                // SAFETY: Caller guarantees value points to a valid curl_blob
+                let blob = unsafe { &*value.cast::<curl_blob>() };
+                if blob.data.is_null() || blob.len == 0 {
+                    return CURLcode::CURLE_BAD_FUNCTION_ARGUMENT;
+                }
+                // SAFETY: Caller guarantees blob.data points to blob.len bytes
+                let data = unsafe { std::slice::from_raw_parts(blob.data.cast::<u8>(), blob.len) };
+                h.easy.ssl_client_cert_blob(data.to_vec());
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_SSLKEY_BLOB = 40292
+            40292 => {
+                if value.is_null() {
+                    return CURLcode::CURLE_BAD_FUNCTION_ARGUMENT;
+                }
+                // SAFETY: Caller guarantees value points to a valid curl_blob
+                let blob = unsafe { &*value.cast::<curl_blob>() };
+                if blob.data.is_null() || blob.len == 0 {
+                    return CURLcode::CURLE_BAD_FUNCTION_ARGUMENT;
+                }
+                // SAFETY: Caller guarantees blob.data points to blob.len bytes
+                let data = unsafe { std::slice::from_raw_parts(blob.data.cast::<u8>(), blob.len) };
+                h.easy.ssl_client_key_blob(data.to_vec());
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_CAINFO_BLOB = 40309
+            40309 => {
+                if value.is_null() {
+                    return CURLcode::CURLE_BAD_FUNCTION_ARGUMENT;
+                }
+                // SAFETY: Caller guarantees value points to a valid curl_blob
+                let blob = unsafe { &*value.cast::<curl_blob>() };
+                if blob.data.is_null() || blob.len == 0 {
+                    return CURLcode::CURLE_BAD_FUNCTION_ARGUMENT;
+                }
+                // SAFETY: Caller guarantees blob.data points to blob.len bytes
+                let data = unsafe { std::slice::from_raw_parts(blob.data.cast::<u8>(), blob.len) };
+                h.easy.ssl_ca_cert_blob(data.to_vec());
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_MAXLIFETIME_CONN = 314
+            314 => {
+                // Accept max connection lifetime — pool handles expiry internally
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_BUFFERSIZE = 98
+            98 => {
+                // Accept buffer size hint — tokio manages its own buffer sizes
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_UPLOAD_BUFFERSIZE = 280
+            280 => {
+                // Accept upload buffer size hint
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_FILETIME = 69
+            69 => {
+                // Accept filetime request — transfer info already captures this
+                CURLcode::CURLE_OK
+            }
+
+            // ─── FTP options ───
+
+            // CURLOPT_FTPPORT = 10017
+            10017 => {
+                // SAFETY: value must be a null-terminated C string
+                if let Some(s) = unsafe { read_cstr(value) } {
+                    h.easy.ftp_active_port(s);
+                }
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_FTP_USE_EPSV = 85
+            85 => {
+                h.easy.ftp_use_epsv(value as c_long != 0);
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_FTP_USE_EPRT = 106
+            106 => {
+                h.easy.ftp_use_eprt(value as c_long != 0);
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_FTP_CREATE_MISSING_DIRS = 110
+            110 => {
+                h.easy.ftp_create_dirs(value as c_long != 0);
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_FTP_SKIP_PASV_IP = 137
+            137 => {
+                h.easy.ftp_skip_pasv_ip(value as c_long != 0);
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_FTP_FILEMETHOD = 138
+            138 => {
+                #[allow(clippy::cast_sign_loss)]
+                let method = match value as c_long {
+                    1 => liburlx::FtpMethod::MultiCwd,
+                    2 => liburlx::FtpMethod::NoCwd,
+                    3 => liburlx::FtpMethod::SingleCwd,
+                    _ => liburlx::FtpMethod::default(),
+                };
+                h.easy.ftp_method(method);
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_FTP_ACCOUNT = 10134
+            10134 => {
+                // SAFETY: value must be a null-terminated C string
+                if let Some(s) = unsafe { read_cstr(value) } {
+                    h.easy.ftp_account(s);
+                }
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_FTP_ALTERNATIVE_TO_USER = 10147
+            10147 => {
+                // Accept but store as no-op (API compat)
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_FTP_SSL_CCC = 154
+            154 => {
+                // Accept clear command channel mode (not yet implemented)
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_FTP_USE_PRET = 188
+            188 => {
+                // Accept PRET option (not yet implemented)
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_USE_SSL = 119
+            119 => {
+                let mode = match value as c_long {
+                    2 | 3 => liburlx::FtpSslMode::Explicit,
+                    _ => liburlx::FtpSslMode::None,
+                };
+                h.easy.ftp_ssl_mode(mode);
+                CURLcode::CURLE_OK
+            }
+
+            // ─── SSH options ───
+
+            // CURLOPT_SSH_AUTH_TYPES = 151
+            151 => {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                h.easy.ssh_auth_types(value as u32);
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_SSH_PUBLIC_KEYFILE = 10152
+            10152 => {
+                // SAFETY: value must be a null-terminated C string
+                if let Some(s) = unsafe { read_cstr(value) } {
+                    h.easy.ssh_public_keyfile(s);
+                }
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_SSH_PRIVATE_KEYFILE = 10153
+            10153 => {
+                // SAFETY: value must be a null-terminated C string
+                if let Some(s) = unsafe { read_cstr(value) } {
+                    h.easy.ssh_key_path(s);
+                }
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_SSH_KNOWNHOSTS = 10183
+            10183 => {
+                // SAFETY: value must be a null-terminated C string
+                if let Some(s) = unsafe { read_cstr(value) } {
+                    h.easy.ssh_known_hosts_path(s);
+                }
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_SSH_HOST_PUBLIC_KEY_SHA256 = 10270
+            10270 => {
+                // SAFETY: value must be a null-terminated C string
+                if let Some(s) = unsafe { read_cstr(value) } {
+                    h.easy.ssh_host_key_sha256(s);
+                }
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_SSH_HOST_PUBLIC_KEY_MD5 = 10162
+            10162 => {
+                // Accept MD5 fingerprint (deprecated, prefer SHA256)
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_SSH_COMPRESSION = 268
+            268 => {
+                // Accept compression flag (not yet implemented)
+                CURLcode::CURLE_OK
+            }
+
+            // ─── Proxy options ───
+
+            // CURLOPT_PROXYPORT = 59
+            59 => {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                h.easy.proxy_port(value as u16);
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_PROXYTYPE = 101
+            101 => {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                h.easy.proxy_type(value as u32);
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_PROXYUSERNAME = 10175
+            10175 => {
+                // SAFETY: value must be a null-terminated C string
+                if let Some(s) = unsafe { read_cstr(value) } {
+                    // Store username, combine with existing password
+                    h.easy.proxy_auth(s, "");
+                }
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_PROXYPASSWORD = 10176
+            10176 => {
+                // SAFETY: value must be a null-terminated C string
+                if let Some(s) = unsafe { read_cstr(value) } {
+                    // Store password, combine with existing username
+                    h.easy.proxy_auth("", s);
+                }
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_PRE_PROXY = 10262
+            10262 => {
+                // SAFETY: value must be a null-terminated C string
+                if let Some(s) = unsafe { read_cstr(value) } {
+                    h.easy.pre_proxy(s);
+                }
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_PROXY_CAPATH = 10247
+            10247 => {
+                // Accept CA path for proxy — stored but not yet used
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_PROXY_CRLFILE = 10260
+            10260 => {
+                // Accept CRL file for proxy — stored but not yet used
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_PROXY_PINNEDPUBLICKEY = 10263
+            10263 => {
+                // Accept pinned public key for proxy — stored but not yet used
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_PROXY_SSLVERSION = 250
+            250 => {
+                // Accept proxy SSL version — stored but not yet used
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_PROXY_SSL_CIPHER_LIST = 10259
+            10259 => {
+                // Accept proxy cipher list — stored but not yet used
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_PROXY_TLS13_CIPHERS = 10277
+            10277 => {
+                // Accept proxy TLS 1.3 ciphers — stored but not yet used
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_SOCKS5_AUTH = 267
+            267 => {
+                // Accept SOCKS5 auth bitmask — stored but not yet used
+                CURLcode::CURLE_OK
+            }
+
+            _ => CURLcode::CURLE_UNKNOWN_OPTION,
+        }
+    }));
+    result.unwrap_or(CURLcode::CURLE_UNKNOWN_OPTION)
 }
 
 /// `curl_easy_perform` — perform the transfer.
@@ -2887,480 +2955,484 @@ pub unsafe extern "C" fn curl_easy_getinfo(
     info: c_long,
     out: *mut c_void,
 ) -> CURLcode {
-    if handle.is_null() || out.is_null() {
-        return CURLcode::CURLE_FAILED_INIT;
-    }
-
-    // SAFETY: Caller guarantees handle is from curl_easy_init
-    let h = unsafe { &*handle.cast::<EasyHandle>() };
-
-    // CURLINFO_PRIVATE doesn't require a completed transfer
-    if info == 0x10_0015 {
-        // SAFETY: Caller guarantees out points to *mut c_void
-        let out = unsafe { &mut *out.cast::<*mut c_void>() };
-        *out = h.private_data;
-        return CURLcode::CURLE_OK;
-    }
-
-    let Some(ref response) = h.last_response else {
-        return CURLcode::CURLE_GOT_NOTHING;
-    };
-
-    match info {
-        // CURLINFO_EFFECTIVE_URL = 0x100001
-        0x10_0001 => {
-            // SAFETY: Caller guarantees out points to *const c_char
-            let out = unsafe { &mut *out.cast::<*const c_char>() };
-            *out = response.effective_url().as_ptr().cast::<c_char>();
-            CURLcode::CURLE_OK
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if handle.is_null() || out.is_null() {
+            return CURLcode::CURLE_FAILED_INIT;
         }
 
-        // CURLINFO_RESPONSE_CODE = 0x200002
-        0x20_0002 => {
-            // SAFETY: Caller guarantees out points to a c_long
-            let out = unsafe { &mut *out.cast::<c_long>() };
-            *out = c_long::from(response.status());
-            CURLcode::CURLE_OK
+        // SAFETY: Caller guarantees handle is from curl_easy_init
+        let h = unsafe { &*handle.cast::<EasyHandle>() };
+
+        // CURLINFO_PRIVATE doesn't require a completed transfer
+        if info == 0x10_0015 {
+            // SAFETY: Caller guarantees out points to *mut c_void
+            let out = unsafe { &mut *out.cast::<*mut c_void>() };
+            *out = h.private_data;
+            return CURLcode::CURLE_OK;
         }
 
-        // CURLINFO_TOTAL_TIME = 0x300003
-        0x30_0003 => {
-            // SAFETY: Caller guarantees out points to f64
-            let out = unsafe { &mut *out.cast::<f64>() };
-            *out = response.transfer_info().time_total.as_secs_f64();
-            CURLcode::CURLE_OK
-        }
+        let Some(ref response) = h.last_response else {
+            return CURLcode::CURLE_GOT_NOTHING;
+        };
 
-        // CURLINFO_NAMELOOKUP_TIME = 0x300004
-        0x30_0004 => {
-            // SAFETY: Caller guarantees out points to f64
-            let out = unsafe { &mut *out.cast::<f64>() };
-            *out = response.transfer_info().time_namelookup.as_secs_f64();
-            CURLcode::CURLE_OK
-        }
-
-        // CURLINFO_CONNECT_TIME = 0x300005
-        0x30_0005 => {
-            // SAFETY: Caller guarantees out points to f64
-            let out = unsafe { &mut *out.cast::<f64>() };
-            *out = response.transfer_info().time_connect.as_secs_f64();
-            CURLcode::CURLE_OK
-        }
-
-        // CURLINFO_SIZE_DOWNLOAD = 0x300008
-        0x30_0008 => {
-            // SAFETY: Caller guarantees out points to f64
-            let out = unsafe { &mut *out.cast::<f64>() };
-            #[allow(clippy::cast_precision_loss)]
-            {
-                *out = response.size_download() as f64;
+        match info {
+            // CURLINFO_EFFECTIVE_URL = 0x100001
+            0x10_0001 => {
+                // SAFETY: Caller guarantees out points to *const c_char
+                let out = unsafe { &mut *out.cast::<*const c_char>() };
+                *out = response.effective_url().as_ptr().cast::<c_char>();
+                CURLcode::CURLE_OK
             }
-            CURLcode::CURLE_OK
-        }
 
-        // CURLINFO_SPEED_DOWNLOAD = 0x300009
-        0x30_0009 => {
-            // SAFETY: Caller guarantees out points to f64
-            let out = unsafe { &mut *out.cast::<f64>() };
-            let total = response.transfer_info().time_total.as_secs_f64();
-            #[allow(clippy::cast_precision_loss)]
-            if total > 0.0 {
-                *out = response.size_download() as f64 / total;
-            } else {
-                *out = 0.0;
+            // CURLINFO_RESPONSE_CODE = 0x200002
+            0x20_0002 => {
+                // SAFETY: Caller guarantees out points to a c_long
+                let out = unsafe { &mut *out.cast::<c_long>() };
+                *out = c_long::from(response.status());
+                CURLcode::CURLE_OK
             }
-            CURLcode::CURLE_OK
-        }
 
-        // CURLINFO_HEADER_SIZE = 0x20000B
-        0x20_000B => {
-            // SAFETY: Caller guarantees out points to c_long
-            let out = unsafe { &mut *out.cast::<c_long>() };
-            // Estimate header size from response headers
-            let header_size: usize = response
-                .headers()
-                .iter()
-                .map(|(k, v)| k.len() + v.len() + 4) // "key: value\r\n"
-                .sum();
-            #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
-            {
-                *out = header_size as c_long;
+            // CURLINFO_TOTAL_TIME = 0x300003
+            0x30_0003 => {
+                // SAFETY: Caller guarantees out points to f64
+                let out = unsafe { &mut *out.cast::<f64>() };
+                *out = response.transfer_info().time_total.as_secs_f64();
+                CURLcode::CURLE_OK
             }
-            CURLcode::CURLE_OK
-        }
 
-        // CURLINFO_STARTTRANSFER_TIME = 0x300011
-        0x30_0011 => {
-            // SAFETY: Caller guarantees out points to f64
-            let out = unsafe { &mut *out.cast::<f64>() };
-            *out = response.transfer_info().time_starttransfer.as_secs_f64();
-            CURLcode::CURLE_OK
-        }
-
-        // CURLINFO_CONTENT_TYPE = 0x100012
-        0x10_0012 => {
-            // SAFETY: Caller guarantees out points to *const c_char
-            let out = unsafe { &mut *out.cast::<*const c_char>() };
-            *out = response.content_type().map_or(ptr::null(), |ct| ct.as_ptr().cast::<c_char>());
-            CURLcode::CURLE_OK
-        }
-
-        // CURLINFO_REDIRECT_COUNT = 0x200014
-        0x20_0014 => {
-            // SAFETY: Caller guarantees out points to c_long
-            let out = unsafe { &mut *out.cast::<c_long>() };
-            #[allow(clippy::cast_possible_wrap, clippy::cast_lossless)]
-            {
-                *out = response.transfer_info().num_redirects as c_long;
+            // CURLINFO_NAMELOOKUP_TIME = 0x300004
+            0x30_0004 => {
+                // SAFETY: Caller guarantees out points to f64
+                let out = unsafe { &mut *out.cast::<f64>() };
+                *out = response.transfer_info().time_namelookup.as_secs_f64();
+                CURLcode::CURLE_OK
             }
-            CURLcode::CURLE_OK
-        }
 
-        // CURLINFO_APPCONNECT_TIME = 0x300033
-        0x30_0033 => {
-            // SAFETY: Caller guarantees out points to f64
-            let out = unsafe { &mut *out.cast::<f64>() };
-            *out = response.transfer_info().time_appconnect.as_secs_f64();
-            CURLcode::CURLE_OK
-        }
-
-        // CURLINFO_SIZE_UPLOAD = 0x300007, CURLINFO_CONTENT_LENGTH_UPLOAD = 0x300010
-        0x30_0007 | 0x30_0010 => {
-            // SAFETY: Caller guarantees out points to f64
-            let out = unsafe { &mut *out.cast::<f64>() };
-            #[allow(clippy::cast_precision_loss)]
-            {
-                *out = response.transfer_info().size_upload as f64;
+            // CURLINFO_CONNECT_TIME = 0x300005
+            0x30_0005 => {
+                // SAFETY: Caller guarantees out points to f64
+                let out = unsafe { &mut *out.cast::<f64>() };
+                *out = response.transfer_info().time_connect.as_secs_f64();
+                CURLcode::CURLE_OK
             }
-            CURLcode::CURLE_OK
-        }
 
-        // CURLINFO_SPEED_UPLOAD = 0x30000A
-        0x30_000A => {
-            // SAFETY: Caller guarantees out points to f64
-            let out = unsafe { &mut *out.cast::<f64>() };
-            *out = response.transfer_info().speed_upload;
-            CURLcode::CURLE_OK
-        }
-
-        // CURLINFO_PRETRANSFER_TIME = 0x30000E
-        0x30_000E => {
-            // SAFETY: Caller guarantees out points to f64
-            let out = unsafe { &mut *out.cast::<f64>() };
-            *out = response.transfer_info().time_pretransfer.as_secs_f64();
-            CURLcode::CURLE_OK
-        }
-
-        // CURLINFO_SSL_VERIFYRESULT = 0x20000D
-        0x20_000D => {
-            // SAFETY: Caller guarantees out points to c_long
-            let out = unsafe { &mut *out.cast::<c_long>() };
-            // 0 = success (X509_V_OK). Since we either verify successfully or
-            // fail the connection entirely, a completed transfer always means 0.
-            *out = 0;
-            CURLcode::CURLE_OK
-        }
-
-        // CURLINFO_FILETIME = 0x20000E
-        0x20_000E => {
-            // SAFETY: Caller guarantees out points to c_long
-            let out = unsafe { &mut *out.cast::<c_long>() };
-            // We don't track file modification time — return -1 (unknown)
-            *out = -1;
-            CURLcode::CURLE_OK
-        }
-
-        // CURLINFO_CONTENT_LENGTH_DOWNLOAD = 0x30000F
-        0x30_000F => {
-            // SAFETY: Caller guarantees out points to f64
-            let out = unsafe { &mut *out.cast::<f64>() };
-            // Return body size as content length (best we can do without storing the header)
-            #[allow(clippy::cast_precision_loss)]
-            {
-                *out = response.size_download() as f64;
+            // CURLINFO_SIZE_DOWNLOAD = 0x300008
+            0x30_0008 => {
+                // SAFETY: Caller guarantees out points to f64
+                let out = unsafe { &mut *out.cast::<f64>() };
+                #[allow(clippy::cast_precision_loss)]
+                {
+                    *out = response.size_download() as f64;
+                }
+                CURLcode::CURLE_OK
             }
-            CURLcode::CURLE_OK
-        }
 
-        // CURLINFO_HTTP_VERSION = 0x200032
-        0x20_0032 => {
-            // SAFETY: Caller guarantees out points to c_long
-            let out = unsafe { &mut *out.cast::<c_long>() };
-            // Default to HTTP/1.1 = 2 since we currently don't track negotiated version
-            *out = 2;
-            CURLcode::CURLE_OK
-        }
+            // CURLINFO_SPEED_DOWNLOAD = 0x300009
+            0x30_0009 => {
+                // SAFETY: Caller guarantees out points to f64
+                let out = unsafe { &mut *out.cast::<f64>() };
+                let total = response.transfer_info().time_total.as_secs_f64();
+                #[allow(clippy::cast_precision_loss)]
+                if total > 0.0 {
+                    *out = response.size_download() as f64 / total;
+                } else {
+                    *out = 0.0;
+                }
+                CURLcode::CURLE_OK
+            }
 
-        // CURLINFO_PRIMARY_PORT = 0x200040
-        0x20_0040 => {
-            // SAFETY: Caller guarantees out points to c_long
-            let out = unsafe { &mut *out.cast::<c_long>() };
-            // Extract port from effective URL
-            if let Ok(url) = liburlx::Url::parse(response.effective_url()) {
-                *out = c_long::from(url.port_or_default().unwrap_or(0));
-            } else {
+            // CURLINFO_HEADER_SIZE = 0x20000B
+            0x20_000B => {
+                // SAFETY: Caller guarantees out points to c_long
+                let out = unsafe { &mut *out.cast::<c_long>() };
+                // Estimate header size from response headers
+                let header_size: usize = response
+                    .headers()
+                    .iter()
+                    .map(|(k, v)| k.len() + v.len() + 4) // "key: value\r\n"
+                    .sum();
+                #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+                {
+                    *out = header_size as c_long;
+                }
+                CURLcode::CURLE_OK
+            }
+
+            // CURLINFO_STARTTRANSFER_TIME = 0x300011
+            0x30_0011 => {
+                // SAFETY: Caller guarantees out points to f64
+                let out = unsafe { &mut *out.cast::<f64>() };
+                *out = response.transfer_info().time_starttransfer.as_secs_f64();
+                CURLcode::CURLE_OK
+            }
+
+            // CURLINFO_CONTENT_TYPE = 0x100012
+            0x10_0012 => {
+                // SAFETY: Caller guarantees out points to *const c_char
+                let out = unsafe { &mut *out.cast::<*const c_char>() };
+                *out =
+                    response.content_type().map_or(ptr::null(), |ct| ct.as_ptr().cast::<c_char>());
+                CURLcode::CURLE_OK
+            }
+
+            // CURLINFO_REDIRECT_COUNT = 0x200014
+            0x20_0014 => {
+                // SAFETY: Caller guarantees out points to c_long
+                let out = unsafe { &mut *out.cast::<c_long>() };
+                #[allow(clippy::cast_possible_wrap, clippy::cast_lossless)]
+                {
+                    *out = response.transfer_info().num_redirects as c_long;
+                }
+                CURLcode::CURLE_OK
+            }
+
+            // CURLINFO_APPCONNECT_TIME = 0x300033
+            0x30_0033 => {
+                // SAFETY: Caller guarantees out points to f64
+                let out = unsafe { &mut *out.cast::<f64>() };
+                *out = response.transfer_info().time_appconnect.as_secs_f64();
+                CURLcode::CURLE_OK
+            }
+
+            // CURLINFO_SIZE_UPLOAD = 0x300007, CURLINFO_CONTENT_LENGTH_UPLOAD = 0x300010
+            0x30_0007 | 0x30_0010 => {
+                // SAFETY: Caller guarantees out points to f64
+                let out = unsafe { &mut *out.cast::<f64>() };
+                #[allow(clippy::cast_precision_loss)]
+                {
+                    *out = response.transfer_info().size_upload as f64;
+                }
+                CURLcode::CURLE_OK
+            }
+
+            // CURLINFO_SPEED_UPLOAD = 0x30000A
+            0x30_000A => {
+                // SAFETY: Caller guarantees out points to f64
+                let out = unsafe { &mut *out.cast::<f64>() };
+                *out = response.transfer_info().speed_upload;
+                CURLcode::CURLE_OK
+            }
+
+            // CURLINFO_PRETRANSFER_TIME = 0x30000E
+            0x30_000E => {
+                // SAFETY: Caller guarantees out points to f64
+                let out = unsafe { &mut *out.cast::<f64>() };
+                *out = response.transfer_info().time_pretransfer.as_secs_f64();
+                CURLcode::CURLE_OK
+            }
+
+            // CURLINFO_SSL_VERIFYRESULT = 0x20000D
+            0x20_000D => {
+                // SAFETY: Caller guarantees out points to c_long
+                let out = unsafe { &mut *out.cast::<c_long>() };
+                // 0 = success (X509_V_OK). Since we either verify successfully or
+                // fail the connection entirely, a completed transfer always means 0.
                 *out = 0;
+                CURLcode::CURLE_OK
             }
-            CURLcode::CURLE_OK
-        }
 
-        // CURLINFO_OS_ERRNO = 0x200019
-        0x20_0019 => {
-            // SAFETY: Caller guarantees out points to c_long
-            let out = unsafe { &mut *out.cast::<c_long>() };
-            // We don't store OS errno — return 0
-            *out = 0;
-            CURLcode::CURLE_OK
-        }
-
-        // CURLINFO_PRIMARY_IP = 0x100020
-        0x10_0020 => {
-            // SAFETY: Caller guarantees out points to *const c_char
-            let out = unsafe { &mut *out.cast::<*const c_char>() };
-            // We don't track the resolved IP; return empty string
-            *out = c"".as_ptr();
-            CURLcode::CURLE_OK
-        }
-
-        // CURLINFO_NUM_CONNECTS = 0x200026
-        0x20_0026 => {
-            // SAFETY: Caller guarantees out points to c_long
-            let out = unsafe { &mut *out.cast::<c_long>() };
-            // Each transfer makes at least 1 connection
-            *out = 1;
-            CURLcode::CURLE_OK
-        }
-
-        // CURLINFO_LOCAL_IP = 0x100029
-        0x10_0029 => {
-            // SAFETY: Caller guarantees out points to *const c_char
-            let out = unsafe { &mut *out.cast::<*const c_char>() };
-            // We don't track local IP; return empty string
-            *out = c"".as_ptr();
-            CURLcode::CURLE_OK
-        }
-
-        // CURLINFO_REDIRECT_URL = 0x100031
-        0x10_0031 => {
-            // SAFETY: Caller guarantees out points to *const c_char
-            let out = unsafe { &mut *out.cast::<*const c_char>() };
-            // Redirect URL is only set when we don't follow redirects
-            if response.is_redirect() {
-                *out = response
-                    .header("location")
-                    .map_or(ptr::null(), |loc| loc.as_ptr().cast::<c_char>());
-            } else {
-                *out = ptr::null();
+            // CURLINFO_FILETIME = 0x20000E
+            0x20_000E => {
+                // SAFETY: Caller guarantees out points to c_long
+                let out = unsafe { &mut *out.cast::<c_long>() };
+                // We don't track file modification time — return -1 (unknown)
+                *out = -1;
+                CURLcode::CURLE_OK
             }
-            CURLcode::CURLE_OK
-        }
 
-        // CURLINFO_CONDITION_UNMET = 0x200035
-        0x20_0035 => {
-            // SAFETY: Caller guarantees out points to c_long
-            let out = unsafe { &mut *out.cast::<c_long>() };
-            // 304 Not Modified means condition was unmet
-            *out = c_long::from(response.status() == 304);
-            CURLcode::CURLE_OK
-        }
-
-        // CURLINFO_LOCAL_PORT = 0x200042
-        0x20_0042 => {
-            // SAFETY: Caller guarantees out points to c_long
-            let out = unsafe { &mut *out.cast::<c_long>() };
-            // We don't track the local port used; return 0
-            *out = 0;
-            CURLcode::CURLE_OK
-        }
-
-        // CURLINFO_SCHEME = 0x100044
-        0x10_0044 => {
-            // Return the scheme from the effective URL
-            // Note: We store a pointer to the effective URL string which contains the scheme
-            // SAFETY: Caller guarantees out points to *const c_char
-            let out = unsafe { &mut *out.cast::<*const c_char>() };
-            *out = response.effective_url().as_ptr().cast::<c_char>();
-            CURLcode::CURLE_OK
-        }
-
-        // CURLINFO_REDIRECT_TIME = 0x300013
-        0x30_0013 => {
-            // SAFETY: Caller guarantees out points to f64
-            let out = unsafe { &mut *out.cast::<f64>() };
-            // Redirect time = total time - time of the final request
-            // Approximate: we don't track redirect-specific timing yet
-            *out = 0.0;
-            CURLcode::CURLE_OK
-        }
-
-        // CURLINFO_TOTAL_TIME_T = 0x60003E (microseconds as curl_off_t)
-        0x60_003E => {
-            // SAFETY: Caller guarantees out points to i64 (curl_off_t)
-            let out = unsafe { &mut *out.cast::<i64>() };
-            #[allow(clippy::cast_possible_truncation)]
-            {
-                *out = response.transfer_info().time_total.as_micros() as i64;
+            // CURLINFO_CONTENT_LENGTH_DOWNLOAD = 0x30000F
+            0x30_000F => {
+                // SAFETY: Caller guarantees out points to f64
+                let out = unsafe { &mut *out.cast::<f64>() };
+                // Return body size as content length (best we can do without storing the header)
+                #[allow(clippy::cast_precision_loss)]
+                {
+                    *out = response.size_download() as f64;
+                }
+                CURLcode::CURLE_OK
             }
-            CURLcode::CURLE_OK
-        }
 
-        // CURLINFO_NAMELOOKUP_TIME_T = 0x60003F (microseconds)
-        0x60_003F => {
-            // SAFETY: Caller provides valid output pointer; null-checked above
-            let out = unsafe { &mut *out.cast::<i64>() };
-            #[allow(clippy::cast_possible_truncation)]
-            {
-                *out = response.transfer_info().time_namelookup.as_micros() as i64;
+            // CURLINFO_HTTP_VERSION = 0x200032
+            0x20_0032 => {
+                // SAFETY: Caller guarantees out points to c_long
+                let out = unsafe { &mut *out.cast::<c_long>() };
+                // Default to HTTP/1.1 = 2 since we currently don't track negotiated version
+                *out = 2;
+                CURLcode::CURLE_OK
             }
-            CURLcode::CURLE_OK
-        }
 
-        // CURLINFO_CONNECT_TIME_T = 0x600040 (microseconds)
-        0x60_0040 => {
-            // SAFETY: Caller provides valid output pointer; null-checked above
-            let out = unsafe { &mut *out.cast::<i64>() };
-            #[allow(clippy::cast_possible_truncation)]
-            {
-                *out = response.transfer_info().time_connect.as_micros() as i64;
+            // CURLINFO_PRIMARY_PORT = 0x200040
+            0x20_0040 => {
+                // SAFETY: Caller guarantees out points to c_long
+                let out = unsafe { &mut *out.cast::<c_long>() };
+                // Extract port from effective URL
+                if let Ok(url) = liburlx::Url::parse(response.effective_url()) {
+                    *out = c_long::from(url.port_or_default().unwrap_or(0));
+                } else {
+                    *out = 0;
+                }
+                CURLcode::CURLE_OK
             }
-            CURLcode::CURLE_OK
-        }
 
-        // CURLINFO_PRETRANSFER_TIME_T = 0x600041 (microseconds)
-        0x60_0041 => {
-            // SAFETY: Caller provides valid output pointer; null-checked above
-            let out = unsafe { &mut *out.cast::<i64>() };
-            #[allow(clippy::cast_possible_truncation)]
-            {
-                *out = response.transfer_info().time_pretransfer.as_micros() as i64;
+            // CURLINFO_OS_ERRNO = 0x200019
+            0x20_0019 => {
+                // SAFETY: Caller guarantees out points to c_long
+                let out = unsafe { &mut *out.cast::<c_long>() };
+                // We don't store OS errno — return 0
+                *out = 0;
+                CURLcode::CURLE_OK
             }
-            CURLcode::CURLE_OK
-        }
 
-        // CURLINFO_STARTTRANSFER_TIME_T = 0x600042 (microseconds)
-        0x60_0042 => {
-            // SAFETY: Caller provides valid output pointer; null-checked above
-            let out = unsafe { &mut *out.cast::<i64>() };
-            #[allow(clippy::cast_possible_truncation)]
-            {
-                *out = response.transfer_info().time_starttransfer.as_micros() as i64;
+            // CURLINFO_PRIMARY_IP = 0x100020
+            0x10_0020 => {
+                // SAFETY: Caller guarantees out points to *const c_char
+                let out = unsafe { &mut *out.cast::<*const c_char>() };
+                // We don't track the resolved IP; return empty string
+                *out = c"".as_ptr();
+                CURLcode::CURLE_OK
             }
-            CURLcode::CURLE_OK
-        }
 
-        // CURLINFO_REDIRECT_TIME_T = 0x600043 (microseconds)
-        0x60_0043 => {
-            // SAFETY: Caller provides valid output pointer; null-checked above
-            let out = unsafe { &mut *out.cast::<i64>() };
-            // Not yet tracked — return 0
-            *out = 0;
-            CURLcode::CURLE_OK
-        }
-
-        // CURLINFO_APPCONNECT_TIME_T = 0x600044 (microseconds)
-        0x60_0044 => {
-            // SAFETY: Caller provides valid output pointer; null-checked above
-            let out = unsafe { &mut *out.cast::<i64>() };
-            #[allow(clippy::cast_possible_truncation)]
-            {
-                *out = response.transfer_info().time_appconnect.as_micros() as i64;
+            // CURLINFO_NUM_CONNECTS = 0x200026
+            0x20_0026 => {
+                // SAFETY: Caller guarantees out points to c_long
+                let out = unsafe { &mut *out.cast::<c_long>() };
+                // Each transfer makes at least 1 connection
+                *out = 1;
+                CURLcode::CURLE_OK
             }
-            CURLcode::CURLE_OK
-        }
 
-        // CURLINFO_RETRY_AFTER = 0x20003A
-        0x20_003A => {
-            // SAFETY: Caller guarantees out points to c_long
-            let out = unsafe { &mut *out.cast::<c_long>() };
-            // We don't parse Retry-After header; return 0
-            *out = 0;
-            CURLcode::CURLE_OK
-        }
-
-        // CURLINFO_SIZE_UPLOAD_T = 0x600045
-        0x60_0045 => {
-            // SAFETY: Caller provides valid output pointer; null-checked above
-            let out = unsafe { &mut *out.cast::<i64>() };
-            #[allow(clippy::cast_possible_wrap)]
-            {
-                *out = response.transfer_info().size_upload as i64;
+            // CURLINFO_LOCAL_IP = 0x100029
+            0x10_0029 => {
+                // SAFETY: Caller guarantees out points to *const c_char
+                let out = unsafe { &mut *out.cast::<*const c_char>() };
+                // We don't track local IP; return empty string
+                *out = c"".as_ptr();
+                CURLcode::CURLE_OK
             }
-            CURLcode::CURLE_OK
-        }
 
-        // CURLINFO_SIZE_DOWNLOAD_T = 0x600046
-        0x60_0046 => {
-            // SAFETY: Caller provides valid output pointer; null-checked above
-            let out = unsafe { &mut *out.cast::<i64>() };
-            #[allow(clippy::cast_possible_wrap)]
-            {
-                *out = response.size_download() as i64;
+            // CURLINFO_REDIRECT_URL = 0x100031
+            0x10_0031 => {
+                // SAFETY: Caller guarantees out points to *const c_char
+                let out = unsafe { &mut *out.cast::<*const c_char>() };
+                // Redirect URL is only set when we don't follow redirects
+                if response.is_redirect() {
+                    *out = response
+                        .header("location")
+                        .map_or(ptr::null(), |loc| loc.as_ptr().cast::<c_char>());
+                } else {
+                    *out = ptr::null();
+                }
+                CURLcode::CURLE_OK
             }
-            CURLcode::CURLE_OK
-        }
 
-        // CURLINFO_SPEED_DOWNLOAD_T = 0x600047
-        0x60_0047 => {
-            // SAFETY: Caller provides valid output pointer; null-checked above
-            let out = unsafe { &mut *out.cast::<i64>() };
-            #[allow(clippy::cast_possible_truncation)]
-            {
-                *out = response.transfer_info().speed_download as i64;
+            // CURLINFO_CONDITION_UNMET = 0x200035
+            0x20_0035 => {
+                // SAFETY: Caller guarantees out points to c_long
+                let out = unsafe { &mut *out.cast::<c_long>() };
+                // 304 Not Modified means condition was unmet
+                *out = c_long::from(response.status() == 304);
+                CURLcode::CURLE_OK
             }
-            CURLcode::CURLE_OK
-        }
 
-        // CURLINFO_SPEED_UPLOAD_T = 0x600048
-        0x60_0048 => {
-            // SAFETY: Caller provides valid output pointer; null-checked above
-            let out = unsafe { &mut *out.cast::<i64>() };
-            #[allow(clippy::cast_possible_truncation)]
-            {
-                *out = response.transfer_info().speed_upload as i64;
+            // CURLINFO_LOCAL_PORT = 0x200042
+            0x20_0042 => {
+                // SAFETY: Caller guarantees out points to c_long
+                let out = unsafe { &mut *out.cast::<c_long>() };
+                // We don't track the local port used; return 0
+                *out = 0;
+                CURLcode::CURLE_OK
             }
-            CURLcode::CURLE_OK
-        }
 
-        // CURLINFO_REQUEST_SIZE = 0x20000C
-        0x20_000C => {
-            // SAFETY: Caller guarantees out points to c_long
-            let out = unsafe { &mut *out.cast::<c_long>() };
-            // We don't track request size; return 0
-            *out = 0;
-            CURLcode::CURLE_OK
-        }
+            // CURLINFO_SCHEME = 0x100044
+            0x10_0044 => {
+                // Return the scheme from the effective URL
+                // Note: We store a pointer to the effective URL string which contains the scheme
+                // SAFETY: Caller guarantees out points to *const c_char
+                let out = unsafe { &mut *out.cast::<*const c_char>() };
+                *out = response.effective_url().as_ptr().cast::<c_char>();
+                CURLcode::CURLE_OK
+            }
 
-        // CURLINFO_HTTP_CONNECTCODE = 0x200016
-        0x20_0016 => {
-            // SAFETY: Caller guarantees out points to c_long
-            let out = unsafe { &mut *out.cast::<c_long>() };
-            // HTTP CONNECT response code (proxy tunneling); 0 if no proxy tunnel
-            *out = 0;
-            CURLcode::CURLE_OK
-        }
+            // CURLINFO_REDIRECT_TIME = 0x300013
+            0x30_0013 => {
+                // SAFETY: Caller guarantees out points to f64
+                let out = unsafe { &mut *out.cast::<f64>() };
+                // Redirect time = total time - time of the final request
+                // Approximate: we don't track redirect-specific timing yet
+                *out = 0.0;
+                CURLcode::CURLE_OK
+            }
 
-        // CURLINFO_HTTPAUTH_AVAIL = 0x200017
-        0x20_0017 => {
-            // SAFETY: Caller guarantees out points to c_long
-            let out = unsafe { &mut *out.cast::<c_long>() };
-            // Bitmask of available auth methods from server's WWW-Authenticate
-            // CURLAUTH_BASIC=1, CURLAUTH_DIGEST=2, CURLAUTH_BEARER=64
-            // Default to basic available
-            *out = 1;
-            CURLcode::CURLE_OK
-        }
+            // CURLINFO_TOTAL_TIME_T = 0x60003E (microseconds as curl_off_t)
+            0x60_003E => {
+                // SAFETY: Caller guarantees out points to i64 (curl_off_t)
+                let out = unsafe { &mut *out.cast::<i64>() };
+                #[allow(clippy::cast_possible_truncation)]
+                {
+                    *out = response.transfer_info().time_total.as_micros() as i64;
+                }
+                CURLcode::CURLE_OK
+            }
 
-        // CURLINFO_PROXYAUTH_AVAIL = 0x200018
-        0x20_0018 => {
-            // SAFETY: Caller guarantees out points to c_long
-            let out = unsafe { &mut *out.cast::<c_long>() };
-            // Bitmask of available proxy auth methods; 0 if no proxy
-            *out = 0;
-            CURLcode::CURLE_OK
-        }
+            // CURLINFO_NAMELOOKUP_TIME_T = 0x60003F (microseconds)
+            0x60_003F => {
+                // SAFETY: Caller provides valid output pointer; null-checked above
+                let out = unsafe { &mut *out.cast::<i64>() };
+                #[allow(clippy::cast_possible_truncation)]
+                {
+                    *out = response.transfer_info().time_namelookup.as_micros() as i64;
+                }
+                CURLcode::CURLE_OK
+            }
 
-        _ => CURLcode::CURLE_UNKNOWN_OPTION,
-    }
+            // CURLINFO_CONNECT_TIME_T = 0x600040 (microseconds)
+            0x60_0040 => {
+                // SAFETY: Caller provides valid output pointer; null-checked above
+                let out = unsafe { &mut *out.cast::<i64>() };
+                #[allow(clippy::cast_possible_truncation)]
+                {
+                    *out = response.transfer_info().time_connect.as_micros() as i64;
+                }
+                CURLcode::CURLE_OK
+            }
+
+            // CURLINFO_PRETRANSFER_TIME_T = 0x600041 (microseconds)
+            0x60_0041 => {
+                // SAFETY: Caller provides valid output pointer; null-checked above
+                let out = unsafe { &mut *out.cast::<i64>() };
+                #[allow(clippy::cast_possible_truncation)]
+                {
+                    *out = response.transfer_info().time_pretransfer.as_micros() as i64;
+                }
+                CURLcode::CURLE_OK
+            }
+
+            // CURLINFO_STARTTRANSFER_TIME_T = 0x600042 (microseconds)
+            0x60_0042 => {
+                // SAFETY: Caller provides valid output pointer; null-checked above
+                let out = unsafe { &mut *out.cast::<i64>() };
+                #[allow(clippy::cast_possible_truncation)]
+                {
+                    *out = response.transfer_info().time_starttransfer.as_micros() as i64;
+                }
+                CURLcode::CURLE_OK
+            }
+
+            // CURLINFO_REDIRECT_TIME_T = 0x600043 (microseconds)
+            0x60_0043 => {
+                // SAFETY: Caller provides valid output pointer; null-checked above
+                let out = unsafe { &mut *out.cast::<i64>() };
+                // Not yet tracked — return 0
+                *out = 0;
+                CURLcode::CURLE_OK
+            }
+
+            // CURLINFO_APPCONNECT_TIME_T = 0x600044 (microseconds)
+            0x60_0044 => {
+                // SAFETY: Caller provides valid output pointer; null-checked above
+                let out = unsafe { &mut *out.cast::<i64>() };
+                #[allow(clippy::cast_possible_truncation)]
+                {
+                    *out = response.transfer_info().time_appconnect.as_micros() as i64;
+                }
+                CURLcode::CURLE_OK
+            }
+
+            // CURLINFO_RETRY_AFTER = 0x20003A
+            0x20_003A => {
+                // SAFETY: Caller guarantees out points to c_long
+                let out = unsafe { &mut *out.cast::<c_long>() };
+                // We don't parse Retry-After header; return 0
+                *out = 0;
+                CURLcode::CURLE_OK
+            }
+
+            // CURLINFO_SIZE_UPLOAD_T = 0x600045
+            0x60_0045 => {
+                // SAFETY: Caller provides valid output pointer; null-checked above
+                let out = unsafe { &mut *out.cast::<i64>() };
+                #[allow(clippy::cast_possible_wrap)]
+                {
+                    *out = response.transfer_info().size_upload as i64;
+                }
+                CURLcode::CURLE_OK
+            }
+
+            // CURLINFO_SIZE_DOWNLOAD_T = 0x600046
+            0x60_0046 => {
+                // SAFETY: Caller provides valid output pointer; null-checked above
+                let out = unsafe { &mut *out.cast::<i64>() };
+                #[allow(clippy::cast_possible_wrap)]
+                {
+                    *out = response.size_download() as i64;
+                }
+                CURLcode::CURLE_OK
+            }
+
+            // CURLINFO_SPEED_DOWNLOAD_T = 0x600047
+            0x60_0047 => {
+                // SAFETY: Caller provides valid output pointer; null-checked above
+                let out = unsafe { &mut *out.cast::<i64>() };
+                #[allow(clippy::cast_possible_truncation)]
+                {
+                    *out = response.transfer_info().speed_download as i64;
+                }
+                CURLcode::CURLE_OK
+            }
+
+            // CURLINFO_SPEED_UPLOAD_T = 0x600048
+            0x60_0048 => {
+                // SAFETY: Caller provides valid output pointer; null-checked above
+                let out = unsafe { &mut *out.cast::<i64>() };
+                #[allow(clippy::cast_possible_truncation)]
+                {
+                    *out = response.transfer_info().speed_upload as i64;
+                }
+                CURLcode::CURLE_OK
+            }
+
+            // CURLINFO_REQUEST_SIZE = 0x20000C
+            0x20_000C => {
+                // SAFETY: Caller guarantees out points to c_long
+                let out = unsafe { &mut *out.cast::<c_long>() };
+                // We don't track request size; return 0
+                *out = 0;
+                CURLcode::CURLE_OK
+            }
+
+            // CURLINFO_HTTP_CONNECTCODE = 0x200016
+            0x20_0016 => {
+                // SAFETY: Caller guarantees out points to c_long
+                let out = unsafe { &mut *out.cast::<c_long>() };
+                // HTTP CONNECT response code (proxy tunneling); 0 if no proxy tunnel
+                *out = 0;
+                CURLcode::CURLE_OK
+            }
+
+            // CURLINFO_HTTPAUTH_AVAIL = 0x200017
+            0x20_0017 => {
+                // SAFETY: Caller guarantees out points to c_long
+                let out = unsafe { &mut *out.cast::<c_long>() };
+                // Bitmask of available auth methods from server's WWW-Authenticate
+                // CURLAUTH_BASIC=1, CURLAUTH_DIGEST=2, CURLAUTH_BEARER=64
+                // Default to basic available
+                *out = 1;
+                CURLcode::CURLE_OK
+            }
+
+            // CURLINFO_PROXYAUTH_AVAIL = 0x200018
+            0x20_0018 => {
+                // SAFETY: Caller guarantees out points to c_long
+                let out = unsafe { &mut *out.cast::<c_long>() };
+                // Bitmask of available proxy auth methods; 0 if no proxy
+                *out = 0;
+                CURLcode::CURLE_OK
+            }
+
+            _ => CURLcode::CURLE_UNKNOWN_OPTION,
+        }
+    }));
+    result.unwrap_or(CURLcode::CURLE_UNKNOWN_OPTION)
 }
 
 /// `curl_easy_strerror` — return a human-readable error message.
@@ -3371,55 +3443,58 @@ pub unsafe extern "C" fn curl_easy_getinfo(
 #[no_mangle]
 #[allow(clippy::missing_const_for_fn)] // const extern "C" fn not stable on MSRV 1.75
 pub extern "C" fn curl_easy_strerror(code: CURLcode) -> *const c_char {
-    let msg = match code {
-        CURLcode::CURLE_OK => c"No error",
-        CURLcode::CURLE_UNSUPPORTED_PROTOCOL => c"Unsupported protocol",
-        CURLcode::CURLE_FAILED_INIT => c"Failed initialization",
-        CURLcode::CURLE_URL_MALFORMAT => c"URL using bad/illegal format or missing URL",
-        CURLcode::CURLE_COULDNT_RESOLVE_PROXY => c"Couldn't resolve proxy name",
-        CURLcode::CURLE_COULDNT_RESOLVE_HOST => c"Couldn't resolve host name",
-        CURLcode::CURLE_COULDNT_CONNECT => c"Failed to connect to host or proxy",
-        CURLcode::CURLE_FTP_WEIRD_SERVER_REPLY => c"Weird server reply",
-        CURLcode::CURLE_REMOTE_ACCESS_DENIED => c"Access denied",
-        CURLcode::CURLE_HTTP2 => c"Error in the HTTP2 framing layer",
-        CURLcode::CURLE_HTTP_RETURNED_ERROR => c"HTTP response code said error",
-        CURLcode::CURLE_WRITE_ERROR => c"Failed writing received data to disk/application",
-        CURLcode::CURLE_READ_ERROR => c"Failed to read data",
-        CURLcode::CURLE_OUT_OF_MEMORY => c"Out of memory",
-        CURLcode::CURLE_OPERATION_TIMEDOUT => c"Operation timed out",
-        CURLcode::CURLE_SSL_CONNECT_ERROR => c"SSL connect error",
-        CURLcode::CURLE_ABORTED_BY_CALLBACK => c"Aborted by callback",
-        CURLcode::CURLE_BAD_FUNCTION_ARGUMENT => c"A libcurl function was given a bad argument",
-        CURLcode::CURLE_UNKNOWN_OPTION => c"An unknown option was passed to libcurl",
-        CURLcode::CURLE_GOT_NOTHING => c"Server returned nothing (no headers, no data)",
-        CURLcode::CURLE_SEND_ERROR => c"Failed sending data to the peer",
-        CURLcode::CURLE_RECV_ERROR => c"Failure when receiving data from the peer",
-        CURLcode::CURLE_SSL_CERTPROBLEM => c"Problem with the local SSL certificate",
-        CURLcode::CURLE_PEER_FAILED_VERIFICATION => {
-            c"SSL peer certificate or SSH remote key was not OK"
-        }
-        CURLcode::CURLE_LOGIN_DENIED => c"Login denied",
-        CURLcode::CURLE_FILESIZE_EXCEEDED => c"Maximum file size exceeded",
-        CURLcode::CURLE_TOO_MANY_REDIRECTS => c"Number of redirects hit maximum amount",
-        CURLcode::CURLE_HTTP3 => c"Error in the HTTP3 layer",
-        CURLcode::CURLE_PARTIAL_FILE => c"Transferred a partial file",
-        CURLcode::CURLE_RANGE_ERROR => c"Requested range was not delivered",
-        CURLcode::CURLE_AGAIN => c"Socket is not ready for send/recv",
-        CURLcode::CURLE_AUTH_ERROR => c"An authentication function returned an error",
-        CURLcode::CURLE_UNRECOVERABLE_POLL => c"Unrecoverable error in select/poll",
-        CURLcode::CURLE_FTP_COULDNT_RETR_FILE => c"FTP: couldn't retrieve (RETR failed)",
-        CURLcode::CURLE_UPLOAD_FAILED => c"Upload failed",
-        CURLcode::CURLE_LDAP_SEARCH_FAILED => c"LDAP search failed",
-        CURLcode::CURLE_FUNCTION_NOT_FOUND => c"A required function was not found",
-        CURLcode::CURLE_INTERFACE_FAILED => c"Failed binding local connection end",
-        CURLcode::CURLE_SSL_ENGINE_NOTFOUND => c"SSL crypto engine not found",
-        CURLcode::CURLE_SSL_ENGINE_SETFAILED => c"Can not set SSL crypto engine as default",
-        CURLcode::CURLE_SSL_PINNEDPUBKEYNOTMATCH => c"SSL public key does not match pinned key",
-        CURLcode::CURLE_SSL_INVALIDCERTSTATUS => {
-            c"SSL server certificate status verification failed"
-        }
-    };
-    msg.as_ptr()
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let msg = match code {
+            CURLcode::CURLE_OK => c"No error",
+            CURLcode::CURLE_UNSUPPORTED_PROTOCOL => c"Unsupported protocol",
+            CURLcode::CURLE_FAILED_INIT => c"Failed initialization",
+            CURLcode::CURLE_URL_MALFORMAT => c"URL using bad/illegal format or missing URL",
+            CURLcode::CURLE_COULDNT_RESOLVE_PROXY => c"Couldn't resolve proxy name",
+            CURLcode::CURLE_COULDNT_RESOLVE_HOST => c"Couldn't resolve host name",
+            CURLcode::CURLE_COULDNT_CONNECT => c"Failed to connect to host or proxy",
+            CURLcode::CURLE_FTP_WEIRD_SERVER_REPLY => c"Weird server reply",
+            CURLcode::CURLE_REMOTE_ACCESS_DENIED => c"Access denied",
+            CURLcode::CURLE_HTTP2 => c"Error in the HTTP2 framing layer",
+            CURLcode::CURLE_HTTP_RETURNED_ERROR => c"HTTP response code said error",
+            CURLcode::CURLE_WRITE_ERROR => c"Failed writing received data to disk/application",
+            CURLcode::CURLE_READ_ERROR => c"Failed to read data",
+            CURLcode::CURLE_OUT_OF_MEMORY => c"Out of memory",
+            CURLcode::CURLE_OPERATION_TIMEDOUT => c"Operation timed out",
+            CURLcode::CURLE_SSL_CONNECT_ERROR => c"SSL connect error",
+            CURLcode::CURLE_ABORTED_BY_CALLBACK => c"Aborted by callback",
+            CURLcode::CURLE_BAD_FUNCTION_ARGUMENT => c"A libcurl function was given a bad argument",
+            CURLcode::CURLE_UNKNOWN_OPTION => c"An unknown option was passed to libcurl",
+            CURLcode::CURLE_GOT_NOTHING => c"Server returned nothing (no headers, no data)",
+            CURLcode::CURLE_SEND_ERROR => c"Failed sending data to the peer",
+            CURLcode::CURLE_RECV_ERROR => c"Failure when receiving data from the peer",
+            CURLcode::CURLE_SSL_CERTPROBLEM => c"Problem with the local SSL certificate",
+            CURLcode::CURLE_PEER_FAILED_VERIFICATION => {
+                c"SSL peer certificate or SSH remote key was not OK"
+            }
+            CURLcode::CURLE_LOGIN_DENIED => c"Login denied",
+            CURLcode::CURLE_FILESIZE_EXCEEDED => c"Maximum file size exceeded",
+            CURLcode::CURLE_TOO_MANY_REDIRECTS => c"Number of redirects hit maximum amount",
+            CURLcode::CURLE_HTTP3 => c"Error in the HTTP3 layer",
+            CURLcode::CURLE_PARTIAL_FILE => c"Transferred a partial file",
+            CURLcode::CURLE_RANGE_ERROR => c"Requested range was not delivered",
+            CURLcode::CURLE_AGAIN => c"Socket is not ready for send/recv",
+            CURLcode::CURLE_AUTH_ERROR => c"An authentication function returned an error",
+            CURLcode::CURLE_UNRECOVERABLE_POLL => c"Unrecoverable error in select/poll",
+            CURLcode::CURLE_FTP_COULDNT_RETR_FILE => c"FTP: couldn't retrieve (RETR failed)",
+            CURLcode::CURLE_UPLOAD_FAILED => c"Upload failed",
+            CURLcode::CURLE_LDAP_SEARCH_FAILED => c"LDAP search failed",
+            CURLcode::CURLE_FUNCTION_NOT_FOUND => c"A required function was not found",
+            CURLcode::CURLE_INTERFACE_FAILED => c"Failed binding local connection end",
+            CURLcode::CURLE_SSL_ENGINE_NOTFOUND => c"SSL crypto engine not found",
+            CURLcode::CURLE_SSL_ENGINE_SETFAILED => c"Can not set SSL crypto engine as default",
+            CURLcode::CURLE_SSL_PINNEDPUBKEYNOTMATCH => c"SSL public key does not match pinned key",
+            CURLcode::CURLE_SSL_INVALIDCERTSTATUS => {
+                c"SSL server certificate status verification failed"
+            }
+        };
+        msg.as_ptr()
+    }));
+    result.unwrap_or(c"Unknown error".as_ptr())
 }
 
 // ───────────────────────── Multi handle ─────────────────────────
@@ -3453,16 +3528,19 @@ unsafe impl Send for MultiHandle {}
 /// Returns a new handle that must be freed with `curl_multi_cleanup`.
 #[no_mangle]
 pub extern "C" fn curl_multi_init() -> *mut c_void {
-    let handle = Box::new(MultiHandle {
-        multi: liburlx::Multi::new(),
-        easy_handles: Vec::new(),
-        msg_queue: Vec::new(),
-        socket_callback: None,
-        socket_data: ptr::null_mut(),
-        timer_callback: None,
-        timer_data: ptr::null_mut(),
-    });
-    Box::into_raw(handle).cast::<c_void>()
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let handle = Box::new(MultiHandle {
+            multi: liburlx::Multi::new(),
+            easy_handles: Vec::new(),
+            msg_queue: Vec::new(),
+            socket_callback: None,
+            socket_data: ptr::null_mut(),
+            timer_callback: None,
+            timer_data: ptr::null_mut(),
+        });
+        Box::into_raw(handle).cast::<c_void>()
+    }));
+    result.unwrap_or(ptr::null_mut())
 }
 
 /// `curl_multi_cleanup` — free a multi handle.
@@ -3472,12 +3550,15 @@ pub extern "C" fn curl_multi_init() -> *mut c_void {
 /// `handle` must be a valid pointer from `curl_multi_init`, or null.
 #[no_mangle]
 pub unsafe extern "C" fn curl_multi_cleanup(handle: *mut c_void) -> CURLMcode {
-    if handle.is_null() {
-        return CURLMcode::CURLM_BAD_HANDLE;
-    }
-    // SAFETY: Caller guarantees handle is from curl_multi_init
-    let _ = unsafe { Box::from_raw(handle.cast::<MultiHandle>()) };
-    CURLMcode::CURLM_OK
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if handle.is_null() {
+            return CURLMcode::CURLM_BAD_HANDLE;
+        }
+        // SAFETY: Caller guarantees handle is from curl_multi_init
+        let _ = unsafe { Box::from_raw(handle.cast::<MultiHandle>()) };
+        CURLMcode::CURLM_OK
+    }));
+    result.unwrap_or(CURLMcode::CURLM_INTERNAL_ERROR)
 }
 
 /// `curl_multi_add_handle` — add an easy handle to a multi handle.
@@ -3487,21 +3568,24 @@ pub unsafe extern "C" fn curl_multi_cleanup(handle: *mut c_void) -> CURLMcode {
 /// `multi` must be from `curl_multi_init`, `easy` from `curl_easy_init`.
 #[no_mangle]
 pub unsafe extern "C" fn curl_multi_add_handle(multi: *mut c_void, easy: *mut c_void) -> CURLMcode {
-    if multi.is_null() {
-        return CURLMcode::CURLM_BAD_HANDLE;
-    }
-    if easy.is_null() {
-        return CURLMcode::CURLM_BAD_EASY_HANDLE;
-    }
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if multi.is_null() {
+            return CURLMcode::CURLM_BAD_HANDLE;
+        }
+        if easy.is_null() {
+            return CURLMcode::CURLM_BAD_EASY_HANDLE;
+        }
 
-    // SAFETY: Caller guarantees handles are valid
-    let m = unsafe { &mut *multi.cast::<MultiHandle>() };
-    let e = unsafe { &*easy.cast::<EasyHandle>() };
+        // SAFETY: Caller guarantees handles are valid
+        let m = unsafe { &mut *multi.cast::<MultiHandle>() };
+        let e = unsafe { &*easy.cast::<EasyHandle>() };
 
-    m.multi.add(e.easy.clone());
-    m.easy_handles.push(easy);
+        m.multi.add(e.easy.clone());
+        m.easy_handles.push(easy);
 
-    CURLMcode::CURLM_OK
+        CURLMcode::CURLM_OK
+    }));
+    result.unwrap_or(CURLMcode::CURLM_INTERNAL_ERROR)
 }
 
 /// `curl_multi_remove_handle` — remove an easy handle from a multi handle.
@@ -3514,23 +3598,26 @@ pub unsafe extern "C" fn curl_multi_remove_handle(
     multi: *mut c_void,
     easy: *mut c_void,
 ) -> CURLMcode {
-    if multi.is_null() {
-        return CURLMcode::CURLM_BAD_HANDLE;
-    }
-    if easy.is_null() {
-        return CURLMcode::CURLM_BAD_EASY_HANDLE;
-    }
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if multi.is_null() {
+            return CURLMcode::CURLM_BAD_HANDLE;
+        }
+        if easy.is_null() {
+            return CURLMcode::CURLM_BAD_EASY_HANDLE;
+        }
 
-    // SAFETY: Caller guarantees handles are valid
-    let m = unsafe { &mut *multi.cast::<MultiHandle>() };
+        // SAFETY: Caller guarantees handles are valid
+        let m = unsafe { &mut *multi.cast::<MultiHandle>() };
 
-    if let Some(pos) = m.easy_handles.iter().position(|&h| h == easy) {
-        let _ = m.easy_handles.remove(pos);
-        let _ = m.multi.remove(pos);
-        CURLMcode::CURLM_OK
-    } else {
-        CURLMcode::CURLM_BAD_EASY_HANDLE
-    }
+        if let Some(pos) = m.easy_handles.iter().position(|&h| h == easy) {
+            let _ = m.easy_handles.remove(pos);
+            let _ = m.multi.remove(pos);
+            CURLMcode::CURLM_OK
+        } else {
+            CURLMcode::CURLM_BAD_EASY_HANDLE
+        }
+    }));
+    result.unwrap_or(CURLMcode::CURLM_INTERNAL_ERROR)
 }
 
 /// `curl_multi_perform` — perform all queued transfers.
@@ -3544,63 +3631,66 @@ pub unsafe extern "C" fn curl_multi_perform(
     multi: *mut c_void,
     running_handles: *mut c_long,
 ) -> CURLMcode {
-    if multi.is_null() {
-        return CURLMcode::CURLM_BAD_HANDLE;
-    }
-
-    // SAFETY: Caller guarantees multi is from curl_multi_init
-    let m = unsafe { &mut *multi.cast::<MultiHandle>() };
-
-    // Snapshot easy handle pointers before perform (which drains internal handles)
-    let easy_ptrs: Vec<*mut c_void> = m.easy_handles.clone();
-
-    let result = m.multi.perform_blocking();
-
-    match result {
-        Ok(results) => {
-            // Clear any stale messages from a previous perform
-            m.msg_queue.clear();
-
-            // Store results back into easy handles and build msg_queue
-            for (i, result) in results.into_iter().enumerate() {
-                if i < easy_ptrs.len() {
-                    // SAFETY: easy_handles[i] is from curl_easy_init
-                    let eh = unsafe { &mut *easy_ptrs[i].cast::<EasyHandle>() };
-                    let curl_result = match result {
-                        Ok(response) => {
-                            eh.last_response = Some(response);
-                            CURLcode::CURLE_OK
-                        }
-                        Err(e) => {
-                            let code = error_to_curlcode(&e);
-                            let msg = e.to_string();
-                            let bytes = msg.as_bytes();
-                            let len = bytes.len().min(eh.error_buf.len() - 1);
-                            eh.error_buf[..len].copy_from_slice(&bytes[..len]);
-                            eh.error_buf[len] = 0;
-                            code
-                        }
-                    };
-
-                    m.msg_queue.push(CURLMsg {
-                        msg: CURLMSG::CURLMSG_DONE,
-                        easy_handle: easy_ptrs[i],
-                        result: curl_result,
-                    });
-                }
-            }
-
-            if !running_handles.is_null() {
-                // SAFETY: Caller guarantees running_handles is valid
-                unsafe {
-                    *running_handles = 0;
-                } // All done after blocking perform
-            }
-
-            CURLMcode::CURLM_OK
+    let outer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if multi.is_null() {
+            return CURLMcode::CURLM_BAD_HANDLE;
         }
-        Err(_) => CURLMcode::CURLM_INTERNAL_ERROR,
-    }
+
+        // SAFETY: Caller guarantees multi is from curl_multi_init
+        let m = unsafe { &mut *multi.cast::<MultiHandle>() };
+
+        // Snapshot easy handle pointers before perform (which drains internal handles)
+        let easy_ptrs: Vec<*mut c_void> = m.easy_handles.clone();
+
+        let result = m.multi.perform_blocking();
+
+        match result {
+            Ok(results) => {
+                // Clear any stale messages from a previous perform
+                m.msg_queue.clear();
+
+                // Store results back into easy handles and build msg_queue
+                for (i, result) in results.into_iter().enumerate() {
+                    if i < easy_ptrs.len() {
+                        // SAFETY: easy_handles[i] is from curl_easy_init
+                        let eh = unsafe { &mut *easy_ptrs[i].cast::<EasyHandle>() };
+                        let curl_result = match result {
+                            Ok(response) => {
+                                eh.last_response = Some(response);
+                                CURLcode::CURLE_OK
+                            }
+                            Err(e) => {
+                                let code = error_to_curlcode(&e);
+                                let msg = e.to_string();
+                                let bytes = msg.as_bytes();
+                                let len = bytes.len().min(eh.error_buf.len() - 1);
+                                eh.error_buf[..len].copy_from_slice(&bytes[..len]);
+                                eh.error_buf[len] = 0;
+                                code
+                            }
+                        };
+
+                        m.msg_queue.push(CURLMsg {
+                            msg: CURLMSG::CURLMSG_DONE,
+                            easy_handle: easy_ptrs[i],
+                            result: curl_result,
+                        });
+                    }
+                }
+
+                if !running_handles.is_null() {
+                    // SAFETY: Caller guarantees running_handles is valid
+                    unsafe {
+                        *running_handles = 0;
+                    } // All done after blocking perform
+                }
+
+                CURLMcode::CURLM_OK
+            }
+            Err(_) => CURLMcode::CURLM_INTERNAL_ERROR,
+        }
+    }));
+    outer.unwrap_or(CURLMcode::CURLM_INTERNAL_ERROR)
 }
 
 /// `curl_multi_info_read` — read a completion message from the multi handle.
@@ -3619,50 +3709,53 @@ pub unsafe extern "C" fn curl_multi_info_read(
     multi: *mut c_void,
     msgs_in_queue: *mut c_long,
 ) -> *const CURLMsg {
-    if multi.is_null() {
-        if !msgs_in_queue.is_null() {
-            // SAFETY: Caller guarantees msgs_in_queue is valid
-            unsafe {
-                *msgs_in_queue = 0;
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if multi.is_null() {
+            if !msgs_in_queue.is_null() {
+                // SAFETY: Caller guarantees msgs_in_queue is valid
+                unsafe {
+                    *msgs_in_queue = 0;
+                }
             }
+            return ptr::null();
         }
-        return ptr::null();
-    }
 
-    // SAFETY: Caller guarantees multi is from curl_multi_init
-    let m = unsafe { &mut *multi.cast::<MultiHandle>() };
+        // SAFETY: Caller guarantees multi is from curl_multi_init
+        let m = unsafe { &mut *multi.cast::<MultiHandle>() };
 
-    if m.msg_queue.is_empty() {
+        if m.msg_queue.is_empty() {
+            if !msgs_in_queue.is_null() {
+                // SAFETY: Caller guarantees pointer is valid
+                unsafe {
+                    *msgs_in_queue = 0;
+                }
+            }
+            return ptr::null();
+        }
+
+        // Pop the first message and return a pointer to the last element
+        // We rotate: remove from front, but we need a stable pointer.
+        // Strategy: swap-remove from front, store "current" separately.
+        let msg = m.msg_queue.remove(0);
+
+        // Store remaining count
         if !msgs_in_queue.is_null() {
             // SAFETY: Caller guarantees pointer is valid
             unsafe {
-                *msgs_in_queue = 0;
+                #[allow(clippy::cast_possible_wrap)]
+                {
+                    *msgs_in_queue = m.msg_queue.len() as c_long;
+                }
             }
         }
-        return ptr::null();
-    }
 
-    // Pop the first message and return a pointer to the last element
-    // We rotate: remove from front, but we need a stable pointer.
-    // Strategy: swap-remove from front, store "current" separately.
-    let msg = m.msg_queue.remove(0);
-
-    // Store remaining count
-    if !msgs_in_queue.is_null() {
-        // SAFETY: Caller guarantees pointer is valid
-        unsafe {
-            #[allow(clippy::cast_possible_wrap)]
-            {
-                *msgs_in_queue = m.msg_queue.len() as c_long;
-            }
-        }
-    }
-
-    // We need to return a pointer that remains valid until next call.
-    // Push to the end and return pointer to last element.
-    m.msg_queue.push(msg);
-    let last_idx = m.msg_queue.len() - 1;
-    &raw const m.msg_queue[last_idx]
+        // We need to return a pointer that remains valid until next call.
+        // Push to the end and return pointer to last element.
+        m.msg_queue.push(msg);
+        let last_idx = m.msg_queue.len() - 1;
+        &raw const m.msg_queue[last_idx]
+    }));
+    result.unwrap_or(ptr::null::<CURLMsg>())
 }
 
 /// `curl_multi_setopt` — set options on a multi handle.
@@ -3677,75 +3770,79 @@ pub unsafe extern "C" fn curl_multi_setopt(
     option: c_long,
     value: *const c_void,
 ) -> CURLMcode {
-    if multi.is_null() {
-        return CURLMcode::CURLM_BAD_HANDLE;
-    }
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if multi.is_null() {
+            return CURLMcode::CURLM_BAD_HANDLE;
+        }
 
-    // SAFETY: Caller guarantees multi is from curl_multi_init
-    let m = unsafe { &mut *multi.cast::<MultiHandle>() };
+        // SAFETY: Caller guarantees multi is from curl_multi_init
+        let m = unsafe { &mut *multi.cast::<MultiHandle>() };
 
-    match option {
-        // CURLMOPT_PIPELINING = 3
-        3 => {
-            let val = value as c_long;
-            if val == 0 {
-                m.multi.pipelining(liburlx::PipeliningMode::Nothing);
-            } else {
-                m.multi.pipelining(liburlx::PipeliningMode::Multiplex);
+        match option {
+            // CURLMOPT_PIPELINING = 3
+            3 => {
+                let val = value as c_long;
+                if val == 0 {
+                    m.multi.pipelining(liburlx::PipeliningMode::Nothing);
+                } else {
+                    m.multi.pipelining(liburlx::PipeliningMode::Multiplex);
+                }
+                CURLMcode::CURLM_OK
             }
-            CURLMcode::CURLM_OK
-        }
-        // CURLMOPT_MAXCONNECTS = 6, CURLMOPT_MAX_TOTAL_CONNECTIONS = 13
-        6 | 13 => {
-            let val = value as usize;
-            if val > 0 {
-                m.multi.max_total_connections(val);
+            // CURLMOPT_MAXCONNECTS = 6, CURLMOPT_MAX_TOTAL_CONNECTIONS = 13
+            6 | 13 => {
+                let val = value as usize;
+                if val > 0 {
+                    m.multi.max_total_connections(val);
+                }
+                CURLMcode::CURLM_OK
             }
-            CURLMcode::CURLM_OK
-        }
-        // CURLMOPT_MAX_HOST_CONNECTIONS = 7
-        7 => {
-            let val = value as usize;
-            if val > 0 {
-                m.multi.max_host_connections(val);
+            // CURLMOPT_MAX_HOST_CONNECTIONS = 7
+            7 => {
+                let val = value as usize;
+                if val > 0 {
+                    m.multi.max_host_connections(val);
+                }
+                CURLMcode::CURLM_OK
             }
-            CURLMcode::CURLM_OK
-        }
-        // CURLMOPT_SOCKETDATA = 10002
-        10002 => {
-            m.socket_data = value.cast_mut();
-            CURLMcode::CURLM_OK
-        }
-        // CURLMOPT_TIMERDATA = 10005
-        10005 => {
-            m.timer_data = value.cast_mut();
-            CURLMcode::CURLM_OK
-        }
-        // CURLMOPT_SOCKETFUNCTION = 20001
-        20001 => {
-            if value.is_null() {
-                m.socket_callback = None;
-            } else {
-                // SAFETY: Caller guarantees value is a valid function pointer
-                m.socket_callback = Some(unsafe {
-                    std::mem::transmute::<*const c_void, CurlSocketCallback>(value)
-                });
+            // CURLMOPT_SOCKETDATA = 10002
+            10002 => {
+                m.socket_data = value.cast_mut();
+                CURLMcode::CURLM_OK
             }
-            CURLMcode::CURLM_OK
-        }
-        // CURLMOPT_TIMERFUNCTION = 20004
-        20004 => {
-            if value.is_null() {
-                m.timer_callback = None;
-            } else {
-                // SAFETY: Caller guarantees value is a valid function pointer
-                m.timer_callback =
-                    Some(unsafe { std::mem::transmute::<*const c_void, CurlTimerCallback>(value) });
+            // CURLMOPT_TIMERDATA = 10005
+            10005 => {
+                m.timer_data = value.cast_mut();
+                CURLMcode::CURLM_OK
             }
-            CURLMcode::CURLM_OK
+            // CURLMOPT_SOCKETFUNCTION = 20001
+            20001 => {
+                if value.is_null() {
+                    m.socket_callback = None;
+                } else {
+                    // SAFETY: Caller guarantees value is a valid function pointer
+                    m.socket_callback = Some(unsafe {
+                        std::mem::transmute::<*const c_void, CurlSocketCallback>(value)
+                    });
+                }
+                CURLMcode::CURLM_OK
+            }
+            // CURLMOPT_TIMERFUNCTION = 20004
+            20004 => {
+                if value.is_null() {
+                    m.timer_callback = None;
+                } else {
+                    // SAFETY: Caller guarantees value is a valid function pointer
+                    m.timer_callback = Some(unsafe {
+                        std::mem::transmute::<*const c_void, CurlTimerCallback>(value)
+                    });
+                }
+                CURLMcode::CURLM_OK
+            }
+            _ => CURLMcode::CURLM_UNKNOWN_OPTION,
         }
-        _ => CURLMcode::CURLM_UNKNOWN_OPTION,
-    }
+    }));
+    result.unwrap_or(CURLMcode::CURLM_INTERNAL_ERROR)
 }
 
 /// `curl_multi_timeout` — return the timeout value for the multi handle.
@@ -3762,31 +3859,34 @@ pub unsafe extern "C" fn curl_multi_timeout(
     multi: *mut c_void,
     timeout_ms: *mut c_long,
 ) -> CURLMcode {
-    if multi.is_null() {
-        return CURLMcode::CURLM_BAD_HANDLE;
-    }
-    if timeout_ms.is_null() {
-        return CURLMcode::CURLM_BAD_HANDLE;
-    }
-
-    // Since tokio owns the event loop, we report -1 (no timeout needed)
-    // when no transfers are running, or 0 (call immediately) when there are
-    // pending messages to read.
-    // SAFETY: Caller guarantees multi is from curl_multi_init
-    let m = unsafe { &*multi.cast::<MultiHandle>() };
-
-    // SAFETY: Caller guarantees timeout_ms is valid
-    unsafe {
-        if m.msg_queue.is_empty() && m.easy_handles.is_empty() {
-            *timeout_ms = -1; // No work to do
-        } else if !m.msg_queue.is_empty() {
-            *timeout_ms = 0; // Messages ready
-        } else {
-            *timeout_ms = 100; // Transfers pending, suggest polling at 100ms
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if multi.is_null() {
+            return CURLMcode::CURLM_BAD_HANDLE;
         }
-    }
+        if timeout_ms.is_null() {
+            return CURLMcode::CURLM_BAD_HANDLE;
+        }
 
-    CURLMcode::CURLM_OK
+        // Since tokio owns the event loop, we report -1 (no timeout needed)
+        // when no transfers are running, or 0 (call immediately) when there are
+        // pending messages to read.
+        // SAFETY: Caller guarantees multi is from curl_multi_init
+        let m = unsafe { &*multi.cast::<MultiHandle>() };
+
+        // SAFETY: Caller guarantees timeout_ms is valid
+        unsafe {
+            if m.msg_queue.is_empty() && m.easy_handles.is_empty() {
+                *timeout_ms = -1; // No work to do
+            } else if !m.msg_queue.is_empty() {
+                *timeout_ms = 0; // Messages ready
+            } else {
+                *timeout_ms = 100; // Transfers pending, suggest polling at 100ms
+            }
+        }
+
+        CURLMcode::CURLM_OK
+    }));
+    result.unwrap_or(CURLMcode::CURLM_INTERNAL_ERROR)
 }
 
 /// `curl_multi_wait` — wait for activity on any of the multi handle's transfers.
@@ -3807,24 +3907,27 @@ pub unsafe extern "C" fn curl_multi_wait(
     timeout_ms: c_long,
     numfds: *mut c_long,
 ) -> CURLMcode {
-    if multi.is_null() {
-        return CURLMcode::CURLM_BAD_HANDLE;
-    }
-
-    // Sleep for the requested timeout. Since tokio handles I/O internally,
-    // we just provide a simple delay for C consumers that expect poll-style behavior.
-    #[allow(clippy::cast_sign_loss)]
-    let ms = if timeout_ms <= 0 { 100 } else { timeout_ms as u64 };
-    std::thread::sleep(std::time::Duration::from_millis(ms));
-
-    if !numfds.is_null() {
-        // SAFETY: Caller guarantees numfds is valid
-        unsafe {
-            *numfds = 0;
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if multi.is_null() {
+            return CURLMcode::CURLM_BAD_HANDLE;
         }
-    }
 
-    CURLMcode::CURLM_OK
+        // Sleep for the requested timeout. Since tokio handles I/O internally,
+        // we just provide a simple delay for C consumers that expect poll-style behavior.
+        #[allow(clippy::cast_sign_loss)]
+        let ms = if timeout_ms <= 0 { 100 } else { timeout_ms as u64 };
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+
+        if !numfds.is_null() {
+            // SAFETY: Caller guarantees numfds is valid
+            unsafe {
+                *numfds = 0;
+            }
+        }
+
+        CURLMcode::CURLM_OK
+    }));
+    result.unwrap_or(CURLMcode::CURLM_INTERNAL_ERROR)
 }
 
 /// `curl_multi_poll` — poll for activity on any of the multi handle's transfers.
@@ -3843,8 +3946,11 @@ pub unsafe extern "C" fn curl_multi_poll(
     timeout_ms: c_long,
     numfds: *mut c_long,
 ) -> CURLMcode {
-    // SAFETY: Same guarantees apply — delegating to curl_multi_wait
-    unsafe { curl_multi_wait(multi, fds, nfds, timeout_ms, numfds) }
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // SAFETY: Same guarantees apply — delegating to curl_multi_wait
+        unsafe { curl_multi_wait(multi, fds, nfds, timeout_ms, numfds) }
+    }));
+    result.unwrap_or(CURLMcode::CURLM_INTERNAL_ERROR)
 }
 
 /// `curl_multi_wakeup` — wake up a sleeping `curl_multi_poll`.
@@ -3855,12 +3961,15 @@ pub unsafe extern "C" fn curl_multi_poll(
 ///
 /// `multi` must be from `curl_multi_init`.
 #[no_mangle]
-pub const unsafe extern "C" fn curl_multi_wakeup(multi: *mut c_void) -> CURLMcode {
-    if multi.is_null() {
-        return CURLMcode::CURLM_BAD_HANDLE;
-    }
-    // No-op: tokio manages I/O internally
-    CURLMcode::CURLM_OK
+pub unsafe extern "C" fn curl_multi_wakeup(multi: *mut c_void) -> CURLMcode {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if multi.is_null() {
+            return CURLMcode::CURLM_BAD_HANDLE;
+        }
+        // No-op: tokio manages I/O internally
+        CURLMcode::CURLM_OK
+    }));
+    result.unwrap_or(CURLMcode::CURLM_INTERNAL_ERROR)
 }
 
 /// `curl_multi_fdset` — extract file descriptors from the multi handle.
@@ -3881,18 +3990,21 @@ pub unsafe extern "C" fn curl_multi_fdset(
     _exc_fd_set: *mut c_void,
     max_fd: *mut c_long,
 ) -> CURLMcode {
-    if multi.is_null() {
-        return CURLMcode::CURLM_BAD_HANDLE;
-    }
-
-    if !max_fd.is_null() {
-        // SAFETY: Caller guarantees max_fd is valid
-        unsafe {
-            *max_fd = -1; // No fds exposed — tokio owns socket polling
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if multi.is_null() {
+            return CURLMcode::CURLM_BAD_HANDLE;
         }
-    }
 
-    CURLMcode::CURLM_OK
+        if !max_fd.is_null() {
+            // SAFETY: Caller guarantees max_fd is valid
+            unsafe {
+                *max_fd = -1; // No fds exposed — tokio owns socket polling
+            }
+        }
+
+        CURLMcode::CURLM_OK
+    }));
+    result.unwrap_or(CURLMcode::CURLM_INTERNAL_ERROR)
 }
 
 /// `curl_multi_socket_action` — socket action interface for event-driven programs.
@@ -3912,31 +4024,34 @@ pub unsafe extern "C" fn curl_multi_socket_action(
     _ev_bitmask: c_long,
     running_handles: *mut c_long,
 ) -> CURLMcode {
-    if multi.is_null() {
-        return CURLMcode::CURLM_BAD_HANDLE;
-    }
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if multi.is_null() {
+            return CURLMcode::CURLM_BAD_HANDLE;
+        }
 
-    // CURL_SOCKET_TIMEOUT = -1 means "timeout expired, check for work"
-    if sockfd == -1 {
-        // Delegate to perform
-        // SAFETY: Same guarantees apply
-        return unsafe { curl_multi_perform(multi, running_handles) };
-    }
+        // CURL_SOCKET_TIMEOUT = -1 means "timeout expired, check for work"
+        if sockfd == -1 {
+            // Delegate to perform
+            // SAFETY: Same guarantees apply
+            return unsafe { curl_multi_perform(multi, running_handles) };
+        }
 
-    // For specific socket events, report current state
-    if !running_handles.is_null() {
-        // SAFETY: Caller guarantees multi is from curl_multi_init
-        let m = unsafe { &*multi.cast::<MultiHandle>() };
-        // SAFETY: Caller guarantees running_handles is valid
-        unsafe {
-            #[allow(clippy::cast_possible_wrap)]
-            {
-                *running_handles = m.easy_handles.len() as c_long;
+        // For specific socket events, report current state
+        if !running_handles.is_null() {
+            // SAFETY: Caller guarantees multi is from curl_multi_init
+            let m = unsafe { &*multi.cast::<MultiHandle>() };
+            // SAFETY: Caller guarantees running_handles is valid
+            unsafe {
+                #[allow(clippy::cast_possible_wrap)]
+                {
+                    *running_handles = m.easy_handles.len() as c_long;
+                }
             }
         }
-    }
 
-    CURLMcode::CURLM_OK
+        CURLMcode::CURLM_OK
+    }));
+    result.unwrap_or(CURLMcode::CURLM_INTERNAL_ERROR)
 }
 
 /// `curl_multi_strerror` — return a human-readable multi error message.
@@ -3947,15 +4062,18 @@ pub unsafe extern "C" fn curl_multi_socket_action(
 #[no_mangle]
 #[allow(clippy::missing_const_for_fn)]
 pub extern "C" fn curl_multi_strerror(code: CURLMcode) -> *const c_char {
-    let msg = match code {
-        CURLMcode::CURLM_OK => c"No error",
-        CURLMcode::CURLM_BAD_HANDLE => c"Invalid multi handle",
-        CURLMcode::CURLM_BAD_EASY_HANDLE => c"Invalid easy handle",
-        CURLMcode::CURLM_OUT_OF_MEMORY => c"Out of memory",
-        CURLMcode::CURLM_INTERNAL_ERROR => c"Internal error",
-        CURLMcode::CURLM_UNKNOWN_OPTION => c"Unknown option",
-    };
-    msg.as_ptr()
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let msg = match code {
+            CURLMcode::CURLM_OK => c"No error",
+            CURLMcode::CURLM_BAD_HANDLE => c"Invalid multi handle",
+            CURLMcode::CURLM_BAD_EASY_HANDLE => c"Invalid easy handle",
+            CURLMcode::CURLM_OUT_OF_MEMORY => c"Out of memory",
+            CURLMcode::CURLM_INTERNAL_ERROR => c"Internal error",
+            CURLMcode::CURLM_UNKNOWN_OPTION => c"Unknown option",
+        };
+        msg.as_ptr()
+    }));
+    result.unwrap_or(c"Unknown error".as_ptr())
 }
 
 // ───────────────────────── Utility functions ─────────────────────────
@@ -3971,24 +4089,27 @@ pub extern "C" fn curl_multi_strerror(code: CURLMcode) -> *const c_char {
 /// If `length` is 0, `string` must be null-terminated.
 #[no_mangle]
 pub unsafe extern "C" fn curl_escape(string: *const c_char, length: c_long) -> *mut c_char {
-    if string.is_null() {
-        return ptr::null_mut();
-    }
-
-    let input = if length == 0 {
-        // SAFETY: Caller guarantees string is null-terminated
-        unsafe { CStr::from_ptr(string) }.to_bytes()
-    } else {
-        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-        // SAFETY: Caller guarantees string points to at least length bytes
-        unsafe {
-            std::slice::from_raw_parts(string.cast::<u8>(), length as usize)
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if string.is_null() {
+            return ptr::null_mut();
         }
-    };
 
-    let encoded = percent_encode(input);
+        let input = if length == 0 {
+            // SAFETY: Caller guarantees string is null-terminated
+            unsafe { CStr::from_ptr(string) }.to_bytes()
+        } else {
+            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+            // SAFETY: Caller guarantees string points to at least length bytes
+            unsafe {
+                std::slice::from_raw_parts(string.cast::<u8>(), length as usize)
+            }
+        };
 
-    std::ffi::CString::new(encoded).map_or(ptr::null_mut(), std::ffi::CString::into_raw)
+        let encoded = percent_encode(input);
+
+        std::ffi::CString::new(encoded).map_or(ptr::null_mut(), std::ffi::CString::into_raw)
+    }));
+    result.unwrap_or(ptr::null_mut())
 }
 
 /// `curl_unescape` — URL-decode a string.
@@ -4007,34 +4128,37 @@ pub unsafe extern "C" fn curl_unescape(
     length: c_long,
     outlength: *mut c_long,
 ) -> *mut c_char {
-    if string.is_null() {
-        return ptr::null_mut();
-    }
-
-    let input = if length == 0 {
-        // SAFETY: Caller guarantees string is null-terminated
-        unsafe { CStr::from_ptr(string) }.to_bytes()
-    } else {
-        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-        // SAFETY: Caller guarantees string points to at least length bytes
-        unsafe {
-            std::slice::from_raw_parts(string.cast::<u8>(), length as usize)
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if string.is_null() {
+            return ptr::null_mut();
         }
-    };
 
-    let decoded = percent_decode(input);
+        let input = if length == 0 {
+            // SAFETY: Caller guarantees string is null-terminated
+            unsafe { CStr::from_ptr(string) }.to_bytes()
+        } else {
+            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+            // SAFETY: Caller guarantees string points to at least length bytes
+            unsafe {
+                std::slice::from_raw_parts(string.cast::<u8>(), length as usize)
+            }
+        };
 
-    if !outlength.is_null() {
-        // SAFETY: Caller guarantees outlength is valid
-        unsafe {
-            #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
-            {
-                *outlength = decoded.len() as c_long;
+        let decoded = percent_decode(input);
+
+        if !outlength.is_null() {
+            // SAFETY: Caller guarantees outlength is valid
+            unsafe {
+                #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+                {
+                    *outlength = decoded.len() as c_long;
+                }
             }
         }
-    }
 
-    std::ffi::CString::new(decoded).map_or(ptr::null_mut(), std::ffi::CString::into_raw)
+        std::ffi::CString::new(decoded).map_or(ptr::null_mut(), std::ffi::CString::into_raw)
+    }));
+    result.unwrap_or(ptr::null_mut())
 }
 
 /// `curl_easy_escape` — URL-encode a string using an easy handle.
@@ -4052,8 +4176,11 @@ pub unsafe extern "C" fn curl_easy_escape(
     string: *const c_char,
     length: c_long,
 ) -> *mut c_char {
-    // SAFETY: Delegates to curl_escape with same safety requirements
-    unsafe { curl_escape(string, length) }
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // SAFETY: Delegates to curl_escape with same safety requirements
+        unsafe { curl_escape(string, length) }
+    }));
+    result.unwrap_or(ptr::null_mut())
 }
 
 /// `curl_easy_unescape` — URL-decode a string using an easy handle.
@@ -4073,8 +4200,11 @@ pub unsafe extern "C" fn curl_easy_unescape(
     inlength: c_long,
     outlength: *mut c_long,
 ) -> *mut c_char {
-    // SAFETY: Delegates to curl_unescape with same safety requirements
-    unsafe { curl_unescape(string, inlength, outlength) }
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // SAFETY: Delegates to curl_unescape with same safety requirements
+        unsafe { curl_unescape(string, inlength, outlength) }
+    }));
+    result.unwrap_or(ptr::null_mut())
 }
 
 /// `curl_getdate` — parse a date string to a Unix timestamp.
@@ -4088,16 +4218,19 @@ pub unsafe extern "C" fn curl_easy_unescape(
 /// `now` is unused (accepted for API compatibility, can be null).
 #[no_mangle]
 pub unsafe extern "C" fn curl_getdate(datestring: *const c_char, _now: *const c_void) -> i64 {
-    if datestring.is_null() {
-        return -1;
-    }
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if datestring.is_null() {
+            return -1;
+        }
 
-    // SAFETY: Caller guarantees datestring is null-terminated
-    let Ok(s) = unsafe { CStr::from_ptr(datestring) }.to_str() else {
-        return -1;
-    };
+        // SAFETY: Caller guarantees datestring is null-terminated
+        let Ok(s) = unsafe { CStr::from_ptr(datestring) }.to_str() else {
+            return -1;
+        };
 
-    parse_http_date(s).unwrap_or(-1)
+        parse_http_date(s).unwrap_or(-1)
+    }));
+    result.unwrap_or(-1)
 }
 
 /// `curl_formadd` — deprecated multipart form API.
@@ -4111,7 +4244,10 @@ pub unsafe extern "C" fn curl_getdate(datestring: *const c_char, _now: *const c_
 #[no_mangle]
 #[allow(clippy::missing_const_for_fn)]
 pub unsafe extern "C" fn curl_formadd(_first: *mut *mut c_void, _last: *mut *mut c_void) -> c_long {
-    7 // CURL_FORMADD_DISABLED
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        7 // CURL_FORMADD_DISABLED
+    }));
+    result.unwrap_or(7) // CURL_FORMADD_DISABLED
 }
 
 /// `curl_formfree` — free a form created by `curl_formadd`.
@@ -4124,7 +4260,9 @@ pub unsafe extern "C" fn curl_formadd(_first: *mut *mut c_void, _last: *mut *mut
 #[no_mangle]
 #[allow(clippy::missing_const_for_fn)]
 pub unsafe extern "C" fn curl_formfree(_form: *mut c_void) {
-    // No-op: curl_formadd is disabled
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // No-op: curl_formadd is disabled
+    }));
 }
 
 /// Percent-encode bytes for URL escaping.
@@ -4347,7 +4485,9 @@ fn parse_asctime(s: &str) -> Option<i64> {
 #[no_mangle]
 #[allow(clippy::missing_const_for_fn)]
 pub extern "C" fn curl_version() -> *const c_char {
-    c"liburlx/0.1.0".as_ptr()
+    let result =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| c"liburlx/0.1.0".as_ptr()));
+    result.unwrap_or(c"liburlx/unknown".as_ptr())
 }
 
 /// `urlx_version` — returns the version string.
@@ -4358,7 +4498,9 @@ pub extern "C" fn curl_version() -> *const c_char {
 #[no_mangle]
 #[allow(clippy::missing_const_for_fn)]
 pub extern "C" fn urlx_version() -> *const c_char {
-    c"liburlx/0.1.0".as_ptr()
+    let result =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| c"liburlx/0.1.0".as_ptr()));
+    result.unwrap_or(c"liburlx/unknown".as_ptr())
 }
 
 // ───────────────────────── Global init/cleanup ─────────────────────────
@@ -4374,7 +4516,8 @@ pub extern "C" fn urlx_version() -> *const c_char {
 #[no_mangle]
 #[allow(clippy::missing_const_for_fn)] // const extern "C" fn not stable
 pub extern "C" fn curl_global_init(_flags: c_long) -> CURLcode {
-    CURLcode::CURLE_OK
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| CURLcode::CURLE_OK));
+    result.unwrap_or(CURLcode::CURLE_UNKNOWN_OPTION)
 }
 
 /// `curl_global_cleanup` — global cleanup (no-op in urlx).
@@ -4384,7 +4527,9 @@ pub extern "C" fn curl_global_init(_flags: c_long) -> CURLcode {
 /// This function is always safe to call.
 #[no_mangle]
 #[allow(clippy::missing_const_for_fn)] // const extern "C" fn not stable
-pub extern "C" fn curl_global_cleanup() {}
+pub extern "C" fn curl_global_cleanup() {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {}));
+}
 
 /// Bitmask constants for `curl_global_init`.
 /// `CURL_GLOBAL_SSL` — initialize SSL.
@@ -4447,34 +4592,37 @@ pub const CURL_VERSION_PSL: c_long = 1 << 20;
 /// The returned pointer is valid for the lifetime of the program.
 #[no_mangle]
 pub extern "C" fn curl_version_info(_age: c_long) -> *const CurlVersionInfo {
-    // Use Box::leak to create a 'static reference. OnceLock ensures single init.
-    static INFO: std::sync::OnceLock<&'static CurlVersionInfo> = std::sync::OnceLock::new();
-    let info = INFO.get_or_init(|| {
-        // Protocols array — leaked to get a 'static pointer
-        let protocols: &'static [*const c_char] = Box::leak(Box::new([
-            c"http".as_ptr(),
-            c"https".as_ptr(),
-            c"ftp".as_ptr(),
-            c"ftps".as_ptr(),
-            c"sftp".as_ptr(),
-            c"scp".as_ptr(),
-            c"ws".as_ptr(),
-            c"wss".as_ptr(),
-            ptr::null(), // Null terminator
-        ]));
-        Box::leak(Box::new(CurlVersionInfo {
-            age: 0,
-            version: c"0.1.0".as_ptr(),
-            version_num: 0x000_100, // 0.1.0
-            host: c"urlx".as_ptr(),
-            features: CURL_VERSION_SSL | CURL_VERSION_HTTP2 | CURL_VERSION_PSL,
-            ssl_version: c"rustls/0.23".as_ptr(),
-            ssl_version_num: 0,
-            libz_version: ptr::null(),
-            protocols: protocols.as_ptr(),
-        }))
-    });
-    *info
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // Use Box::leak to create a 'static reference. OnceLock ensures single init.
+        static INFO: std::sync::OnceLock<&'static CurlVersionInfo> = std::sync::OnceLock::new();
+        let info = INFO.get_or_init(|| {
+            // Protocols array — leaked to get a 'static pointer
+            let protocols: &'static [*const c_char] = Box::leak(Box::new([
+                c"http".as_ptr(),
+                c"https".as_ptr(),
+                c"ftp".as_ptr(),
+                c"ftps".as_ptr(),
+                c"sftp".as_ptr(),
+                c"scp".as_ptr(),
+                c"ws".as_ptr(),
+                c"wss".as_ptr(),
+                ptr::null(), // Null terminator
+            ]));
+            Box::leak(Box::new(CurlVersionInfo {
+                age: 0,
+                version: c"0.1.0".as_ptr(),
+                version_num: 0x000_100, // 0.1.0
+                host: c"urlx".as_ptr(),
+                features: CURL_VERSION_SSL | CURL_VERSION_HTTP2 | CURL_VERSION_PSL,
+                ssl_version: c"rustls/0.23".as_ptr(),
+                ssl_version_num: 0,
+                libz_version: ptr::null(),
+                protocols: protocols.as_ptr(),
+            }))
+        });
+        std::ptr::from_ref::<CurlVersionInfo>(info)
+    }));
+    result.unwrap_or(ptr::null::<CurlVersionInfo>())
 }
 
 /// `curl_easy_pause` — pause/unpause a transfer (stub).
@@ -4485,8 +4633,11 @@ pub extern "C" fn curl_version_info(_age: c_long) -> *const CurlVersionInfo {
 #[no_mangle]
 #[allow(clippy::missing_const_for_fn)] // const extern "C" fn not stable
 pub extern "C" fn curl_easy_pause(_handle: *mut c_void, _bitmask: c_long) -> CURLcode {
-    // Pause/unpause is not yet implemented; return OK as a no-op
-    CURLcode::CURLE_OK
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // Pause/unpause is not yet implemented; return OK as a no-op
+        CURLcode::CURLE_OK
+    }));
+    result.unwrap_or(CURLcode::CURLE_UNKNOWN_OPTION)
 }
 
 /// Pause direction constants.
@@ -4507,7 +4658,8 @@ pub const CURLPAUSE_CONT: c_long = 0;
 #[no_mangle]
 #[allow(clippy::missing_const_for_fn)] // const extern "C" fn not stable
 pub extern "C" fn curl_easy_upkeep(_handle: *mut c_void) -> CURLcode {
-    CURLcode::CURLE_OK
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| CURLcode::CURLE_OK));
+    result.unwrap_or(CURLcode::CURLE_UNKNOWN_OPTION)
 }
 
 /// `curl_multi_assign` — assign custom pointer to socket (no-op stub).
@@ -4522,7 +4674,8 @@ pub extern "C" fn curl_multi_assign(
     _sockfd: c_long,
     _sockp: *mut c_void,
 ) -> CURLMcode {
-    CURLMcode::CURLM_OK
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| CURLMcode::CURLM_OK));
+    result.unwrap_or(CURLMcode::CURLM_INTERNAL_ERROR)
 }
 
 // ───────────────────────── Error mapping ─────────────────────────
