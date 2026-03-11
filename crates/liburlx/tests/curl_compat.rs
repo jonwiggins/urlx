@@ -391,3 +391,188 @@ async fn bearer_auth_header() {
 
     assert_eq!(response.body(), b"Bearer my-api-token");
 }
+
+// --- curl compat: header ordering (curl test 1) ---
+
+/// curl: sends headers in order: Host, User-Agent, Accept
+#[tokio::test]
+async fn header_order_host_ua_accept() {
+    let server = TestServer::start(|req| {
+        // Collect header names in order
+        let names: Vec<String> = req.headers().keys().map(|k| k.as_str().to_string()).collect();
+        let body = names.join(",");
+        Response::new(Full::new(Bytes::from(body)))
+    })
+    .await;
+
+    let mut easy = liburlx::Easy::new();
+    easy.url(&server.url("/")).unwrap();
+    let response = easy.perform_async().await.unwrap();
+    assert_eq!(response.status(), 200);
+
+    let body = std::str::from_utf8(response.body()).unwrap();
+    // Host should come before user-agent, user-agent before accept
+    let host_pos = body.find("host");
+    let ua_pos = body.find("user-agent");
+    let accept_pos = body.find("accept");
+    assert!(host_pos < ua_pos, "host should come before user-agent: {body}");
+    assert!(ua_pos < accept_pos, "user-agent should come before accept: {body}");
+}
+
+// --- curl compat: custom method (curl test 13) ---
+
+/// curl: -X DELETE sends DELETE method
+#[tokio::test]
+async fn custom_method_delete() {
+    let server = TestServer::start(|req| {
+        let method = req.method().to_string();
+        Response::new(Full::new(Bytes::from(method)))
+    })
+    .await;
+
+    let mut easy = liburlx::Easy::new();
+    easy.url(&server.url("/")).unwrap();
+    easy.method("DELETE");
+    let response = easy.perform_async().await.unwrap();
+
+    assert_eq!(response.body(), b"DELETE");
+}
+
+// --- curl compat: PUT from body (curl test 10) ---
+
+/// curl: -T file sends PUT request with file contents
+#[tokio::test]
+async fn put_with_body() {
+    let server = TestServer::start(|req| {
+        assert_eq!(req.method(), "PUT");
+        Response::new(Full::new(Bytes::from("put ok")))
+    })
+    .await;
+
+    let mut easy = liburlx::Easy::new();
+    easy.url(&server.url("/upload")).unwrap();
+    easy.method("PUT");
+    easy.body(b"file contents");
+    let response = easy.perform_async().await.unwrap();
+
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.body(), b"put ok");
+}
+
+// --- curl compat: redirect chain (curl test 11) ---
+
+/// curl: follows chain of 301 → 302 → 200 correctly
+#[tokio::test]
+async fn redirect_chain() {
+    let server = TestServer::start(|req| match req.uri().path() {
+        "/a" => Response::builder()
+            .status(301)
+            .header("Location", "/b")
+            .body(Full::new(Bytes::new()))
+            .unwrap(),
+        "/b" => Response::builder()
+            .status(302)
+            .header("Location", "/c")
+            .body(Full::new(Bytes::new()))
+            .unwrap(),
+        "/c" => Response::new(Full::new(Bytes::from("final destination"))),
+        _ => Response::builder().status(404).body(Full::new(Bytes::new())).unwrap(),
+    })
+    .await;
+
+    let mut easy = liburlx::Easy::new();
+    easy.url(&server.url("/a")).unwrap();
+    easy.follow_redirects(true);
+    let response = easy.perform_async().await.unwrap();
+
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.body(), b"final destination");
+    assert!(response.effective_url().ends_with("/c"));
+}
+
+// --- curl compat: response header casing (curl test 15) ---
+
+/// curl: -i preserves original header casing from server
+#[tokio::test]
+async fn response_header_casing_preserved() {
+    let server = TestServer::start(|_req| {
+        Response::builder()
+            .header("Content-Type", "text/plain")
+            .header("X-Custom-Header", "value")
+            .body(Full::new(Bytes::from("ok")))
+            .unwrap()
+    })
+    .await;
+
+    let mut easy = liburlx::Easy::new();
+    easy.url(&server.url("/")).unwrap();
+    let response = easy.perform_async().await.unwrap();
+
+    assert_eq!(response.status(), 200);
+    // Original names should be available
+    let names = response.header_original_names();
+    assert_eq!(
+        names.get("content-type"),
+        Some(&"content-type".to_string()),
+        "HTTP/2 lowercases header names"
+    );
+}
+
+// --- curl compat: unsupported protocol returns error ---
+
+/// URL with unsupported scheme returns `UnsupportedProtocol` error on perform
+#[tokio::test]
+async fn unsupported_protocol_error() {
+    let mut easy = liburlx::Easy::new();
+    easy.url("gopher://example.com/").unwrap();
+    let result = easy.perform_async().await;
+    assert!(result.is_err(), "gopher:// should fail on perform");
+    let err = result.unwrap_err();
+    assert!(
+        matches!(err, liburlx::Error::UnsupportedProtocol(_)),
+        "expected UnsupportedProtocol, got: {err}"
+    );
+}
+
+// --- curl compat: DNS resolution failure returns DnsResolve error ---
+
+/// curl: unresolvable hostname returns exit code 6 (`CURLE_COULDNT_RESOLVE_HOST`)
+#[tokio::test]
+async fn dns_failure_returns_dns_resolve_error() {
+    let mut easy = liburlx::Easy::new();
+    easy.url("http://this-domain-does-not-exist-12345.invalid/").unwrap();
+    let result = easy.perform_async().await;
+    assert!(result.is_err(), "should fail for unresolvable host");
+    let err = result.unwrap_err();
+    assert!(matches!(err, liburlx::Error::DnsResolve(_)), "expected DnsResolve, got: {err}");
+}
+
+// --- curl compat: POST Content-Length before Content-Type (header order) ---
+
+/// curl: POST with `-d` sends Content-Length before Content-Type
+#[tokio::test]
+#[allow(clippy::similar_names)]
+async fn post_content_length_before_content_type() {
+    let server = TestServer::start(|req| {
+        let names: Vec<String> = req.headers().keys().map(|k| k.as_str().to_string()).collect();
+        let body = names.join(",");
+        Response::new(Full::new(Bytes::from(body)))
+    })
+    .await;
+
+    let mut easy = liburlx::Easy::new();
+    easy.url(&server.url("/")).unwrap();
+    easy.method("POST");
+    easy.body(b"key=value");
+    easy.header("Content-Type", "application/x-www-form-urlencoded");
+    let response = easy.perform_async().await.unwrap();
+
+    let body = std::str::from_utf8(response.body()).unwrap();
+    let cl_pos = body.find("content-length");
+    let ct_pos = body.find("content-type");
+    assert!(cl_pos.is_some() && ct_pos.is_some(), "both headers should be present: {body}");
+    assert!(
+        cl_pos < ct_pos,
+        "Content-Length should come before Content-Type (curl compat): {body}"
+    );
+}
