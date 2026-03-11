@@ -17,12 +17,14 @@ pub fn format_headers(response: &liburlx::Response) -> String {
         "3" => "3".to_string(),
         v => v.to_string(),
     };
+    // Preserve original line endings from the server (curl does this)
+    let eol = if response.uses_crlf() { "\r\n" } else { "\n" };
     // Use server's original reason phrase, fall back to standard text
     let reason = response.status_reason().unwrap_or_else(|| http_status_text(response.status()));
     let mut result = if reason.is_empty() {
-        format!("HTTP/{version_label} {}\r\n", response.status())
+        format!("HTTP/{version_label} {}{eol}", response.status())
     } else {
-        format!("HTTP/{version_label} {} {reason}\r\n", response.status())
+        format!("HTTP/{version_label} {} {reason}{eol}", response.status())
     };
 
     let ordered = response.headers_ordered();
@@ -34,7 +36,7 @@ pub fn format_headers(response: &liburlx::Response) -> String {
             result.push_str(display_name);
             result.push_str(": ");
             result.push_str(value);
-            result.push_str("\r\n");
+            result.push_str(eol);
         }
     } else {
         // Use wire-order headers (preserves order, casing, and duplicates)
@@ -42,10 +44,10 @@ pub fn format_headers(response: &liburlx::Response) -> String {
             result.push_str(name);
             result.push_str(": ");
             result.push_str(value);
-            result.push_str("\r\n");
+            result.push_str(eol);
         }
     }
-    result.push_str("\r\n");
+    result.push_str(eol);
     result
 }
 
@@ -232,11 +234,23 @@ pub fn output_response(
     include_headers: bool,
     silent: bool,
 ) -> ExitCode {
+    // Build all header text including redirect chain (for -L --include)
+    let all_headers = if include_headers {
+        let mut h = String::new();
+        for redir in response.redirect_responses() {
+            h.push_str(&format_headers(redir));
+        }
+        h.push_str(&format_headers(response));
+        Some(h)
+    } else {
+        None
+    };
+
     if let Some(path) = output_file {
         // When --output is set, everything (headers if --include, then body) goes to the file
         let mut data = Vec::new();
-        if include_headers {
-            data.extend_from_slice(format_headers(response).as_bytes());
+        if let Some(ref headers) = all_headers {
+            data.extend_from_slice(headers.as_bytes());
         }
         data.extend_from_slice(response.body());
         if let Err(e) = std::fs::write(path, &data) {
@@ -247,9 +261,8 @@ pub fn output_response(
         }
     } else {
         // No --output: write to stdout
-        if include_headers {
-            let header_text = format_headers(response);
-            if let Err(e) = std::io::stdout().write_all(header_text.as_bytes()) {
+        if let Some(ref headers) = all_headers {
+            if let Err(e) = std::io::stdout().write_all(headers.as_bytes()) {
                 if !silent {
                     eprintln!("urlx: write error: {e}");
                 }

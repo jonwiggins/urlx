@@ -85,6 +85,8 @@ pub struct Response {
     header_original_names: HashMap<String, String>,
     /// Headers in wire order with original casing. Preserves duplicates.
     headers_ordered: Vec<(String, String)>,
+    /// Whether the response used CRLF (`true`) or bare LF (`false`) line endings.
+    uses_crlf: bool,
     /// Trailer headers from chunked transfer encoding.
     trailers: HashMap<String, String>,
     /// Response body bytes.
@@ -95,6 +97,8 @@ pub struct Response {
     info: TransferInfo,
     /// HTTP/2 server-pushed responses received during this transfer.
     pushed_responses: Vec<PushedResponse>,
+    /// Intermediate redirect responses (for `-L --include` output).
+    redirect_responses: Vec<Self>,
 }
 
 /// An HTTP/2 server-pushed response.
@@ -129,11 +133,13 @@ impl Response {
             headers,
             header_original_names: HashMap::new(),
             headers_ordered: Vec::new(),
+            uses_crlf: true,
             trailers: HashMap::new(),
             body,
             effective_url,
             info: TransferInfo::default(),
             pushed_responses: Vec::new(),
+            redirect_responses: Vec::new(),
         }
     }
 
@@ -153,11 +159,13 @@ impl Response {
             headers,
             header_original_names: HashMap::new(),
             headers_ordered: Vec::new(),
+            uses_crlf: true,
             trailers: HashMap::new(),
             body,
             effective_url,
             info,
             pushed_responses: Vec::new(),
+            redirect_responses: Vec::new(),
         }
     }
 
@@ -183,6 +191,17 @@ impl Response {
     #[must_use]
     pub fn headers_ordered(&self) -> &[(String, String)] {
         &self.headers_ordered
+    }
+
+    /// Whether the response used CRLF line endings (vs bare LF).
+    #[must_use]
+    pub const fn uses_crlf(&self) -> bool {
+        self.uses_crlf
+    }
+
+    /// Set whether the response used CRLF line endings.
+    pub const fn set_uses_crlf(&mut self, uses_crlf: bool) {
+        self.uses_crlf = uses_crlf;
     }
 
     /// Set trailer headers on this response.
@@ -316,6 +335,22 @@ impl Response {
     /// Set pushed responses on this response.
     pub fn set_pushed_responses(&mut self, pushed: Vec<PushedResponse>) {
         self.pushed_responses = pushed;
+    }
+
+    /// Returns intermediate redirect responses in the chain.
+    #[must_use]
+    pub fn redirect_responses(&self) -> &[Self] {
+        &self.redirect_responses
+    }
+
+    /// Add an intermediate redirect response to the chain.
+    pub fn push_redirect_response(&mut self, resp: Self) {
+        self.redirect_responses.push(resp);
+    }
+
+    /// Set intermediate redirect responses.
+    pub fn set_redirect_responses(&mut self, resps: Vec<Self>) {
+        self.redirect_responses = resps;
     }
 }
 

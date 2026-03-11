@@ -2157,6 +2157,7 @@ async fn perform_transfer(
     let mut current_method = method.unwrap_or("GET").to_string();
     let mut current_body = body.map(<[u8]>::to_vec);
     let mut redirects_followed: u32 = 0;
+    let mut redirect_chain: Vec<Response> = Vec::new();
 
     loop {
         // Determine effective proxy for this URL
@@ -2439,6 +2440,9 @@ async fn perform_transfer(
                     current_body = None;
                 }
 
+                // Capture intermediate redirect response for -L --include output
+                redirect_chain.push(response);
+
                 current_url = next_url;
                 redirects_followed += 1;
                 continue;
@@ -2461,6 +2465,9 @@ async fn perform_transfer(
         info.speed_upload = speed_upload;
         info.size_upload = upload_size;
         response.set_transfer_info(info);
+        if !redirect_chain.is_empty() {
+            response.set_redirect_responses(redirect_chain);
+        }
         return Ok(response);
     }
 }
@@ -3252,14 +3259,20 @@ async fn do_single_request(
             };
 
             // Add proxy-specific headers for non-tunnel HTTP proxy requests
+            let is_http_proxy = proxy.is_some() && !is_socks_proxy;
             let mut proxy_effective_headers = effective_headers.clone();
-            if proxy.is_some() && !is_socks_proxy {
+            if is_http_proxy {
                 proxy_effective_headers.extend_from_slice(proxy_headers);
+                // curl sends Proxy-Connection: Keep-Alive for HTTP proxy requests
+                proxy_effective_headers
+                    .push(("Proxy-Connection".to_string(), "Keep-Alive".to_string()));
             }
 
             let use_http10 = http_version == HttpVersion::Http10;
             let time_pretransfer = request_start.elapsed();
             let mut stream = PooledStream::Tcp(tcp_stream);
+            // For HTTP proxy: use keep_alive=true to suppress Connection: close
+            let proxy_keep_alive = if is_http_proxy { true } else { use_pool };
             let (resp, can_reuse) = crate::protocol::http::h1::request(
                 &mut stream,
                 method,
@@ -3268,7 +3281,7 @@ async fn do_single_request(
                 &proxy_effective_headers,
                 body,
                 url.as_str(),
-                use_pool,
+                proxy_keep_alive,
                 use_http10,
                 expect_100_timeout,
                 ignore_content_length,

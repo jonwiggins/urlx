@@ -79,7 +79,7 @@ where
 
     // Headers that curl emits before User-Agent (priority headers)
     let priority_headers: &[&str] =
-        &["authorization", "proxy-authorization", "range", "content-range", "cookie"];
+        &["authorization", "proxy-authorization", "range", "content-range"];
 
     // Emit priority custom headers right after Host (curl compat order)
     for (i, (name, value)) in custom_headers.iter().enumerate() {
@@ -236,6 +236,7 @@ where
                     resp.set_header_original_names(ph.original_names);
                     resp.set_headers_ordered(ph.headers_ordered);
                     resp.set_status_reason(ph.reason);
+                    resp.set_uses_crlf(ph.uses_crlf);
                     resp.set_http_version(ph.version);
                     if !trailers.is_empty() {
                         resp.set_trailers(trailers);
@@ -316,6 +317,7 @@ where
     resp.set_header_original_names(ph.original_names);
     resp.set_headers_ordered(ph.headers_ordered);
     resp.set_status_reason(ph.reason);
+    resp.set_uses_crlf(ph.uses_crlf);
     resp.set_http_version(ph.version);
     if !trailers.is_empty() {
         resp.set_trailers(trailers);
@@ -408,6 +410,23 @@ where
 ///
 /// Returns the raw header bytes (including the trailing `\r\n\r\n`) and
 /// any body data that was read past the header boundary.
+/// Find the end of HTTP headers in a buffer.
+///
+/// Supports both `\r\n\r\n` (standard) and `\n\n` (bare LF) header terminators.
+/// Returns `(position, length)` where position is the start of the terminator
+/// and length is the terminator's byte count (4 for CRLF, 2 for LF).
+fn find_header_end(buf: &[u8]) -> Option<(usize, usize)> {
+    // Prefer \r\n\r\n (standard)
+    if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+        return Some((pos, 4));
+    }
+    // Fall back to \n\n (bare LF — some servers omit \r)
+    if let Some(pos) = buf.windows(2).position(|w| w == b"\n\n") {
+        return Some((pos, 2));
+    }
+    None
+}
+
 async fn read_response_headers<S>(stream: &mut S) -> Result<(Vec<u8>, Vec<u8>), Error>
 where
     S: AsyncRead + Unpin,
@@ -431,9 +450,9 @@ where
 
         buf.extend_from_slice(&tmp[..n]);
 
-        // Check for end of headers
-        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-            let header_end = pos + 4;
+        // Check for end of headers (supports both \r\n\r\n and \n\n)
+        if let Some((pos, len)) = find_header_end(&buf) {
+            let header_end = pos + len;
             let body_prefix = buf[header_end..].to_vec();
             buf.truncate(header_end);
             return Ok((buf, body_prefix));
@@ -463,8 +482,8 @@ where
     let mut tmp = [0u8; 4096];
 
     // Check if headers are already complete in the prefix
-    if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-        let header_end = pos + 4;
+    if let Some((pos, len)) = find_header_end(&buf) {
+        let header_end = pos + len;
         let body_prefix = buf[header_end..].to_vec();
         buf.truncate(header_end);
         return Ok((buf, body_prefix));
@@ -486,8 +505,8 @@ where
 
         buf.extend_from_slice(&tmp[..n]);
 
-        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-            let header_end = pos + 4;
+        if let Some((pos, len)) = find_header_end(&buf) {
+            let header_end = pos + len;
             let body_prefix = buf[header_end..].to_vec();
             buf.truncate(header_end);
             return Ok((buf, body_prefix));
@@ -507,6 +526,7 @@ struct ParsedHeaders {
     status: u16,
     reason: Option<String>,
     version: ResponseHttpVersion,
+    uses_crlf: bool,
     headers: HashMap<String, String>,
     original_names: HashMap<String, String>,
     headers_ordered: Vec<(String, String)>,
@@ -541,6 +561,8 @@ fn parse_headers(data: &[u8]) -> Result<ParsedHeaders, Error> {
     } else {
         ResponseHttpVersion::Http11
     };
+    // Detect line ending style: if we find \r\n it's CRLF, otherwise bare LF
+    let uses_crlf = data.windows(2).any(|w| w == b"\r\n");
 
     let mut headers = HashMap::with_capacity(parsed.headers.len());
     let mut original_names = HashMap::with_capacity(parsed.headers.len());
@@ -566,7 +588,15 @@ fn parse_headers(data: &[u8]) -> Result<ParsedHeaders, Error> {
         }
     }
 
-    Ok(ParsedHeaders { status, reason, version, headers, original_names, headers_ordered })
+    Ok(ParsedHeaders {
+        status,
+        reason,
+        version,
+        uses_crlf,
+        headers,
+        original_names,
+        headers_ordered,
+    })
 }
 
 /// Write body data with optional rate limiting.
@@ -956,11 +986,13 @@ pub fn parse_response(data: &[u8], effective_url: &str, is_head: bool) -> Result
         Some(0) => ResponseHttpVersion::Http10,
         _ => ResponseHttpVersion::Http11,
     };
+    let uses_crlf = data.windows(2).any(|w| w == b"\r\n");
 
     if is_head {
         let mut resp = Response::new(status, headers, Vec::new(), effective_url.to_string());
         resp.set_header_original_names(original_names);
         resp.set_headers_ordered(headers_ordered);
+        resp.set_uses_crlf(uses_crlf);
         resp.set_http_version(version);
         return Ok(resp);
     }
@@ -987,6 +1019,7 @@ pub fn parse_response(data: &[u8], effective_url: &str, is_head: bool) -> Result
     let mut resp = Response::new(status, headers, body, effective_url.to_string());
     resp.set_header_original_names(original_names);
     resp.set_headers_ordered(headers_ordered);
+    resp.set_uses_crlf(uses_crlf);
     resp.set_http_version(version);
     Ok(resp)
 }

@@ -3,7 +3,6 @@
 //! Contains the main [`run`] function that orchestrates URL transfers,
 //! retry logic, and curl-compatible exit code mapping.
 
-use std::io::Write;
 use std::process::ExitCode;
 
 use crate::args::{
@@ -11,8 +10,8 @@ use crate::args::{
     ParseResult,
 };
 use crate::output::{
-    content_disposition_filename, format_headers, format_write_out, http_status_text,
-    output_response, write_trace_file,
+    content_disposition_filename, format_headers, http_status_text, output_response,
+    write_trace_file,
 };
 
 /// Takes the last path segment. Falls back to `"index.html"` if no filename.
@@ -374,6 +373,7 @@ pub fn run(args: &[String]) -> ExitCode {
             &opts.urls,
             opts.output_file.as_deref(),
             opts.write_out.as_deref(),
+            opts.include_headers,
             opts.silent,
             opts.show_error,
             opts.fail_on_error,
@@ -896,8 +896,9 @@ pub const fn is_retryable_status(code: u16) -> bool {
 pub fn run_multi(
     template: &liburlx::Easy,
     urls: &[String],
-    _output_file: Option<&str>,
+    output_file: Option<&str>,
     write_out: Option<&str>,
+    include_headers: bool,
     silent: bool,
     show_error: bool,
     fail_on_error: bool,
@@ -938,15 +939,12 @@ pub fn run_multi(
                     any_failed = true;
                     continue;
                 }
-                if let Err(e) = std::io::stdout().write_all(response.body()) {
-                    if !silent || show_error {
-                        eprintln!("urlx: write error: {e}");
-                    }
+                // First URL uses --output file if specified; rest go to stdout
+                let file_for_this = if i == 0 { output_file } else { None };
+                let exit =
+                    output_response(&response, file_for_this, write_out, include_headers, silent);
+                if exit != ExitCode::SUCCESS {
                     any_failed = true;
-                }
-                if let Some(fmt) = write_out {
-                    let output = format_write_out(fmt, &response);
-                    print!("{output}");
                 }
             }
             Err(e) => {

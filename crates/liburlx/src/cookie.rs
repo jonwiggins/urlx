@@ -99,7 +99,7 @@ impl CookieJar {
         let now = SystemTime::now();
         let host_lower = host.to_ascii_lowercase();
 
-        // Collect candidate domains: exact match + parent domains
+        // Collect candidate domains: exact match + parent domains + wildcard (empty domain)
         let mut candidate_indices: Vec<usize> = Vec::new();
 
         // Check exact domain match
@@ -117,6 +117,11 @@ impl CookieJar {
                 }
             }
             dot_pos += pos + 1;
+        }
+
+        // Check cookies with empty domain (loaded from files without domain attr, match all)
+        if let Some(indices) = self.domain_index.get("") {
+            candidate_indices.extend(indices);
         }
 
         // Filter candidates by expiry, secure, domain match, and path
@@ -145,6 +150,17 @@ impl CookieJar {
         if matching.is_empty() {
             return None;
         }
+
+        // Sort matching curl's cookie_sort: path length DESC, domain length DESC,
+        // name length DESC, then creation order (stable sort preserves Vec order)
+        let mut matching = matching;
+        matching.sort_by(|a, b| {
+            b.path
+                .len()
+                .cmp(&a.path.len())
+                .then_with(|| b.domain.len().cmp(&a.domain.len()))
+                .then_with(|| b.name.len().cmp(&a.name.len()))
+        });
 
         let cookie_str = matching
             .iter()
@@ -193,7 +209,12 @@ impl CookieJar {
         Ok(jar)
     }
 
-    /// Load cookies from a reader in Netscape cookie file format.
+    /// Load cookies from a reader in Netscape cookie file format or HTTP header dump.
+    ///
+    /// Detects the format automatically:
+    /// - Lines with `Set-Cookie:` are parsed as HTTP header dump (curl compat)
+    /// - Lines starting with `HTTP/` are skipped (response status line)
+    /// - Tab-separated lines with 7+ fields are parsed as Netscape format
     ///
     /// # Errors
     ///
@@ -205,6 +226,20 @@ impl CookieJar {
 
             // Skip empty lines
             if line.is_empty() {
+                continue;
+            }
+
+            // HTTP header dump format: parse Set-Cookie lines
+            if let Some(value) =
+                line.strip_prefix("Set-Cookie:").or_else(|| line.strip_prefix("set-cookie:"))
+            {
+                // Use empty host/path defaults — the cookie's own domain/path attrs apply
+                self.parse_set_cookie(value.trim(), "", "/");
+                continue;
+            }
+
+            // Skip HTTP response status lines and other headers in header dumps
+            if line.starts_with("HTTP/") || line.contains(':') && !line.contains('\t') {
                 continue;
             }
 
@@ -315,6 +350,14 @@ impl CookieJar {
             return; // Invalid cookie
         };
 
+        // Reject cookies with control characters BEFORE trimming (curl compat)
+        // Tab (0x09) is allowed; other control chars (0x00-0x08, 0x0A-0x1F, 0x7F) are rejected
+        let has_control =
+            name.bytes().chain(value.bytes()).any(|b| b != b'\t' && (b < 0x20 || b == 0x7F));
+        if has_control {
+            return;
+        }
+
         let name = name.trim().to_string();
         let value = value.trim().to_string();
 
@@ -347,7 +390,10 @@ impl CookieJar {
                         }
                     } else if attr_name.eq_ignore_ascii_case("path") {
                         if !attr_value.is_empty() {
-                            path = attr_value.to_string();
+                            // Strip surrounding quotes (some servers quote the path)
+                            let p = attr_value.strip_prefix('"').unwrap_or(attr_value);
+                            let p = p.strip_suffix('"').unwrap_or(p);
+                            path = p.to_string();
                         }
                     } else if attr_name.eq_ignore_ascii_case("max-age") {
                         if let Ok(seconds) = attr_value.parse::<i64>() {
@@ -436,8 +482,18 @@ fn is_public_suffix(domain: &str) -> bool {
 /// Per RFC 6265 §5.1.3: either exact match or the domain is a suffix
 /// of the host preceded by a dot.
 fn domain_matches(host: &str, cookie_domain: &str) -> bool {
+    // Empty cookie domain matches any host (cookies loaded from file without domain attr)
+    if cookie_domain.is_empty() {
+        return true;
+    }
+
     if host.eq_ignore_ascii_case(cookie_domain) {
         return true;
+    }
+
+    // IP addresses don't have domain hierarchy — only exact match allowed
+    if is_ip_address(host) {
+        return false;
     }
 
     // Host is foo.example.com, domain is example.com
@@ -448,6 +504,16 @@ fn domain_matches(host: &str, cookie_domain: &str) -> bool {
     } else {
         false
     }
+}
+
+/// Check if a string looks like an IP address (v4 or v6).
+fn is_ip_address(s: &str) -> bool {
+    // IPv4: all chars are digits or dots
+    if s.bytes().all(|b| b.is_ascii_digit() || b == b'.') && s.contains('.') {
+        return true;
+    }
+    // IPv6: contains colons
+    s.contains(':')
 }
 
 /// Check if a request path matches a cookie path.

@@ -95,6 +95,8 @@ pub struct CliOptions {
     pub(crate) is_stdin_upload: bool,
     /// Filename from `-T` for appending to URL path.
     pub(crate) upload_filename: Option<String>,
+    /// Accumulated inline cookie values from `-b` (joined with "; " before sending).
+    pub(crate) inline_cookies: Vec<String>,
 }
 
 /// Print version information to stdout.
@@ -303,7 +305,7 @@ fn expand_combined_flags(args: &[String]) -> Vec<String> {
     // Set of short flags that take an argument (next arg is the value)
     const ARG_FLAGS: &[char] = &[
         'X', 'H', 'd', 'o', 'D', 'w', 'x', 'u', 'A', 'F', 'r', 'C', 'T', 'b', 'e', 'm', 'K', 'c',
-        'z',
+        'z', 'U',
     ];
 
     let mut result = Vec::with_capacity(args.len());
@@ -402,6 +404,7 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
         is_upload: false,
         is_stdin_upload: false,
         upload_filename: None,
+        inline_cookies: Vec::new(),
     };
 
     let mut i = 1;
@@ -667,9 +670,9 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
             "--digest" => {
                 opts.use_digest = true;
             }
-            "--proxy-user" => {
+            "-U" | "--proxy-user" => {
                 i += 1;
-                let val = require_arg(args, i, "--proxy-user")?;
+                let val = require_arg(args, i, "-U")?;
                 let (user, pass) =
                     if let Some((u, p)) = val.split_once(':') { (u, p) } else { (val, "") };
                 opts.proxy_user = Some((user.to_string(), pass.to_string()));
@@ -807,20 +810,19 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
             "-b" | "--cookie" => {
                 i += 1;
                 let val = require_arg(args, i, "-b")?;
-                // If the value looks like a file path (contains no = and exists on disk), load from file
-                if !val.contains('=') && std::path::Path::new(val).exists() {
+                // "-b none" or "-b ''" enables the cookie engine without sending cookies
+                if val == "none" || val.is_empty() {
+                    opts.easy.cookie_jar(true);
+                } else if !val.contains('=') && std::path::Path::new(val).exists() {
+                    // File path: load cookies from cookie file
                     if let Err(e) = opts.easy.cookie_file(val) {
                         eprintln!("urlx: error reading cookie file '{val}': {e}");
                         return None;
                     }
                 } else {
-                    // Parse inline cookie string: split on ';', trim, rejoin with '; '
-                    // curl sends "Cookie: a=1; b=2; c=3" from "-b 'a=1;b=2; c=3'"
+                    // Inline cookie string: accumulate verbatim for later joining
                     opts.easy.cookie_jar(true);
-                    let cookies: Vec<&str> =
-                        val.split(';').map(str::trim).filter(|c| !c.is_empty()).collect();
-                    let cookie_header = cookies.join("; ");
-                    opts.easy.header("Cookie", &cookie_header);
+                    opts.inline_cookies.push(val.to_string());
                 }
             }
             "--data-binary" => {
@@ -1050,9 +1052,14 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
                 match contents_result {
                     Ok(contents) => {
                         let config_args = parse_config_file(&contents);
+                        // Re-parse with: args before -K, config args, args after -K
                         let mut full_args = vec!["urlx".to_string()];
+                        // Include CLI args that came before -K (skip program name at [0])
+                        for arg in args.iter().take(i - 1).skip(1) {
+                            full_args.push(arg.clone());
+                        }
                         full_args.extend(config_args);
-                        // Re-parse with the remaining CLI args
+                        // Include CLI args that came after -K <value>
                         for arg in args.iter().skip(i + 1) {
                             full_args.push(arg.clone());
                         }
@@ -1557,6 +1564,12 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
         }
     }
 
+    // Apply accumulated inline cookies as a single Cookie header
+    if !opts.inline_cookies.is_empty() {
+        let cookie_header = opts.inline_cookies.join("; ");
+        opts.easy.header("Cookie", &cookie_header);
+    }
+
     Some(opts)
 }
 
@@ -1688,16 +1701,49 @@ pub fn parse_config_file(contents: &str) -> Vec<String> {
     args
 }
 
-/// Remove surrounding quotes from a config file value.
+/// Remove surrounding quotes from a config file value and process escape sequences.
+///
+/// Double-quoted strings process `\t`, `\n`, `\r`, `\\`, `\"`.
+/// Single-quoted strings are returned as-is (no escape processing).
 pub fn unquote(s: &str) -> String {
     let bytes = s.as_bytes();
-    if bytes.len() >= 2
-        && ((bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"')
-            || (bytes[0] == b'\'' && bytes[bytes.len() - 1] == b'\''))
-    {
-        return s[1..s.len() - 1].to_string();
+    if bytes.len() >= 2 {
+        if bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"' {
+            // Double-quoted: process escape sequences
+            let inner = &s[1..s.len() - 1];
+            return unescape(inner);
+        }
+        if bytes[0] == b'\'' && bytes[bytes.len() - 1] == b'\'' {
+            // Single-quoted: no escape processing
+            return s[1..s.len() - 1].to_string();
+        }
     }
-    s.to_string()
+    // Unquoted: also process escape sequences (curl config behavior)
+    unescape(s)
+}
+
+/// Process backslash escape sequences in a string (curl config file convention).
+fn unescape(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('t') => result.push('\t'),
+                Some('n') => result.push('\n'),
+                Some('r') => result.push('\r'),
+                Some('\\') | None => result.push('\\'),
+                Some('"') => result.push('"'),
+                Some(other) => {
+                    result.push('\\');
+                    result.push(other);
+                }
+            }
+        } else {
+            result.push(c);
+        }
+    }
+    result
 }
 
 /// Helper to require an argument value for an option flag.
