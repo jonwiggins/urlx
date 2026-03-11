@@ -575,7 +575,9 @@ pub fn run(args: &[String]) -> ExitCode {
 /// Matches curl's exit code conventions for the most common errors.
 pub fn error_to_exit_code(err: &liburlx::Error) -> ExitCode {
     match err {
-        liburlx::Error::UrlParse(_) => ExitCode::from(3),
+        liburlx::Error::UrlParse(_) => ExitCode::from(3), // CURLE_URL_MALFORMAT
+        liburlx::Error::UnsupportedProtocol(_) => ExitCode::from(1), // CURLE_UNSUPPORTED_PROTOCOL
+        liburlx::Error::DnsResolve(_) => ExitCode::from(6), // CURLE_COULDNT_RESOLVE_HOST
         liburlx::Error::Connect(io_err) => {
             match io_err.kind() {
                 // DNS resolution failure
@@ -908,6 +910,18 @@ mod tests {
     fn error_to_exit_code_http_unsupported_protocol() {
         let err = liburlx::Error::Http("unsupported protocol".to_string());
         assert_eq!(error_to_exit_code(&err), ExitCode::from(1));
+    }
+
+    #[test]
+    fn error_to_exit_code_unsupported_protocol_variant() {
+        let err = liburlx::Error::UnsupportedProtocol("gopher".to_string());
+        assert_eq!(error_to_exit_code(&err), ExitCode::from(1));
+    }
+
+    #[test]
+    fn error_to_exit_code_dns_resolve() {
+        let err = liburlx::Error::DnsResolve("nonexistent.example.com".to_string());
+        assert_eq!(error_to_exit_code(&err), ExitCode::from(6));
     }
 
     #[test]

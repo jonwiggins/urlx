@@ -2510,7 +2510,10 @@ async fn do_single_request(
         "ws" | "wss" => {
             return crate::protocol::ws::connect(url, headers, tls_config).await;
         }
-        _ => {}
+        "http" | "https" => {}
+        scheme => {
+            return Err(Error::UnsupportedProtocol(scheme.to_string()));
+        }
     }
 
     let (host, port) = url.host_and_port()?;
@@ -3122,7 +3125,9 @@ async fn do_single_request(
             let request_target = if let Some(target) = custom_request_target {
                 target.to_string()
             } else if proxy.is_some() && !is_socks_proxy {
-                url.as_str().to_string()
+                // Strip fragment from proxy request URL (curl behavior)
+                let full = url.as_str();
+                full.split_once('#').map_or_else(|| full.to_string(), |(base, _)| base.to_string())
             } else if path_as_is {
                 extract_path_and_query(url.as_str())
             } else {
@@ -3169,7 +3174,7 @@ async fn do_single_request(
             resp.set_transfer_info(info);
             resp
         }
-        scheme => return Err(Error::Http(format!("unsupported scheme: {scheme}"))),
+        scheme => return Err(Error::UnsupportedProtocol(scheme.to_string())),
     };
 
     maybe_decompress(response, accept_encoding)

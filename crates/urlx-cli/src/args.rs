@@ -419,6 +419,8 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
                 if opts.easy.method_is_default() {
                     opts.easy.method("POST");
                 }
+                // Auto-add Content-Type for form data (curl behavior)
+                opts.easy.header("Content-Type", "application/x-www-form-urlencoded");
             }
             "--data-raw" => {
                 i += 1;
@@ -427,6 +429,7 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
                 if opts.easy.method_is_default() {
                     opts.easy.method("POST");
                 }
+                opts.easy.header("Content-Type", "application/x-www-form-urlencoded");
             }
             "--data-ascii" => {
                 i += 1;
@@ -435,6 +438,7 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
                 if opts.easy.method_is_default() {
                     opts.easy.method("POST");
                 }
+                opts.easy.header("Content-Type", "application/x-www-form-urlencoded");
             }
             "-L" | "--location" => {
                 opts.easy.follow_redirects(true);
@@ -755,9 +759,13 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
                         return None;
                     }
                 } else {
-                    // Treat as inline cookie string
+                    // Parse inline cookie string: split on ';', trim, rejoin with '; '
+                    // curl sends "Cookie: a=1; b=2; c=3" from "-b 'a=1;b=2; c=3'"
                     opts.easy.cookie_jar(true);
-                    opts.easy.header("Cookie", val);
+                    let cookies: Vec<&str> =
+                        val.split(';').map(str::trim).filter(|c| !c.is_empty()).collect();
+                    let cookie_header = cookies.join("; ");
+                    opts.easy.header("Cookie", &cookie_header);
                 }
             }
             "--data-binary" => {
