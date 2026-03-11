@@ -272,9 +272,9 @@ pub fn run(args: &[String]) -> ExitCode {
                 Ok(urls) => expanded.extend(urls),
                 Err(e) => {
                     if !opts.silent || opts.show_error {
-                        eprintln!("urlx: glob error: {e}");
+                        eprintln!("urlx: {e}");
                     }
-                    return ExitCode::FAILURE;
+                    return ExitCode::from(3); // CURLE_URL_MALFORMAT
                 }
             }
         }
@@ -330,7 +330,7 @@ pub fn run(args: &[String]) -> ExitCode {
             if !opts.silent || opts.show_error {
                 eprintln!("urlx: error parsing URL: {e}");
             }
-            return ExitCode::FAILURE;
+            return ExitCode::from(3); // CURLE_URL_MALFORMAT
         }
 
         // --netrc: load credentials from .netrc file for this URL

@@ -74,26 +74,8 @@ where
         req.push_str("Accept: */*\r\n");
     }
 
-    // Add custom headers (deduplicate: last header with same name wins)
-    {
-        let mut seen: Vec<String> = Vec::new();
-        let mut keep = vec![true; custom_headers.len()];
-        for i in (0..custom_headers.len()).rev() {
-            let name_lower = custom_headers[i].0.to_lowercase();
-            if seen.iter().any(|s| s.eq_ignore_ascii_case(&name_lower)) {
-                keep[i] = false;
-            } else {
-                seen.push(name_lower);
-            }
-        }
-        for (i, (name, value)) in custom_headers.iter().enumerate() {
-            if keep[i] {
-                let _ = write!(req, "{name}: {value}\r\n");
-            }
-        }
-    }
-
-    // Add Content-Length or Transfer-Encoding for bodies
+    // Add Content-Length or Transfer-Encoding for bodies (before custom headers,
+    // matching curl's header order: Content-Length comes before Content-Type)
     let has_content_length =
         custom_headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("content-length"));
     let has_transfer_encoding =
@@ -111,6 +93,25 @@ where
     }
     if use_expect {
         req.push_str("Expect: 100-continue\r\n");
+    }
+
+    // Add custom headers (deduplicate: last header with same name wins)
+    {
+        let mut seen: Vec<String> = Vec::new();
+        let mut keep = vec![true; custom_headers.len()];
+        for i in (0..custom_headers.len()).rev() {
+            let name_lower = custom_headers[i].0.to_lowercase();
+            if seen.iter().any(|s| s.eq_ignore_ascii_case(&name_lower)) {
+                keep[i] = false;
+            } else {
+                seen.push(name_lower);
+            }
+        }
+        for (i, (name, value)) in custom_headers.iter().enumerate() {
+            if keep[i] {
+                let _ = write!(req, "{name}: {value}\r\n");
+            }
+        }
     }
 
     // Connection management — HTTP/1.0 always closes
@@ -1994,7 +1995,8 @@ mod tests {
             let n = server.read(&mut buf).await.unwrap();
             let req = String::from_utf8_lossy(&buf[..n]).to_string();
 
-            // Verify exact order: Host, User-Agent, Accept, Content-Type, Content-Length
+            // Verify exact order: Host, User-Agent, Accept, Content-Length, Content-Type
+            // (curl sends Content-Length before Content-Type)
             let host_pos = req.find("Host:").unwrap();
             let ua_pos = req.find("User-Agent:").unwrap();
             let accept_pos = req.find("Accept:").unwrap();
@@ -2002,8 +2004,8 @@ mod tests {
             let cl_pos = req.find("Content-Length:").unwrap();
             assert!(host_pos < ua_pos, "Host < User-Agent");
             assert!(ua_pos < accept_pos, "User-Agent < Accept");
-            assert!(accept_pos < ct_pos, "Accept < Content-Type (custom)");
-            assert!(ct_pos < cl_pos, "Content-Type < Content-Length");
+            assert!(accept_pos < cl_pos, "Accept < Content-Length");
+            assert!(cl_pos < ct_pos, "Content-Length < Content-Type (custom)");
 
             let response = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
             server.write_all(response).await.unwrap();

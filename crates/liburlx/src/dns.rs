@@ -32,7 +32,7 @@ impl DnsResolver {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Connect`] if DNS resolution fails.
+    /// Returns [`Error::DnsResolve`] if DNS resolution fails.
     pub async fn resolve(&self, host: &str, port: u16) -> Result<Vec<SocketAddr>, Error> {
         match self {
             Self::System => system_resolve(host, port).await,
@@ -45,12 +45,13 @@ impl DnsResolver {
 /// Resolve using the system DNS resolver (`tokio::net::lookup_host`).
 async fn system_resolve(host: &str, port: u16) -> Result<Vec<SocketAddr>, Error> {
     let addr_str = format!("{host}:{port}");
-    let addrs: Vec<SocketAddr> =
-        tokio::net::lookup_host(&addr_str).await.map_err(Error::Connect)?.collect();
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host(&addr_str)
+        .await
+        .map_err(|e| Error::DnsResolve(format!("Could not resolve host: {host} ({e})")))?
+        .collect();
     if addrs.is_empty() {
-        return Err(Error::Connect(std::io::Error::new(
-            std::io::ErrorKind::AddrNotAvailable,
-            format!("DNS resolution failed for {host}"),
+        return Err(Error::DnsResolve(format!(
+            "Could not resolve host: {host} (no addresses returned)"
         )));
     }
     Ok(addrs)
@@ -124,12 +125,11 @@ impl HickoryResolver {
             .resolver
             .lookup_ip(host)
             .await
-            .map_err(|e| Error::Connect(std::io::Error::other(e)))?;
+            .map_err(|e| Error::DnsResolve(format!("Could not resolve host: {host} ({e})")))?;
         let addrs: Vec<SocketAddr> = response.iter().map(|ip| SocketAddr::new(ip, port)).collect();
         if addrs.is_empty() {
-            return Err(Error::Connect(std::io::Error::new(
-                std::io::ErrorKind::AddrNotAvailable,
-                format!("DNS resolution failed for {host}"),
+            return Err(Error::DnsResolve(format!(
+                "Could not resolve host: {host} (no addresses returned)"
             )));
         }
         Ok(addrs)
