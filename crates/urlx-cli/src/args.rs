@@ -809,7 +809,7 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
                     return None;
                 }
             }
-            "--http1.0" => {
+            "-0" | "--http1.0" => {
                 opts.easy.http_version(liburlx::HttpVersion::Http10);
             }
             "--http1.1" => {

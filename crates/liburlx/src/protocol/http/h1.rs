@@ -63,6 +63,28 @@ where
     // Build the request line
     let mut req = format!("{method} {request_target} {http_ver}\r\nHost: {host}\r\n");
 
+    // Deduplicate custom headers (last header with same name wins)
+    let mut seen: Vec<String> = Vec::new();
+    let mut keep = vec![true; custom_headers.len()];
+    for i in (0..custom_headers.len()).rev() {
+        let name_lower = custom_headers[i].0.to_lowercase();
+        if seen.iter().any(|s| s.eq_ignore_ascii_case(&name_lower)) {
+            keep[i] = false;
+        } else {
+            seen.push(name_lower);
+        }
+    }
+
+    // Headers that curl emits before User-Agent (priority headers)
+    let priority_headers: &[&str] = &["authorization", "proxy-authorization", "range", "cookie"];
+
+    // Emit priority custom headers right after Host (curl compat order)
+    for (i, (name, value)) in custom_headers.iter().enumerate() {
+        if keep[i] && priority_headers.iter().any(|p| name.eq_ignore_ascii_case(p)) {
+            let _ = write!(req, "{name}: {value}\r\n");
+        }
+    }
+
     // Add default headers if not overridden
     let has_user_agent = custom_headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("user-agent"));
     if !has_user_agent {
@@ -74,7 +96,7 @@ where
         req.push_str("Accept: */*\r\n");
     }
 
-    // Add Content-Length or Transfer-Encoding for bodies (before custom headers,
+    // Add Content-Length or Transfer-Encoding for bodies (before remaining custom headers,
     // matching curl's header order: Content-Length comes before Content-Type)
     let has_content_length =
         custom_headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("content-length"));
@@ -95,27 +117,16 @@ where
         req.push_str("Expect: 100-continue\r\n");
     }
 
-    // Add custom headers (deduplicate: last header with same name wins)
-    {
-        let mut seen: Vec<String> = Vec::new();
-        let mut keep = vec![true; custom_headers.len()];
-        for i in (0..custom_headers.len()).rev() {
-            let name_lower = custom_headers[i].0.to_lowercase();
-            if seen.iter().any(|s| s.eq_ignore_ascii_case(&name_lower)) {
-                keep[i] = false;
-            } else {
-                seen.push(name_lower);
-            }
-        }
-        for (i, (name, value)) in custom_headers.iter().enumerate() {
-            if keep[i] {
-                let _ = write!(req, "{name}: {value}\r\n");
-            }
+    // Emit remaining custom headers (non-priority)
+    for (i, (name, value)) in custom_headers.iter().enumerate() {
+        if keep[i] && !priority_headers.iter().any(|p| name.eq_ignore_ascii_case(p)) {
+            let _ = write!(req, "{name}: {value}\r\n");
         }
     }
 
-    // Connection management — HTTP/1.0 always closes
-    if !keep_alive || use_http10 {
+    // Connection management — only send Connection: close for HTTP/1.1 non-keepalive.
+    // HTTP/1.0 defaults to close, so omit it (curl compat).
+    if !keep_alive && !use_http10 {
         req.push_str("Connection: close\r\n");
     }
 
@@ -1273,7 +1284,11 @@ mod tests {
             let n = server.read(&mut buf).await.unwrap();
             let req = String::from_utf8_lossy(&buf[..n]);
             assert!(req.starts_with("GET /test HTTP/1.0\r\n"), "expected HTTP/1.0: {req}");
-            assert!(req.contains("Connection: close"), "HTTP/1.0 should have Connection: close");
+            // HTTP/1.0 defaults to close, so no explicit Connection: close needed (curl compat)
+            assert!(
+                !req.contains("Connection: close"),
+                "HTTP/1.0 should not send redundant Connection: close"
+            );
 
             let response = b"HTTP/1.0 200 OK\r\nContent-Length: 5\r\n\r\nhello";
             server.write_all(response).await.unwrap();
