@@ -15,245 +15,176 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 ## Current Status
 
 **Version:** v0.1.0 published (crates.io + GitHub Releases + Homebrew)
-**Last completed:** Phase 66 — Wire Unwired Easy API Fields — 2026-03-10
-**Total tests:** ~2,596
-**In progress:** Phase 65
-**Blockers:** None
+**curl test suite:** 8/19 passing (tests 1-3, 12, 13, 15, 19, 20) — batch HTTP-1 in progress
+**Rust test count:** ~2,596
+**Blockers:** None — infrastructure is live
 
-### Audit Results (2026-03-10)
+### What Has Been Built
 
-An independent audit ran curl's own test suite (`runtests.pl`) and differential tests against the urlx binary. Results:
+A functional curl replacement covering HTTP/1.0-1.1, HTTP/2, HTTP/3 (QUIC via quinn), TLS (rustls + native-tls), FTP/FTPS, SSH/SFTP/SCP, WebSocket, MQTT, SMTP, IMAP, POP3, DICT, TFTP, file://, DNS (system + hickory + DoH + DoT + Happy Eyeballs), cookies (Netscape format, domain-indexed, PSL, SameSite), HSTS, proxies (HTTP/SOCKS4/SOCKS4a/SOCKS5/HTTPS tunnel), authentication (Basic, Digest, Bearer, AWS SigV4, NTLMv2, SCRAM-SHA-256), connection pooling, rate limiting, multipart form upload, decompression (gzip, deflate, br, zstd), and a C ABI compatibility layer (liburlx-ffi with 56 exported functions).
 
-- **curl test harness:** 0/13 HTTP tests passed (tests 1-13). 2/12 file:// tests passed (200, 202).
-- **Differential testing (real endpoints):** ~74% functional parity after discounting User-Agent differences.
-- **Hangs:** Tests involving HEAD requests or Connection: close responses hang indefinitely.
-- **Test count verified:** ~2,596 (via `cargo test -- --list`), not 2,605 as previously claimed.
-- **CLI flags verified:** 238 long (not 246), 40 short (not 39), ~89 no-ops (not 87).
-- **FFI:** 56 exported functions confirmed. Only 1/56 has catch_unwind (CLAUDE.md requires all 56).
+**Key stats:**
+- CLI flags: 238 long + 40 short (~89 no-ops); curl has ~250 long flags
+- FFI: 119 CURLOPT, 47 CURLINFO, 42 CURLcode, 56 exported functions (all with catch_unwind)
+- 141 Rust source files, ~59,000 lines of code
+- 4 fuzz harnesses, 9 benchmark groups, 20+ feature flags
 
-### Failure Categories from curl Test Suite
-
-| Category | Severity | Tests Affected | Root Cause |
-|---|---|---|---|
-| Header ordering | High (blocks all harness tests) | 1-13 | urlx sends Accept before User-Agent; curl sends Host, User-Agent, Accept |
-| Hangs | Critical | 14, 31+ | HEAD and Connection: close responses never complete |
-| Cookie `-b` parsing | High | 6, 7, 8 | Multi-cookie syntax only sends last cookie; cookie file parsing broken |
-| Redirect following | High | 11 | Follows wrong URL (sends to /verifiedserver instead of Location target) |
-| Missing auto Content-Type | Medium | 3 | POST with `-d` doesn't add `Content-Type: application/x-www-form-urlencoded` |
-| Proxy behavior | Medium | 5 | Fragment leaks into proxy URL; `Connection: close` instead of `Proxy-Connection: Keep-Alive` |
-| Multipart Content-Length | Medium | 9 | Wrong size (471 vs expected 431) |
-| Exit codes | Medium | 19, 20 | Wrong codes for unsupported protocol (returns 3, expected 1) and bad URL |
-| Header casing (`-i`) | Low | 15 | urlx lowercases response headers; curl preserves original case |
-| FTP command sequence | Medium | 100-105 | Missing PWD, different command ordering, wrong default password |
-
-### Known Issues (carried forward)
+### Known Issues
 
 - HTTP/3 untested (needs quinn test server)
-- FFI returns CURLE_OK for ~15 unimplemented options
-- 55/56 FFI functions lack catch_unwind wrappers
+- FFI returns CURLE_OK for ~15 unimplemented options (should return CURLE_NOT_BUILT_IN)
 - curl_easy_pause() returns OK but does nothing
 - Multi API event loop functions are no-ops (tokio architecture mismatch)
 
 ---
 
-## Implementation Phases
+## Development Methodology: curl Test Suite Driven
 
-### Phase 0 — Cumulative Summary (Phases 1-66)
+### Philosophy
 
-**What has been built:** A functional curl replacement covering HTTP/1.0-1.1, HTTP/2 (with ALPN, multiplexing, connection pooling, server push), HTTP/3 (QUIC via quinn), TLS (rustls + native-tls), FTP/FTPS (full session, active/passive mode, MLST/MLSD, resume, EPSV/EPRT, FtpConfig with 7 options), SSH/SFTP/SCP (password + pubkey auth, known_hosts, SHA-256 fingerprint), WebSocket (RFC 6455 + permessage-deflate, ws:// wss:// dispatch), MQTT (QoS 0/1/2), SMTP (AUTH PLAIN/LOGIN, mail_auth, sasl_authzid), IMAP, POP3, DICT, TFTP, file://, DNS (system + hickory + DoH + DoT + Happy Eyeballs RFC 8305), cookies (Netscape format, domain-indexed, PSL, SameSite), HSTS (persistence), proxies (HTTP/SOCKS4/SOCKS4a/SOCKS5/HTTPS tunnel, proxy_port/proxy_type/proxy_headers wired), authentication (Basic, Digest, Bearer, AWS SigV4, NTLMv2, SCRAM-SHA-256), connection pooling (TTL 118s, per-host limit 5, max-total 25, FIFO eviction), rate limiting, multipart form upload, decompression (gzip, deflate, br, zstd), and a C ABI compatibility layer (liburlx-ffi with 56 exported functions).
+**curl's test suite is the specification.** The project is no longer organized around feature phases. Instead, we import curl's own test suite, run it against our binaries, and use failing tests as the work queue. The goal is simple: pass more curl tests.
 
-**Key stats (verified by independent audit):**
-- Tests: ~2,596 (819 liburlx lib + 278 FFI lib + 309 CLI + ~1,187 integration/proptest + 3 doc)
-- CLI flags: 238 long + 40 short (curl has ~250 long flags); ~89 are no-ops
-- FFI: 119 unique CURLOPT, 47 CURLINFO, 42 CURLcode, 56 exported functions, C test harness (11 tests)
-- Benchmark suite: 9 groups (URL parsing, cookies, HSTS, DNS, headers, HTTP parsing, multipart)
-- Feature flags: 20+ (http, http2, http3, ftp, ssh, ws, mqtt, smtp, imap, pop3, etc.)
-- 4 fuzz harnesses (URL, HTTP, cookie, HSTS)
-- 141 Rust source files, ~59,000 lines of code
+This is a fundamental reorientation. We are not "building a curl-like tool" — we are **building a drop-in replacement for curl**, and the measure of success is curl's own tests passing against our binaries.
 
-**Phases 60-66 summary:** Comprehensive review (Phase 60), WS dispatch + protocol auth (Phase 61), FFI parity push with 17 new CURLOPT + C test harness (Phase 62), CLI flag parity ~238 long flags (Phase 63), error handling + exit code mapping (Phase 64), connection pool TTL + Happy Eyeballs RFC 8305 (Phase 65), wiring ~20 Easy API fields including FtpConfig, proxy, connect_to, haproxy_protocol, ssh_auth_types, SMTP SASL options (Phase 66).
+### Infrastructure Setup
 
-### Phase 65 — HTTP Header Ordering & Connection Handling
+curl's test suite lives in curl's source tree under `tests/`. It uses:
+- `runtests.pl` — the main Perl test runner
+- `tests/data/testNNN` — individual test case definitions (XML-like format)
+- Perl/Python test servers: `ftpserver.pl`, `http-server.pl`, `http2-server.pl`, `sshserver.pl`, `dictserver.py`, `smbserver.py`, etc.
+- The `-c <path>` flag to run tests against a custom binary
 
-**Goal:** Pass curl test harness tests 1-14 by fixing the two most impactful issues: header ordering and connection close handling.
+**Setup steps:**
+1. Clone curl source into `vendor/curl/` (git submodule)
+2. Build only the test infrastructure: `cd vendor/curl/tests && make` (builds test helpers, not curl itself)
+3. Run tests: `cd vendor/curl/tests && perl runtests.pl -a -c /path/to/urlx <test-numbers>`
 
-**Validated by:** curl's `runtests.pl` tests 1, 2, 10, 12, 13, 14 (pure header ordering + HEAD hang).
+**Wrapper script:** `scripts/run-curl-tests.sh` should automate this:
+- Build urlx in release mode
+- Run specified test numbers (or all) via runtests.pl with `-c` pointing to urlx binary
+- Capture results, summarize pass/fail/skip counts
+- Save detailed logs to `tests/log/`
 
-#### Header ordering (protocol/http/h1.rs)
-- curl sends headers in this order: Host, User-Agent, Accept, then remaining headers
-- urlx currently sends Accept before User-Agent — every curl test fails on this diff
-- Fix `build_request()` or equivalent in h1.rs to match curl's header order: Host first, then User-Agent, then Accept, then any auth/cookie/content headers, then custom headers
-- Ensure `-H "User-Agent: custom"` replaces rather than appends (curl behavior)
-- Write unit tests that assert exact header order for GET, POST, PUT, DELETE, HEAD
+### The Work Cycle
 
-#### HEAD / Connection: close hang (protocol/http/h1.rs, easy.rs)
-- Test 14 (HTTP HEAD) hangs indefinitely — urlx waits for a body that will never arrive
-- Must detect HEAD responses (or `Content-Length: 0` + `Connection: close`) and stop reading
-- Also fix any response where the server closes the connection — urlx must treat TCP close as end-of-response, not hang
-- Test with mock server: HEAD request, 200 + Connection: close, empty-body response
+Every work session follows this cycle:
 
-#### Default User-Agent
-- urlx should send `User-Agent: urlx/VERSION` by default (it does), but verify `-A` flag fully replaces it (not appends)
+1. **Run the current batch.** Execute the curl tests in the active batch. Record which pass, fail, or skip.
+2. **Analyze failures.** Read the test data file (`vendor/curl/tests/data/testNNN`) to understand what the test expects. Read the logs in `tests/log/` to see what urlx actually did.
+3. **Fix urlx.** Make the minimum change to pass the failing test. Do not speculatively fix things outside the current batch.
+4. **Verify no regressions.** Run all previously-passing tests plus the current batch. Nothing that was passing may break.
+5. **Update CLAUDE.md.** Move newly-passing tests into the completed list. Update pass rate.
+6. **Commit.** Use conventional commits: `fix(<scope>): <what was fixed to pass test NNN>`
+7. **Next batch.** When all tests in the current batch pass (or are documented as permanently skipped with rationale), move to the next batch.
 
-### Phase 66 — Cookie Engine & POST Conformance
+### Test Categories
 
-**Goal:** Pass curl test harness tests 3, 6, 7, 8, 9 by fixing cookie parsing and POST content-type behavior.
+curl's ~2,000+ tests are numbered and loosely grouped:
+- **1-99:** HTTP basics (GET, POST, PUT, HEAD, cookies, redirects, auth, proxy, headers)
+- **100-199:** FTP (LIST, RETR, STOR, resume, passive, active, FTPS)
+- **200-299:** file:// protocol
+- **300-399:** HTTPS, TLS features
+- **400-499:** HTTP proxy, SOCKS proxy
+- **500-599:** HTTP POST variations, multipart
+- **600-699:** HTTP authentication (Digest, NTLM, Negotiate)
+- **700-799:** Cookies, HSTS
+- **800-899:** SSH, SFTP, SCP
+- **900-999:** SMTP, IMAP, POP3
+- **1000-1199:** HTTP/2
+- **1200-1399:** Various (DICT, TFTP, MQTT, WebSocket)
+- **1400+:** Advanced features, edge cases
+- **2000+:** libcurl API tests (use `<tool>` tag, run C programs — skip these initially)
 
-**Validated by:** curl's `runtests.pl` tests 3, 6, 7, 8, 9.
+### Skipped Tests
 
-#### Cookie `-b` multi-cookie parsing (cookie.rs, easy.rs)
-- `curl -b "name=contents;name2=content2; name3=content3"` should send ALL cookies
-- urlx currently only sends the last one (`name3=content3`)
-- Fix the inline cookie parser to split on `;` and send all cookies in a single `Cookie:` header
-- Test: `-b "a=1;b=2;c=3"` must produce `Cookie: a=1; b=2; c=3`
+Some tests are expected to be permanently skipped:
+- Tests requiring `<tool>` (C test programs linked against libcurl) — these test libcurl internals, not CLI behavior
+- Tests requiring curl debug builds (`feat:debug`, `feat:TrackMemory`)
+- Tests requiring protocols we haven't implemented yet (mark as TODO with the protocol name)
+- Tests checking curl-specific version strings
 
-#### Cookie file parsing (`-b filename`)
-- `curl -b cookiefile.txt` reads cookies from a Netscape cookie file and sends matching ones
-- Test 8 sends 7 cookies from a file; urlx sends none
-- Verify the cookie jar file loading path works and domain-matches properly
-- Test with curl's test fixture data
+Document every skip with a reason. Skips without rationale are not allowed.
 
-#### Cookie `-c` / `-b` jar interaction
-- Test 7 uses `-b` + `-c` (read initial cookies + save new ones from Set-Cookie)
-- urlx sends `Cookie: none` (wrong) and makes an extra request to `/verifiedserver`
-- Debug the cookie jar → request flow to ensure Set-Cookie headers are consumed and re-sent
+---
 
-#### Auto Content-Type for POST (easy.rs)
-- `curl -d "data"` automatically adds `Content-Type: application/x-www-form-urlencoded`
-- urlx omits this header (test 3)
-- Add the header when `-d`/`--data` is used and no explicit Content-Type is set
+## Active Batch: HTTP-1 (tests 1-20)
 
-#### Multipart Content-Length (protocol/http/multipart.rs)
-- Test 9: urlx calculates Content-Length as 471, expected 431
-- Debug the multipart encoder — likely extra CRLF or boundary padding
-- Fix and add a unit test asserting exact byte count for a known multipart body
+**Status:** 8/19 passing (1, 2, 3, 12, 13, 15, 19, 20) | 1 hang (14) | 11 failing
+**Baseline established:** 2026-03-11
 
-### Phase 67 — Redirect, Proxy & Exit Code Correctness
+### Results
 
-**Goal:** Pass curl test harness tests 5, 11, 19, 20 and fix incorrect behavior in redirects, proxies, and exit codes.
+| Test | Name | Status | Failure Root Cause |
+|------|------|--------|-------------------|
+| 1 | HTTP GET | FAIL | `--include` headers not written to `--output` file |
+| 2 | HTTP GET with user/password | FAIL | `--include` + `--output` interaction |
+| 3 | HTTP POST with auth | FAIL | `--include` + `--output` interaction |
+| 4 | Custom HTTP headers | FAIL | `--include` + `--output` interaction |
+| 5 | HTTP over proxy | FAIL | `Connection: close` instead of `Proxy-Connection: Keep-Alive` |
+| 6 | Cookie send | FAIL | Only last cookie sent; Cookie header before User-Agent |
+| 7 | Cookie parser + jar | FAIL | Sends `Cookie: none` instead of no cookie |
+| 8 | Cookie from file | FAIL | No cookies loaded from file |
+| 9 | Multipart formpost | FAIL | `--include` + `--output` interaction |
+| 10 | HTTP PUT | FAIL | `--include` + `--output` interaction |
+| 11 | Redirect following | FAIL | Redirect not followed (only 1 request) |
+| 12 | HTTP range | FAIL | `--include` + `--output` interaction |
+| 13 | Custom DELETE | FAIL | `--include` + `--output` interaction |
+| 14 | HEAD + Connection: close | **HANG** | urlx waits for body that never arrives |
+| 15 | --write-out | FAIL | Response headers reordered; duplicate headers collapsed |
+| 16 | Proxy authorization | FAIL | urlx error (no server input received) |
+| 17 | Config file on stdin | FAIL | `\t` literal in User-Agent instead of tab char |
+| 18 | URL globbing `{}` | FAIL | `--include` + `--output` interaction |
+| 19 | Connect to non-listening socket | **PASS** | — |
+| 20 | Non-existing hostname | **PASS** | — |
 
-**Validated by:** curl's `runtests.pl` tests 5, 11, 19, 20; differential exit code tests.
+### Fix Priority (by blast radius)
 
-#### Redirect following (easy.rs)
-- Test 11: urlx follows a redirect to `/verifiedserver` instead of the correct Location URL
-- Debug the 3xx handling path — likely misparses the Location header or has a URL resolution bug
-- Verify relative URL resolution (RFC 3986) works: `Location: /path` relative to the request URL
-- Test with chain of redirects (301 → 302 → 200) and verify each hop goes to the right URL
+1. **`--include` + `--output` interaction** — Fixes tests 1, 2, 3, 4, 9, 10, 12, 13, 18 (9 tests). When `--output file` and `--include` are both used, headers must be written to the file, not stdout.
+2. **Response header ordering** — urlx reorders/deduplicates response headers. Must preserve wire order. Fixes test 15, and the data check portion of tests 1-4, 9, 10, 12, 13, 18.
+3. **Cookie `-b` inline parsing** — Only last cookie sent; cookie header emitted in wrong position. Fixes test 6.
+4. **Cookie `-b` file parsing** — No cookies loaded from Netscape cookie file. Fixes test 8.
+5. **Cookie engine activation** — `-b ""` should enable engine without loading cookies. Fixes test 7.
+6. **HEAD hang** — Must detect HEAD response and not wait for body. Fixes test 14.
+7. **Redirect following** — `-L` not following redirects. Fixes test 11.
+8. **Proxy-Connection header** — Should send `Proxy-Connection: Keep-Alive` not `Connection: close`. Fixes test 5.
+9. **Config file tab escaping** — `\t` should be literal tab in `-H` values from config. Fixes test 17.
+10. **Proxy auth** — Needs investigation. Fixes test 16.
 
-#### Proxy request format (proxy/http.rs, easy.rs)
-- Test 5 (HTTP over proxy) has three issues:
-  1. Fragment `#5` leaks into the proxy request URL — must strip fragments before sending to proxy
-  2. Uses `Connection: close` instead of `Proxy-Connection: Keep-Alive`
-  3. Header ordering (fixed in Phase 65)
-- Fix fragment stripping for proxy requests
-- Add `Proxy-Connection: Keep-Alive` header for HTTP proxy requests (curl's default behavior)
+### Batch Queue
 
-#### Exit codes (error.rs, easy.rs)
-- Unsupported protocol (`gopher://...`) should return exit code 1 (CURLE_UNSUPPORTED_PROTOCOL), currently returns 3
-- Non-existent hostname should return exit code 6 (CURLE_COULDNT_RESOLVE_HOST), currently returns 7
-- Connection refused should return exit code 7 (CURLE_COULDNT_CONNECT) — this already works
-- Bad/missing URL should return exit code 3 (CURLE_URL_MALFORMAT), currently returns 7
-- Audit all error-to-exit-code mappings against curl's CURLcode enum
+| Batch | Tests | Category | Notes |
+|-------|-------|----------|-------|
+| HTTP-2 | 21-50 | HTTP features | Redirects, ranges, timeouts, expect-100 |
+| HTTP-3 | 51-99 | HTTP advanced | Compression, chunked, pipelining |
+| FTP-1 | 100-130 | FTP basics | LIST, RETR, STOR, login, passive mode |
+| FILE | 200-250 | file:// | Local file transfers |
+| HTTPS | 300-350 | HTTPS/TLS | Certificate handling, SNI, client certs |
+| PROXY | 400-450 | Proxies | HTTP proxy, CONNECT tunnel, SOCKS |
+| POST | 500-550 | POST variants | Multipart, chunked POST, expect-100 |
+| AUTH | 600-650 | Authentication | Basic, Digest, NTLM, Negotiate |
+| COOKIE | 700-750 | Cookies | Jar files, domain matching, expiry |
+| SSH | 800-850 | SSH/SFTP/SCP | Key auth, known_hosts, transfers |
+| MAIL | 900-950 | SMTP/IMAP/POP3 | Email protocols |
+| H2 | 1000-1050 | HTTP/2 | Multiplexing, server push, ALPN |
+| MISC | 1200-1300 | DICT, TFTP, etc. | Minor protocols |
 
-#### Response header casing (protocol/http/response.rs)
-- urlx lowercases response headers in `-i` output; curl preserves original case from server
-- Preserve original header name casing when outputting with `--include` / `-i`
-- Internal lookups can remain case-insensitive
+---
 
-### Phase 68 — FTP Conformance & Integration Test Harness
+## Completed Batches
 
-**Goal:** Pass curl FTP tests 100, 102, 104 and establish a permanent integration test harness using curl's test infrastructure.
-
-**Validated by:** curl's `runtests.pl` tests 100, 102, 104; new Rust integration tests.
-
-#### FTP protocol sequence (protocol/ftp.rs)
-- Test 100 (FTP LIST): urlx sends `RETR` instead of `LIST`; missing `PWD` after login; sends `TYPE I` instead of `TYPE A` for directory listing
-- Test 102 (FTP RETR): missing `PWD` and `SIZE` commands; different command order
-- Test 104 (FTP HEAD/size-only): urlx sends RETR when it should just do MDTM+SIZE+REST for `--head`
-- Fix: after USER/PASS, send `PWD` to establish working directory (curl always does this)
-- Fix: use `TYPE A` for LIST operations, `TYPE I` for binary RETR
-- Fix: `--head` on FTP should run MDTM+SIZE without downloading the file
-- Fix: default anonymous password should be `ftp@example.com` (curl's default), not `urlx@`
-
-#### Integration test harness (tests/)
-- Create a Rust integration test file (`tests/curl_compat.rs`) that:
-  - Starts a mock HTTP server (hyper on a random port)
-  - Runs urlx as a subprocess against it
-  - Asserts on: response body, exit code, and request headers the server received
-- Port at least the following curl tests as permanent Rust tests:
-  - Test 1: basic HTTP GET (header order)
-  - Test 3: POST with auth + Content-Type
-  - Test 6: cookie sending
-  - Test 10: PUT from file
-  - Test 11: redirect following
-  - Test 13: custom HTTP method
-  - Test 14: HEAD request
-- These tests become the regression suite — they must pass before any future release
-
-### Phase 69 — FFI Safety & Remaining Polish
-
-**Goal:** Fix the FFI catch_unwind gap and clean up remaining audit findings before release.
-
-#### FFI catch_unwind (liburlx-ffi/src/lib.rs)
-- Only 1 of 56 exported functions (`curl_easy_perform`) has `catch_unwind`
-- CLAUDE.md requires all exported functions to have it — this is a real safety bug
-- Add `std::panic::catch_unwind(AssertUnwindSafe(|| { ... }))` to all 55 remaining exported functions
-- Functions that return CURLcode should return CURLE_UNKNOWN_OPTION or similar on panic
-- Functions that return pointers should return null on panic
-- Add 4 missing `// SAFETY:` comments (curl_mime_free, curl_multi_add_handle, curl_slist_append, curl_slist_free_all)
-
-#### FFI honesty — return CURLE_NOT_BUILT_IN for unimplemented options
-- ~15 CURLOPT options currently return CURLE_OK but do nothing
-- Change these to return CURLE_NOT_BUILT_IN so callers know the option isn't supported
-- Document which options are accepted-but-ignored vs truly unimplemented
-
-#### Final verification
-- Run full `cargo test`, `cargo clippy --all-targets`, `cargo fmt --check`, `cargo doc`
-- Run curl test harness tests 1-20, 100-105, 200-205 and record pass rate
-- Run differential test suite against real endpoints and record pass rate
-- Update test count and completeness metrics in CLAUDE.md
-
-### Phase 70 — v0.2.0 Release
-
-**Milestone release.** All audit-driven fixes from Phases 65-69 are complete. Ship v0.2.0.
-
-#### Pre-release verification
-- All curl harness tests targeted in Phases 65-68 must pass
-- Differential test suite against real endpoints must show >90% parity (excluding User-Agent)
-- `cargo test --all`, clippy, fmt, doc — zero errors
-- Run the Rust integration tests from Phase 68
-
-#### Version bump
-- Bump version to `0.2.0` in all Cargo.toml files (workspace root, liburlx, liburlx-ffi, urlx-cli)
-- Update CHANGELOG.md with changes since v0.1.0:
-  - **Fixed:** Header ordering, HEAD hang, cookie parsing, redirect following, proxy fragment leak, POST Content-Type, multipart Content-Length, exit codes, header casing, FTP sequence, FFI safety
-  - **Added:** Permanent curl-compat integration test suite, catch_unwind on all FFI functions
-
-#### Documentation
-- Update README.md with revised completeness table and Quick Start examples
-- Update API docs (`cargo doc`)
-
-#### Publish
-- `cargo publish -p liburlx` → crates.io
-- `cargo publish -p liburlx-ffi` → crates.io
-- `cargo publish -p urlx-cli` → crates.io
-- Create GitHub Release v0.2.0
-- Update Homebrew formula
-
-#### Post-release
-- **STOP and report.** Provide summary of what was fixed, updated pass rates, test count, and recommended next phases
+(none yet)
 
 ---
 
 ## Guiding Principles
 
-1. **Test-driven development is non-negotiable.** Every feature begins with a failing test. No code is merged without tests. Integration tests run against real protocol servers.
+1. **curl's test suite is the specification.** When in doubt, match curl's behavior. The goal is not to be curl-like — it is to be curl-compatible. curl's tests are the acceptance criteria.
 2. **Zero `unsafe` outside of `liburlx-ffi`.** The core library and CLI must be 100% safe Rust. All `unsafe` is confined to the FFI boundary in `liburlx-ffi` and must have `// SAFETY:` comments.
 3. **Correctness over performance.** Get the behavior right first. Optimize later with benchmarks proving the need.
-4. **Behavioral compatibility with curl.** When in doubt about how something should work, match curl's behavior. curl's test suite is the specification.
+4. **No regressions.** Once a curl test passes, it must never regress. This is enforced by running all previously-passing tests in CI.
 5. **Feature flags for optional functionality.** Each protocol, TLS backend, and optional feature is behind a Cargo feature flag. The default feature set covers HTTP/HTTPS. Minimal builds must be possible.
 6. **Conventional commits.** Every commit message must follow the Conventional Commits specification. This is enforced by CI.
-7. **This file is a living document.** CLAUDE.md is the project's source of truth. As work is completed, remove finished sections and add new plans for upcoming work. The file should always reflect the current state and next steps — never stale.
+7. **This file is a living document.** CLAUDE.md is the project's source of truth. Update it as batches are completed and new batches are started.
 
 ---
 
@@ -268,6 +199,10 @@ urlx/
 ├── rustfmt.toml               # Formatting configuration
 ├── .github/workflows/         # CI (ci.yml) and release (release.yml) pipelines
 ├── .pre-commit-config.yaml    # Pre-commit hooks
+├── scripts/
+│   └── run-curl-tests.sh      # Wrapper to run curl tests against urlx
+├── vendor/
+│   └── curl/                  # curl source (git submodule) — for test suite only
 ├── crates/
 │   ├── liburlx/               # Core library (pure Rust, idiomatic API)
 │   │   └── src/               # lib.rs, easy.rs, multi.rs, error.rs, options.rs, info.rs,
@@ -281,8 +216,8 @@ urlx/
 │   │   └── src/               # lib.rs, easy.rs, multi.rs, options.rs, info.rs, error.rs
 │   └── urlx-cli/              # Command-line tool
 │       └── src/               # main.rs, args.rs, config.rs, output.rs, progress.rs
-├── tests/                     # Integration tests, fixtures, test servers
-├── benches/                   # Criterion benchmarks (throughput, latency, concurrency)
+├── tests/                     # Rust integration tests, fixtures, FFI test harness
+├── benches/                   # Criterion benchmarks
 └── fuzz/                      # 4 cargo-fuzz harnesses (URL, HTTP, cookie, HSTS)
 ```
 
@@ -324,31 +259,6 @@ Default features: `http`, `rustls`, `cookies`, `decompression`. Optional: `http2
 
 ---
 
-## Test-Driven Development Protocol
-
-### The TDD Cycle for Every Feature
-
-1. **Write the test first.** The test must fail (or not compile) before any implementation.
-2. **Write the minimum code to pass.** No speculative features.
-3. **Refactor.** Clean up while all tests still pass.
-4. **Verify guardrails.** `cargo clippy`, `cargo fmt`, `cargo doc` must all pass.
-
-### Test Categories
-
-- **Unit tests:** In-crate `#[cfg(test)]` modules. Run with `cargo test --lib`.
-- **Integration tests:** `tests/` directory, against real servers (hyper/tokio on random ports). Run with `cargo test --test '*'`.
-- **Property-based:** `proptest` for parser correctness (URL, cookie, HSTS, WebSocket, FTP, multipart).
-- **Fuzz harnesses:** 4 cargo-fuzz harnesses in `fuzz/`.
-- **FFI tests:** C-language test programs linking against liburlx-ffi.
-
-### Coverage Requirements
-
-- **Unit test coverage target: 80%+** for all crates. Measured by `cargo-tarpaulin`.
-- **Integration test coverage: every public API function** must be exercised.
-- **Every bug fix must include a regression test** that would have caught it.
-
----
-
 ## Agent Instructions
 
 When working on this project:
@@ -359,66 +269,36 @@ When working on this project:
 
 2. **Never suppress warnings.** If clippy or the compiler warns about something, fix it properly. The only allowed suppressions are targeted `#[allow(...)]` with a comment explaining why.
 
-### Test-Driven Development
+### Working with the curl Test Suite
 
-3. **Write the test before the implementation.** If you find yourself writing implementation code without a corresponding test, stop and write the test first.
+3. **Read the test file first.** Before fixing a failing curl test, read `vendor/curl/tests/data/testNNN` to understand exactly what the test expects: what command it runs, what the server returns, and what output/protocol/exit code it verifies.
 
-4. **Every bug fix must include a regression test** that would have caught it.
+4. **Check curl's source when stuck.** Clone curl's repo and examine the relevant source file. curl's behavior is the specification. When curl's behavior seems wrong, document it and match it anyway (with a comment noting the curl compat quirk).
+
+5. **No regressions.** After fixing a test, always re-run all previously-passing tests. If a fix for test N breaks test M, fix both before committing.
+
+6. **Document skips.** If a test cannot pass (requires libcurl internals, debug builds, etc.), add it to the skip list with a clear rationale. Never silently skip tests.
 
 ### Commits
 
-5. **Use conventional commits for every commit.** Format: `<type>(<scope>): <description>`. Never commit with a freeform message. Examples:
-   - `feat(http): add chunked transfer encoding`
-   - `test(url): add edge case tests for IDN domains`
-   - `fix(cookie): match curl behavior for expired cookie cleanup`
-   - `chore: update dependencies`
-   - `docs: update CLAUDE.md — mark Phase 1 complete`
+7. **Use conventional commits for every commit.** Format: `<type>(<scope>): <description>`. Examples:
+   - `fix(http): match curl header ordering to pass tests 1-13`
+   - `fix(cookie): parse multi-cookie -b strings (curl tests 6-8)`
+   - `chore: add curl test suite as git submodule`
+   - `docs: update CLAUDE.md batch status`
 
-6. **Commit atomically.** Each commit should be one logical change with one type. If a commit needs both `feat` and `test`, split it into `test(...): add tests for X` followed by `feat(...): implement X`. The test commit comes first.
+8. **Commit atomically.** Each commit should be one logical change. Reference the curl test numbers that the change addresses.
 
-7. **Scope names** must match crate or module names: `http`, `ftp`, `tls`, `url`, `cookie`, `dns`, `proxy`, `auth`, `ffi`, `cli`, `pool`, `filter`, `ws`, `mqtt`, `smtp`, `imap`. Use no scope for cross-cutting changes.
+9. **Scope names** must match crate or module names: `http`, `ftp`, `tls`, `url`, `cookie`, `dns`, `proxy`, `auth`, `ffi`, `cli`, `pool`, `filter`, `ws`, `mqtt`, `smtp`, `imap`. Use no scope for cross-cutting changes.
 
 ### Maintaining CLAUDE.md
 
-8. **This file is a living document. Update it as you work.** CLAUDE.md must always reflect the current state of the project and the immediate next steps. Specifically:
-
-   - **When a phase is fully complete,** collapse its detailed steps into a brief "Completed" summary. Do not leave stale instructions.
-
-   - **When starting a new phase,** expand it with detailed, actionable implementation steps. Future phases should remain as brief outlines until they become current.
-
-   - **When plans change,** update this file immediately.
-
-   - **Update the Current Status section** with every phase transition.
-
-   - **Record decisions in the Decision Log** when significant architectural or design choices are made.
-
-### Milestone Review Phases
-
-9. **Every 10th phase (10, 20, 30, ...) must be a comprehensive review.** These phases are dedicated to auditing the entire codebase against curl/libcurl for completeness, running differential tests, measuring FFI coverage, profiling performance, and planning the next 10 phases. No new features are added during review phases — only testing, gap analysis, and planning. **During review phases, compact the phase list:** merge all completed phases from the prior 10-phase block into the existing "Phase 0" summary (or create one if it doesn't exist). Phase 0 should describe the current state of the repo — what has been built, key stats, and architectural decisions. After compaction, the Implementation Phases section should contain only Phase 0 (cumulative summary of all completed work) followed by the next 10 planned phases (brief outlines of future work). This keeps CLAUDE.md concise and avoids unbounded growth.
-
-### Behavioral Correctness
-
-10. **When stuck on behavior, check curl.** Clone curl's repo and examine the relevant source file. curl's behavior is the specification. When curl's behavior seems wrong, document it and match it anyway (with a comment noting the curl compat quirk and a link to the relevant curl source).
-
-11. **Keep the scope tight.** Implement the minimum for the current phase. Do not speculatively add protocols or features ahead of schedule.
-
-### Protocol Implementation Checklist
-
-12. **When implementing a protocol handler,** follow this order:
-    a. Write integration tests with a mock server
-    b. Define the protocol-specific error variants
-    c. Implement the happy path
-    d. Add error handling for each failure mode (with tests)
-    e. Add edge case handling (with tests)
-    f. Run clippy, fmt, doc
-    g. Add a fuzz harness for any parser
-    h. Commit: `test(<proto>): add tests for <feature>` then `feat(<proto>): implement <feature>`
+10. **Update this file as batches progress.** When tests in a batch start passing, update the Active Batch section. When a batch is complete, move it to Completed Batches and promote the next batch. Keep the pass rate current.
 
 ### FFI Safety
 
-13. **For the FFI layer,** every `#[no_mangle] pub extern "C" fn` must have:
+11. **For the FFI layer,** every `#[no_mangle] pub extern "C" fn` must have:
     - A `// SAFETY:` comment on every `unsafe` block
     - Null pointer checks on all pointer arguments
     - Proper error code returns (never panic across FFI boundary)
-    - A corresponding C test program that exercises it
     - A catch_unwind wrapper to prevent Rust panics from unwinding into C
