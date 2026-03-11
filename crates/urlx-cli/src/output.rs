@@ -7,6 +7,8 @@ use std::io::Write;
 use std::process::ExitCode;
 
 /// Format response headers as HTTP status line + headers.
+///
+/// Preserves original header name casing from the server when available.
 pub fn format_headers(response: &liburlx::Response) -> String {
     let version = http_version_string(response);
     let version_label = match version.as_str() {
@@ -19,8 +21,11 @@ pub fn format_headers(response: &liburlx::Response) -> String {
         response.status(),
         http_status_text(response.status()),
     );
+    let original_names = response.header_original_names();
     for (name, value) in response.headers() {
-        result.push_str(name);
+        // Use original casing if available, otherwise use the stored (lowercase) name
+        let display_name = original_names.get(name).map_or(name.as_str(), String::as_str);
+        result.push_str(display_name);
         result.push_str(": ");
         result.push_str(value);
         result.push_str("\r\n");
