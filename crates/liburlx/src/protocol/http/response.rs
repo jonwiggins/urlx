@@ -290,10 +290,14 @@ impl Response {
         &self.effective_url
     }
 
-    /// Returns true if this is a redirect response (3xx with Location header).
+    /// Returns true if this is a redirect response (3xx with non-empty Location header).
+    ///
+    /// A blank or whitespace-only `Location` header is treated as "no redirect",
+    /// matching curl's behavior and avoiding infinite redirect loops.
     #[must_use]
     pub fn is_redirect(&self) -> bool {
-        matches!(self.status, 301 | 302 | 303 | 307 | 308) && self.headers.contains_key("location")
+        matches!(self.status, 301 | 302 | 303 | 307 | 308)
+            && self.headers.get("location").is_some_and(|v| !v.trim().is_empty())
     }
 
     /// Returns the Content-Type header value, if present.
@@ -496,5 +500,46 @@ mod tests {
         // Miss: both paths return None
         assert_eq!(resp.header("x-missing"), None);
         assert_eq!(resp.header("X-Missing"), None);
+    }
+
+    #[test]
+    fn is_redirect_with_valid_location() {
+        let mut headers = HashMap::new();
+        headers.insert("location".to_string(), "http://example.com/new".to_string());
+        let resp = Response::new(302, headers, Vec::new(), String::new());
+        assert!(resp.is_redirect());
+    }
+
+    #[test]
+    fn is_redirect_with_empty_location() {
+        let mut headers = HashMap::new();
+        headers.insert("location".to_string(), String::new());
+        let resp = Response::new(302, headers, Vec::new(), String::new());
+        assert!(!resp.is_redirect(), "empty Location should not be treated as a redirect");
+    }
+
+    #[test]
+    fn is_redirect_with_whitespace_only_location() {
+        let mut headers = HashMap::new();
+        headers.insert("location".to_string(), "   \t  ".to_string());
+        let resp = Response::new(301, headers, Vec::new(), String::new());
+        assert!(
+            !resp.is_redirect(),
+            "whitespace-only Location should not be treated as a redirect"
+        );
+    }
+
+    #[test]
+    fn is_redirect_without_location_header() {
+        let resp = Response::new(301, HashMap::new(), Vec::new(), String::new());
+        assert!(!resp.is_redirect(), "redirect status without Location header should not redirect");
+    }
+
+    #[test]
+    fn is_redirect_non_redirect_status() {
+        let mut headers = HashMap::new();
+        headers.insert("location".to_string(), "http://example.com/new".to_string());
+        let resp = Response::new(200, headers, Vec::new(), String::new());
+        assert!(!resp.is_redirect(), "200 with Location should not be treated as a redirect");
     }
 }

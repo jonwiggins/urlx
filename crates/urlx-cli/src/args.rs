@@ -16,7 +16,8 @@ pub enum ParseResult {
     /// `--version` / `-V` was requested — print version and exit 0.
     Version,
     /// Parse error — message already printed to stderr.
-    Error,
+    /// Contains the curl-compatible exit code (default 1).
+    Error(u8),
 }
 
 /// Parsed CLI options.
@@ -292,8 +293,10 @@ pub fn parse_args(args: &[String]) -> ParseResult {
     }
 
     // Step 3: Parse options
-    parse_args_options(&expanded)
-        .map_or(ParseResult::Error, |opts| ParseResult::Options(Box::new(opts)))
+    match parse_args_options(&expanded) {
+        Ok(opts) => ParseResult::Options(Box::new(opts)),
+        Err(code) => ParseResult::Error(code),
+    }
 }
 
 /// Expand combined short flags into individual flags.
@@ -337,9 +340,9 @@ fn expand_combined_flags(args: &[String]) -> Vec<String> {
     result
 }
 
-/// Internal option parser. Returns `None` if parsing fails (error already printed).
+/// Internal option parser. Returns `Err(exit_code)` if parsing fails (error already printed).
 #[allow(clippy::too_many_lines)]
-fn parse_args_options(args: &[String]) -> Option<CliOptions> {
+fn parse_args_options(args: &[String]) -> Result<CliOptions, u8> {
     let mut opts = CliOptions {
         easy: liburlx::Easy::new(),
         urls: Vec::new(),
@@ -450,7 +453,7 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
                         Ok(data) => opts.easy.body(&data),
                         Err(e) => {
                             eprintln!("urlx: error reading data: {e}");
-                            return None;
+                            return Err(1);
                         }
                     }
                 } else {
@@ -494,7 +497,7 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
                     opts.easy.max_redirects(max);
                 } else {
                     eprintln!("urlx: invalid max-redirs value: {val}");
-                    return None;
+                    return Err(1);
                 }
             }
             "-I" | "--head" => {
@@ -559,7 +562,7 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
                     opts.easy.connect_timeout(std::time::Duration::from_secs_f64(secs));
                 } else {
                     eprintln!("urlx: invalid timeout value: {val}");
-                    return None;
+                    return Err(1);
                 }
             }
             "-m" | "--max-time" => {
@@ -569,7 +572,7 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
                     opts.easy.timeout(std::time::Duration::from_secs_f64(secs));
                 } else {
                     eprintln!("urlx: invalid timeout value: {val}");
-                    return None;
+                    return Err(1);
                 }
             }
             "-w" | "--write-out" => {
@@ -582,7 +585,7 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
                 let val = require_arg(args, i, "-x")?;
                 if let Err(e) = opts.easy.proxy(val) {
                     eprintln!("urlx: invalid proxy URL: {e}");
-                    return None;
+                    return Err(1);
                 }
             }
             "--noproxy" => {
@@ -610,7 +613,8 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
                 let val = require_arg(args, i, "-F")?;
                 if let Err(msg) = parse_form_field(&mut opts.easy, val) {
                     eprintln!("urlx: {msg}");
-                    return None;
+                    // Exit code 26 = CURLE_READ_ERROR (file not found / read error)
+                    return Err(26);
                 }
             }
             "-r" | "--range" => {
@@ -630,7 +634,7 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
                     opts.easy.resume_from(offset);
                 } else {
                     eprintln!("urlx: invalid offset value: {val}");
-                    return None;
+                    return Err(1);
                 }
             }
             "-#" | "--progress-bar" => {
@@ -701,7 +705,7 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
                     "1.3" => opts.easy.ssl_max_version(liburlx::TlsVersion::Tls13),
                     _ => {
                         eprintln!("urlx: unsupported TLS version: {val}");
-                        return None;
+                        return Err(1);
                     }
                 }
             }
@@ -734,7 +738,7 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
                     0
                 });
                 if port == 0 {
-                    return None;
+                    return Err(1);
                 }
                 opts.easy.local_port(port);
             }
@@ -752,7 +756,7 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
                 let val = require_arg(args, i, "--dns-servers")?;
                 if let Err(e) = opts.easy.dns_servers(val) {
                     eprintln!("urlx: invalid DNS servers: {e}");
-                    return None;
+                    return Err(1);
                 }
             }
             "--doh-url" => {
@@ -767,7 +771,7 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
                     opts.easy.happy_eyeballs_timeout(std::time::Duration::from_millis(ms));
                 } else {
                     eprintln!("urlx: invalid happy-eyeballs-timeout-ms: {val}");
-                    return None;
+                    return Err(1);
                 }
             }
             "-T" | "--upload-file" => {
@@ -779,7 +783,7 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
                     let mut data = Vec::new();
                     if let Err(e) = std::io::stdin().read_to_end(&mut data) {
                         eprintln!("urlx: can't read from stdin: {e}");
-                        return None;
+                        return Err(1);
                     }
                     opts.easy.body(&data);
                     opts.is_upload = true;
@@ -806,7 +810,7 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
                         }
                         Err(e) => {
                             eprintln!("urlx: can't read file '{val}': {e}");
-                            return None;
+                            return Err(1);
                         }
                     }
                 }
@@ -821,7 +825,7 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
                     // File path: load cookies from cookie file
                     if let Err(e) = opts.easy.cookie_file(val) {
                         eprintln!("urlx: error reading cookie file '{val}': {e}");
-                        return None;
+                        return Err(1);
                     }
                 } else {
                     // Inline cookie string: accumulate verbatim for later joining
@@ -837,7 +841,7 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
                         Ok(data) => opts.easy.body(&data),
                         Err(e) => {
                             eprintln!("urlx: error reading data: {e}");
-                            return None;
+                            return Err(1);
                         }
                     }
                 } else {
@@ -867,7 +871,7 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
                 } else {
                     eprintln!("urlx: invalid --resolve format: {val}");
                     eprintln!("  Use: --resolve host:port:address");
-                    return None;
+                    return Err(1);
                 }
             }
             "-0" | "--http1.0" => {
@@ -892,7 +896,7 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
                     opts.easy.expect_100_timeout(std::time::Duration::from_millis(ms));
                 } else {
                     eprintln!("urlx: invalid expect100-timeout value: {val}");
-                    return None;
+                    return Err(1);
                 }
             }
             "--retry" => {
@@ -902,7 +906,7 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
                     opts.retry_count = n;
                 } else {
                     eprintln!("urlx: invalid retry count: {val}");
-                    return None;
+                    return Err(1);
                 }
             }
             "--retry-delay" => {
@@ -912,7 +916,7 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
                     opts.retry_delay_secs = s;
                 } else {
                     eprintln!("urlx: invalid retry-delay value: {val}");
-                    return None;
+                    return Err(1);
                 }
             }
             "--retry-max-time" => {
@@ -922,7 +926,7 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
                     opts.retry_max_time_secs = s;
                 } else {
                     eprintln!("urlx: invalid retry-max-time value: {val}");
-                    return None;
+                    return Err(1);
                 }
             }
             "--retry-all-errors" => {
@@ -938,7 +942,7 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
                     opts.parallel_max = n;
                 } else {
                     eprintln!("urlx: invalid parallel-max value: {val}");
-                    return None;
+                    return Err(1);
                 }
             }
             "--socks5-hostname" => {
@@ -947,7 +951,7 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
                 let proxy_url = format!("socks5h://{val}");
                 if let Err(e) = opts.easy.proxy(&proxy_url) {
                     eprintln!("urlx: invalid SOCKS5 proxy: {e}");
-                    return None;
+                    return Err(1);
                 }
             }
             "--tcp-nodelay" => {
@@ -960,7 +964,7 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
                     opts.easy.tcp_keepalive(std::time::Duration::from_secs(secs));
                 } else {
                     eprintln!("urlx: invalid tcp-keepalive value: {val}");
-                    return None;
+                    return Err(1);
                 }
             }
             "--keepalive-time" => {
@@ -970,7 +974,7 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
                     opts.easy.tcp_keepalive(std::time::Duration::from_secs(secs));
                 } else {
                     eprintln!("urlx: invalid keepalive-time value: {val}");
-                    return None;
+                    return Err(1);
                 }
             }
             "--hsts" => {
@@ -997,7 +1001,7 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
                     opts.easy.max_send_speed(bps);
                 } else {
                     eprintln!("urlx: invalid rate limit: {val}");
-                    return None;
+                    return Err(1);
                 }
             }
             "--speed-limit" => {
@@ -1008,7 +1012,7 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
                     opts.easy.low_speed_limit(limit);
                 } else {
                     eprintln!("urlx: invalid speed limit: {val}");
-                    return None;
+                    return Err(1);
                 }
             }
             "--speed-time" => {
@@ -1019,7 +1023,7 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
                     opts.easy.low_speed_time(std::time::Duration::from_secs(secs));
                 } else {
                     eprintln!("urlx: invalid speed time: {val}");
-                    return None;
+                    return Err(1);
                 }
             }
             "--trace" => {
@@ -1072,7 +1076,7 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
                     }
                     Err(e) => {
                         eprintln!("urlx: can't read config file '{val}': {e}");
-                        return None;
+                        return Err(1);
                     }
                 }
             }
@@ -1096,7 +1100,7 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
                     opts.max_filesize = Some(size);
                 } else {
                     eprintln!("urlx: invalid max-filesize: {val}");
-                    return None;
+                    return Err(1);
                 }
             }
             "--no-keepalive" => {
@@ -1123,7 +1127,7 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
                     opts.easy.proxy_header(name.trim(), value.trim());
                 } else {
                     eprintln!("urlx: invalid proxy-header format: {val}");
-                    return None;
+                    return Err(1);
                 }
             }
             "--post301" => {
@@ -1152,7 +1156,7 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
                 i += 1;
                 if i >= args.len() {
                     eprintln!("urlx: --ftp-port requires an argument");
-                    return None;
+                    return Err(1);
                 }
                 opts.easy.ftp_active_port(&args[i]);
             }
@@ -1249,7 +1253,7 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
                     _ => {
                         eprintln!("urlx: invalid FTP method: {val}");
                         eprintln!("  Valid values: multicwd, singlecwd, nocwd");
-                        return None;
+                        return Err(1);
                     }
                 }
             }
@@ -1322,7 +1326,7 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
                 } else {
                     eprintln!("urlx: invalid form-string format: {val}");
                     eprintln!("  Use: --form-string name=value");
-                    return None;
+                    return Err(1);
                 }
             }
             "--request-target" => {
@@ -1336,7 +1340,7 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
                 let proxy_url = format!("socks4://{val}");
                 if let Err(e) = opts.easy.proxy(&proxy_url) {
                     eprintln!("urlx: invalid SOCKS4 proxy: {e}");
-                    return None;
+                    return Err(1);
                 }
             }
             "--socks4a" => {
@@ -1345,7 +1349,7 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
                 let proxy_url = format!("socks4a://{val}");
                 if let Err(e) = opts.easy.proxy(&proxy_url) {
                     eprintln!("urlx: invalid SOCKS4a proxy: {e}");
-                    return None;
+                    return Err(1);
                 }
             }
             "--socks5" => {
@@ -1354,7 +1358,7 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
                 let proxy_url = format!("socks5://{val}");
                 if let Err(e) = opts.easy.proxy(&proxy_url) {
                     eprintln!("urlx: invalid SOCKS5 proxy: {e}");
-                    return None;
+                    return Err(1);
                 }
             }
             "--proxy-1.0" => {
@@ -1362,7 +1366,7 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
                 let val = require_arg(args, i, "--proxy-1.0")?;
                 if let Err(e) = opts.easy.proxy(val) {
                     eprintln!("urlx: invalid proxy URL: {e}");
-                    return None;
+                    return Err(1);
                 }
                 opts.easy.http_version(liburlx::HttpVersion::Http10);
             }
@@ -1378,7 +1382,7 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
                     opts.easy.tftp_blksize(bs);
                 } else {
                     eprintln!("urlx: invalid tftp-blksize: {val}");
-                    return None;
+                    return Err(1);
                 }
             }
             "--tftp-no-options" => {
@@ -1534,7 +1538,7 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
             }
             arg if arg.starts_with('-') => {
                 eprintln!("urlx: unknown option: {arg}");
-                return None;
+                return Err(1);
             }
             url => {
                 opts.urls.push(url.to_string());
@@ -1579,7 +1583,7 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
         opts.output_file = Some(opts.output_files[0].clone());
     }
 
-    Some(opts)
+    Ok(opts)
 }
 
 /// Used by `-d @filename` and `--data-binary @filename`.
@@ -1914,12 +1918,12 @@ fn unescape_form_filename(s: &str) -> String {
     result
 }
 
-pub fn require_arg<'a>(args: &'a [String], i: usize, flag: &str) -> Option<&'a str> {
+pub fn require_arg<'a>(args: &'a [String], i: usize, flag: &str) -> Result<&'a str, u8> {
     if i >= args.len() {
         eprintln!("urlx: option {flag} requires an argument");
-        None
+        Err(1)
     } else {
-        Some(&args[i])
+        Ok(&args[i])
     }
 }
 
@@ -1952,13 +1956,13 @@ mod tests {
             ParseResult::Options(opts) => *opts,
             ParseResult::Help => panic!("expected Options, got Help"),
             ParseResult::Version => panic!("expected Options, got Version"),
-            ParseResult::Error => panic!("expected Options, got Error"),
+            ParseResult::Error(_) => panic!("expected Options, got Error"),
         }
     }
 
     /// Helper to check if `ParseResult` is an error.
     fn is_error(result: &ParseResult) -> bool {
-        matches!(result, ParseResult::Error)
+        matches!(result, ParseResult::Error(_))
     }
 
     /// Helper to construct arg list from string slices.

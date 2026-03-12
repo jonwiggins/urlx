@@ -324,8 +324,8 @@ pub fn run(args: &[String]) -> ExitCode {
             print_version();
             return ExitCode::SUCCESS;
         }
-        ParseResult::Error => {
-            return ExitCode::FAILURE;
+        ParseResult::Error(code) => {
+            return ExitCode::from(code);
         }
     };
 
@@ -368,8 +368,12 @@ pub fn run(args: &[String]) -> ExitCode {
                 url.push_str(&query);
             }
         }
-        // -G always forces GET (overrides -d's implicit POST)
-        opts.easy.method("GET");
+        // -G converts POST to GET, but explicit -I (HEAD) or -X wins
+        let current = opts.easy.method_str().map(String::from);
+        match current.as_deref() {
+            None | Some("POST") => opts.easy.method("GET"),
+            _ => {} // preserve HEAD (-I) or any -X override
+        }
         // Remove auto-added Content-Type for form data
         opts.easy.remove_header("Content-Type");
         opts.easy.set_form_data(false);
@@ -974,7 +978,14 @@ pub fn run_multi(
     }
 
     // Sequential mode: run each URL one at a time, sharing the Easy handle
-    // so cookies and other state carry between requests (curl behavior)
+    // and tokio runtime so cookies, connection pool, and TCP state carry
+    // between requests (curl behavior — avoids [DISCONNECT] between requests)
+    let rt =
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap_or_else(|e| {
+            eprintln!("urlx: failed to create runtime: {e}");
+            std::process::exit(1);
+        });
+
     let mut easy = template.clone();
     let mut any_failed = false;
 
@@ -986,7 +997,7 @@ pub fn run_multi(
             return ExitCode::FAILURE;
         }
 
-        match easy.perform() {
+        match rt.block_on(easy.perform_async()) {
             Ok(response) => {
                 if fail_on_error && response.status() >= 400 {
                     any_failed = true;
