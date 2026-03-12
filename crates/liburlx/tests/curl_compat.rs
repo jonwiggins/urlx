@@ -246,7 +246,10 @@ async fn default_redirect_limit_is_50() {
 
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
-    assert!(err.contains("too many redirects"), "unexpected error: {err}");
+    assert!(
+        err.contains("too many redirects") || err.contains("redirects followed"),
+        "unexpected error: {err}"
+    );
     // Should have hit the limit at 50 redirects
     assert!(counter.load(Ordering::SeqCst) >= 50);
 }

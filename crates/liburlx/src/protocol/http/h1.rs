@@ -55,6 +55,7 @@ pub async fn request<S>(
     ignore_content_length: bool,
     speed_limits: &SpeedLimits,
     chunked_upload: bool,
+    deadline: Option<tokio::time::Instant>,
 ) -> Result<(Response, bool), Error>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -222,6 +223,7 @@ where
                             keep_alive,
                             ignore_content_length,
                             &mut recv_limiter,
+                            deadline,
                         )
                         .await?
                     };
@@ -294,18 +296,30 @@ where
     let server_close =
         ph.headers.get("connection").is_some_and(|v| v.eq_ignore_ascii_case("close"));
     let effective_keepalive = keep_alive && !use_http10 && !server_close;
-    let (response_body, body_read_to_eof, trailers) = if no_body {
-        (Vec::new(), false, HashMap::new())
+    let (response_body, body_read_to_eof, trailers, body_error) = if no_body {
+        (Vec::new(), false, HashMap::new(), None)
     } else {
-        read_body_from_headers(
+        match read_body_from_headers(
             stream,
             &ph.headers,
             body_prefix,
             effective_keepalive,
             ignore_content_length,
             &mut recv_limiter,
+            deadline,
         )
-        .await?
+        .await
+        {
+            Ok((body, eof, trailers)) => (body, eof, trailers, None),
+            Err(Error::PartialBody { partial_body, message }) => {
+                // Chunked decode error with partial data — return headers + partial body
+                (partial_body, true, HashMap::new(), Some(message))
+            }
+            Err(e) => {
+                // Other body read errors — return headers only
+                (Vec::new(), true, HashMap::new(), Some(e.to_string()))
+            }
+        }
     };
 
     // Determine if connection can be reused
@@ -322,6 +336,13 @@ where
     if !trailers.is_empty() {
         resp.set_trailers(trailers);
     }
+
+    // If body reading failed, mark the response as partial for the caller
+    if let Some(err) = body_error {
+        resp.set_body_error(Some(err));
+        return Ok((resp, false));
+    }
+
     Ok((resp, can_reuse))
 }
 
@@ -564,14 +585,19 @@ fn parse_headers(data: &[u8]) -> Result<ParsedHeaders, Error> {
     // Detect line ending style: if we find \r\n it's CRLF, otherwise bare LF
     let uses_crlf = data.windows(2).any(|w| w == b"\r\n");
 
+    // Extract raw header values from the wire data (httparse trims whitespace,
+    // but curl preserves it in -i output)
+    let raw_values = extract_raw_header_values(&data[..header_len]);
+
     let mut headers = HashMap::with_capacity(parsed.headers.len());
     let mut original_names = HashMap::with_capacity(parsed.headers.len());
     let mut headers_ordered = Vec::with_capacity(parsed.headers.len());
-    for header in parsed.headers.iter() {
+    for (idx, header) in parsed.headers.iter().enumerate() {
         let name = header.name.to_ascii_lowercase();
         let value = String::from_utf8_lossy(header.value).to_string();
-        // Wire-order list with original casing (preserves duplicates)
-        headers_ordered.push((header.name.to_string(), value.clone()));
+        // For wire-order list, use the raw (untrimmed) value if available
+        let raw_value = raw_values.get(idx).cloned().unwrap_or_else(|| value.clone());
+        headers_ordered.push((header.name.to_string(), raw_value));
         // Preserve the first occurrence of the original header name casing
         let _old = original_names.entry(name.clone()).or_insert_with(|| header.name.to_string());
         // For set-cookie, append with newline to preserve multiple values
@@ -597,6 +623,41 @@ fn parse_headers(data: &[u8]) -> Result<ParsedHeaders, Error> {
         original_names,
         headers_ordered,
     })
+}
+
+/// Extract raw header values from wire data, preserving leading/trailing whitespace.
+///
+/// `httparse` trims OWS from header values per RFC 7230, but curl preserves
+/// the raw whitespace in `-i` output. This function extracts the untrimmed
+/// values by parsing the raw header block.
+fn extract_raw_header_values(header_data: &[u8]) -> Vec<String> {
+    let mut values = Vec::new();
+    let text = String::from_utf8_lossy(header_data);
+    let mut first_line = true;
+    for line in text.split('\n') {
+        // Skip the status line
+        if first_line {
+            first_line = false;
+            continue;
+        }
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        // Empty line marks end of headers
+        if line.is_empty() {
+            break;
+        }
+        // Extract value after first ":"
+        if let Some(colon_pos) = line.find(':') {
+            // Value starts right after the colon — preserve leading whitespace except
+            // the single space that's part of ": " convention. Actually, curl preserves
+            // everything after ": " literally. The convention is "Name: value" with one
+            // space. But if there are extra spaces, curl preserves them.
+            // So we take everything after the colon, strip exactly one leading space.
+            let raw = &line[colon_pos + 1..];
+            let value = raw.strip_prefix(' ').unwrap_or(raw);
+            values.push(value.to_string());
+        }
+    }
+    values
 }
 
 /// Write body data with optional rate limiting.
@@ -701,6 +762,7 @@ async fn read_body_from_headers<S>(
     keep_alive: bool,
     ignore_content_length: bool,
     limiter: &mut RateLimiter,
+    deadline: Option<tokio::time::Instant>,
 ) -> Result<(Vec<u8>, bool, HashMap<String, String>), Error>
 where
     S: AsyncRead + Unpin,
@@ -709,8 +771,13 @@ where
         headers.get("transfer-encoding").is_some_and(|te| te.eq_ignore_ascii_case("chunked"));
 
     if is_chunked {
-        let (body, trailers) = read_chunked_body_streaming(stream, body_prefix, limiter).await?;
-        Ok((body, false, trailers))
+        match read_chunked_body_streaming(stream, body_prefix, limiter).await {
+            Ok((body, trailers)) => Ok((body, false, trailers)),
+            Err(Error::PartialBody { partial_body, message }) => {
+                Err(Error::PartialBody { message, partial_body })
+            }
+            Err(e) => Err(e),
+        }
     } else if !ignore_content_length && headers.contains_key("content-length") {
         let cl = &headers["content-length"];
         let content_length: usize =
@@ -722,28 +789,53 @@ where
         Ok((body_prefix, false, HashMap::new()))
     } else {
         // No Content-Length (or ignoring it), connection close → read until EOF
-        let body = read_to_eof_throttled(stream, body_prefix, limiter).await?;
+        let body = read_to_eof_throttled(stream, body_prefix, limiter, deadline).await?;
         Ok((body, true, HashMap::new()))
     }
 }
 
-/// Read until EOF with optional throttling.
+/// Read until EOF with optional throttling and deadline.
+///
+/// If a `deadline` is provided and a read exceeds it, returns whatever data
+/// has been received so far (curl outputs partial data on timeout).
 async fn read_to_eof_throttled<S>(
     stream: &mut S,
     prefix: Vec<u8>,
     limiter: &mut RateLimiter,
+    deadline: Option<tokio::time::Instant>,
 ) -> Result<Vec<u8>, Error>
 where
     S: AsyncRead + Unpin,
 {
     if !limiter.is_active() {
-        // Fast path: read all at once
+        // Fast path: read chunks until EOF or deadline
         let mut body = prefix;
-        match stream.read_to_end(&mut body).await {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof && !body.is_empty() => {}
-            Err(e) if is_close_notify_error(&e) => {} // Treat as EOF (curl compat)
-            Err(e) => return Err(Error::Http(format!("read failed: {e}"))),
+        let mut buf = [0u8; 8192];
+        loop {
+            let read_fut = stream.read(&mut buf);
+            let result = if let Some(dl) = deadline {
+                match tokio::time::timeout_at(dl, read_fut).await {
+                    Ok(r) => r,
+                    Err(_) => {
+                        // Deadline hit — return partial body with error
+                        return Err(Error::PartialBody {
+                            message: "transfer timeout".into(),
+                            partial_body: body,
+                        });
+                    }
+                }
+            } else {
+                read_fut.await
+            };
+            match result {
+                Ok(0) => break,
+                Ok(n) => body.extend_from_slice(&buf[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof && !body.is_empty() => {
+                    break;
+                }
+                Err(e) if is_close_notify_error(&e) => break,
+                Err(e) => return Err(Error::Http(format!("read failed: {e}"))),
+            }
         }
         return Ok(body);
     }
@@ -756,7 +848,21 @@ where
 
     let mut buf = [0u8; THROTTLE_CHUNK_SIZE];
     loop {
-        match stream.read(&mut buf).await {
+        let read_fut = stream.read(&mut buf);
+        let result = if let Some(dl) = deadline {
+            match tokio::time::timeout_at(dl, read_fut).await {
+                Ok(r) => r,
+                Err(_) => {
+                    return Err(Error::PartialBody {
+                        message: "transfer timeout".into(),
+                        partial_body: body,
+                    });
+                }
+            }
+        } else {
+            read_fut.await
+        };
+        match result {
             Ok(0) => break,
             Ok(n) => {
                 body.extend_from_slice(&buf[..n]);
@@ -804,11 +910,16 @@ where
         let line_end = find_crlf(&buf, pos)
             .ok_or_else(|| Error::Http("incomplete chunked encoding".into()))?;
 
-        let size_str = std::str::from_utf8(&buf[pos..line_end])
-            .map_err(|_| Error::Http("invalid chunk size encoding".into()))?;
+        let size_str =
+            std::str::from_utf8(&buf[pos..line_end]).map_err(|_| Error::PartialBody {
+                message: "invalid chunk size encoding".into(),
+                partial_body: decoded.clone(),
+            })?;
         let size_str = size_str.split(';').next().unwrap_or(size_str).trim();
-        let chunk_size = usize::from_str_radix(size_str, 16)
-            .map_err(|e| Error::Http(format!("invalid chunk size '{size_str}': {e}")))?;
+        let chunk_size = usize::from_str_radix(size_str, 16).map_err(|e| Error::PartialBody {
+            message: format!("invalid chunk size '{size_str}': {e}"),
+            partial_body: decoded.clone(),
+        })?;
 
         pos = line_end + 2;
 
@@ -961,13 +1072,16 @@ pub fn parse_response(data: &[u8], effective_url: &str, is_head: bool) -> Result
     let status =
         parsed.code.ok_or_else(|| Error::Http("response has no status code".to_string()))?;
 
+    let raw_values = extract_raw_header_values(&data[..header_len]);
+
     let mut headers = HashMap::with_capacity(parsed.headers.len());
     let mut original_names = HashMap::with_capacity(parsed.headers.len());
     let mut headers_ordered = Vec::with_capacity(parsed.headers.len());
-    for header in parsed.headers.iter() {
+    for (idx, header) in parsed.headers.iter().enumerate() {
         let name = header.name.to_ascii_lowercase();
         let value = String::from_utf8_lossy(header.value).to_string();
-        headers_ordered.push((header.name.to_string(), value.clone()));
+        let raw_value = raw_values.get(idx).cloned().unwrap_or_else(|| value.clone());
+        headers_ordered.push((header.name.to_string(), raw_value));
         let _old = original_names.entry(name.clone()).or_insert_with(|| header.name.to_string());
         if name == "set-cookie" {
             let _entry = headers
@@ -1186,6 +1300,7 @@ mod tests {
             false,
             &SpeedLimits::default(),
             false,
+            None,
         )
         .await
         .unwrap();
@@ -1228,6 +1343,7 @@ mod tests {
             false,
             &SpeedLimits::default(),
             false,
+            None,
         )
         .await
         .unwrap();
@@ -1274,6 +1390,7 @@ mod tests {
             false,
             &SpeedLimits::default(),
             false,
+            None,
         )
         .await
         .unwrap();
@@ -1315,6 +1432,7 @@ mod tests {
             false,
             &SpeedLimits::default(),
             false,
+            None,
         )
         .await
         .unwrap();
@@ -1357,6 +1475,7 @@ mod tests {
             false,
             &SpeedLimits::default(),
             false,
+            None,
         )
         .await
         .unwrap();
@@ -1404,6 +1523,7 @@ mod tests {
             false,
             &SpeedLimits::default(),
             false,
+            None,
         )
         .await
         .unwrap();
@@ -1458,6 +1578,7 @@ mod tests {
             false,
             &SpeedLimits::default(),
             false,
+            None,
         )
         .await
         .unwrap();
@@ -1498,6 +1619,7 @@ mod tests {
             false,
             &SpeedLimits::default(),
             false,
+            None,
         )
         .await
         .unwrap();
@@ -1543,6 +1665,7 @@ mod tests {
             false,
             &SpeedLimits::default(),
             false,
+            None,
         )
         .await
         .unwrap();
@@ -1591,6 +1714,7 @@ mod tests {
             false,
             &SpeedLimits::default(),
             false,
+            None,
         )
         .await
         .unwrap();
@@ -1637,6 +1761,7 @@ mod tests {
             false,
             &SpeedLimits::default(),
             false,
+            None,
         )
         .await
         .unwrap();
@@ -1675,6 +1800,7 @@ mod tests {
             true, // ignore_content_length
             &SpeedLimits::default(),
             false,
+            None,
         )
         .await
         .unwrap();
@@ -1719,6 +1845,7 @@ mod tests {
             false,
             &SpeedLimits::default(),
             false,
+            None,
         )
         .await
         .unwrap();
@@ -1763,6 +1890,7 @@ mod tests {
             false,
             &SpeedLimits::default(),
             false,
+            None,
         )
         .await
         .unwrap();
@@ -1831,6 +1959,7 @@ mod tests {
             false,
             &SpeedLimits::default(),
             true,
+            None,
         )
         .await
         .unwrap();
@@ -1892,6 +2021,7 @@ mod tests {
             false,
             &SpeedLimits::default(),
             false,
+            None,
         )
         .await
         .unwrap();
@@ -1937,6 +2067,7 @@ mod tests {
             false,
             &SpeedLimits::default(),
             false,
+            None,
         )
         .await
         .unwrap();
@@ -1982,6 +2113,7 @@ mod tests {
             false,
             &SpeedLimits::default(),
             false,
+            None,
         )
         .await
         .unwrap();
@@ -2023,6 +2155,7 @@ mod tests {
                 false,
                 &SpeedLimits::default(),
                 false,
+                None,
             ),
         )
         .await;
@@ -2067,6 +2200,7 @@ mod tests {
                 false,
                 &SpeedLimits::default(),
                 false,
+                None,
             ),
         )
         .await;
@@ -2140,6 +2274,7 @@ mod tests {
             false,
             &SpeedLimits::default(),
             false,
+            None,
         )
         .await
         .unwrap();

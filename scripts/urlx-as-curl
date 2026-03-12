@@ -4,7 +4,7 @@
 # 2. Strips flags that urlx doesn't support yet (e.g. -q)
 # 3. Overrides default User-Agent to match curl's format
 
-URLX="$(dirname "$0")/../target/release/urlx"
+URLX="${URLX_BIN:-$(dirname "$0")/../target/debug/urlx}"
 VERSION="0.1.0"
 
 if [ "$1" = "--version" ]; then
@@ -37,4 +37,5 @@ if [ "$has_user_agent" = false ]; then
     args=("-A" "curl/${VERSION}" "${args[@]}")
 fi
 
-exec "$URLX" "${args[@]}"
+# Run urlx, translating "urlx:" to "curl:" in stderr for test compatibility
+"$URLX" "${args[@]}" 2> >(sed 's/^urlx:/curl:/' >&2)

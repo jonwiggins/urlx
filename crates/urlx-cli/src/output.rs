@@ -246,7 +246,10 @@ pub fn output_response(
         None
     };
 
-    if let Some(path) = output_file {
+    // "-" means stdout (curl compat)
+    let effective_output = output_file.filter(|p| *p != "-");
+
+    if let Some(path) = effective_output {
         // When --output is set, everything (headers if --include, then body) goes to the file
         let mut data = Vec::new();
         if let Some(ref headers) = all_headers {

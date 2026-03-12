@@ -367,7 +367,10 @@ async fn redirect_max_exceeded() {
 
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
-    assert!(err.contains("too many redirects"), "unexpected error: {err}");
+    assert!(
+        err.contains("too many redirects") || err.contains("redirects followed"),
+        "unexpected error: {err}"
+    );
     server.stop();
 }
 

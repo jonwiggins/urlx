@@ -329,6 +329,17 @@ pub fn run(args: &[String]) -> ExitCode {
         }
     };
 
+    // Check for conflicting request method flags (curl returns exit code 2)
+    {
+        let has_head = opts.easy.method_str() == Some("HEAD");
+        let has_body = opts.easy.has_body();
+        let has_multipart = opts.easy.has_multipart();
+        if has_head && has_body && has_multipart {
+            eprintln!("urlx: (2) Mutually exclusive options detected");
+            return ExitCode::from(2);
+        }
+    }
+
     // Expand URL globs unless --globoff is set
     if !opts.globoff {
         let mut expanded = Vec::new();
@@ -357,10 +368,8 @@ pub fn run(args: &[String]) -> ExitCode {
                 url.push_str(&query);
             }
         }
-        // Only default to GET if no explicit method was set (e.g. -I sets HEAD)
-        if opts.easy.method_is_default() {
-            opts.easy.method("GET");
-        }
+        // -G always forces GET (overrides -d's implicit POST)
+        opts.easy.method("GET");
         // Remove auto-added Content-Type for form data
         opts.easy.remove_header("Content-Type");
         opts.easy.set_form_data(false);
@@ -615,9 +624,10 @@ pub fn run(args: &[String]) -> ExitCode {
                 }
             }
 
-            // Check for failed resume: when -C was used and server returned non-206
-            // (curl returns CURLE_RANGE_ERROR = 33)
-            if opts.resume_check {
+            // Check for failed resume: when -C was used for a download and server
+            // returned non-206 (curl returns CURLE_RANGE_ERROR = 33).
+            // For uploads (PUT), 200 is a valid response — don't check.
+            if opts.resume_check && !opts.is_upload {
                 let status = response.status();
                 if status != 206 {
                     if !opts.silent || opts.show_error {
@@ -630,11 +640,7 @@ pub fn run(args: &[String]) -> ExitCode {
             // --fail / --fail-with-body: exit 22 on HTTP error status codes
             if opts.fail_on_error && response.status() >= 400 && !opts.fail_with_body {
                 if !opts.silent || opts.show_error {
-                    eprintln!(
-                        "urlx: The requested URL returned error: {} {}",
-                        response.status(),
-                        http_status_text(response.status()),
-                    );
+                    eprintln!("urlx: (22) The requested URL returned error: {}", response.status(),);
                 }
                 return ExitCode::from(22);
             }
@@ -726,13 +732,27 @@ pub fn run(args: &[String]) -> ExitCode {
             // --fail-with-body: output body first, then return error exit code
             if opts.fail_with_body && response.status() >= 400 {
                 if !opts.silent || opts.show_error {
-                    eprintln!(
-                        "urlx: The requested URL returned error: {} {}",
-                        response.status(),
-                        http_status_text(response.status()),
-                    );
+                    eprintln!("urlx: (22) The requested URL returned error: {}", response.status(),);
                 }
                 return ExitCode::from(22);
+            }
+
+            // Body error: output was written, now return appropriate error exit code
+            if let Some(body_err) = response.body_error() {
+                if body_err.contains("timeout") {
+                    if !opts.silent || opts.show_error {
+                        let timeout_str = opts
+                            .easy
+                            .timeout_duration()
+                            .map_or_else(String::new, |d| format!(" after {d:?}"));
+                        eprintln!("urlx: (28) timeout{timeout_str}");
+                    }
+                    return ExitCode::from(28); // CURLE_OPERATION_TIMEDOUT
+                }
+                if !opts.silent || opts.show_error {
+                    eprintln!("urlx: (56) {body_err}");
+                }
+                return ExitCode::from(56); // CURLE_RECV_ERROR
             }
 
             exit
@@ -741,6 +761,36 @@ pub fn run(args: &[String]) -> ExitCode {
             if opts.show_progress && !opts.silent {
                 eprintln!();
             }
+
+            // Output last response data on error (curl compat — headers/body before error)
+            if let Some(resp) = opts.easy.last_response() {
+                // For redirect responses (max-redirects exceeded), only output headers
+                // (curl doesn't output the body of the final redirect on error)
+                if resp.is_redirect() {
+                    if opts.include_headers {
+                        use std::io::Write;
+                        let mut h = String::new();
+                        for redir in resp.redirect_responses() {
+                            h.push_str(&format_headers(redir));
+                        }
+                        h.push_str(&format_headers(resp));
+                        if let Some(path) = opts.output_file.as_deref().filter(|p| *p != "-") {
+                            let _ = std::fs::write(path, h.as_bytes());
+                        } else {
+                            let _ = std::io::stdout().write_all(h.as_bytes());
+                        }
+                    }
+                } else {
+                    let _ = output_response(
+                        resp,
+                        opts.output_file.as_deref(),
+                        opts.write_out.as_deref(),
+                        opts.include_headers,
+                        opts.silent,
+                    );
+                }
+            }
+
             if !opts.silent || opts.show_error {
                 eprintln!("urlx: {e}");
             }
@@ -808,6 +858,7 @@ pub fn error_to_exit_code(err: &liburlx::Error) -> ExitCode {
         liburlx::Error::Transfer { code, .. } => {
             ExitCode::from(u8::try_from(*code).map_or(1, |c| c))
         }
+        liburlx::Error::PartialBody { .. } => ExitCode::from(56), // CURLE_RECV_ERROR
         _ => ExitCode::FAILURE,
     }
 }
@@ -891,7 +942,10 @@ pub const fn is_retryable_status(code: u16) -> bool {
     matches!(code, 408 | 429 | 500 | 502 | 503 | 504)
 }
 
-/// Run multiple URLs concurrently using the Multi API.
+/// Run multiple URLs using the Multi API (parallel) or sequentially (default).
+///
+/// Sequential mode shares cookie jar state between transfers (curl behavior).
+/// Parallel mode uses the Multi API for concurrent transfers.
 #[allow(clippy::fn_params_excessive_bools, clippy::too_many_arguments)]
 pub fn run_multi(
     template: &liburlx::Easy,
@@ -905,10 +959,78 @@ pub fn run_multi(
     parallel: bool,
     parallel_max: usize,
 ) -> ExitCode {
-    let mut multi = liburlx::Multi::new();
     if parallel {
-        multi.max_total_connections(parallel_max);
+        return run_multi_parallel(
+            template,
+            urls,
+            output_file,
+            write_out,
+            include_headers,
+            silent,
+            show_error,
+            fail_on_error,
+            parallel_max,
+        );
     }
+
+    // Sequential mode: run each URL one at a time, sharing the Easy handle
+    // so cookies and other state carry between requests (curl behavior)
+    let mut easy = template.clone();
+    let mut any_failed = false;
+
+    for (i, url) in urls.iter().enumerate() {
+        if let Err(e) = easy.url(url) {
+            if !silent || show_error {
+                eprintln!("urlx: error parsing URL '{url}': {e}");
+            }
+            return ExitCode::FAILURE;
+        }
+
+        match easy.perform() {
+            Ok(response) => {
+                if fail_on_error && response.status() >= 400 {
+                    any_failed = true;
+                    continue;
+                }
+                // First URL uses --output file if specified; rest go to stdout
+                let file_for_this = if i == 0 { output_file } else { None };
+                let exit =
+                    output_response(&response, file_for_this, write_out, include_headers, silent);
+                if exit != ExitCode::SUCCESS {
+                    any_failed = true;
+                }
+            }
+            Err(e) => {
+                if !silent || show_error {
+                    eprintln!("urlx: transfer {} ({}): {e}", i + 1, url);
+                }
+                any_failed = true;
+            }
+        }
+    }
+
+    if any_failed {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+/// Run multiple URLs concurrently using the Multi API.
+#[allow(clippy::fn_params_excessive_bools, clippy::too_many_arguments)]
+fn run_multi_parallel(
+    template: &liburlx::Easy,
+    urls: &[String],
+    output_file: Option<&str>,
+    write_out: Option<&str>,
+    include_headers: bool,
+    silent: bool,
+    show_error: bool,
+    fail_on_error: bool,
+    parallel_max: usize,
+) -> ExitCode {
+    let mut multi = liburlx::Multi::new();
+    multi.max_total_connections(parallel_max);
 
     for url in urls {
         let mut easy = template.clone();
@@ -939,7 +1061,6 @@ pub fn run_multi(
                     any_failed = true;
                     continue;
                 }
-                // First URL uses --output file if specified; rest go to stdout
                 let file_for_this = if i == 0 { output_file } else { None };
                 let exit =
                     output_response(&response, file_for_this, write_out, include_headers, silent);

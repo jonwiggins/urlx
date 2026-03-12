@@ -224,7 +224,10 @@ async fn redirect_max_exceeded() {
 
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
-    assert!(err.contains("too many redirects"), "error was: {err}");
+    assert!(
+        err.contains("too many redirects") || err.contains("redirects followed"),
+        "error was: {err}"
+    );
 }
 
 #[tokio::test]

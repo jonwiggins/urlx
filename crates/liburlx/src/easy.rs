@@ -194,6 +194,9 @@ pub struct Easy {
     tftp_blksize: Option<u16>,
     /// Disable TFTP options negotiation (curl `--tftp-no-options`).
     tftp_no_options: bool,
+    /// Last response received, even if the transfer ultimately failed.
+    /// This allows callers to output partial response data on error (curl compat).
+    last_response: Option<Response>,
 }
 
 #[allow(clippy::missing_fields_in_debug, clippy::too_many_lines)] // h2_pool is cfg-gated and opaque
@@ -406,6 +409,7 @@ impl Clone for Easy {
             pre_proxy: self.pre_proxy.clone(),
             tftp_blksize: self.tftp_blksize,
             tftp_no_options: self.tftp_no_options,
+            last_response: None, // ephemeral — not cloned
         }
     }
 }
@@ -515,6 +519,7 @@ impl Easy {
             pre_proxy: None,
             tftp_blksize: None,
             tftp_no_options: false,
+            last_response: None,
         }
     }
 
@@ -653,6 +658,35 @@ impl Easy {
     #[must_use]
     pub fn method_str(&self) -> Option<&str> {
         self.method.as_deref()
+    }
+
+    /// Returns true if a request body has been set.
+    #[must_use]
+    pub const fn has_body(&self) -> bool {
+        self.body.is_some()
+    }
+
+    /// Returns true if multipart form data has been set.
+    #[must_use]
+    pub const fn has_multipart(&self) -> bool {
+        self.multipart.is_some()
+    }
+
+    /// Returns the configured transfer timeout duration, if any.
+    #[must_use]
+    pub const fn timeout_duration(&self) -> Option<Duration> {
+        self.timeout
+    }
+
+    /// Returns the last response received, even if the transfer failed.
+    ///
+    /// curl outputs partial response data (headers, body) even when the
+    /// transfer ultimately fails (e.g., timeout, chunked decode error,
+    /// max redirects exceeded). This method provides access to whatever
+    /// response data was received before the error.
+    #[must_use]
+    pub const fn last_response(&self) -> Option<&Response> {
+        self.last_response.as_ref()
     }
 
     /// Returns the configured custom headers as a slice.
@@ -1958,7 +1992,11 @@ impl Easy {
         #[cfg(not(feature = "ssh"))]
         let ssh_host_key_policy = ();
 
+        let last_resp_store = std::sync::Arc::new(std::sync::Mutex::new(None::<Response>));
+        let deadline = self.timeout.map(|d| tokio::time::Instant::now() + d);
         let fut = perform_transfer(
+            last_resp_store.clone(),
+            deadline,
             &url,
             Some(effective_method.as_str()),
             &headers,
@@ -2029,7 +2067,13 @@ impl Easy {
         // Box::pin to avoid large future on stack.
         let fut = Box::pin(fut);
         let response = if let Some(timeout) = self.timeout {
-            tokio::time::timeout(timeout, fut).await.map_err(|_| Error::Timeout(timeout))?
+            if let Ok(result) = tokio::time::timeout(timeout, fut).await {
+                result
+            } else {
+                // Timeout — grab whatever response was stored before cancellation
+                self.last_response = last_resp_store.lock().ok().and_then(|mut g| g.take());
+                return Err(Error::Timeout(timeout));
+            }
         } else {
             fut.await
         };
@@ -2050,7 +2094,13 @@ impl Easy {
             }
         }
 
+        // Store last response for error recovery (curl outputs partial data on error)
+        self.last_response = last_resp_store.lock().ok().and_then(|mut g| g.take());
+
         let response = response?;
+
+        // Store the successful response as last_response (overrides any partial from Arc)
+        self.last_response = Some(response.clone());
 
         // Check fail_on_error: HTTP status >= 400 becomes an error
         if self.fail_on_error && response.status() >= 400 {
@@ -2087,6 +2137,8 @@ impl Default for Easy {
 /// Internal async transfer implementation.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines, clippy::fn_params_excessive_bools)]
 async fn perform_transfer(
+    last_resp_store: std::sync::Arc<std::sync::Mutex<Option<Response>>>,
+    deadline: Option<tokio::time::Instant>,
     url: &Url,
     method: Option<&str>,
     headers: &[(String, String)],
@@ -2245,8 +2297,14 @@ async fn perform_transfer(
             haproxy_protocol,
             abstract_unix_socket,
             chunked_upload,
+            deadline,
         ))
         .await?;
+
+        // Store latest response for error recovery (timeout, max-redirects, etc.)
+        if let Ok(mut guard) = last_resp_store.lock() {
+            *guard = Some(response.clone());
+        }
 
         // Handle Digest auth: if 401 with WWW-Authenticate: Digest, retry with credentials
         if response.status() == 401 {
@@ -2344,6 +2402,7 @@ async fn perform_transfer(
                                 haproxy_protocol,
                                 abstract_unix_socket,
                                 chunked_upload,
+                                deadline,
                             ))
                             .await?;
                         }
@@ -2395,7 +2454,28 @@ async fn perform_transfer(
         // Check for redirects
         if follow_redirects && response.is_redirect() {
             if redirects_followed >= max_redirects {
-                return Err(Error::Http(format!("too many redirects (max {max_redirects})")));
+                // Include the final redirect response in the chain for output
+                redirect_chain.push(response);
+                // Build a response that carries the redirect chain for -L --include output
+                // redirect_chain is non-empty (we just pushed); pop the last as final
+                let final_resp_base = redirect_chain.pop();
+                let chain = redirect_chain;
+                let Some(mut final_resp) = final_resp_base else {
+                    // Unreachable — we pushed just above
+                    return Err(Error::Transfer {
+                        code: 47,
+                        message: format!("Maximum ({max_redirects}) redirects followed"),
+                    });
+                };
+                final_resp.set_redirect_responses(chain);
+                // Store for last_response recovery (curl outputs all redirect headers)
+                if let Ok(mut guard) = last_resp_store.lock() {
+                    *guard = Some(final_resp);
+                }
+                return Err(Error::Transfer {
+                    code: 47,
+                    message: format!("Maximum ({max_redirects}) redirects followed"),
+                });
             }
 
             if let Some(location) = response.header("location") {
@@ -2477,7 +2557,8 @@ async fn perform_transfer(
     clippy::too_many_arguments,
     clippy::too_many_lines,
     clippy::fn_params_excessive_bools,
-    clippy::large_futures
+    clippy::large_futures,
+    clippy::large_stack_frames
 )]
 async fn do_single_request(
     url: &Url,
@@ -2532,6 +2613,7 @@ async fn do_single_request(
     haproxy_protocol: bool,
     #[cfg_attr(not(unix), allow(unused_variables))] abstract_unix_socket: Option<&str>,
     chunked_upload: bool,
+    deadline: Option<tokio::time::Instant>,
 ) -> Result<Response, Error> {
     // Handle non-HTTP schemes directly
     match url.scheme() {
@@ -2730,6 +2812,7 @@ async fn do_single_request(
                 ignore_content_length,
                 speed_limits,
                 chunked_upload,
+                deadline,
             )
             .await;
 
@@ -2845,6 +2928,7 @@ async fn do_single_request(
             ignore_content_length,
             speed_limits,
             chunked_upload,
+            deadline,
         )
         .await?;
         let time_starttransfer = request_start.elapsed();
@@ -3119,6 +3203,7 @@ async fn do_single_request(
                         ignore_content_length,
                         speed_limits,
                         chunked_upload,
+                        deadline,
                     )
                     .await?;
                     let time_starttransfer = request_start.elapsed();
@@ -3220,6 +3305,7 @@ async fn do_single_request(
                     ignore_content_length,
                     speed_limits,
                     chunked_upload,
+                    deadline,
                 )
                 .await?;
                 let time_starttransfer = request_start.elapsed();
@@ -3287,6 +3373,7 @@ async fn do_single_request(
                 ignore_content_length,
                 speed_limits,
                 chunked_upload,
+                deadline,
             )
             .await?;
             let time_starttransfer = request_start.elapsed();

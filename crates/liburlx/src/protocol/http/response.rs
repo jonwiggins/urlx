@@ -99,6 +99,10 @@ pub struct Response {
     pushed_responses: Vec<PushedResponse>,
     /// Intermediate redirect responses (for `-L --include` output).
     redirect_responses: Vec<Self>,
+    /// Error message from body reading (e.g., bad chunked encoding).
+    /// When set, the response is partial — headers are valid but the body
+    /// may be incomplete. Used to output partial data on error (curl compat).
+    body_error: Option<String>,
 }
 
 /// An HTTP/2 server-pushed response.
@@ -140,6 +144,7 @@ impl Response {
             info: TransferInfo::default(),
             pushed_responses: Vec::new(),
             redirect_responses: Vec::new(),
+            body_error: None,
         }
     }
 
@@ -166,6 +171,7 @@ impl Response {
             info,
             pushed_responses: Vec::new(),
             redirect_responses: Vec::new(),
+            body_error: None,
         }
     }
 
@@ -351,6 +357,21 @@ impl Response {
     /// Set intermediate redirect responses.
     pub fn set_redirect_responses(&mut self, resps: Vec<Self>) {
         self.redirect_responses = resps;
+    }
+
+    /// Returns the body error message, if any.
+    ///
+    /// When set, the response is partial — headers are valid but the body
+    /// may be incomplete. The caller should output available data and then
+    /// return the appropriate error exit code.
+    #[must_use]
+    pub fn body_error(&self) -> Option<&str> {
+        self.body_error.as_deref()
+    }
+
+    /// Set a body error message (for partial responses).
+    pub fn set_body_error(&mut self, error: Option<String>) {
+        self.body_error = error;
     }
 }
 

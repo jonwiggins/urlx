@@ -69,6 +69,17 @@ pub enum Error {
     /// DNS name resolution failed.
     #[error("could not resolve host: {0}")]
     DnsResolve(String),
+
+    /// Body read failed with partial data available.
+    /// The `partial_body` contains whatever was successfully decoded before
+    /// the error (e.g., valid chunks before an invalid chunk size).
+    #[error("partial body error: {message}")]
+    PartialBody {
+        /// Error description.
+        message: String,
+        /// Body data decoded before the error.
+        partial_body: Vec<u8>,
+    },
 }
 
 #[cfg(test)]

@@ -25,6 +25,9 @@ pub struct CliOptions {
     pub(crate) easy: liburlx::Easy,
     pub(crate) urls: Vec<String>,
     pub(crate) output_file: Option<String>,
+    /// All output files specified (each `-o` adds to this list).
+    /// Each entry pairs with a URL by position.
+    pub(crate) output_files: Vec<String>,
     pub(crate) write_out: Option<String>,
     pub(crate) show_progress: bool,
     pub(crate) silent: bool,
@@ -341,6 +344,7 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
         easy: liburlx::Easy::new(),
         urls: Vec::new(),
         output_file: None,
+        output_files: Vec::new(),
         write_out: None,
         show_progress: false,
         silent: false,
@@ -499,7 +503,7 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
             "-o" | "--output" => {
                 i += 1;
                 let val = require_arg(args, i, "-o")?;
-                opts.output_file = Some(val.to_string());
+                opts.output_files.push(val.to_string());
             }
             "-O" | "--remote-name" => {
                 opts.remote_name = true;
@@ -1022,13 +1026,13 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
                 i += 1;
                 let val = require_arg(args, i, "--trace")?;
                 opts.trace_file = Some(val.to_string());
-                opts.easy.verbose(true);
+                // Don't set verbose — trace output goes to file, not stderr
             }
             "--trace-ascii" => {
                 i += 1;
                 let val = require_arg(args, i, "--trace-ascii")?;
                 opts.trace_ascii_file = Some(val.to_string());
-                opts.easy.verbose(true);
+                // Don't set verbose — trace output goes to file, not stderr
             }
             "--trace-time" => {
                 opts.trace_time = true;
@@ -1568,6 +1572,11 @@ fn parse_args_options(args: &[String]) -> Option<CliOptions> {
     if !opts.inline_cookies.is_empty() {
         let cookie_header = opts.inline_cookies.join("; ");
         opts.easy.header("Cookie", &cookie_header);
+    }
+
+    // Set output_file from the first collected output file (each -o pairs with a URL by position)
+    if !opts.output_files.is_empty() {
+        opts.output_file = Some(opts.output_files[0].clone());
     }
 
     Some(opts)
