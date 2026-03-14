@@ -986,7 +986,11 @@ pub fn error_to_exit_code(err: &liburlx::Error) -> ExitCode {
                 ExitCode::from(47) // CURLE_TOO_MANY_REDIRECTS
             } else if msg.contains("fail_on_error") {
                 ExitCode::from(22) // CURLE_HTTP_RETURNED_ERROR
-            } else if msg.contains("unsupported protocol") || msg.contains("Unsupported protocol") {
+            } else if msg.contains("unsupported protocol")
+                || msg.contains("Unsupported protocol")
+                || msg.contains("invalid HTTP version")
+                || msg.contains("unsupported HTTP version")
+            {
                 ExitCode::from(1) // CURLE_UNSUPPORTED_PROTOCOL
             } else if msg.contains("partial") || msg.contains("Partial") {
                 ExitCode::from(18) // CURLE_PARTIAL_FILE

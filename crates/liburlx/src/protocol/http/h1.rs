@@ -641,10 +641,12 @@ fn parse_headers(data: &[u8]) -> Result<ParsedHeaders, Error> {
     let status =
         parsed.code.ok_or_else(|| Error::Http("response has no status code".to_string()))?;
     let reason = parsed.reason.map(str::to_string);
-    let version = if parsed.version == Some(0) {
-        ResponseHttpVersion::Http10
-    } else {
-        ResponseHttpVersion::Http11
+    let version = match parsed.version {
+        Some(0) => ResponseHttpVersion::Http10,
+        Some(1) | None => ResponseHttpVersion::Http11,
+        Some(v) => {
+            return Err(Error::UnsupportedProtocol(format!("unsupported HTTP version: 1.{v}")));
+        }
     };
     // Detect line ending style: if we find \r\n it's CRLF, otherwise bare LF
     let uses_crlf = data.windows(2).any(|w| w == b"\r\n");
