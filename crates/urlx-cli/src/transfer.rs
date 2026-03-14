@@ -14,6 +14,48 @@ use crate::output::{
     write_trace_file,
 };
 
+/// Substitute `#1`, `#2`, etc. in an output filename template with glob match values.
+///
+/// `#N` references the Nth glob group (1-indexed). If N is out of range, the `#N`
+/// is kept literally (curl compat: test 87).
+pub fn substitute_glob_template(template: &str, glob_values: &[String]) -> String {
+    let mut result = String::with_capacity(template.len());
+    let mut chars = template.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '#' {
+            // Collect digits after '#'
+            let mut digits = String::new();
+            while let Some(&d) = chars.peek() {
+                if d.is_ascii_digit() {
+                    digits.push(d);
+                    let _ = chars.next();
+                } else {
+                    break;
+                }
+            }
+            if digits.is_empty() {
+                result.push('#');
+            } else if let Ok(n) = digits.parse::<usize>() {
+                if n >= 1 && n <= glob_values.len() {
+                    result.push_str(&glob_values[n - 1]);
+                } else {
+                    // Out of range: keep literal #N (curl compat)
+                    result.push('#');
+                    result.push_str(&digits);
+                }
+            } else {
+                result.push('#');
+                result.push_str(&digits);
+            }
+        } else {
+            result.push(ch);
+        }
+    }
+
+    result
+}
+
 /// Takes the last path segment. Falls back to `"index.html"` if no filename.
 pub fn remote_name_from_url(url: &str) -> String {
     // Strip scheme (e.g., "http://")
@@ -342,19 +384,26 @@ pub fn run(args: &[String]) -> ExitCode {
 
     // Expand URL globs unless --globoff is set
     if !opts.globoff {
-        let mut expanded = Vec::new();
+        let mut expanded_urls = Vec::new();
+        let mut expanded_values = Vec::new();
         for url in &opts.urls {
-            match liburlx::glob::expand_glob(url) {
-                Ok(urls) => expanded.extend(urls),
+            match liburlx::glob::expand_glob_with_values(url) {
+                Ok(entries) => {
+                    for (expanded_url, values) in entries {
+                        expanded_urls.push(expanded_url);
+                        expanded_values.push(values);
+                    }
+                }
                 Err(e) => {
                     if !opts.silent || opts.show_error {
-                        eprintln!("urlx: {e}");
+                        eprintln!("urlx: (3) {e}");
                     }
                     return ExitCode::from(3); // CURLE_URL_MALFORMAT
                 }
             }
         }
-        opts.urls = expanded;
+        opts.urls = expanded_urls;
+        opts.glob_values = expanded_values;
     }
 
     // -G/--get: move POST body data into URL query string
@@ -381,10 +430,24 @@ pub fn run(args: &[String]) -> ExitCode {
 
     // Multiple URLs: use Multi API for concurrent transfers
     if opts.urls.len() > 1 {
+        // Build per-URL output filenames with #N glob template substitution
+        let per_url_output: Vec<String> = if let Some(ref tmpl) = opts.output_file {
+            opts.urls
+                .iter()
+                .enumerate()
+                .map(|(i, _)| {
+                    let values = opts.glob_values.get(i).map(Vec::as_slice).unwrap_or_default();
+                    substitute_glob_template(tmpl, values)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         return run_multi(
             &opts.easy,
             &opts.urls,
-            opts.output_file.as_deref(),
+            &per_url_output,
             opts.write_out.as_deref(),
             opts.include_headers,
             opts.silent,
@@ -484,6 +547,14 @@ pub fn run(args: &[String]) -> ExitCode {
         // -O/--remote-name: derive output filename from URL
         if opts.remote_name && opts.output_file.is_none() {
             opts.output_file = Some(remote_name_from_url(&url));
+        }
+    }
+
+    // Substitute #N glob templates in output filename (single-URL path)
+    if let Some(ref tmpl) = opts.output_file {
+        let values = opts.glob_values.first().map(Vec::as_slice).unwrap_or_default();
+        if !values.is_empty() {
+            opts.output_file = Some(substitute_glob_template(tmpl, values));
         }
     }
 
@@ -1027,7 +1098,7 @@ pub const fn is_retryable_status(code: u16) -> bool {
 pub fn run_multi(
     template: &liburlx::Easy,
     urls: &[String],
-    output_file: Option<&str>,
+    output_files: &[String],
     write_out: Option<&str>,
     include_headers: bool,
     silent: bool,
@@ -1040,7 +1111,7 @@ pub fn run_multi(
         return run_multi_parallel(
             template,
             urls,
-            output_file,
+            output_files,
             write_out,
             include_headers,
             silent,
@@ -1076,8 +1147,8 @@ pub fn run_multi(
                     any_failed = true;
                     continue;
                 }
-                // First URL uses --output file if specified; rest go to stdout
-                let file_for_this = if i == 0 { output_file } else { None };
+                // Each URL uses its corresponding output file (from #N substitution)
+                let file_for_this = output_files.get(i).map(String::as_str);
                 let exit = output_response(
                     &response,
                     file_for_this,
@@ -1111,7 +1182,7 @@ pub fn run_multi(
 fn run_multi_parallel(
     template: &liburlx::Easy,
     urls: &[String],
-    output_file: Option<&str>,
+    output_files: &[String],
     write_out: Option<&str>,
     include_headers: bool,
     silent: bool,
@@ -1151,7 +1222,7 @@ fn run_multi_parallel(
                     any_failed = true;
                     continue;
                 }
-                let file_for_this = if i == 0 { output_file } else { None };
+                let file_for_this = output_files.get(i).map(String::as_str);
                 let exit = output_response(
                     &response,
                     file_for_this,

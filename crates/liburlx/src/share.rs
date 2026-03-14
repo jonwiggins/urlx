@@ -225,7 +225,7 @@ mod tests {
         // Store a cookie through the shared jar
         {
             let mut jar = share.cookie_jar().unwrap().lock().unwrap();
-            jar.store_cookies(&["session=abc123"], "example.com", "/");
+            jar.store_cookies(&["session=abc123"], "example.com", "/", true);
         }
 
         // Read it back through a clone — clone shares same Arc

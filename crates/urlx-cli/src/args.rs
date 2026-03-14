@@ -29,6 +29,9 @@ pub struct CliOptions {
     /// All output files specified (each `-o` adds to this list).
     /// Each entry pairs with a URL by position.
     pub(crate) output_files: Vec<String>,
+    /// Per-URL glob match values for `#1`, `#2` output template substitution.
+    /// Each inner vec contains the glob group values for the corresponding URL.
+    pub(crate) glob_values: Vec<Vec<String>>,
     pub(crate) write_out: Option<String>,
     pub(crate) show_progress: bool,
     pub(crate) silent: bool,
@@ -352,6 +355,7 @@ fn parse_args_options(args: &[String]) -> Result<CliOptions, u8> {
         urls: Vec::new(),
         output_file: None,
         output_files: Vec::new(),
+        glob_values: Vec::new(),
         write_out: None,
         show_progress: false,
         silent: false,

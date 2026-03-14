@@ -80,6 +80,31 @@ pub enum Error {
         /// Body data decoded before the error.
         partial_body: Vec<u8>,
     },
+
+    /// A URL glob pattern error with position info (curl-compatible format).
+    /// Formats as:
+    /// ```text
+    /// bad range in URL position 47:
+    /// http://example.com/[2-1]
+    ///                         ^
+    /// ```
+    #[error("{}", format_url_glob_error(message, url, *position))]
+    UrlGlob {
+        /// Error message (e.g., "bad range in URL position 47:").
+        message: String,
+        /// The original URL pattern.
+        url: String,
+        /// Character position (0-indexed) for the caret indicator.
+        position: usize,
+    },
+}
+
+/// Format a URL glob error with position caret.
+fn format_url_glob_error(message: &str, url: &str, position: usize) -> String {
+    if url.is_empty() {
+        return message.to_string();
+    }
+    format!("{message}\n{url}\n{:>width$}", "^", width = position + 1)
 }
 
 #[cfg(test)]

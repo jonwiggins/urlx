@@ -81,7 +81,7 @@ impl Segment {
     }
 }
 
-/// Parse a URL glob pattern into segments.
+/// Parse a URL glob pattern into segments, tracking character position for errors.
 ///
 /// # Errors
 ///
@@ -90,6 +90,7 @@ fn parse_glob(pattern: &str) -> Result<Vec<Segment>, Error> {
     let mut segments = Vec::new();
     let mut chars = pattern.chars().peekable();
     let mut literal = String::new();
+    let mut pos: usize = 0;
 
     while let Some(&ch) = chars.peek() {
         match ch {
@@ -98,20 +99,26 @@ fn parse_glob(pattern: &str) -> Result<Vec<Segment>, Error> {
                     segments.push(Segment::Literal(std::mem::take(&mut literal)));
                 }
                 let _ = chars.next(); // consume '{'
-                let set = parse_set(&mut chars)?;
+                pos += 1;
+                let (set, consumed) = parse_set_with_len(&mut chars)?;
+                pos += consumed;
                 segments.push(set);
             }
             '[' => {
                 if !literal.is_empty() {
                     segments.push(Segment::Literal(std::mem::take(&mut literal)));
                 }
+                let open_pos = pos;
                 let _ = chars.next(); // consume '['
-                let range = parse_range(&mut chars)?;
+                pos += 1;
+                let (range, consumed) = parse_range_with_len(&mut chars, pattern, open_pos)?;
+                pos += consumed;
                 segments.push(range);
             }
             _ => {
                 literal.push(ch);
                 let _ = chars.next();
+                pos += ch.len_utf8();
             }
         }
     }
@@ -123,13 +130,17 @@ fn parse_glob(pattern: &str) -> Result<Vec<Segment>, Error> {
     Ok(segments)
 }
 
-/// Parse a set expansion `{a,b,c}`.
-fn parse_set(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Result<Segment, Error> {
+/// Parse a set expansion `{a,b,c}`, returning the segment and character count consumed.
+fn parse_set_with_len(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+) -> Result<(Segment, usize), Error> {
     let mut items = Vec::new();
     let mut current = String::new();
     let mut depth = 1;
+    let mut consumed: usize = 0;
 
     for ch in chars.by_ref() {
+        consumed += ch.len_utf8();
         match ch {
             '{' => {
                 depth += 1;
@@ -142,7 +153,7 @@ fn parse_set(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Result<Seg
                     if items.is_empty() {
                         return Err(Error::Http("empty glob set {}".to_string()));
                     }
-                    return Ok(Segment::Set(items));
+                    return Ok((Segment::Set(items), consumed));
                 }
                 current.push(ch);
             }
@@ -158,13 +169,23 @@ fn parse_set(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Result<Seg
     Err(Error::Http("unclosed glob set '{'".to_string()))
 }
 
-/// Parse a range `[start-end]` or `[start-end:step]`.
-fn parse_range(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Result<Segment, Error> {
+/// Parse a range `[start-end]` or `[start-end:step]`, returning the segment and chars consumed.
+/// `url` and `open_pos` are used to generate curl-compatible error messages with position info.
+fn parse_range_with_len(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    url: &str,
+    open_pos: usize,
+) -> Result<(Segment, usize), Error> {
     let mut content = String::new();
+    let mut consumed: usize = 0;
 
     for ch in chars.by_ref() {
+        consumed += ch.len_utf8();
         if ch == ']' {
-            return parse_range_content(&content);
+            // Position after the closing ']' (1-indexed for curl compat)
+            let end_pos = open_pos + 1 + consumed;
+            let seg = parse_range_content_with_pos(&content, url, end_pos)?;
+            return Ok((seg, consumed));
         }
         content.push(ch);
     }
@@ -172,8 +193,12 @@ fn parse_range(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Result<S
     Err(Error::Http("unclosed glob range '['".to_string()))
 }
 
-/// Parse the content inside `[...]`.
-fn parse_range_content(content: &str) -> Result<Segment, Error> {
+/// Parse the content inside `[...]` with position info for curl-compatible errors.
+fn parse_range_content_with_pos(
+    content: &str,
+    url: &str,
+    end_pos: usize,
+) -> Result<Segment, Error> {
     // Split on '-' to get start and end (possibly with :step)
     // Careful: negative numbers could have leading '-'
     // Format: start-end or start-end:step
@@ -198,6 +223,9 @@ fn parse_range_content(content: &str) -> Result<Segment, Error> {
                 .transpose()
                 .map_err(|_| Error::Http(format!("invalid glob range step: [{content}]")))?
                 .unwrap_or(1);
+            if start_ch > end_ch {
+                return Err(bad_range_error(url, end_pos));
+            }
             return Ok(Segment::AlphaRange { start: start_ch, end: end_ch, step });
         }
     }
@@ -230,10 +258,31 @@ fn parse_range_content(content: &str) -> Result<Segment, Error> {
 
     // Validate range direction matches step sign (curl compat: [2-1] is an error)
     if (step > 0 && start > end) || (step < 0 && start < end) {
-        return Err(Error::Http(format!("bad range in URL position: [{content}]")));
+        return Err(bad_range_error(url, end_pos));
     }
 
     Ok(Segment::NumericRange { start, end, step, width })
+}
+
+/// Build a curl-compatible "bad range" error with URL position and caret indicator.
+///
+/// `end_pos` is the 0-indexed byte position after the closing `]`.
+/// curl uses 1-indexed positions in its error messages.
+fn bad_range_error(url: &str, end_pos: usize) -> Error {
+    if url.is_empty() {
+        return Error::UrlGlob {
+            message: "bad range in URL".to_string(),
+            url: String::new(),
+            position: 0,
+        };
+    }
+    // curl uses 1-indexed positions
+    let display_pos = end_pos + 1;
+    Error::UrlGlob {
+        message: format!("bad range in URL position {display_pos}:"),
+        url: url.to_string(),
+        position: end_pos,
+    }
 }
 
 /// Find the dash that separates start from end in a range.
@@ -286,6 +335,77 @@ pub fn expand_glob(pattern: &str) -> Result<Vec<String>, Error> {
             url.push_str(&segment.value_at(indices[seg_idx]));
         }
         results.push(url);
+
+        // Increment indices (rightmost first, like an odometer)
+        let mut carry = true;
+        for i in (0..indices.len()).rev() {
+            if carry {
+                indices[i] += 1;
+                if indices[i] >= counts[i] {
+                    indices[i] = 0;
+                } else {
+                    carry = false;
+                }
+            }
+        }
+    }
+
+    Ok(results)
+}
+
+/// Expand a URL glob pattern, returning both the expanded URLs and per-URL
+/// glob match values (for `#1`, `#2` output template substitution).
+///
+/// Each element of the returned vector is `(expanded_url, glob_values)` where
+/// `glob_values[0]` is the value of the first glob group, etc.
+///
+/// When there are no glob patterns, returns a single entry with an empty values vec.
+///
+/// # Errors
+///
+/// Returns an error if the glob pattern is malformed (unclosed braces, invalid ranges).
+pub fn expand_glob_with_values(pattern: &str) -> Result<Vec<(String, Vec<String>)>, Error> {
+    let segments = parse_glob(pattern)?;
+
+    // Identify which segments are glob patterns (non-literal)
+    let glob_segment_indices: Vec<usize> = segments
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| !matches!(s, Segment::Literal(_)))
+        .map(|(i, _)| i)
+        .collect();
+
+    if glob_segment_indices.is_empty() {
+        // No expansion needed
+        return Ok(vec![(pattern.to_string(), Vec::new())]);
+    }
+
+    // Compute total combinations
+    let total: usize = segments.iter().map(Segment::count).product();
+
+    if total > MAX_EXPANSION {
+        return Err(Error::Http(format!(
+            "glob expansion too large: {total} URLs (max {MAX_EXPANSION})"
+        )));
+    }
+
+    let mut results = Vec::with_capacity(total);
+
+    let counts: Vec<usize> = segments.iter().map(Segment::count).collect();
+    let mut indices = vec![0usize; segments.len()];
+
+    for _ in 0..total {
+        // Build current URL from indices
+        let mut url = String::new();
+        for (seg_idx, segment) in segments.iter().enumerate() {
+            url.push_str(&segment.value_at(indices[seg_idx]));
+        }
+
+        // Collect glob match values (only non-literal segments)
+        let values: Vec<String> =
+            glob_segment_indices.iter().map(|&i| segments[i].value_at(indices[i])).collect();
+
+        results.push((url, values));
 
         // Increment indices (rightmost first, like an odometer)
         let mut carry = true;

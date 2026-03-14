@@ -24,10 +24,23 @@ fi
 # Filter out unsupported flags and check for explicit User-Agent
 args=()
 has_user_agent=false
+stderr_to_stdout=false
+skip_next=false
 for arg in "$@"; do
+    if $skip_next; then
+        skip_next=false
+        # Check if this is the value for --stderr
+        if [ "$arg" = "-" ]; then
+            stderr_to_stdout=true
+        else
+            args+=("--stderr" "$arg")
+        fi
+        continue
+    fi
     case "$arg" in
         -q) ;; # urlx has no .curlrc, -q is a no-op
         -A|--user-agent) has_user_agent=true; args+=("$arg") ;;
+        --stderr) skip_next=true ;;
         *)  args+=("$arg") ;;
     esac
 done
@@ -38,4 +51,9 @@ if [ "$has_user_agent" = false ]; then
 fi
 
 # Run urlx, translating "urlx:" to "curl:" in stderr for test compatibility
-"$URLX" "${args[@]}" 2> >(sed 's/^urlx:/curl:/' >&2)
+# When --stderr - is used, redirect translated stderr to stdout
+if $stderr_to_stdout; then
+    "$URLX" "${args[@]}" 2> >(sed 's/^urlx:/curl:/' >&1)
+else
+    "$URLX" "${args[@]}" 2> >(sed 's/^urlx:/curl:/' >&2)
+fi

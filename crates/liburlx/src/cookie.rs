@@ -75,17 +75,21 @@ impl CookieJar {
     ///
     /// `request_host` and `request_path` are used as defaults when the
     /// cookie doesn't specify domain/path attributes.
+    /// `is_secure_origin` indicates whether the request was made over HTTPS;
+    /// cookies with the `Secure` attribute are rejected from non-secure origins
+    /// (curl compat).
     pub fn store_from_headers(
         &mut self,
         headers: &HashMap<String, String>,
         request_host: &str,
         request_path: &str,
+        is_secure_origin: bool,
     ) {
         // Look for set-cookie headers (case-insensitive, already lowercased)
         // Multiple Set-Cookie headers are joined with newline by the parser
         if let Some(set_cookie) = headers.get("set-cookie") {
             for value in set_cookie.split('\n') {
-                self.parse_set_cookie(value, request_host, request_path);
+                self.parse_set_cookie(value, request_host, request_path, is_secure_origin);
             }
         }
     }
@@ -94,9 +98,15 @@ impl CookieJar {
     ///
     /// This handles the case where multiple Set-Cookie headers are present
     /// (joined with a separator by the response parser).
-    pub fn store_cookies(&mut self, set_cookie_values: &[&str], host: &str, path: &str) {
+    pub fn store_cookies(
+        &mut self,
+        set_cookie_values: &[&str],
+        host: &str,
+        path: &str,
+        is_secure_origin: bool,
+    ) {
         for value in set_cookie_values {
-            self.parse_set_cookie(value, host, path);
+            self.parse_set_cookie(value, host, path, is_secure_origin);
         }
     }
 
@@ -245,8 +255,9 @@ impl CookieJar {
             if let Some(value) =
                 line.strip_prefix("Set-Cookie:").or_else(|| line.strip_prefix("set-cookie:"))
             {
-                // Use empty host/path defaults — the cookie's own domain/path attrs apply
-                self.parse_set_cookie(value.trim(), "", "/");
+                // Use empty host/path defaults — the cookie's own domain/path attrs apply.
+                // Allow secure cookies from file (they may have been saved from HTTPS).
+                self.parse_set_cookie(value.trim(), "", "/", true);
                 continue;
             }
 
@@ -368,8 +379,17 @@ impl CookieJar {
     }
 
     /// Parse a single Set-Cookie header value and store it.
+    ///
+    /// `is_secure_origin` controls whether cookies with the `Secure` flag are
+    /// accepted. curl rejects `Secure` cookies received over plain HTTP.
     #[allow(clippy::too_many_lines)]
-    fn parse_set_cookie(&mut self, header: &str, request_host: &str, request_path: &str) {
+    fn parse_set_cookie(
+        &mut self,
+        header: &str,
+        request_host: &str,
+        request_path: &str,
+        is_secure_origin: bool,
+    ) {
         let parts: Vec<&str> = header.splitn(2, ';').collect();
         let name_value = parts[0].trim();
 
@@ -463,6 +483,12 @@ impl CookieJar {
             return; // Reject the cookie
         }
 
+        // Reject Secure cookies received over plain HTTP (curl compat).
+        // Secure cookies may only be set by HTTPS origins.
+        if secure && !is_secure_origin {
+            return;
+        }
+
         // Reject cookies with explicit Domain attribute set to a public suffix
         // (e.g., "com", "co.uk", "github.io") to prevent super-domain cookie attacks.
         // Host-only cookies (no Domain attr) are always allowed.
@@ -511,8 +537,20 @@ impl CookieJar {
             (domain.clone(), false)
         };
 
-        // Replace existing cookie with same name+domain+path
-        self.cookies.retain(|c| !(c.name == name && c.domain == domain && c.path == path));
+        // Strip trailing slash from cookie path (curl compat).
+        // Root path "/" is kept as-is.
+        if path.len() > 1 && path.ends_with('/') {
+            path = path.trim_end_matches('/').to_string();
+        }
+
+        // Replace existing cookie with same name+domain+path.
+        // Normalize paths by stripping trailing slashes for comparison (curl compat:
+        // paths "/overwrite/" and "/overwrite" refer to the same cookie).
+        let path_normalized = path.trim_end_matches('/');
+        self.cookies.retain(|c| {
+            let existing_normalized = c.path.trim_end_matches('/');
+            !(c.name == name && c.domain == domain && existing_normalized == path_normalized)
+        });
 
         let idx = self.next_creation_index;
         self.next_creation_index += 1;
@@ -799,7 +837,7 @@ mod tests {
     #[test]
     fn parse_simple_cookie() {
         let mut jar = CookieJar::new();
-        jar.parse_set_cookie("name=value", "example.com", "/");
+        jar.parse_set_cookie("name=value", "example.com", "/", true);
         assert_eq!(jar.len(), 1);
         assert_eq!(jar.cookie_header("example.com", "/", false), Some("name=value".to_string()));
     }
@@ -807,7 +845,7 @@ mod tests {
     #[test]
     fn parse_cookie_with_attributes() {
         let mut jar = CookieJar::new();
-        jar.parse_set_cookie("sid=abc123; Path=/api; Secure; HttpOnly", "example.com", "/");
+        jar.parse_set_cookie("sid=abc123; Path=/api; Secure; HttpOnly", "example.com", "/", true);
         assert_eq!(jar.len(), 1);
 
         // Secure cookie should not match non-secure request
@@ -819,7 +857,7 @@ mod tests {
     #[test]
     fn parse_cookie_with_domain() {
         let mut jar = CookieJar::new();
-        jar.parse_set_cookie("name=value; Domain=example.com", "www.example.com", "/");
+        jar.parse_set_cookie("name=value; Domain=example.com", "www.example.com", "/", true);
         assert_eq!(jar.len(), 1);
 
         // Should match exact domain
@@ -836,7 +874,7 @@ mod tests {
     #[test]
     fn parse_cookie_with_leading_dot_domain() {
         let mut jar = CookieJar::new();
-        jar.parse_set_cookie("name=value; Domain=.example.com", "www.example.com", "/");
+        jar.parse_set_cookie("name=value; Domain=.example.com", "www.example.com", "/", true);
         assert_eq!(jar.len(), 1);
         // Leading dot is stripped per RFC 6265
         assert_eq!(jar.cookie_header("example.com", "/", false), Some("name=value".to_string()));
@@ -845,7 +883,7 @@ mod tests {
     #[test]
     fn path_matching() {
         let mut jar = CookieJar::new();
-        jar.parse_set_cookie("name=value; Path=/api", "example.com", "/");
+        jar.parse_set_cookie("name=value; Path=/api", "example.com", "/", true);
         assert_eq!(jar.len(), 1);
 
         // Exact match
@@ -862,8 +900,8 @@ mod tests {
     #[test]
     fn multiple_cookies() {
         let mut jar = CookieJar::new();
-        jar.parse_set_cookie("a=1", "example.com", "/");
-        jar.parse_set_cookie("b=2", "example.com", "/");
+        jar.parse_set_cookie("a=1", "example.com", "/", true);
+        jar.parse_set_cookie("b=2", "example.com", "/", true);
         assert_eq!(jar.len(), 2);
 
         let header = jar.cookie_header("example.com", "/", false).unwrap();
@@ -875,8 +913,8 @@ mod tests {
     #[test]
     fn cookie_replacement() {
         let mut jar = CookieJar::new();
-        jar.parse_set_cookie("name=old", "example.com", "/");
-        jar.parse_set_cookie("name=new", "example.com", "/");
+        jar.parse_set_cookie("name=old", "example.com", "/", true);
+        jar.parse_set_cookie("name=new", "example.com", "/", true);
         assert_eq!(jar.len(), 1);
         assert_eq!(jar.cookie_header("example.com", "/", false), Some("name=new".to_string()));
     }
@@ -884,11 +922,11 @@ mod tests {
     #[test]
     fn max_age_zero_expires_cookie() {
         let mut jar = CookieJar::new();
-        jar.parse_set_cookie("name=value", "example.com", "/");
+        jar.parse_set_cookie("name=value", "example.com", "/", true);
         assert_eq!(jar.len(), 1);
 
         // Max-Age=0 should mark as expired
-        jar.parse_set_cookie("name=value; Max-Age=0", "example.com", "/");
+        jar.parse_set_cookie("name=value; Max-Age=0", "example.com", "/", true);
         jar.remove_expired();
         assert!(jar.is_empty());
     }
@@ -896,7 +934,7 @@ mod tests {
     #[test]
     fn max_age_positive() {
         let mut jar = CookieJar::new();
-        jar.parse_set_cookie("name=value; Max-Age=3600", "example.com", "/");
+        jar.parse_set_cookie("name=value; Max-Age=3600", "example.com", "/", true);
         assert_eq!(jar.len(), 1);
         // Should still be valid (not expired)
         assert!(jar.cookie_header("example.com", "/", false).is_some());
@@ -905,14 +943,14 @@ mod tests {
     #[test]
     fn empty_cookie_name_rejected() {
         let mut jar = CookieJar::new();
-        jar.parse_set_cookie("=value", "example.com", "/");
+        jar.parse_set_cookie("=value", "example.com", "/", true);
         assert!(jar.is_empty());
     }
 
     #[test]
     fn no_equals_rejected() {
         let mut jar = CookieJar::new();
-        jar.parse_set_cookie("nocookie", "example.com", "/");
+        jar.parse_set_cookie("nocookie", "example.com", "/", true);
         assert!(jar.is_empty());
     }
 
@@ -943,8 +981,13 @@ mod tests {
     #[test]
     fn save_and_load_roundtrip() {
         let mut jar = CookieJar::new();
-        jar.parse_set_cookie("name=value; Path=/; Max-Age=3600", "example.com", "/");
-        jar.parse_set_cookie("sid=abc123; Path=/api; Secure; HttpOnly", "sub.example.com", "/");
+        jar.parse_set_cookie("name=value; Path=/; Max-Age=3600", "example.com", "/", true);
+        jar.parse_set_cookie(
+            "sid=abc123; Path=/api; Secure; HttpOnly",
+            "sub.example.com",
+            "/",
+            true,
+        );
 
         let mut buf = Vec::new();
         jar.save_to_writer(&mut buf).unwrap();
@@ -1013,7 +1056,7 @@ mod tests {
         let path = dir.join("urlx_test_cookies.txt");
 
         let mut jar = CookieJar::new();
-        jar.parse_set_cookie("test=123; Path=/; Max-Age=7200", "filetest.com", "/");
+        jar.parse_set_cookie("test=123; Path=/; Max-Age=7200", "filetest.com", "/", true);
         jar.save_to_file(&path).unwrap();
 
         let loaded = CookieJar::load_from_file(&path).unwrap();
@@ -1027,7 +1070,7 @@ mod tests {
     #[test]
     fn save_format_fields() {
         let mut jar = CookieJar::new();
-        jar.parse_set_cookie("k=v; Path=/p; Secure", "example.com", "/");
+        jar.parse_set_cookie("k=v; Path=/p; Secure", "example.com", "/", true);
 
         let mut buf = Vec::new();
         jar.save_to_writer(&mut buf).unwrap();
@@ -1089,6 +1132,7 @@ mod tests {
             "k=v; SECURE; HTTPONLY; PATH=/api; DOMAIN=example.com",
             "example.com",
             "/",
+            true,
         );
         assert_eq!(jar.len(), 1);
         // SECURE flag should be set
@@ -1099,9 +1143,9 @@ mod tests {
     #[test]
     fn domain_index_basic() {
         let mut jar = CookieJar::new();
-        jar.parse_set_cookie("a=1", "foo.com", "/");
-        jar.parse_set_cookie("b=2", "bar.com", "/");
-        jar.parse_set_cookie("c=3", "foo.com", "/");
+        jar.parse_set_cookie("a=1", "foo.com", "/", true);
+        jar.parse_set_cookie("b=2", "bar.com", "/", true);
+        jar.parse_set_cookie("c=3", "foo.com", "/", true);
         // Index should have 2 domains
         assert_eq!(jar.domain_index.len(), 2);
         assert_eq!(jar.domain_index["foo.com"].len(), 2);
@@ -1111,7 +1155,7 @@ mod tests {
     #[test]
     fn domain_index_subdomain_lookup() {
         let mut jar = CookieJar::new();
-        jar.parse_set_cookie("k=v; Domain=example.com", "www.example.com", "/");
+        jar.parse_set_cookie("k=v; Domain=example.com", "www.example.com", "/", true);
         // Cookie is stored under "example.com"
         assert_eq!(jar.domain_index.len(), 1);
         // Subdomain lookup should find it
@@ -1123,8 +1167,8 @@ mod tests {
     #[test]
     fn domain_index_after_replacement() {
         let mut jar = CookieJar::new();
-        jar.parse_set_cookie("k=old", "example.com", "/");
-        jar.parse_set_cookie("k=new", "example.com", "/");
+        jar.parse_set_cookie("k=old", "example.com", "/", true);
+        jar.parse_set_cookie("k=new", "example.com", "/", true);
         // Should have only 1 cookie (replaced)
         assert_eq!(jar.len(), 1);
         assert_eq!(jar.domain_index["example.com"].len(), 1);
@@ -1137,7 +1181,7 @@ mod tests {
     fn psl_rejects_cookie_for_tld() {
         // Setting a cookie for ".com" should be rejected
         let mut jar = CookieJar::new();
-        jar.parse_set_cookie("name=value; Domain=com", "example.com", "/");
+        jar.parse_set_cookie("name=value; Domain=com", "example.com", "/", true);
         assert!(jar.is_empty(), "cookie for TLD 'com' should be rejected");
     }
 
@@ -1145,7 +1189,7 @@ mod tests {
     fn psl_rejects_cookie_for_co_uk() {
         // ".co.uk" is a public suffix
         let mut jar = CookieJar::new();
-        jar.parse_set_cookie("name=value; Domain=co.uk", "example.co.uk", "/");
+        jar.parse_set_cookie("name=value; Domain=co.uk", "example.co.uk", "/", true);
         assert!(jar.is_empty(), "cookie for public suffix 'co.uk' should be rejected");
     }
 
@@ -1153,14 +1197,14 @@ mod tests {
     fn psl_allows_cookie_for_etld_plus_one() {
         // "example.com" is eTLD+1, should be allowed
         let mut jar = CookieJar::new();
-        jar.parse_set_cookie("name=value; Domain=example.com", "www.example.com", "/");
+        jar.parse_set_cookie("name=value; Domain=example.com", "www.example.com", "/", true);
         assert_eq!(jar.len(), 1, "cookie for eTLD+1 should be allowed");
     }
 
     #[test]
     fn psl_allows_cookie_for_subdomain() {
         let mut jar = CookieJar::new();
-        jar.parse_set_cookie("name=value; Domain=sub.example.com", "sub.example.com", "/");
+        jar.parse_set_cookie("name=value; Domain=sub.example.com", "sub.example.com", "/", true);
         assert_eq!(jar.len(), 1);
     }
 
@@ -1168,7 +1212,7 @@ mod tests {
     fn psl_rejects_cookie_for_github_io() {
         // "github.io" is a public suffix (wildcard rule)
         let mut jar = CookieJar::new();
-        jar.parse_set_cookie("name=value; Domain=github.io", "foo.github.io", "/");
+        jar.parse_set_cookie("name=value; Domain=github.io", "foo.github.io", "/", true);
         assert!(jar.is_empty(), "cookie for public suffix 'github.io' should be rejected");
     }
 
@@ -1176,7 +1220,7 @@ mod tests {
     fn psl_allows_cookie_for_specific_github_io() {
         // "foo.github.io" is eTLD+1 under the wildcard rule
         let mut jar = CookieJar::new();
-        jar.parse_set_cookie("name=value; Domain=foo.github.io", "foo.github.io", "/");
+        jar.parse_set_cookie("name=value; Domain=foo.github.io", "foo.github.io", "/", true);
         assert_eq!(jar.len(), 1, "cookie for eTLD+1 under wildcard should be allowed");
     }
 
@@ -1184,14 +1228,14 @@ mod tests {
     fn psl_allows_cookie_without_domain_attr() {
         // Host-only cookies (no Domain attr) are always allowed
         let mut jar = CookieJar::new();
-        jar.parse_set_cookie("name=value", "example.com", "/");
+        jar.parse_set_cookie("name=value", "example.com", "/", true);
         assert_eq!(jar.len(), 1, "host-only cookie should always be allowed");
     }
 
     #[test]
     fn psl_rejects_cookie_for_org() {
         let mut jar = CookieJar::new();
-        jar.parse_set_cookie("name=value; Domain=org", "example.org", "/");
+        jar.parse_set_cookie("name=value; Domain=org", "example.org", "/", true);
         assert!(jar.is_empty());
     }
 
@@ -1199,14 +1243,14 @@ mod tests {
     fn psl_rejects_cookie_for_tokyo_jp() {
         // "tokyo.jp" is a public suffix
         let mut jar = CookieJar::new();
-        jar.parse_set_cookie("name=value; Domain=tokyo.jp", "example.tokyo.jp", "/");
+        jar.parse_set_cookie("name=value; Domain=tokyo.jp", "example.tokyo.jp", "/", true);
         assert!(jar.is_empty());
     }
 
     #[test]
     fn psl_allows_cookie_for_etld1_tokyo_jp() {
         let mut jar = CookieJar::new();
-        jar.parse_set_cookie("name=value; Domain=example.tokyo.jp", "example.tokyo.jp", "/");
+        jar.parse_set_cookie("name=value; Domain=example.tokyo.jp", "example.tokyo.jp", "/", true);
         assert_eq!(jar.len(), 1);
     }
 
@@ -1224,7 +1268,7 @@ mod tests {
     fn domain_index_many_domains() {
         let mut jar = CookieJar::new();
         for i in 0..100 {
-            jar.store_cookies(&[&format!("k{i}=v{i}")], &format!("host{i}.com"), "/");
+            jar.store_cookies(&[&format!("k{i}=v{i}")], &format!("host{i}.com"), "/", true);
         }
         assert_eq!(jar.len(), 100);
         assert_eq!(jar.domain_index.len(), 100);
@@ -1239,7 +1283,7 @@ mod tests {
     #[test]
     fn samesite_lax_parsed() {
         let mut jar = CookieJar::new();
-        jar.store_cookies(&["id=123; SameSite=Lax"], "example.com", "/");
+        jar.store_cookies(&["id=123; SameSite=Lax"], "example.com", "/", true);
         assert_eq!(jar.len(), 1);
         assert_eq!(jar.cookies[0].same_site, SameSite::Lax);
     }
@@ -1247,7 +1291,7 @@ mod tests {
     #[test]
     fn samesite_strict_parsed() {
         let mut jar = CookieJar::new();
-        jar.store_cookies(&["id=456; SameSite=Strict"], "example.com", "/");
+        jar.store_cookies(&["id=456; SameSite=Strict"], "example.com", "/", true);
         assert_eq!(jar.len(), 1);
         assert_eq!(jar.cookies[0].same_site, SameSite::Strict);
     }
@@ -1255,7 +1299,7 @@ mod tests {
     #[test]
     fn samesite_none_with_secure_accepted() {
         let mut jar = CookieJar::new();
-        jar.store_cookies(&["id=789; SameSite=None; Secure"], "example.com", "/");
+        jar.store_cookies(&["id=789; SameSite=None; Secure"], "example.com", "/", true);
         assert_eq!(jar.len(), 1);
         assert_eq!(jar.cookies[0].same_site, SameSite::None);
         assert!(jar.cookies[0].secure);
@@ -1264,7 +1308,7 @@ mod tests {
     #[test]
     fn samesite_none_without_secure_rejected() {
         let mut jar = CookieJar::new();
-        jar.store_cookies(&["id=bad; SameSite=None"], "example.com", "/");
+        jar.store_cookies(&["id=bad; SameSite=None"], "example.com", "/", true);
         // SameSite=None without Secure must be rejected
         assert_eq!(jar.len(), 0);
     }
@@ -1272,7 +1316,7 @@ mod tests {
     #[test]
     fn samesite_default_is_lax() {
         let mut jar = CookieJar::new();
-        jar.store_cookies(&["id=def"], "example.com", "/");
+        jar.store_cookies(&["id=def"], "example.com", "/", true);
         assert_eq!(jar.len(), 1);
         assert_eq!(jar.cookies[0].same_site, SameSite::Lax);
     }
@@ -1280,17 +1324,17 @@ mod tests {
     #[test]
     fn samesite_case_insensitive() {
         let mut jar = CookieJar::new();
-        jar.store_cookies(&["a=1; samesite=STRICT"], "example.com", "/");
+        jar.store_cookies(&["a=1; samesite=STRICT"], "example.com", "/", true);
         assert_eq!(jar.cookies[0].same_site, SameSite::Strict);
 
-        jar.store_cookies(&["b=2; SAMESITE=lax"], "example.com", "/");
+        jar.store_cookies(&["b=2; SAMESITE=lax"], "example.com", "/", true);
         assert_eq!(jar.cookies[1].same_site, SameSite::Lax);
     }
 
     #[test]
     fn samesite_unknown_value_defaults_to_lax() {
         let mut jar = CookieJar::new();
-        jar.store_cookies(&["id=x; SameSite=Invalid"], "example.com", "/");
+        jar.store_cookies(&["id=x; SameSite=Invalid"], "example.com", "/", true);
         assert_eq!(jar.len(), 1);
         assert_eq!(jar.cookies[0].same_site, SameSite::Lax);
     }
@@ -1298,7 +1342,7 @@ mod tests {
     #[test]
     fn samesite_none_secure_cookie_sent_over_https() {
         let mut jar = CookieJar::new();
-        jar.store_cookies(&["id=s; SameSite=None; Secure"], "example.com", "/");
+        jar.store_cookies(&["id=s; SameSite=None; Secure"], "example.com", "/", true);
         // Secure cookies should be sent over HTTPS
         assert!(jar.cookie_header("example.com", "/", true).is_some());
         // But not over HTTP

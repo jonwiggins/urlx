@@ -2245,10 +2245,16 @@ async fn perform_transfer(
             }
         }
         if let Some(ref jar) = cookie_jar {
-            let host = current_url.host_str().unwrap_or("");
+            // Use custom Host header for cookie domain matching if present (curl compat)
+            let cookie_host =
+                request_headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("host")).map_or_else(
+                    || current_url.host_str().unwrap_or(""),
+                    // Strip port from Host header value if present
+                    |(_, v)| v.split(':').next().unwrap_or(v.as_str()),
+                );
             let path = current_url.path();
             let is_secure = current_url.scheme() == "https";
-            if let Some(cookie_header) = jar.cookie_header(host, path, is_secure) {
+            if let Some(cookie_header) = jar.cookie_header(cookie_host, path, is_secure) {
                 // Only add if user hasn't set a Cookie header
                 if !request_headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("cookie")) {
                     request_headers.push(("Cookie".to_string(), cookie_header));
@@ -2456,11 +2462,18 @@ async fn perform_transfer(
             }
         }
 
-        // Store cookies from response
+        // Store cookies from response.
+        // Use custom Host header for cookie domain matching if present (curl compat).
         if let Some(ref mut jar) = cookie_jar {
-            let host = current_url.host_str().unwrap_or("");
+            let cookie_host =
+                headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("host")).map_or_else(
+                    || current_url.host_str().unwrap_or(""),
+                    // Strip port from Host header value if present
+                    |(_, v)| v.split(':').next().unwrap_or(v),
+                );
             let path = current_url.path();
-            jar.store_from_headers(response.headers(), host, path);
+            let is_secure = current_url.scheme() == "https";
+            jar.store_from_headers(response.headers(), cookie_host, path, is_secure);
         }
 
         // Store HSTS headers from HTTPS responses

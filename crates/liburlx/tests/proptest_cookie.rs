@@ -13,7 +13,7 @@ proptest! {
     ) {
         let mut jar = liburlx::CookieJar::new();
         let header = format!("{name}={value}");
-        jar.store_cookies(&[&header], "example.com", "/");
+        jar.store_cookies(&[&header], "example.com", "/", true);
         let cookie = jar.cookie_header("example.com", "/", false);
         prop_assert!(cookie.is_some(), "cookie should be retrievable");
         let cookie = cookie.unwrap();
@@ -26,7 +26,7 @@ proptest! {
     fn empty_name_rejected(value in "[a-zA-Z0-9]{1,20}") {
         let mut jar = liburlx::CookieJar::new();
         let header = format!("={value}");
-        jar.store_cookies(&[&header], "example.com", "/");
+        jar.store_cookies(&[&header], "example.com", "/", true);
         prop_assert!(jar.is_empty(), "empty name should be rejected");
     }
 
@@ -34,7 +34,7 @@ proptest! {
     #[test]
     fn no_equals_rejected(s in "[a-zA-Z]{1,20}") {
         let mut jar = liburlx::CookieJar::new();
-        jar.store_cookies(&[s.as_str()], "example.com", "/");
+        jar.store_cookies(&[s.as_str()], "example.com", "/", true);
         prop_assert!(jar.is_empty(), "no-equals cookie should be rejected");
     }
 
@@ -46,7 +46,7 @@ proptest! {
     ) {
         let mut jar = liburlx::CookieJar::new();
         let header = format!("{name}={value}; Max-Age=0");
-        jar.store_cookies(&[&header], "example.com", "/");
+        jar.store_cookies(&[&header], "example.com", "/", true);
         jar.remove_expired();
         prop_assert!(jar.is_empty(), "Max-Age=0 cookie should be expired");
     }
@@ -63,11 +63,13 @@ proptest! {
             &[&format!("{name}={old_value}")],
             "example.com",
             "/",
+            true,
         );
         jar.store_cookies(
             &[&format!("{name}={new_value}")],
             "example.com",
             "/",
+            true,
         );
         prop_assert_eq!(jar.len(), 1);
         let cookie = jar.cookie_header("example.com", "/", false).unwrap();
@@ -87,7 +89,7 @@ proptest! {
         let domain = format!("{subdomain}.example.com");
         let mut jar = liburlx::CookieJar::new();
         let header = format!("{name}={value}; Domain={domain}");
-        jar.store_cookies(&[&header], &domain, "/");
+        jar.store_cookies(&[&header], &domain, "/", true);
 
         // Uppercase version should still match
         let upper = domain.to_uppercase();
@@ -105,7 +107,7 @@ proptest! {
     ) {
         let mut jar = liburlx::CookieJar::new();
         let header = format!("{name}={value}; Path={prefix}");
-        jar.store_cookies(&[&header], "example.com", "/");
+        jar.store_cookies(&[&header], "example.com", "/", true);
 
         // Should match the prefix + suffix
         let full_path = format!("{prefix}{suffix}");
@@ -128,7 +130,7 @@ proptest! {
     ) {
         let mut jar = liburlx::CookieJar::new();
         let header = format!("{name}={value}; Secure");
-        jar.store_cookies(&[&header], "example.com", "/");
+        jar.store_cookies(&[&header], "example.com", "/", true);
         prop_assert!(jar.cookie_header("example.com", "/", false).is_none(),
             "secure cookie should not be sent over HTTP");
         prop_assert!(jar.cookie_header("example.com", "/", true).is_some(),

@@ -46,6 +46,7 @@ fn bench_cookie_jar(c: &mut Criterion) {
                 black_box(&["session=abc123"]),
                 black_box("example.com"),
                 black_box("/"),
+                true,
             );
         });
     });
@@ -59,6 +60,7 @@ fn bench_cookie_jar(c: &mut Criterion) {
                 ]),
                 black_box("example.com"),
                 black_box("/"),
+                true,
             );
         });
     });
@@ -66,7 +68,7 @@ fn bench_cookie_jar(c: &mut Criterion) {
     group.bench_function("lookup_10_cookies", |b| {
         let mut jar = liburlx::CookieJar::new();
         for i in 0..10 {
-            jar.store_cookies(&[&format!("key{i}=value{i}")], "example.com", "/");
+            jar.store_cookies(&[&format!("key{i}=value{i}")], "example.com", "/", true);
         }
         b.iter(|| jar.cookie_header(black_box("example.com"), black_box("/api"), black_box(false)));
     });
@@ -74,7 +76,7 @@ fn bench_cookie_jar(c: &mut Criterion) {
     group.bench_function("lookup_100_cookies", |b| {
         let mut jar = liburlx::CookieJar::new();
         for i in 0..100 {
-            jar.store_cookies(&[&format!("key{i}=value{i}")], "example.com", "/");
+            jar.store_cookies(&[&format!("key{i}=value{i}")], "example.com", "/", true);
         }
         b.iter(|| jar.cookie_header(black_box("example.com"), black_box("/api"), black_box(false)));
     });
@@ -178,13 +180,13 @@ fn bench_cookie_domain_matching(c: &mut Criterion) {
 
     group.bench_function("exact_match", |b| {
         let mut jar = liburlx::CookieJar::new();
-        jar.store_cookies(&["key=val"], "example.com", "/");
+        jar.store_cookies(&["key=val"], "example.com", "/", true);
         b.iter(|| jar.cookie_header(black_box("example.com"), black_box("/"), black_box(false)));
     });
 
     group.bench_function("subdomain_match", |b| {
         let mut jar = liburlx::CookieJar::new();
-        jar.store_cookies(&["key=val; Domain=example.com"], "www.example.com", "/");
+        jar.store_cookies(&["key=val; Domain=example.com"], "www.example.com", "/", true);
         b.iter(|| {
             jar.cookie_header(
                 black_box("sub.deep.example.com"),
@@ -197,7 +199,7 @@ fn bench_cookie_domain_matching(c: &mut Criterion) {
     group.bench_function("no_match_1000_cookies", |b| {
         let mut jar = liburlx::CookieJar::new();
         for i in 0..1000 {
-            jar.store_cookies(&[&format!("k{i}=v{i}")], &format!("host{i}.com"), "/");
+            jar.store_cookies(&[&format!("k{i}=v{i}")], &format!("host{i}.com"), "/", true);
         }
         b.iter(|| jar.cookie_header(black_box("other.com"), black_box("/"), black_box(false)));
     });
