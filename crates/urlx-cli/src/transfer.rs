@@ -638,9 +638,35 @@ pub fn run(args: &[String]) -> ExitCode {
             // Check for failed resume: when -C was used for a download and server
             // returned non-206 (curl returns CURLE_RANGE_ERROR = 33).
             // For uploads (PUT), 200 is a valid response — don't check.
+            // 416 Range Not Satisfiable = file already fully downloaded (success,
+            // output headers but suppress body).
             if opts.resume_check && !opts.is_upload {
                 let status = response.status();
+                if status == 416 {
+                    // File already complete — output headers only, exit success
+                    let exit = output_response(
+                        &response,
+                        opts.output_file.as_deref(),
+                        opts.write_out.as_deref(),
+                        opts.include_headers,
+                        opts.silent,
+                        true, // suppress body
+                    );
+                    return exit;
+                }
                 if status != 206 {
+                    // Output headers but suppress body. When auto-resuming (-C -),
+                    // don't write to the output file (it's the resume source).
+                    let out_file =
+                        if opts.auto_resume { None } else { opts.output_file.as_deref() };
+                    let _exit = output_response(
+                        &response,
+                        out_file,
+                        opts.write_out.as_deref(),
+                        opts.include_headers,
+                        opts.silent,
+                        true, // suppress body
+                    );
                     if !opts.silent || opts.show_error {
                         eprintln!("urlx: server returned {status} but resume was requested");
                     }
@@ -807,17 +833,27 @@ pub fn run(args: &[String]) -> ExitCode {
                         }
                     }
                 } else {
+                    // For 416 with resume, suppress body (file already downloaded)
+                    let suppress = opts.resume_check && resp.status() == 416;
                     let _ = output_response(
                         resp,
                         opts.output_file.as_deref(),
                         opts.write_out.as_deref(),
                         opts.include_headers,
                         opts.silent,
-                        false,
+                        suppress,
                     );
                 }
             }
 
+            // 416 Range Not Satisfiable with resume = file already fully downloaded (success)
+            if opts.resume_check {
+                if let Some(resp) = opts.easy.last_response() {
+                    if resp.status() == 416 {
+                        return ExitCode::SUCCESS;
+                    }
+                }
+            }
             if !opts.silent || opts.show_error {
                 eprintln!("urlx: {e}");
             }
