@@ -803,8 +803,28 @@ impl Easy {
     ///
     /// Returns [`Error::UrlParse`] if the proxy URL is invalid.
     pub fn proxy(&mut self, proxy_url: &str) -> Result<(), Error> {
+        // Extract userinfo credentials from proxy URL (e.g., http://user:pass@host:port/)
+        if let Ok(parsed) = url::Url::parse(proxy_url) {
+            let user = parsed.username();
+            let pass = parsed.password().unwrap_or("");
+            if !user.is_empty() {
+                self.proxy_auth(user, pass);
+            }
+        }
         self.proxy = Some(Url::parse(proxy_url)?);
         Ok(())
+    }
+
+    /// Returns true if a proxy has been configured.
+    #[must_use]
+    pub const fn has_proxy(&self) -> bool {
+        self.proxy.is_some()
+    }
+
+    /// Returns a reference to the current URL, if set.
+    #[must_use]
+    pub const fn url_ref(&self) -> Option<&Url> {
+        self.url.as_ref()
     }
 
     /// Set the no-proxy list (comma-separated hostnames/domains).

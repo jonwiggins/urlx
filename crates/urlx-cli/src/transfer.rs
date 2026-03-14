@@ -503,6 +503,20 @@ pub fn run(args: &[String]) -> ExitCode {
         }
     }
 
+    // Proxy from environment variables (if no explicit -x/--proxy was set)
+    if !opts.easy.has_proxy() {
+        let scheme = opts.easy.url_ref().map(|u| u.scheme().to_lowercase()).unwrap_or_default();
+        let env_var = match scheme.as_str() {
+            "https" => std::env::var("https_proxy").or_else(|_| std::env::var("HTTPS_PROXY")).ok(),
+            _ => std::env::var("http_proxy").or_else(|_| std::env::var("HTTP_PROXY")).ok(),
+        };
+        if let Some(proxy_url) = env_var {
+            if !proxy_url.is_empty() {
+                let _ = opts.easy.proxy(&proxy_url);
+            }
+        }
+    }
+
     // -C - auto-resume: determine offset from existing output file size
     if opts.auto_resume {
         if let Some(ref path) = opts.output_file {
