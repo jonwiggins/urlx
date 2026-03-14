@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **HTTP response parsing** — Preserve raw header bytes for exact wire-format `--include` output, correctly handling mixed CRLF/LF line endings and no-space-after-colon headers (e.g., `Set-Cookie:value`)
+- **Header end detection** — Handle mixed line ending patterns (`\n\r\n`) and always find the earliest terminator, preventing body data from being parsed as headers
+- **HEAD response hang** — Correctly detect HEAD responses and skip body reading
+- **Resume hang** — Skip body read for failed Range requests without Content-Length, avoiding infinite wait when servers don't close the connection
+- **Redirect hang** — Skip body read for 3xx redirects without Content-Length when server says Connection: close but doesn't close
+- **Resume error handling** — 416 Range Not Satisfiable treated as success (file already downloaded), output headers only; non-206 resume errors output headers but preserve auto-resume source files
+- **User-Agent suppression** — `-A ""` now fully suppresses the User-Agent header instead of sending an empty one
+- **Digest auth** — Only emit `algorithm=` in Authorization header when server explicitly specified it in the challenge
+- **Cookie jar output** — Write all cookies (not just persistent), track include_subdomains flag and domain display for Netscape format, validate Set-Cookie domain against request host
+- **Config file parsing** — Handle `flag = value` syntax with `=` separator
+- **Time condition** — Parse `-z` timestamp and suppress body when condition is not met
+- **Version string** — Match curl's feature flag format for test suite compatibility
+- **Test infrastructure** — Fix `urlx-as-curl` wrapper to default to release binary; export `URLX_BIN` from `run-curl-tests.sh`
+
+### Changed
+
+- curl test suite compatibility: **69/98 tests passing** (tests 1–99), up from 8/19
+
 ## [0.1.0] - 2026-03-10
 
 ### Added
