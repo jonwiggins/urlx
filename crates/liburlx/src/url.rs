@@ -138,10 +138,15 @@ impl Url {
     /// form-encoded spaces).
     #[must_use]
     pub fn request_target(&self) -> String {
-        self.inner.query().map_or_else(
-            || self.inner.path().to_string(),
-            |q| format!("{}?{}", self.inner.path(), q.replace("%20", "+")),
-        )
+        // Use the parsed URL's path (which normalizes dot segments like `../`)
+        // but decode characters that curl sends raw (e.g., `"` encoded as `%22`
+        // by the url crate). This matches curl's behavior of preserving the
+        // user's encoding while still normalizing paths.
+        let path = self.inner.path().replace("%22", "\"");
+        match self.inner.query() {
+            Some(q) => format!("{path}?{}", q.replace("%20", "+")),
+            None => path,
+        }
     }
 
     /// Set the port on the URL.

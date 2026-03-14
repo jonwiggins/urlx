@@ -132,8 +132,10 @@ impl DigestChallenge {
             self.algorithm.hash(format!("{ha1}:{nonce}:{ha2}", nonce = self.nonce).as_bytes())
         };
 
+        // Escape `"` in URI for the quoted-string value (RFC 7616 §3.4)
+        let uri_escaped = uri.replace('"', "\\\"");
         let mut header = format!(
-            "Digest username=\"{username}\", realm=\"{realm}\", nonce=\"{nonce}\", uri=\"{uri}\", response=\"{response}\"",
+            "Digest username=\"{username}\", realm=\"{realm}\", nonce=\"{nonce}\", uri=\"{uri_escaped}\", response=\"{response}\"",
             realm = self.realm,
             nonce = self.nonce,
         );

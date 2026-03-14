@@ -2236,11 +2236,25 @@ async fn perform_transfer(
             }
         }
 
+        // For Digest auth, don't send body on initial request — it will be
+        // rejected with 401 anyway. Send body only on the retry with credentials.
+        // Send Content-Length: 0 for PUT/POST to match curl behavior.
+        let is_digest_initial =
+            auth_credentials.as_ref().is_some_and(|a| a.method == AuthMethod::Digest);
+        let initial_body = if is_digest_initial {
+            if current_body.is_some() {
+                Some(&[] as &[u8]) // Empty body → sends Content-Length: 0
+            } else {
+                None
+            }
+        } else {
+            current_body.as_deref()
+        };
         let mut response = Box::pin(do_single_request(
             &current_url,
             &current_method,
             &request_headers,
-            current_body.as_deref(),
+            initial_body,
             verbose,
             accept_encoding,
             connect_timeout,
@@ -2306,13 +2320,16 @@ async fn perform_transfer(
             *guard = Some(response.clone());
         }
 
-        // Handle Digest auth: if 401 with WWW-Authenticate: Digest, retry with credentials
+        // Handle Digest auth: if 401 with WWW-Authenticate: Digest, retry with credentials.
+        // Triggers for --digest and --anyauth (any method willing to negotiate).
         if response.status() == 401 {
             if let Some(auth) = auth_credentials {
                 if auth.method == AuthMethod::Digest {
                     if let Some(www_auth) = response.header("www-authenticate") {
                         if let Ok(challenge) = crate::auth::digest::DigestChallenge::parse(www_auth)
                         {
+                            // Save the 401 response for --include output (curl compat)
+                            redirect_chain.push(response.clone());
                             if verbose {
                                 #[allow(clippy::print_stderr)]
                                 {
