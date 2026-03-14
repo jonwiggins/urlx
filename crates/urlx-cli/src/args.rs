@@ -612,7 +612,14 @@ fn parse_args_options(args: &[String]) -> Result<CliOptions, u8> {
             "-A" | "--user-agent" => {
                 i += 1;
                 let val = require_arg(args, i, "-A")?;
-                opts.easy.header("User-Agent", val);
+                if val.is_empty() {
+                    // -A "" removes the User-Agent header entirely (curl compat).
+                    // Set empty value so h1 detects it and suppresses the default.
+                    opts.easy.remove_header("User-Agent");
+                    opts.easy.header("User-Agent", "");
+                } else {
+                    opts.easy.header("User-Agent", val);
+                }
             }
             "-F" | "--form" => {
                 i += 1;

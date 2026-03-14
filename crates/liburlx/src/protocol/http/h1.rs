@@ -109,19 +109,22 @@ where
         }
     }
 
-    // Emit User-Agent in its fixed position: custom value from -A, or default
+    // Emit User-Agent in its fixed position: custom value from -A, or default.
+    // An empty value (from -A "" or -H "User-Agent:") suppresses the header entirely.
     let custom_ua = custom_headers
         .iter()
         .enumerate()
         .find(|(i, (k, _))| keep[*i] && k.eq_ignore_ascii_case("user-agent"));
-    if let Some((_, (name, value))) = custom_ua {
-        if value.is_empty() {
-            let _ = write!(req, "{name}:\r\n");
-        } else {
+    match custom_ua {
+        Some((_, (_, value))) if value.is_empty() => {
+            // Empty User-Agent = suppress entirely (curl compat)
+        }
+        Some((_, (name, value))) => {
             let _ = write!(req, "{name}: {value}\r\n");
         }
-    } else {
-        req.push_str("User-Agent: urlx/0.1.0\r\n");
+        None => {
+            req.push_str("User-Agent: urlx/0.1.0\r\n");
+        }
     }
 
     // Emit default Accept right after User-Agent (curl compat), or skip
