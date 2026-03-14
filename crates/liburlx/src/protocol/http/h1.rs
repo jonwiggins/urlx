@@ -296,6 +296,24 @@ where
 
     // Read response headers, skipping 1xx informational responses
     let (mut header_bytes, mut body_prefix) = read_response_headers(stream).await?;
+
+    // HTTP/0.9: no headers at all — return body-only response
+    if header_bytes.is_empty() {
+        // Read remaining body to EOF
+        let mut body = body_prefix;
+        let mut tmp = [0u8; 8192];
+        loop {
+            match stream.read(&mut tmp).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => body.extend_from_slice(&tmp[..n]),
+            }
+        }
+        let mut resp = Response::new(200, HashMap::new(), body, url.to_string());
+        // Set empty raw headers so format_headers outputs nothing
+        resp.set_raw_headers(Vec::new());
+        return Ok((resp, false));
+    }
+
     let mut ph = parse_headers(&header_bytes)?;
 
     // Skip 1xx informational responses (100 Continue, 103 Early Hints, etc.)
@@ -506,6 +524,11 @@ where
         if n == 0 {
             if buf.is_empty() {
                 return Err(Error::Http("empty response (connection closed)".to_string()));
+            }
+            // If response doesn't start with "HTTP/", treat as HTTP/0.9
+            // (raw body, no headers). Return empty headers + all data as body prefix.
+            if !buf.starts_with(b"HTTP/") {
+                return Ok((Vec::new(), buf));
             }
             return Err(Error::Http("incomplete response headers".to_string()));
         }
