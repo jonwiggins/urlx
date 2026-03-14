@@ -63,6 +63,8 @@ brotli = { version = "7", optional = true }
 zstd = { version = "0.13", optional = true, default-features = false }
 hickory-resolver = { version = "0.25", optional = true, default-features = false, features = ["tokio", "system-config", "https-ring", "tls-ring"] }
 psl = "2"
+des = "0.8"
+cipher = "0.4"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }

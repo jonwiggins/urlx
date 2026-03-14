@@ -1072,6 +1072,7 @@ impl Easy {
             username: user.to_string(),
             password: password.to_string(),
             method: AuthMethod::Digest,
+            domain: None,
         });
     }
 
@@ -1638,12 +1639,40 @@ impl Easy {
     /// Set HTTP NTLM authentication credentials.
     ///
     /// NTLM is a multi-step challenge-response authentication mechanism.
+    /// Supports `DOMAIN\user` format — the domain prefix is extracted and
+    /// sent in the NTLM Type 3 message.
     /// Equivalent to curl's `--ntlm -u user:pass`.
     pub fn ntlm_auth(&mut self, user: &str, password: &str) {
+        let (domain, username) = if let Some((d, u)) = user.split_once('\\') {
+            (Some(d.to_string()), u.to_string())
+        } else {
+            (None, user.to_string())
+        };
         self.auth_credentials = Some(AuthCredentials {
-            username: user.to_string(),
+            username,
             password: password.to_string(),
             method: AuthMethod::Ntlm,
+            domain,
+        });
+    }
+
+    /// Set authentication credentials for `--anyauth` mode.
+    ///
+    /// The first request is sent without auth. On 401, the
+    /// `WWW-Authenticate` header is examined and the strongest
+    /// supported method is used (Digest > NTLM > Basic).
+    /// Supports `DOMAIN\user` format for NTLM.
+    pub fn anyauth(&mut self, user: &str, password: &str) {
+        let (domain, username) = if let Some((d, u)) = user.split_once('\\') {
+            (Some(d.to_string()), u.to_string())
+        } else {
+            (None, user.to_string())
+        };
+        self.auth_credentials = Some(AuthCredentials {
+            username,
+            password: password.to_string(),
+            method: AuthMethod::AnyAuth,
+            domain,
         });
     }
 
@@ -2299,12 +2328,14 @@ async fn perform_transfer(
             }
         }
 
-        // For Digest auth, don't send body on initial request — it will be
+        // For Digest/AnyAuth, don't send body on initial request — it will be
         // rejected with 401 anyway. Send body only on the retry with credentials.
         // Send Content-Length: 0 for PUT/POST to match curl behavior.
-        let is_digest_initial =
-            auth_credentials.as_ref().is_some_and(|a| a.method == AuthMethod::Digest);
-        let initial_body = if is_digest_initial {
+        // For NTLM, add Authorization: NTLM Type1 to the first request.
+        let is_challenge_response = auth_credentials
+            .as_ref()
+            .is_some_and(|a| matches!(a.method, AuthMethod::Digest | AuthMethod::AnyAuth));
+        let initial_body = if is_challenge_response {
             if current_body.is_some() {
                 Some(&[] as &[u8]) // Empty body → sends Content-Length: 0
             } else {
@@ -2313,6 +2344,22 @@ async fn perform_transfer(
         } else {
             current_body.as_deref()
         };
+
+        // For explicit NTLM, send Type 1 message on the first request
+        if let Some(auth) = auth_credentials {
+            if auth.method == AuthMethod::Ntlm {
+                let type1 = crate::auth::ntlm::create_type1_message();
+                request_headers.push(("Authorization".to_string(), format!("NTLM {type1}")));
+            }
+        }
+
+        // For proxy NTLM, send Proxy-Authorization: NTLM Type1 on the first request
+        if let Some(pcreds) = proxy_credentials {
+            if pcreds.method == ProxyAuthMethod::Ntlm {
+                let type1 = crate::auth::ntlm::create_type1_message();
+                request_headers.push(("Proxy-Authorization".to_string(), format!("NTLM {type1}")));
+            }
+        }
         let mut response = Box::pin(do_single_request(
             &current_url,
             &current_method,
@@ -2385,14 +2432,31 @@ async fn perform_transfer(
             *guard = Some(response.clone());
         }
 
-        // Handle Digest auth: if 401 with WWW-Authenticate: Digest, retry with credentials.
-        // Triggers for --digest and --anyauth (any method willing to negotiate).
+        // Handle 401: Digest, NTLM, and AnyAuth challenge-response flows.
         if response.status() == 401 {
             if let Some(auth) = auth_credentials {
-                if auth.method == AuthMethod::Digest {
-                    if let Some(www_auth) = response.header("www-authenticate") {
-                        if let Ok(challenge) = crate::auth::digest::DigestChallenge::parse(www_auth)
-                        {
+                // Determine which auth method to use for this 401
+                let effective_method = if auth.method == AuthMethod::AnyAuth {
+                    // AnyAuth: pick the strongest method from WWW-Authenticate headers
+                    pick_best_auth_method(&response)
+                } else {
+                    Some(auth.method.clone())
+                };
+
+                match effective_method.as_ref() {
+                    Some(AuthMethod::Digest) => {
+                        // Find the Digest challenge among potentially multiple
+                        // WWW-Authenticate headers (use ordered headers to see all).
+                        // Raw values in headers_ordered start with ": " prefix.
+                        let digest_challenge = response
+                            .headers_ordered()
+                            .iter()
+                            .filter(|(k, _)| k.eq_ignore_ascii_case("www-authenticate"))
+                            .find_map(|(_, v)| {
+                                let clean = strip_raw_header_value(v);
+                                crate::auth::digest::DigestChallenge::parse(clean).ok()
+                            });
+                        if let Some(challenge) = digest_challenge {
                             // Save the 401 response for --include output (curl compat)
                             redirect_chain.push(response.clone());
                             if verbose {
@@ -2427,6 +2491,278 @@ async fn perform_transfer(
                                 &current_url,
                                 &current_method,
                                 &auth_headers,
+                                current_body.as_deref(),
+                                verbose,
+                                accept_encoding,
+                                connect_timeout,
+                                effective_proxy,
+                                proxy_credentials,
+                                resolve_overrides,
+                                tls_config,
+                                tcp_nodelay,
+                                tcp_keepalive,
+                                unix_socket,
+                                interface,
+                                local_port,
+                                dns_shuffle,
+                                dns_cache,
+                                pool,
+                                #[cfg(feature = "http2")]
+                                h2_pool,
+                                http_version,
+                                expect_100_timeout,
+                                happy_eyeballs_timeout,
+                                ignore_content_length,
+                                speed_limits,
+                                ftp_ssl_mode,
+                                ssh_key_path,
+                                proxy_tls_config,
+                                alt_svc_cache,
+                                #[cfg(feature = "http2")]
+                                h2_config,
+                                dns_resolver,
+                                custom_request_target,
+                                tftp_blksize,
+                                tftp_no_options,
+                                #[cfg(feature = "ssh")]
+                                ssh_host_key_policy,
+                                mail_from,
+                                mail_rcpt,
+                                fresh_connect,
+                                forbid_reuse,
+                                ftp_config,
+                                proxy_headers,
+                                connect_to,
+                                path_as_is,
+                                #[cfg(feature = "ssh")]
+                                ssh_public_keyfile,
+                                #[cfg(not(feature = "ssh"))]
+                                None,
+                                #[cfg(feature = "ssh")]
+                                ssh_auth_types,
+                                #[cfg(not(feature = "ssh"))]
+                                None,
+                                mail_auth,
+                                sasl_authzid,
+                                sasl_ir,
+                                haproxy_protocol,
+                                abstract_unix_socket,
+                                chunked_upload,
+                                deadline,
+                                http_proxy_tunnel,
+                                proxy_http_10,
+                            ))
+                            .await?;
+                        }
+                    }
+                    Some(AuthMethod::Ntlm) => {
+                        // NTLM flow: either we already sent Type1 (--ntlm) or we need
+                        // to send it now (--anyauth picked NTLM).
+                        let domain = auth.domain.as_deref().unwrap_or("");
+
+                        if auth.method == AuthMethod::AnyAuth {
+                            // --anyauth: first request had no auth. Send Type 1 now.
+                            redirect_chain.push(response.clone());
+                            let type1 = crate::auth::ntlm::create_type1_message();
+                            let mut type1_headers = request_headers.clone();
+                            type1_headers
+                                .push(("Authorization".to_string(), format!("NTLM {type1}")));
+
+                            response = Box::pin(do_single_request(
+                                &current_url,
+                                &current_method,
+                                &type1_headers,
+                                current_body.as_deref(),
+                                verbose,
+                                accept_encoding,
+                                connect_timeout,
+                                effective_proxy,
+                                proxy_credentials,
+                                resolve_overrides,
+                                tls_config,
+                                tcp_nodelay,
+                                tcp_keepalive,
+                                unix_socket,
+                                interface,
+                                local_port,
+                                dns_shuffle,
+                                dns_cache,
+                                pool,
+                                #[cfg(feature = "http2")]
+                                h2_pool,
+                                http_version,
+                                expect_100_timeout,
+                                happy_eyeballs_timeout,
+                                ignore_content_length,
+                                speed_limits,
+                                ftp_ssl_mode,
+                                ssh_key_path,
+                                proxy_tls_config,
+                                alt_svc_cache,
+                                #[cfg(feature = "http2")]
+                                h2_config,
+                                dns_resolver,
+                                custom_request_target,
+                                tftp_blksize,
+                                tftp_no_options,
+                                #[cfg(feature = "ssh")]
+                                ssh_host_key_policy,
+                                mail_from,
+                                mail_rcpt,
+                                fresh_connect,
+                                forbid_reuse,
+                                ftp_config,
+                                proxy_headers,
+                                connect_to,
+                                path_as_is,
+                                #[cfg(feature = "ssh")]
+                                ssh_public_keyfile,
+                                #[cfg(not(feature = "ssh"))]
+                                None,
+                                #[cfg(feature = "ssh")]
+                                ssh_auth_types,
+                                #[cfg(not(feature = "ssh"))]
+                                None,
+                                mail_auth,
+                                sasl_authzid,
+                                sasl_ir,
+                                haproxy_protocol,
+                                abstract_unix_socket,
+                                chunked_upload,
+                                deadline,
+                                http_proxy_tunnel,
+                                proxy_http_10,
+                            ))
+                            .await?;
+                        }
+
+                        // At this point we should have a 401 with NTLM Type 2 challenge
+                        if response.status() == 401 {
+                            if let Some(www_auth) = response.header("www-authenticate") {
+                                if let Some(type2_data) = www_auth.strip_prefix("NTLM ") {
+                                    let challenge =
+                                        crate::auth::ntlm::parse_type2_message(type2_data)?;
+                                    let type3 = crate::auth::ntlm::create_type3_message(
+                                        &challenge,
+                                        &auth.username,
+                                        &auth.password,
+                                        domain,
+                                    );
+
+                                    // Save the Type 2 401 response for --include output
+                                    redirect_chain.push(response.clone());
+
+                                    let mut type3_headers = request_headers.clone();
+                                    type3_headers.push((
+                                        "Authorization".to_string(),
+                                        format!("NTLM {type3}"),
+                                    ));
+
+                                    response = Box::pin(do_single_request(
+                                        &current_url,
+                                        &current_method,
+                                        &type3_headers,
+                                        current_body.as_deref(),
+                                        verbose,
+                                        accept_encoding,
+                                        connect_timeout,
+                                        effective_proxy,
+                                        proxy_credentials,
+                                        resolve_overrides,
+                                        tls_config,
+                                        tcp_nodelay,
+                                        tcp_keepalive,
+                                        unix_socket,
+                                        interface,
+                                        local_port,
+                                        dns_shuffle,
+                                        dns_cache,
+                                        pool,
+                                        #[cfg(feature = "http2")]
+                                        h2_pool,
+                                        http_version,
+                                        expect_100_timeout,
+                                        happy_eyeballs_timeout,
+                                        ignore_content_length,
+                                        speed_limits,
+                                        ftp_ssl_mode,
+                                        ssh_key_path,
+                                        proxy_tls_config,
+                                        alt_svc_cache,
+                                        #[cfg(feature = "http2")]
+                                        h2_config,
+                                        dns_resolver,
+                                        custom_request_target,
+                                        tftp_blksize,
+                                        tftp_no_options,
+                                        #[cfg(feature = "ssh")]
+                                        ssh_host_key_policy,
+                                        mail_from,
+                                        mail_rcpt,
+                                        fresh_connect,
+                                        forbid_reuse,
+                                        ftp_config,
+                                        proxy_headers,
+                                        connect_to,
+                                        path_as_is,
+                                        #[cfg(feature = "ssh")]
+                                        ssh_public_keyfile,
+                                        #[cfg(not(feature = "ssh"))]
+                                        None,
+                                        #[cfg(feature = "ssh")]
+                                        ssh_auth_types,
+                                        #[cfg(not(feature = "ssh"))]
+                                        None,
+                                        mail_auth,
+                                        sasl_authzid,
+                                        sasl_ir,
+                                        haproxy_protocol,
+                                        abstract_unix_socket,
+                                        chunked_upload,
+                                        deadline,
+                                        http_proxy_tunnel,
+                                        proxy_http_10,
+                                    ))
+                                    .await?;
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Handle 407 Proxy Authentication Required for proxy NTLM (non-CONNECT path)
+        if response.status() == 407 {
+            if let Some(pcreds) = proxy_credentials {
+                if pcreds.method == ProxyAuthMethod::Ntlm {
+                    // We sent Type 1 already; now parse Type 2 and send Type 3
+                    if let Some(proxy_auth) = response.header("proxy-authenticate") {
+                        if let Some(type2_data) = proxy_auth.strip_prefix("NTLM ") {
+                            let challenge = crate::auth::ntlm::parse_type2_message(type2_data)?;
+                            let domain = pcreds.domain.as_deref().unwrap_or("");
+                            let type3 = crate::auth::ntlm::create_type3_message(
+                                &challenge,
+                                &pcreds.username,
+                                &pcreds.password,
+                                domain,
+                            );
+
+                            // Save the 407 response for --include output
+                            redirect_chain.push(response.clone());
+
+                            let mut type3_headers = request_headers.clone();
+                            // Remove the old Proxy-Authorization header (Type 1)
+                            type3_headers
+                                .retain(|(k, _)| !k.eq_ignore_ascii_case("proxy-authorization"));
+                            type3_headers
+                                .push(("Proxy-Authorization".to_string(), format!("NTLM {type3}")));
+
+                            response = Box::pin(do_single_request(
+                                &current_url,
+                                &current_method,
+                                &type3_headers,
                                 current_body.as_deref(),
                                 verbose,
                                 accept_encoding,
@@ -3947,6 +4283,59 @@ fn resolve_request_target(custom: Option<&str>, url: &Url, path_as_is: bool) -> 
         extract_path_and_query(url.as_str())
     } else {
         url.request_target()
+    }
+}
+
+/// Strip the raw header value prefix that `headers_ordered` includes.
+///
+/// The `headers_ordered()` raw values start with `": value"` (colon + optional
+/// whitespace) because they preserve wire format. This helper returns just the
+/// value portion, trimmed of leading whitespace.
+fn strip_raw_header_value(raw: &str) -> &str {
+    raw.strip_prefix(':').unwrap_or(raw).trim_start()
+}
+
+/// Pick the strongest authentication method from a 401 response's
+/// `WWW-Authenticate` headers.
+///
+/// Priority order (matching curl): Digest > NTLM > Basic.
+/// Uses `headers_ordered()` to see ALL `WWW-Authenticate` headers
+/// (the HashMap-based `headers()` only keeps the last one per name).
+/// Also handles comma-separated schemes in a single header value.
+fn pick_best_auth_method(response: &Response) -> Option<AuthMethod> {
+    let mut has_digest = false;
+    let mut has_ntlm = false;
+    let mut has_basic = false;
+
+    for (name, raw_value) in response.headers_ordered() {
+        if !name.eq_ignore_ascii_case("www-authenticate") {
+            continue;
+        }
+        let value = strip_raw_header_value(raw_value);
+        // Handle comma-separated schemes in a single header
+        // e.g. "Basic, Wild-and-crazy, NTLM"
+        // Also handle full scheme with params: "Digest realm=..."
+        for part in value.split(',') {
+            let scheme = part.trim().split_ascii_whitespace().next().unwrap_or("");
+            if scheme.eq_ignore_ascii_case("digest") {
+                has_digest = true;
+            } else if scheme.eq_ignore_ascii_case("ntlm") {
+                has_ntlm = true;
+            } else if scheme.eq_ignore_ascii_case("basic") {
+                has_basic = true;
+            }
+        }
+    }
+
+    // Priority: Digest > NTLM > Basic
+    if has_digest {
+        Some(AuthMethod::Digest)
+    } else if has_ntlm {
+        Some(AuthMethod::Ntlm)
+    } else if has_basic {
+        Some(AuthMethod::Basic)
+    } else {
+        None
     }
 }
 

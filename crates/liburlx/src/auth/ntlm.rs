@@ -4,6 +4,10 @@
 //! Type 1 (Negotiate), Type 2 (Challenge), and Type 3 (Authenticate)
 //! message exchange per the MS-NLMP specification.
 //!
+//! The implementation matches curl's NTLM behavior: it sends `NTLMv1` responses
+//! (24-byte LM/NT) using OEM encoding, which is the format expected by most
+//! HTTP test servers and IIS.
+//!
 //! Reference: MS-NLMP specification and RFC 4559.
 
 use crate::error::Error;
@@ -17,11 +21,16 @@ const CHALLENGE_MESSAGE: u32 = 2;
 const AUTHENTICATE_MESSAGE: u32 = 3;
 
 /// NTLM negotiate flags.
+#[allow(dead_code)] // Standard NTLM flag; kept for completeness even though we use OEM encoding.
 const NTLMSSP_NEGOTIATE_UNICODE: u32 = 0x0000_0001;
 const NTLMSSP_NEGOTIATE_OEM: u32 = 0x0000_0002;
 const NTLMSSP_REQUEST_TARGET: u32 = 0x0000_0004;
 const NTLMSSP_NEGOTIATE_NTLM: u32 = 0x0000_0200;
+const NTLMSSP_NEGOTIATE_ALWAYS_SIGN: u32 = 0x0000_8000;
 const NTLMSSP_NEGOTIATE_NTLM2: u32 = 0x0008_0000;
+
+/// Hardcoded workstation name, matching curl behavior.
+const WORKSTATION: &str = "WORKSTATION";
 
 /// A parsed NTLM Type 2 (Challenge) message.
 #[derive(Debug, Clone)]
@@ -38,14 +47,18 @@ pub struct NtlmChallenge {
 ///
 /// Returns the base64-encoded message suitable for use in an
 /// `Authorization: NTLM <base64>` or `Proxy-Authorization: NTLM <base64>` header.
+///
+/// The flags match curl's Type 1: OEM | `REQUEST_TARGET` | NTLM | `ALWAYS_SIGN` | NTLM2.
+/// Note: UNICODE is NOT set (curl compat).
 #[must_use]
 pub fn create_type1_message() -> String {
     use base64::Engine as _;
 
-    let flags = NTLMSSP_NEGOTIATE_UNICODE
-        | NTLMSSP_NEGOTIATE_OEM
+    // Match curl's Type 1 flags: 0x00088206
+    let flags = NTLMSSP_NEGOTIATE_OEM
         | NTLMSSP_REQUEST_TARGET
         | NTLMSSP_NEGOTIATE_NTLM
+        | NTLMSSP_NEGOTIATE_ALWAYS_SIGN
         | NTLMSSP_NEGOTIATE_NTLM2;
 
     let mut msg = Vec::with_capacity(32);
@@ -110,12 +123,10 @@ pub fn parse_type2_message(base64_msg: &str) -> Result<NtlmChallenge, Error> {
     Ok(NtlmChallenge { server_challenge, flags, target_info })
 }
 
-/// Generate an NTLM Type 3 (Authenticate) message using `NTLMv2`.
+/// Generate an NTLM Type 3 (Authenticate) message using `NTLMv1`.
 ///
-/// Uses the proper `NTLMv2` cryptographic algorithm:
-/// 1. NT Hash = `MD4(UTF-16LE(password))`
-/// 2. `NTLMv2` Hash = `HMAC-MD5(NT_Hash, UPPER(username) + domain)`
-/// 3. `NTProofStr` = `HMAC-MD5(NTLMv2_Hash, server_challenge + blob)`
+/// Uses `NTLMv1` (24-byte LM and NT responses) with OEM encoding,
+/// matching curl's NTLM implementation. Includes the `WORKSTATION` hostname.
 ///
 /// Returns the base64-encoded message.
 #[must_use]
@@ -128,33 +139,20 @@ pub fn create_type3_message(
     use base64::Engine as _;
 
     let nt_hash = compute_nt_hash(password);
-    let ntlmv2_hash = compute_ntlmv2_hash(&nt_hash, username, domain);
+    let lm_hash = compute_lm_hash(password);
 
-    // Build NTLMv2 client blob
-    let client_challenge = generate_client_challenge();
-    let timestamp = ntlm_timestamp();
-    let target_info = challenge.target_info.as_deref().unwrap_or(&[]);
-    let blob = build_ntlmv2_blob(timestamp, client_challenge, target_info);
+    // NTLMv1: 24-byte responses using DES
+    let lm_response = des_encrypt_challenge(&lm_hash, &challenge.server_challenge);
+    let nt_response = des_encrypt_challenge(&nt_hash, &challenge.server_challenge);
 
-    // Compute NTProofStr = HMAC-MD5(NTLMv2_Hash, server_challenge + blob)
-    let nt_proof_str = compute_nt_proof_str(&ntlmv2_hash, challenge.server_challenge, &blob);
+    // Use OEM (ASCII) encoding for domain, username, workstation
+    let domain_bytes = domain.as_bytes().to_vec();
+    let username_bytes = username.as_bytes().to_vec();
+    let workstation_bytes = WORKSTATION.as_bytes().to_vec();
 
-    // NT response = NTProofStr + blob
-    let mut nt_response = Vec::with_capacity(nt_proof_str.len() + blob.len());
-    nt_response.extend_from_slice(&nt_proof_str);
-    nt_response.extend_from_slice(&blob);
-
-    // LMv2 response = HMAC-MD5(NTLMv2_Hash, server_challenge + client_challenge)
-    let lm_response =
-        compute_lmv2_response(&ntlmv2_hash, challenge.server_challenge, client_challenge);
-
-    // Encode strings as UTF-16LE
-    let domain_bytes = to_utf16le(domain);
-    let username_bytes = to_utf16le(username);
-    let workstation_bytes: Vec<u8> = Vec::new();
-
-    // Calculate offsets (header is 72 bytes for Type 3)
-    let base_offset: u32 = 72;
+    // Calculate offsets — Type 3 header is 64 bytes:
+    // 8 (sig) + 4 (type) + 6*8 (fields) + 4 (flags) = 64
+    let base_offset: u32 = 64;
     let lm_offset = base_offset;
     #[allow(clippy::cast_possible_truncation)]
     let lm_len = lm_response.len() as u16;
@@ -171,7 +169,8 @@ pub fn create_type3_message(
     #[allow(clippy::cast_possible_truncation)]
     let workstation_len = workstation_bytes.len() as u16;
 
-    let flags = challenge.flags | NTLMSSP_NEGOTIATE_UNICODE | NTLMSSP_NEGOTIATE_NTLM;
+    // Use the server's flags with OEM and NTLM set, matching curl behavior
+    let flags = challenge.flags | NTLMSSP_NEGOTIATE_OEM | NTLMSSP_NEGOTIATE_NTLM;
 
     let mut msg = Vec::with_capacity(256);
     msg.extend_from_slice(NTLMSSP_SIGNATURE);
@@ -231,104 +230,87 @@ fn compute_nt_hash(password: &str) -> [u8; 16] {
     hash
 }
 
-/// Compute the `NTLMv2` hash: `HMAC-MD5(NT_Hash, UPPER(username) + domain)`.
-fn compute_ntlmv2_hash(nt_hash: &[u8; 16], username: &str, domain: &str) -> [u8; 16] {
-    use hmac::{Hmac, Mac as _};
-    use md5::Md5;
+/// Compute the LM hash from a password.
+///
+/// The LM hash algorithm:
+/// 1. Convert password to uppercase ASCII, truncate/pad to 14 bytes
+/// 2. Split into two 7-byte halves
+/// 3. Each half is used as a DES key to encrypt the magic string `KGS!@#$%`
+/// 4. Concatenate the two 8-byte DES outputs to get the 16-byte LM hash
+fn compute_lm_hash(password: &str) -> [u8; 16] {
+    let magic = b"KGS!@#$%";
 
-    let identity = format!("{}{}", username.to_uppercase(), domain);
-    let identity_utf16 = to_utf16le(&identity);
+    // Convert to uppercase, truncate to 14 bytes, pad with zeros
+    let mut pwd_bytes = [0u8; 14];
+    for (i, &b) in password.as_bytes().iter().take(14).enumerate() {
+        pwd_bytes[i] = b.to_ascii_uppercase();
+    }
 
-    // HMAC-MD5 accepts any key length — new_from_slice cannot fail.
-    #[allow(clippy::expect_used)]
-    let mut mac = Hmac::<Md5>::new_from_slice(nt_hash).expect("HMAC-MD5 accepts any key length");
-    mac.update(&identity_utf16);
-    let result = mac.finalize().into_bytes();
+    let key1 = des_key_from_7(&pwd_bytes[0..7]);
+    let key2 = des_key_from_7(&pwd_bytes[7..14]);
+
     let mut hash = [0u8; 16];
-    hash.copy_from_slice(&result);
+    hash[..8].copy_from_slice(&des_ecb_encrypt(&key1, magic));
+    hash[8..].copy_from_slice(&des_ecb_encrypt(&key2, magic));
     hash
 }
 
-/// Compute the `NTProofStr`: `HMAC-MD5(NTLMv2_Hash, server_challenge + blob)`.
-fn compute_nt_proof_str(
-    ntlmv2_hash: &[u8; 16],
-    server_challenge: [u8; 8],
-    blob: &[u8],
-) -> [u8; 16] {
-    use hmac::{Hmac, Mac as _};
-    use md5::Md5;
+/// Encrypt an 8-byte challenge using a 16-byte hash to produce a 24-byte response.
+///
+/// The `NTLMv1` response algorithm:
+/// 1. Pad the 16-byte hash to 21 bytes with zeros
+/// 2. Split into three 7-byte chunks
+/// 3. Each chunk is expanded to a DES key and encrypts the 8-byte challenge
+/// 4. Concatenate the three 8-byte results → 24 bytes
+#[allow(clippy::trivially_copy_pass_by_ref)] // Consistent with DES API conventions
+fn des_encrypt_challenge(hash: &[u8; 16], challenge: &[u8; 8]) -> Vec<u8> {
+    // Pad hash to 21 bytes
+    let mut padded = [0u8; 21];
+    padded[..16].copy_from_slice(hash);
 
-    // HMAC-MD5 accepts any key length — new_from_slice cannot fail.
-    #[allow(clippy::expect_used)]
-    let mut mac =
-        Hmac::<Md5>::new_from_slice(ntlmv2_hash).expect("HMAC-MD5 accepts any key length");
-    mac.update(&server_challenge);
-    mac.update(blob);
-    let result = mac.finalize().into_bytes();
-    let mut proof = [0u8; 16];
-    proof.copy_from_slice(&result);
-    proof
-}
-
-/// Compute the `LMv2` response: `HMAC-MD5(NTLMv2_Hash, server_challenge + client_challenge) + client_challenge`.
-fn compute_lmv2_response(
-    ntlmv2_hash: &[u8; 16],
-    server_challenge: [u8; 8],
-    client_challenge: [u8; 8],
-) -> Vec<u8> {
-    use hmac::{Hmac, Mac as _};
-    use md5::Md5;
-
-    // HMAC-MD5 accepts any key length — new_from_slice cannot fail.
-    #[allow(clippy::expect_used)]
-    let mut mac =
-        Hmac::<Md5>::new_from_slice(ntlmv2_hash).expect("HMAC-MD5 accepts any key length");
-    mac.update(&server_challenge);
-    mac.update(&client_challenge);
-    let result = mac.finalize().into_bytes();
+    let key1 = des_key_from_7(&padded[0..7]);
+    let key2 = des_key_from_7(&padded[7..14]);
+    let key3 = des_key_from_7(&padded[14..21]);
 
     let mut response = Vec::with_capacity(24);
-    response.extend_from_slice(&result);
-    response.extend_from_slice(&client_challenge);
+    response.extend_from_slice(&des_ecb_encrypt(&key1, challenge));
+    response.extend_from_slice(&des_ecb_encrypt(&key2, challenge));
+    response.extend_from_slice(&des_ecb_encrypt(&key3, challenge));
     response
 }
 
-/// Build the `NTLMv2` client blob (temp structure).
-fn build_ntlmv2_blob(timestamp: [u8; 8], client_challenge: [u8; 8], target_info: &[u8]) -> Vec<u8> {
-    let mut blob = Vec::with_capacity(32 + target_info.len());
-    blob.extend_from_slice(&[0x01, 0x01]); // RespType, HiRespType
-    blob.extend_from_slice(&[0x00, 0x00]); // Reserved1
-    blob.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // Reserved2
-    blob.extend_from_slice(&timestamp); // TimeStamp (8 bytes)
-    blob.extend_from_slice(&client_challenge); // ChallengeFromClient (8 bytes)
-    blob.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // Reserved3
-    blob.extend_from_slice(target_info); // AvPairs
-    blob.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // Terminator
-    blob
+/// Expand a 7-byte value to an 8-byte DES key.
+///
+/// DES uses 56 effective key bits (bits 7-1 of each byte; bit 0 is parity).
+/// This function distributes the 56 input bits across 8 bytes, matching
+/// curl's `extend_key_56_to_64` function exactly.
+fn des_key_from_7(src: &[u8]) -> [u8; 8] {
+    [
+        src[0],
+        (src[0] << 7) | (src[1] >> 1),
+        (src[1] << 6) | (src[2] >> 2),
+        (src[2] << 5) | (src[3] >> 3),
+        (src[3] << 4) | (src[4] >> 4),
+        (src[4] << 3) | (src[5] >> 5),
+        (src[5] << 2) | (src[6] >> 6),
+        src[6] << 1,
+    ]
 }
 
-/// Generate an 8-byte random client challenge.
-fn generate_client_challenge() -> [u8; 8] {
-    use rand::Rng as _;
-    let mut rng = rand::rng();
-    let mut challenge = [0u8; 8];
-    rng.fill(&mut challenge);
-    challenge
-}
+/// Perform DES-ECB encryption of an 8-byte block with the given key.
+#[allow(clippy::trivially_copy_pass_by_ref)] // Matches cipher API convention
+fn des_ecb_encrypt(key: &[u8; 8], plaintext: &[u8; 8]) -> [u8; 8] {
+    use cipher::{BlockEncrypt as _, KeyInit as _};
+    use des::Des;
 
-/// Get the current time as an NTLM timestamp (100-nanosecond intervals since 1601-01-01).
-fn ntlm_timestamp() -> [u8; 8] {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    // Offset between 1601-01-01 and 1970-01-01 in 100-nanosecond intervals
-    const EPOCH_DIFF: u64 = 116_444_736_000_000_000;
-
-    let unix_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
-    let ticks = unix_time.as_nanos() / 100;
-
-    #[allow(clippy::cast_possible_truncation)]
-    let timestamp = (ticks as u64) + EPOCH_DIFF;
-    timestamp.to_le_bytes()
+    // Des::new_from_slice cannot fail for 8-byte keys.
+    #[allow(clippy::expect_used)]
+    let cipher = Des::new_from_slice(key).expect("DES accepts 8-byte keys");
+    let mut block = cipher::generic_array::GenericArray::clone_from_slice(plaintext);
+    cipher.encrypt_block(&mut block);
+    let mut out = [0u8; 8];
+    out.copy_from_slice(&block);
+    out
 }
 
 /// Convert a string to UTF-16LE bytes.
@@ -342,7 +324,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn type1_message_is_valid() {
+    fn type1_message_matches_curl() {
         use base64::Engine as _;
 
         let msg = create_type1_message();
@@ -353,11 +335,28 @@ mod tests {
         // Verify message type is 1
         let msg_type = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
         assert_eq!(msg_type, NEGOTIATE_MESSAGE);
-        // Verify flags include NTLM
+        // Verify flags match curl's expected value: 0x00088206
         let flags = u32::from_le_bytes([data[12], data[13], data[14], data[15]]);
+        assert_eq!(flags, 0x0008_8206, "Type1 flags must match curl");
+        // UNICODE should NOT be set
+        assert_eq!(flags & NTLMSSP_NEGOTIATE_UNICODE, 0);
+        // OEM, REQUEST_TARGET, NTLM, ALWAYS_SIGN, NTLM2 should be set
+        assert_ne!(flags & NTLMSSP_NEGOTIATE_OEM, 0);
+        assert_ne!(flags & NTLMSSP_REQUEST_TARGET, 0);
         assert_ne!(flags & NTLMSSP_NEGOTIATE_NTLM, 0);
-        // Should include NTLMv2 session security flag
+        assert_ne!(flags & NTLMSSP_NEGOTIATE_ALWAYS_SIGN, 0);
         assert_ne!(flags & NTLMSSP_NEGOTIATE_NTLM2, 0);
+        // Total size should be 32 bytes
+        assert_eq!(data.len(), 32);
+    }
+
+    #[test]
+    fn type1_base64_matches_curl_test() {
+        // The curl test suite expects this exact base64 for the Type 1 message
+        // (decoded from the %b64[...]b64% pattern in test data files)
+        let msg = create_type1_message();
+        let expected = "TlRMTVNTUAABAAAABoIIAAAAAAAAAAAAAAAAAAAAAAA=";
+        assert_eq!(msg, expected, "Type1 base64 must match curl test expectation");
     }
 
     #[test]
@@ -417,7 +416,7 @@ mod tests {
 
         let challenge = NtlmChallenge {
             server_challenge: [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef],
-            flags: NTLMSSP_NEGOTIATE_NTLM | NTLMSSP_NEGOTIATE_UNICODE,
+            flags: NTLMSSP_NEGOTIATE_NTLM | NTLMSSP_NEGOTIATE_OEM,
             target_info: None,
         };
 
@@ -429,8 +428,108 @@ mod tests {
         // Verify message type is 3
         let msg_type = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
         assert_eq!(msg_type, AUTHENTICATE_MESSAGE);
+
+        // LM response should be 24 bytes (NTLMv1)
+        let lm_len = u16::from_le_bytes([data[12], data[13]]);
+        assert_eq!(lm_len, 24, "LM response must be 24 bytes (NTLMv1)");
+
+        // NT response should be 24 bytes (NTLMv1)
+        let nt_len = u16::from_le_bytes([data[20], data[21]]);
+        assert_eq!(nt_len, 24, "NT response must be 24 bytes (NTLMv1)");
+
         // Should be longer than header (72 bytes) + payloads
         assert!(data.len() > 72);
+    }
+
+    #[test]
+    fn type3_uses_oem_encoding() {
+        use base64::Engine as _;
+
+        let challenge = NtlmChallenge {
+            server_challenge: [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08],
+            flags: NTLMSSP_NEGOTIATE_NTLM | NTLMSSP_NEGOTIATE_OEM,
+            target_info: None,
+        };
+
+        let msg = create_type3_message(&challenge, "testuser", "testpass", "");
+        let data = base64::engine::general_purpose::STANDARD.decode(&msg).unwrap();
+
+        // Username should be OEM (ASCII), not UTF-16LE
+        let usr_len = u16::from_le_bytes([data[36], data[37]]) as usize;
+        let usr_off = u32::from_le_bytes([data[40], data[41], data[42], data[43]]) as usize;
+        let usr = &data[usr_off..usr_off + usr_len];
+        assert_eq!(usr, b"testuser", "Username must be OEM-encoded ASCII");
+
+        // Workstation should be "WORKSTATION"
+        let ws_len = u16::from_le_bytes([data[44], data[45]]) as usize;
+        let ws_off = u32::from_le_bytes([data[48], data[49], data[50], data[51]]) as usize;
+        let ws = &data[ws_off..ws_off + ws_len];
+        assert_eq!(ws, b"WORKSTATION");
+    }
+
+    #[test]
+    fn type3_matches_curl_test_vector() {
+        // Test the exact Type 3 message from curl test 67/68
+        // Server challenge from the Type 2 in the test: 739d406150e0c8d7
+        // User: testuser, Pass: testpass, Domain: (empty)
+        use base64::Engine as _;
+        let expected_b64 = "TlRMTVNTUAADAAAAGAAYAEAAAAAYABgAWAAAAAAAAABwAAAACAAIAHAAAAALAAsAeAAAAAAAAAAAAAAAhoIBAFpkQwKRCZFMhjj0tw47wEjKHRHlvzfxQamFcheMuv8v+xeqphEO5V41xRd7R9deOXRlc3R1c2VyV09SS1NUQVRJT04=";
+        let expected = base64::engine::general_purpose::STANDARD.decode(expected_b64).unwrap();
+
+        // Parse the Type 2 challenge from the test data
+        let type2_b64 = "TlRMTVNTUAACAAAAAgACADAAAACGggEAc51AYVDgyNcAAAAAAAAAAG4AbgAyAAAAQ0MCAAQAQwBDAAEAEgBFAEwASQBTAEEAQgBFAFQASAAEABgAYwBjAC4AaQBjAGUAZABlAHYALgBuAHUAAwAsAGUAbABpAHMAYQBiAGUAdABoAC4AYwBjAC4AaQBjAGUAZABlAHYALgBuAHUAAAAAAA==";
+        let challenge = parse_type2_message(type2_b64).unwrap();
+
+        let msg = create_type3_message(&challenge, "testuser", "testpass", "");
+        let actual = base64::engine::general_purpose::STANDARD.decode(&msg).unwrap();
+
+        // Verify structural match (LM/NT responses will differ due to DES determinism,
+        // but the structure, offsets, flags, username, workstation must match exactly)
+        assert_eq!(actual.len(), expected.len(), "Type3 message length must match");
+
+        // Flags must match
+        assert_eq!(&actual[60..64], &expected[60..64], "Flags must match");
+
+        // Domain, username, workstation offsets and data must match
+        assert_eq!(&actual[28..36], &expected[28..36], "Domain fields must match");
+        assert_eq!(&actual[36..44], &expected[36..44], "Username fields must match");
+        assert_eq!(&actual[44..52], &expected[44..52], "Workstation fields must match");
+
+        // Username bytes
+        assert_eq!(&actual[112..120], b"testuser", "Username data must be 'testuser'");
+        // Workstation bytes
+        assert_eq!(&actual[120..131], b"WORKSTATION", "Workstation data must be 'WORKSTATION'");
+
+        // LM and NT responses are deterministic with NTLMv1 (no random nonce)
+        // so they should match exactly
+        assert_eq!(
+            &actual[64..88],
+            &expected[64..88],
+            "LM response must match (NTLMv1 is deterministic)"
+        );
+        assert_eq!(
+            &actual[88..112],
+            &expected[88..112],
+            "NT response must match (NTLMv1 is deterministic)"
+        );
+    }
+
+    #[test]
+    fn type3_with_domain_matches_curl_test91() {
+        use base64::Engine as _;
+
+        // Test 91: domain\user = mydomain\myself, pass = secret
+        let expected_b64 = "TlRMTVNTUAADAAAAGAAYAEAAAAAYABgAWAAAAAgACABwAAAABgAGAHgAAAALAAsAfgAAAAAAAAAAAAAAhoIBAMIyJpR5mHpg2FZha5kRaFZ9436GAxPu0C5llxexSQ5QzVkiLSfkcpVyRgCXXqR+Am15ZG9tYWlubXlzZWxmV09SS1NUQVRJT04=";
+        let expected = base64::engine::general_purpose::STANDARD.decode(expected_b64).unwrap();
+
+        let type2_b64 = "TlRMTVNTUAACAAAAAgACADAAAACGggEAc51AYVDgyNcAAAAAAAAAAG4AbgAyAAAAQ0MCAAQAQwBDAAEAEgBFAEwASQBTAEEAQgBFAFQASAAEABgAYwBjAC4AaQBjAGUAZABlAHYALgBuAHUAAwAsAGUAbABpAHMAYQBiAGUAdABoAC4AYwBjAC4AaQBjAGUAZABlAHYALgBuAHUAAAAAAA==";
+        let challenge = parse_type2_message(type2_b64).unwrap();
+
+        let msg = create_type3_message(&challenge, "myself", "secret", "mydomain");
+        let actual = base64::engine::general_purpose::STANDARD.decode(&msg).unwrap();
+
+        assert_eq!(actual.len(), expected.len(), "Type3 length must match for test 91");
+        assert_eq!(actual, expected, "Type3 must match curl test 91 exactly");
     }
 
     #[test]
@@ -459,6 +558,35 @@ mod tests {
     }
 
     #[test]
+    fn lm_hash_known_value() {
+        // LM hash of empty password should be the "empty" LM hash
+        let hash = compute_lm_hash("");
+        assert_eq!(hash.len(), 16);
+        // AAD3B435B51404EE is the known LM hash of the empty 7-byte key
+        assert_eq!(
+            hex::encode(&hash[..8]),
+            "aad3b435b51404ee",
+            "First half of LM hash for empty password"
+        );
+    }
+
+    #[test]
+    fn des_key_expansion() {
+        // Verify 7-byte to 8-byte DES key expansion
+        let input = [0xFF_u8; 7];
+        let key = des_key_from_7(&input);
+        assert_eq!(key.len(), 8);
+    }
+
+    #[test]
+    fn des_encrypt_produces_24_bytes() {
+        let hash = compute_nt_hash("password");
+        let challenge = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
+        let response = des_encrypt_challenge(&hash, &challenge);
+        assert_eq!(response.len(), 24, "NTLMv1 response must be 24 bytes");
+    }
+
+    #[test]
     fn roundtrip_type1_type2_type3() {
         use base64::Engine as _;
 
@@ -473,7 +601,7 @@ mod tests {
         // Step 2: Simulate server Type 2 response
         let challenge = NtlmChallenge {
             server_challenge: [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x11],
-            flags: NTLMSSP_NEGOTIATE_NTLM | NTLMSSP_NEGOTIATE_UNICODE,
+            flags: NTLMSSP_NEGOTIATE_NTLM | NTLMSSP_NEGOTIATE_OEM,
             target_info: None,
         };
 
@@ -486,14 +614,10 @@ mod tests {
         );
     }
 
-    // ─── NTLMv2 crypto tests ───
-
     #[test]
     fn nt_hash_known_value() {
         // Known test vector: password "Password" → MD4 of UTF-16LE
         let hash = compute_nt_hash("Password");
-        // MD4(UTF-16LE("Password")) is a well-known value
-        // We verify it's 16 bytes and non-zero
         assert_eq!(hash.len(), 16);
         assert_ne!(hash, [0u8; 16]);
     }
@@ -502,85 +626,6 @@ mod tests {
     fn nt_hash_empty_password() {
         let hash = compute_nt_hash("");
         assert_eq!(hash.len(), 16);
-        // MD4 of empty input is a known constant
         assert_ne!(hash, [0u8; 16]);
-    }
-
-    #[test]
-    fn ntlmv2_hash_computed() {
-        let nt_hash = compute_nt_hash("Password");
-        let v2_hash = compute_ntlmv2_hash(&nt_hash, "User", "Domain");
-        assert_eq!(v2_hash.len(), 16);
-        assert_ne!(v2_hash, [0u8; 16]);
-    }
-
-    #[test]
-    fn ntlmv2_hash_different_users() {
-        let nt_hash = compute_nt_hash("Password");
-        let h1 = compute_ntlmv2_hash(&nt_hash, "User1", "Domain");
-        let h2 = compute_ntlmv2_hash(&nt_hash, "User2", "Domain");
-        assert_ne!(h1, h2);
-    }
-
-    #[test]
-    fn client_challenge_is_random() {
-        let c1 = generate_client_challenge();
-        let c2 = generate_client_challenge();
-        // With 2^64 possible values, collision is practically impossible
-        assert_ne!(c1, c2);
-    }
-
-    #[test]
-    fn ntlm_timestamp_is_nonzero() {
-        let ts = ntlm_timestamp();
-        assert_ne!(ts, [0u8; 8]);
-    }
-
-    #[test]
-    fn lmv2_response_length() {
-        let nt_hash = compute_nt_hash("pass");
-        let v2_hash = compute_ntlmv2_hash(&nt_hash, "user", "dom");
-        let server = [1u8; 8];
-        let client = [2u8; 8];
-        let resp = compute_lmv2_response(&v2_hash, server, client);
-        // LMv2 response is 16 (HMAC) + 8 (client challenge) = 24 bytes
-        assert_eq!(resp.len(), 24);
-    }
-
-    #[test]
-    fn ntlmv2_blob_structure() {
-        let ts = [0u8; 8];
-        let cc = [1u8; 8];
-        let ti = vec![0x02, 0x00, 0x04, 0x00, b'D', 0x00, b'O', 0x00];
-        let blob = build_ntlmv2_blob(ts, cc, &ti);
-        // Verify blob starts with RespType=1, HiRespType=1
-        assert_eq!(blob[0], 0x01);
-        assert_eq!(blob[1], 0x01);
-        // Verify blob contains client challenge at offset 16
-        assert_eq!(&blob[16..24], &cc);
-    }
-
-    #[test]
-    fn type3_with_target_info() {
-        let target_info = vec![
-            0x02, 0x00, 0x06, 0x00, b'D', 0x00, b'O', 0x00, b'M', 0x00, 0x00, 0x00, 0x00, 0x00,
-        ];
-        let challenge = NtlmChallenge {
-            server_challenge: [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08],
-            flags: NTLMSSP_NEGOTIATE_NTLM | NTLMSSP_NEGOTIATE_UNICODE,
-            target_info: Some(target_info),
-        };
-        let msg = create_type3_message(&challenge, "user", "pass", "DOM");
-        assert!(!msg.is_empty());
-    }
-
-    #[test]
-    fn nt_proof_str_deterministic() {
-        let v2_hash = [0xAA; 16];
-        let server = [0xBB; 8];
-        let blob = [0xCC; 32];
-        let p1 = compute_nt_proof_str(&v2_hash, server, &blob);
-        let p2 = compute_nt_proof_str(&v2_hash, server, &blob);
-        assert_eq!(p1, p2);
     }
 }

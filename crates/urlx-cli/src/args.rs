@@ -76,6 +76,7 @@ pub struct CliOptions {
     pub(crate) url_queries: Vec<String>,
     pub(crate) rate: Option<String>,
     pub(crate) use_ntlm: bool,
+    pub(crate) use_anyauth: bool,
     pub(crate) globoff: bool,
     pub(crate) alt_svc_file: Option<String>,
     pub(crate) etag_save_file: Option<String>,
@@ -400,6 +401,7 @@ fn parse_args_options(args: &[String]) -> Result<CliOptions, u8> {
         url_queries: Vec::new(),
         rate: None,
         use_ntlm: false,
+        use_anyauth: false,
         globoff: false,
         alt_svc_file: None,
         etag_save_file: None,
@@ -1218,6 +1220,9 @@ fn parse_args_options(args: &[String]) -> Result<CliOptions, u8> {
             "--ntlm" => {
                 opts.use_ntlm = true;
             }
+            "--anyauth" => {
+                opts.use_anyauth = true;
+            }
             "--delegation" => {
                 i += 1;
                 let _val = require_arg(args, i, "--delegation")?;
@@ -1466,7 +1471,6 @@ fn parse_args_options(args: &[String]) -> Result<CliOptions, u8> {
             | "--disable"
             | "--metalink"
             | "--basic"
-            | "--anyauth"
             | "--proxy-basic"
             | "--proxy-anyauth"
             | "--tcp-fastopen"
@@ -1585,6 +1589,8 @@ fn parse_args_options(args: &[String]) -> Result<CliOptions, u8> {
             opts.easy.aws_credentials(user, pass);
         } else if opts.use_ntlm {
             opts.easy.ntlm_auth(user, pass);
+        } else if opts.use_anyauth {
+            opts.easy.anyauth(user, pass);
         } else if opts.use_digest {
             opts.easy.digest_auth(user, pass);
         } else {

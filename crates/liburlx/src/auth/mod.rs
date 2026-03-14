@@ -27,6 +27,12 @@ pub enum AuthMethod {
     /// Multi-step challenge-response: Type 1 negotiate, Type 2 challenge,
     /// Type 3 authenticate.
     Ntlm,
+    /// Automatic authentication method selection.
+    ///
+    /// Sends the first request without auth, then examines the
+    /// `WWW-Authenticate` header to pick the strongest supported method
+    /// (Digest > NTLM > Basic).
+    AnyAuth,
 }
 
 /// Credentials for HTTP authentication.
@@ -38,6 +44,8 @@ pub struct AuthCredentials {
     pub password: String,
     /// The authentication method to use.
     pub method: AuthMethod,
+    /// Optional NTLM domain (e.g., from `DOMAIN\user` format).
+    pub domain: Option<String>,
 }
 
 /// Proxy authentication method.
