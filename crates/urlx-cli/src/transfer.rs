@@ -525,7 +525,25 @@ pub fn run(args: &[String]) -> ExitCode {
                         if let Some(entry) = liburlx::netrc::lookup(&contents, &host) {
                             let user = entry.login.unwrap_or_default();
                             let pass = entry.password.unwrap_or_default();
-                            if opts.use_digest {
+                            // For FTP/FTPS, embed credentials in URL (FTP uses URL credentials)
+                            if url.starts_with("ftp://") || url.starts_with("ftps://") {
+                                let scheme_end = url.find("://").map_or(0, |p| p + 3);
+                                let new_url = format!(
+                                    "{}{}:{}@{}",
+                                    &url[..scheme_end],
+                                    percent_encode(&user),
+                                    percent_encode(&pass),
+                                    &url[scheme_end..]
+                                );
+                                if let Err(e) = opts.easy.url(&new_url) {
+                                    if !opts.silent || opts.show_error {
+                                        eprintln!(
+                                            "urlx: error parsing URL with netrc credentials: {e}"
+                                        );
+                                    }
+                                    return ExitCode::from(3);
+                                }
+                            } else if opts.use_digest {
                                 opts.easy.digest_auth(&user, &pass);
                             } else {
                                 opts.easy.basic_auth(&user, &pass);
@@ -601,28 +619,37 @@ pub fn run(args: &[String]) -> ExitCode {
         }
     }
 
-    // PUT with -C offset: use Content-Range header instead of Range, and slice the body
+    // PUT with -C offset: handle HTTP vs FTP resume differently
     if opts.is_upload {
         if let Some(offset) = opts.resume_offset {
             if offset > 0 {
-                // For PUT uploads, curl sends Content-Range instead of Range
-                if let Some(body_data) = opts.easy.take_body() {
-                    let total = body_data.len() as u64;
-                    let end = total.saturating_sub(1);
-                    if offset <= end {
-                        // Slice the body from offset onwards
-                        #[allow(clippy::cast_possible_truncation)]
-                        let start = offset as usize;
-                        let sliced = &body_data[start..];
-                        opts.easy.header("Content-Range", &format!("bytes {offset}-{end}/{total}"));
-                        opts.easy.body(sliced);
-                    } else {
-                        // Offset beyond file size — send empty body
-                        opts.easy.body(&[]);
+                // Check if this is an FTP upload (keep Range header for FTP module)
+                let is_ftp_upload = opts
+                    .urls
+                    .first()
+                    .is_some_and(|u| u.starts_with("ftp://") || u.starts_with("ftps://"));
+                if !is_ftp_upload {
+                    // For HTTP PUT uploads, curl sends Content-Range and slices the body
+                    if let Some(body_data) = opts.easy.take_body() {
+                        let total = body_data.len() as u64;
+                        let end = total.saturating_sub(1);
+                        if offset <= end {
+                            // Slice the body from offset onwards
+                            #[allow(clippy::cast_possible_truncation)]
+                            let start = offset as usize;
+                            let sliced = &body_data[start..];
+                            opts.easy
+                                .header("Content-Range", &format!("bytes {offset}-{end}/{total}"));
+                            opts.easy.body(sliced);
+                        } else {
+                            // Offset beyond file size — send empty body
+                            opts.easy.body(&[]);
+                        }
                     }
+                    // Clear the Range setting that resume_from() set (it's for GET, not PUT)
+                    opts.easy.clear_range();
                 }
-                // Clear the Range setting that resume_from() set (it's for GET, not PUT)
-                opts.easy.clear_range();
+                // For FTP, keep the Range header intact — FTP module reads it
             }
         }
     }
@@ -692,6 +719,12 @@ pub fn run(args: &[String]) -> ExitCode {
         }));
     }
 
+    // FTP/FTPS: --include doesn't output HTTP headers (curl compat).
+    // Suppress include_headers for FTP URLs so all output paths skip headers.
+    if opts.urls.first().is_some_and(|u| u.starts_with("ftp://") || u.starts_with("ftps://")) {
+        opts.include_headers = false;
+    }
+
     let result = perform_with_retry(&mut opts);
 
     // Save cookie jar after transfer (even on error)
@@ -723,9 +756,14 @@ pub fn run(args: &[String]) -> ExitCode {
             // Check for failed resume: when -C was used for a download and server
             // returned non-206 (curl returns CURLE_RANGE_ERROR = 33).
             // For uploads (PUT), 200 is a valid response — don't check.
+            // FTP handles resume internally — don't apply HTTP resume logic.
             // 416 Range Not Satisfiable = file already fully downloaded (success,
             // output headers but suppress body).
-            if opts.resume_check && !opts.is_upload {
+            let is_ftp = opts
+                .urls
+                .first()
+                .is_some_and(|u| u.starts_with("ftp://") || u.starts_with("ftps://"));
+            if opts.resume_check && !opts.is_upload && !is_ftp {
                 let status = response.status();
                 if status == 416 {
                     // File already complete — output headers only, exit success

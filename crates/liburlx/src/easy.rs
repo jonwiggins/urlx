@@ -154,6 +154,18 @@ pub struct Easy {
     ftp_create_dirs: bool,
     /// FTP method for directory traversal.
     ftp_method: FtpMethod,
+    /// Use ASCII transfer mode for FTP (curl `--use-ascii` / `-B`).
+    ftp_use_ascii: bool,
+    /// Append to remote file on FTP upload (curl `--append` / `-a`).
+    ftp_append: bool,
+    /// Convert LF to CRLF on FTP upload (curl `--crlf`).
+    ftp_crlf: bool,
+    /// FTP list only (NLST instead of LIST; curl `-l` / `--list-only`).
+    ftp_list_only: bool,
+    /// FTP pre-transfer quote commands (curl `-Q "CMD"`).
+    ftp_pre_quote: Vec<String>,
+    /// FTP post-transfer quote commands (curl `-Q "-CMD"`).
+    ftp_post_quote: Vec<String>,
     /// SASL authorization identity.
     sasl_authzid: Option<String>,
     /// Send SASL initial response in first message.
@@ -394,6 +406,12 @@ impl Clone for Easy {
             mail_auth: self.mail_auth.clone(),
             ftp_create_dirs: self.ftp_create_dirs,
             ftp_method: self.ftp_method,
+            ftp_use_ascii: self.ftp_use_ascii,
+            ftp_append: self.ftp_append,
+            ftp_crlf: self.ftp_crlf,
+            ftp_list_only: self.ftp_list_only,
+            ftp_pre_quote: self.ftp_pre_quote.clone(),
+            ftp_post_quote: self.ftp_post_quote.clone(),
             sasl_authzid: self.sasl_authzid.clone(),
             sasl_ir: self.sasl_ir,
             connect_to: self.connect_to.clone(),
@@ -506,6 +524,12 @@ impl Easy {
             mail_auth: None,
             ftp_create_dirs: false,
             ftp_method: FtpMethod::default(),
+            ftp_use_ascii: false,
+            ftp_append: false,
+            ftp_crlf: false,
+            ftp_list_only: false,
+            ftp_pre_quote: Vec::new(),
+            ftp_post_quote: Vec::new(),
             sasl_authzid: None,
             sasl_ir: false,
             connect_to: Vec::new(),
@@ -1716,6 +1740,46 @@ impl Easy {
         self.ftp_method = method;
     }
 
+    /// Set FTP ASCII transfer mode (curl `--use-ascii` / `-B`).
+    ///
+    /// When enabled, uses TYPE A instead of TYPE I for file transfers.
+    pub const fn ftp_use_ascii(&mut self, enable: bool) {
+        self.ftp_use_ascii = enable;
+    }
+
+    /// Set FTP append mode (curl `--append` / `-a`).
+    ///
+    /// When enabled, uses APPE instead of STOR for uploads.
+    pub const fn ftp_append(&mut self, enable: bool) {
+        self.ftp_append = enable;
+    }
+
+    /// Set FTP CRLF conversion mode (curl `--crlf`).
+    ///
+    /// When enabled, converts LF to CRLF on upload.
+    pub const fn ftp_crlf(&mut self, enable: bool) {
+        self.ftp_crlf = enable;
+    }
+
+    /// Set FTP list-only mode (curl `-l` / `--list-only`).
+    ///
+    /// When enabled, uses NLST instead of LIST for directory listings.
+    pub const fn ftp_list_only(&mut self, enable: bool) {
+        self.ftp_list_only = enable;
+    }
+
+    /// Add an FTP quote command.
+    ///
+    /// Commands prefixed with `-` are sent after the transfer (post-quote).
+    /// Commands without prefix are sent before the transfer (pre-quote).
+    pub fn ftp_quote(&mut self, cmd: &str) {
+        if let Some(stripped) = cmd.strip_prefix('-') {
+            self.ftp_post_quote.push(stripped.to_string());
+        } else {
+            self.ftp_pre_quote.push(cmd.to_string());
+        }
+    }
+
     /// Set SASL authorization identity.
     ///
     /// The authorization identity for SASL authentication.
@@ -2062,6 +2126,13 @@ impl Easy {
             create_dirs: self.ftp_create_dirs,
             method: self.ftp_method,
             active_port: self.ftp_active_port.clone(),
+            use_ascii: self.ftp_use_ascii,
+            append: self.ftp_append,
+            crlf: self.ftp_crlf,
+            list_only: self.ftp_list_only,
+            nobody: effective_method == "HEAD",
+            pre_quote: self.ftp_pre_quote.clone(),
+            post_quote: self.ftp_post_quote.clone(),
         };
 
         let dns_resolver = self.build_dns_resolver();
@@ -3091,26 +3162,17 @@ async fn do_single_request(
                     None
                 }
             });
-            return if method == "PUT" {
-                let upload_data = body.unwrap_or(&[]);
-                crate::protocol::ftp::upload(
-                    url,
-                    upload_data,
-                    effective_ssl_mode,
-                    tls_config,
-                    ftp_config,
-                )
-                .await
-            } else {
-                crate::protocol::ftp::download(
-                    url,
-                    effective_ssl_mode,
-                    tls_config,
-                    resume_offset,
-                    ftp_config,
-                )
-                .await
-            };
+            let upload_data = if method == "PUT" { Some(body.unwrap_or(&[])) } else { None };
+            return crate::protocol::ftp::perform(
+                url,
+                upload_data,
+                effective_ssl_mode,
+                tls_config,
+                resume_offset,
+                ftp_config,
+                None,
+            )
+            .await;
         }
         "smtp" | "smtps" => {
             let mail_data = body.unwrap_or(&[]);
@@ -6424,6 +6486,7 @@ mod tests {
             create_dirs: easy.ftp_create_dirs,
             method: easy.ftp_method,
             active_port: easy.ftp_active_port.clone(),
+            ..Default::default()
         };
         assert!(!config.use_epsv);
         assert!(!config.use_eprt);

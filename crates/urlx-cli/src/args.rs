@@ -319,11 +319,18 @@ fn expand_combined_flags(args: &[String]) -> Vec<String> {
     // Set of short flags that take an argument (next arg is the value)
     const ARG_FLAGS: &[char] = &[
         'X', 'H', 'd', 'o', 'D', 'w', 'x', 'u', 'A', 'F', 'r', 'C', 'T', 'b', 'e', 'm', 'K', 'c',
-        'z', 'U',
+        'z', 'U', 'Q', 'P', 'E', 'Y', 'y',
     ];
 
     let mut result = Vec::with_capacity(args.len());
+    let mut skip_next = false;
     for arg in args {
+        if skip_next {
+            // This arg is the value for a preceding flag — don't expand
+            result.push(arg.clone());
+            skip_next = false;
+            continue;
+        }
         if arg.starts_with('-')
             && !arg.starts_with("--")
             && arg.len() > 2
@@ -333,16 +340,28 @@ fn expand_combined_flags(args: &[String]) -> Vec<String> {
             let chars: Vec<char> = arg[1..].chars().collect();
             for (j, &ch) in chars.iter().enumerate() {
                 result.push(format!("-{ch}"));
-                // If this char takes an argument and there are remaining chars,
-                // treat the rest as the argument value (curl compat)
-                if ARG_FLAGS.contains(&ch) && j + 1 < chars.len() {
-                    let rest: String = chars[j + 1..].iter().collect();
-                    result.push(rest);
+                if ARG_FLAGS.contains(&ch) {
+                    if j + 1 < chars.len() {
+                        // Remaining chars are the argument value (e.g., -ofile → -o, file)
+                        let rest: String = chars[j + 1..].iter().collect();
+                        result.push(rest);
+                    } else {
+                        // Flag is the last char — next arg is the value, skip expansion
+                        skip_next = true;
+                    }
                     break;
                 }
             }
         } else {
             result.push(arg.clone());
+            // For single-char short flags or long flags that take args,
+            // mark the next arg to skip expansion.
+            if arg.len() == 2 && arg.starts_with('-') && !arg.starts_with("--") {
+                let ch = arg.as_bytes()[1] as char;
+                if ARG_FLAGS.contains(&ch) {
+                    skip_next = true;
+                }
+            }
         }
     }
     result
@@ -1458,8 +1477,6 @@ fn parse_args_options(args: &[String]) -> Result<CliOptions, u8> {
             | "--no-npn"
             | "--cert-status"
             | "--false-start"
-            | "--disable-eprt"
-            | "--disable-epsv"
             | "--compressed-ssh"
             | "--doh-cert-status"
             | "--next"
@@ -1497,14 +1514,45 @@ fn parse_args_options(args: &[String]) -> Result<CliOptions, u8> {
             | "-6"
             | "--ipv6"
             | "-j"
-            | "--junk-session-cookies"
-            | "-l"
-            | "--list-only" => {}
+            | "--junk-session-cookies" => {}
+            // FTP: disable EPRT (use PORT for active mode)
+            "--disable-eprt" => {
+                opts.easy.ftp_use_eprt(false);
+            }
+            // FTP: disable EPSV (use PASV for passive mode)
+            "--disable-epsv" => {
+                opts.easy.ftp_use_epsv(false);
+            }
+            // FTP: list only (NLST instead of LIST)
+            "-l" | "--list-only" => {
+                opts.easy.ftp_list_only(true);
+            }
+            // FTP: ASCII transfer mode
+            "-B" | "--use-ascii" => {
+                opts.easy.ftp_use_ascii(true);
+            }
+            // FTP: append to remote file
+            "-a" | "--append" => {
+                opts.easy.ftp_append(true);
+            }
+            // FTP: convert LF to CRLF on upload
+            "--crlf" => {
+                opts.easy.ftp_crlf(true);
+            }
+            // FTP: active mode with specified address
+            "-P" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("urlx: -P requires an argument");
+                    return Err(1);
+                }
+                opts.easy.ftp_active_port(&args[i]);
+            }
             // FTP quote commands
             "-Q" | "--quote" => {
                 i += 1;
-                let _val = require_arg(args, i, &args[i - 1].clone())?;
-                // Accepted for compat; FTP pre/post commands not yet wired
+                let val = require_arg(args, i, &args[i - 1].clone())?;
+                opts.easy.ftp_quote(val);
             }
             // OAuth2 bearer token (alias for --bearer)
             "--oauth2-bearer" => {
