@@ -125,6 +125,11 @@ impl CookieJar {
         if let Some(indices) = self.domain_index.get(&host_lower) {
             candidate_indices.extend(indices);
         }
+        // Also check with leading dot (Netscape cookie format)
+        let dot_host = format!(".{host_lower}");
+        if let Some(indices) = self.domain_index.get(&dot_host) {
+            candidate_indices.extend(indices);
+        }
 
         // Check parent domains (e.g., for host "www.example.com", check "example.com")
         let mut dot_pos = 0;
@@ -604,6 +609,13 @@ fn is_public_suffix(domain: &str) -> bool {
 fn domain_matches(host: &str, cookie_domain: &str) -> bool {
     // Empty cookie domain matches any host (cookies loaded from file without domain attr)
     if cookie_domain.is_empty() {
+        return true;
+    }
+
+    // Strip leading dot from cookie domain for matching (Netscape format)
+    let cookie_domain_clean = cookie_domain.strip_prefix('.').unwrap_or(cookie_domain);
+
+    if host.eq_ignore_ascii_case(cookie_domain_clean) {
         return true;
     }
 

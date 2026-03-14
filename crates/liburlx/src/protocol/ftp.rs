@@ -193,6 +193,13 @@ pub struct FtpConfig {
     pub pre_quote: Vec<String>,
     /// Post-transfer FTP quote commands (from `-Q "-CMD"`).
     pub post_quote: Vec<String>,
+    /// Time condition for conditional download (-z).
+    /// `Some((timestamp, negate))` where `negate=false` means download if newer,
+    /// `negate=true` means download if older.
+    pub time_condition: Option<(i64, bool)>,
+    /// End byte for range download (e.g., `-r 4-16` → `range_end = Some(16)`).
+    /// When set, ABOR is sent after reading `range_end - start + 1` bytes.
+    pub range_end: Option<u64>,
 }
 
 impl Default for FtpConfig {
@@ -212,6 +219,8 @@ impl Default for FtpConfig {
             nobody: false,
             pre_quote: Vec::new(),
             post_quote: Vec::new(),
+            time_condition: None,
+            range_end: None,
         }
     }
 }
@@ -1482,6 +1491,7 @@ pub async fn perform(
     config: &FtpConfig,
     credentials: Option<(&str, &str)>,
 ) -> Result<Response, Error> {
+    let range_end = config.range_end;
     let (host, port) = url.host_and_port()?;
     let raw_path = url.path();
 
@@ -1489,9 +1499,21 @@ pub async fn perform(
     let decoded_path = percent_decode(raw_path);
     let path = decoded_path.as_str();
 
-    // Use provided credentials, URL credentials, or anonymous with curl-compatible password
+    // Use provided credentials, URL credentials, or anonymous with curl-compatible password.
+    // URL credentials are percent-decoded (test 191: ftp://use%3fr:pass%3fword@host/).
     let url_creds = url.credentials();
-    let (user, pass) = credentials.or(url_creds).unwrap_or(("anonymous", "ftp@example.com"));
+    let decoded_user;
+    let decoded_pass;
+    #[allow(clippy::option_if_let_else)]
+    let (user, pass) = if let Some(creds) = credentials {
+        creds
+    } else if let Some((raw_user, raw_pass)) = url_creds {
+        decoded_user = percent_decode(raw_user);
+        decoded_pass = percent_decode(raw_pass);
+        (decoded_user.as_str(), decoded_pass.as_str())
+    } else {
+        ("anonymous", "ftp@example.com")
+    };
 
     // Determine if this is a directory listing (path ends with '/')
     let is_dir_list = path.ends_with('/') && upload_data.is_none();
@@ -1529,12 +1551,31 @@ pub async fn perform(
         send_command(&mut session.writer, &format!("CWD {component}")).await?;
         let cwd_resp = read_response(&mut session.reader).await?;
         if !cwd_resp.is_complete() {
-            // CWD failed - send QUIT and return error code 9
-            let _ = session.quit().await;
-            return Err(Error::Transfer {
-                code: 9,
-                message: format!("FTP CWD failed: {} {}", cwd_resp.code, cwd_resp.message),
-            });
+            if config.create_dirs {
+                // --ftp-create-dirs: try MKD then retry CWD
+                send_command(&mut session.writer, &format!("MKD {component}")).await?;
+                let _mkd_resp = read_response(&mut session.reader).await?;
+                // Always retry CWD after MKD, even if MKD failed (curl compat)
+                send_command(&mut session.writer, &format!("CWD {component}")).await?;
+                let retry_resp = read_response(&mut session.reader).await?;
+                if !retry_resp.is_complete() {
+                    let _ = session.quit().await;
+                    return Err(Error::Transfer {
+                        code: 9,
+                        message: format!(
+                            "FTP CWD failed after MKD: {} {}",
+                            retry_resp.code, retry_resp.message
+                        ),
+                    });
+                }
+            } else {
+                // CWD failed - send QUIT and return error code 9
+                let _ = session.quit().await;
+                return Err(Error::Transfer {
+                    code: 9,
+                    message: format!("FTP CWD failed: {} {}", cwd_resp.code, cwd_resp.message),
+                });
+            }
         }
     }
 
@@ -1556,11 +1597,19 @@ pub async fn perform(
 
     // HEAD/nobody mode: only get file metadata, no data transfer
     if config.nobody {
+        let mut last_modified: Option<String> = None;
+        let mut content_length: Option<String> = None;
+
         // MDTM (modification time)
         if !filename.is_empty() {
             send_command(&mut session.writer, &format!("MDTM {filename}")).await?;
-            let _mdtm_resp = read_response(&mut session.reader).await?;
-            // Ignore MDTM failure (not all servers support it)
+            let mdtm_resp = read_response(&mut session.reader).await?;
+            if mdtm_resp.is_complete() {
+                let mdtm_str = mdtm_resp.message.trim();
+                if let Some(date) = format_mdtm_as_http_date(mdtm_str) {
+                    last_modified = Some(date);
+                }
+            }
         }
 
         // TYPE I for SIZE
@@ -1577,7 +1626,10 @@ pub async fn perform(
         // SIZE
         if !filename.is_empty() {
             send_command(&mut session.writer, &format!("SIZE {filename}")).await?;
-            let _size_resp = read_response(&mut session.reader).await?;
+            let size_resp = read_response(&mut session.reader).await?;
+            if size_resp.is_complete() {
+                content_length = Some(size_resp.message.trim().to_string());
+            }
         }
 
         // REST 0 (curl sends this in HEAD mode)
@@ -1585,8 +1637,29 @@ pub async fn perform(
         let _rest_resp = read_response(&mut session.reader).await?;
 
         let _ = session.quit().await;
-        let headers = std::collections::HashMap::new();
-        return Ok(Response::new(200, headers, Vec::new(), url.as_str().to_string()));
+
+        // Build FTP HEAD output as pseudo-HTTP headers (curl compat)
+        let mut body_text = String::new();
+        if let Some(ref lm) = last_modified {
+            body_text.push_str("Last-Modified: ");
+            body_text.push_str(lm);
+            body_text.push_str("\r\n");
+        }
+        if let Some(ref cl) = content_length {
+            body_text.push_str("Content-Length: ");
+            body_text.push_str(cl);
+            body_text.push_str("\r\n");
+        }
+        body_text.push_str("Accept-ranges: bytes\r\n");
+
+        let mut headers = std::collections::HashMap::new();
+        if let Some(ref cl) = content_length {
+            let _old = headers.insert("content-length".to_string(), cl.clone());
+        }
+        if let Some(ref lm) = last_modified {
+            let _old = headers.insert("last-modified".to_string(), lm.clone());
+        }
+        return Ok(Response::new(200, headers, body_text.into_bytes(), url.as_str().to_string()));
     }
 
     // For uploads
@@ -1780,6 +1853,30 @@ pub async fn perform(
         TransferType::Binary
     }) == TransferType::Ascii;
 
+    // FTP -z: send MDTM before download to check file modification time
+    if let Some((cond_ts, negate)) = config.time_condition {
+        send_command(&mut session.writer, &format!("MDTM {filename}")).await?;
+        let mdtm_resp = read_response(&mut session.reader).await?;
+        if mdtm_resp.is_complete() {
+            // Parse MDTM response: "YYYYMMDDHHMMSS"
+            let mdtm_str = mdtm_resp.message.trim();
+            if let Some(file_ts) = parse_mdtm_timestamp(mdtm_str) {
+                let should_skip = if negate {
+                    // -z -date: download if file is older than date
+                    file_ts >= cond_ts
+                } else {
+                    // -z date: download if file is newer than date
+                    file_ts <= cond_ts
+                };
+                if should_skip {
+                    let _ = session.quit().await;
+                    let headers = std::collections::HashMap::new();
+                    return Ok(Response::new(200, headers, Vec::new(), url.as_str().to_string()));
+                }
+            }
+        }
+    }
+
     // Open data connection BEFORE TYPE/SIZE (curl sends EPSV/PASV before TYPE)
     let data_stream_result = session.open_data_connection().await;
     let mut data_stream = match data_stream_result {
@@ -1862,14 +1959,49 @@ pub async fn perform(
     }
 
     let mut data = Vec::new();
-    let _ = data_stream
-        .read_to_end(&mut data)
-        .await
-        .map_err(|e| Error::Http(format!("FTP data read error: {e}")))?;
-    drop(data_stream);
+
+    // If range_end is set, read only (end - start + 1) bytes, then ABOR
+    let start_offset = resume_from.unwrap_or(0);
+    if let Some(end) = range_end {
+        #[allow(clippy::cast_possible_truncation)]
+        let max_bytes = (end - start_offset + 1) as usize;
+        let mut limited = data_stream.take(max_bytes as u64);
+        let _ = limited
+            .read_to_end(&mut data)
+            .await
+            .map_err(|e| Error::Http(format!("FTP data read error: {e}")))?;
+        drop(limited);
+        // Send ABOR to terminate the transfer early
+        send_command(&mut session.writer, "ABOR").await?;
+        // Ignore response (may be 426 or 226)
+        let _ = read_response(&mut session.reader).await;
+    } else {
+        let _ = data_stream
+            .read_to_end(&mut data)
+            .await
+            .map_err(|e| Error::Http(format!("FTP data read error: {e}")))?;
+        drop(data_stream);
+    }
+
+    // Check for partial file: if we know the expected size and got less data,
+    // return CURLE_PARTIAL_FILE (18) without sending QUIT (curl compat: test 161).
+    // Return the partial data so the CLI can still output it.
+    if range_end.is_none() {
+        if let Some(expected) = remote_size {
+            let actual = data.len() as u64 + resume_from.unwrap_or(0);
+            if actual < expected {
+                // Don't send QUIT — just drop the session (curl compat)
+                let mut headers = std::collections::HashMap::new();
+                let _old = headers.insert("content-length".to_string(), data.len().to_string());
+                let mut resp = Response::new(200, headers, data, url.as_str().to_string());
+                resp.set_body_error(Some("partial".to_string()));
+                return Ok(resp);
+            }
+        }
+    }
 
     // Read 226 Transfer Complete
-    if retr_resp.is_preliminary() {
+    if retr_resp.is_preliminary() && range_end.is_none() {
         let complete_resp = read_response(&mut session.reader).await?;
         if !complete_resp.is_complete() {
             let _ = session.quit().await;
@@ -1925,6 +2057,78 @@ fn percent_decode(s: &str) -> String {
         }
     }
     result
+}
+
+/// Parse an MDTM timestamp "YYYYMMDDHHMMSS" into a Unix timestamp (seconds since epoch).
+fn parse_mdtm_timestamp(s: &str) -> Option<i64> {
+    if s.len() < 14 {
+        return None;
+    }
+    let year: i64 = s[0..4].parse().ok()?;
+    let month: i64 = s[4..6].parse().ok()?;
+    let day: i64 = s[6..8].parse().ok()?;
+    let hour: i64 = s[8..10].parse().ok()?;
+    let min: i64 = s[10..12].parse().ok()?;
+    let sec: i64 = s[12..14].parse().ok()?;
+
+    // Simplified conversion to Unix timestamp (good enough for date comparison)
+    // This doesn't account for leap seconds but is sufficient for -z comparisons.
+    let days = days_from_date(year, month, day)?;
+    Some(days * 86400 + hour * 3600 + min * 60 + sec)
+}
+
+/// Calculate days since Unix epoch from a date.
+fn days_from_date(year: i64, month: i64, day: i64) -> Option<i64> {
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    // Months to days (non-leap year)
+    let month_days: [i64; 12] = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let m = (month - 1) as usize;
+
+    let y = year - 1970;
+    let leap_years = if year > 1970 {
+        ((year - 1) / 4 - (year - 1) / 100 + (year - 1) / 400)
+            - (1969 / 4 - 1969 / 100 + 1969 / 400)
+    } else {
+        0
+    };
+    let mut days = y * 365 + leap_years + month_days[m] + day - 1;
+
+    // Add leap day for current year if applicable
+    if month > 2 && (year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)) {
+        days += 1;
+    }
+
+    Some(days)
+}
+
+/// Format an MDTM timestamp as an HTTP-style "Last-Modified" date string.
+fn format_mdtm_as_http_date(s: &str) -> Option<String> {
+    if s.len() < 14 {
+        return None;
+    }
+    let year: u32 = s[0..4].parse().ok()?;
+    let month: u32 = s[4..6].parse().ok()?;
+    let day: u32 = s[6..8].parse().ok()?;
+    let hour: u32 = s[8..10].parse().ok()?;
+    let min: u32 = s[10..12].parse().ok()?;
+    let sec: u32 = s[12..14].parse().ok()?;
+
+    let month_names =
+        ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    #[allow(clippy::cast_sign_loss)]
+    let month_name = month_names.get((month - 1) as usize)?;
+
+    // Calculate day of week using Zeller-like formula
+    let ts = parse_mdtm_timestamp(s)?;
+    #[allow(clippy::cast_sign_loss)]
+    let day_of_week = ((ts / 86400 + 4) % 7) as usize; // Jan 1, 1970 was Thursday (4)
+    let day_names = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    let dow = day_names.get(day_of_week)?;
+
+    Some(format!("{dow}, {day:02} {month_name} {year} {hour:02}:{min:02}:{sec:02} GMT"))
 }
 
 /// Parse `;type=A` or `;type=I` suffix from FTP URL path (RFC 1738).

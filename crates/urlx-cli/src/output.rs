@@ -334,13 +334,30 @@ pub fn format_write_out(fmt: &str, response: &liburlx::Response) -> String {
     // Header sizes: approximate from response headers
     let header_size: usize = response.headers().iter().map(|(k, v)| k.len() + v.len() + 4).sum();
     result = result.replace("%{size_header}", &header_size.to_string());
-    result = result.replace("%{num_connects}", "1");
+    // num_connects: 1 for the initial request, +1 for each redirect that required
+    // a new connection (Connection: close or different host).
+    let num_connects = {
+        let mut count: u32 = 1;
+        for redir_resp in response.redirect_responses() {
+            let has_close =
+                redir_resp.header("connection").is_some_and(|v| v.eq_ignore_ascii_case("close"));
+            if has_close {
+                count += 1;
+            }
+        }
+        count
+    };
+    #[allow(clippy::literal_string_with_formatting_args)]
+    {
+        result = result.replace("%{num_connects}", &num_connects.to_string());
+    }
     result = result
         .replace("%{time_redirect}", &format!("{:.6}", info.time_namelookup.as_secs_f64() * 0.0));
     result = result.replace("%{redirect_url}", response.header("location").unwrap_or(""));
     result = result.replace("%{method}", "GET");
     result = result.replace("%{errormsg}", "");
     result = result.replace("%{exitcode}", "0");
+    result = result.replace("%{num_retries}", &info.num_retries.to_string());
 
     // Handle escape sequences
     result = result.replace("\\n", "\n");

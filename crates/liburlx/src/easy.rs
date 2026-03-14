@@ -166,6 +166,8 @@ pub struct Easy {
     ftp_pre_quote: Vec<String>,
     /// FTP post-transfer quote commands (curl `-Q "-CMD"`).
     ftp_post_quote: Vec<String>,
+    /// FTP time condition for `-z` flag: `(unix_timestamp, negate)`.
+    ftp_time_condition: Option<(i64, bool)>,
     /// SASL authorization identity.
     sasl_authzid: Option<String>,
     /// Send SASL initial response in first message.
@@ -412,6 +414,7 @@ impl Clone for Easy {
             ftp_list_only: self.ftp_list_only,
             ftp_pre_quote: self.ftp_pre_quote.clone(),
             ftp_post_quote: self.ftp_post_quote.clone(),
+            ftp_time_condition: self.ftp_time_condition,
             sasl_authzid: self.sasl_authzid.clone(),
             sasl_ir: self.sasl_ir,
             connect_to: self.connect_to.clone(),
@@ -530,6 +533,7 @@ impl Easy {
             ftp_list_only: false,
             ftp_pre_quote: Vec::new(),
             ftp_post_quote: Vec::new(),
+            ftp_time_condition: None,
             sasl_authzid: None,
             sasl_ir: false,
             connect_to: Vec::new(),
@@ -903,6 +907,15 @@ impl Easy {
     /// `multipart/form-data` and the method defaults to POST.
     pub fn form_field(&mut self, name: &str, value: &str) {
         self.multipart.get_or_insert_with(MultipartForm::new).field(name, value);
+    }
+
+    /// Add a text field with explicit Content-Type to the multipart form.
+    pub fn form_field_with_type(&mut self, name: &str, value: &str, content_type: &str) {
+        self.multipart.get_or_insert_with(MultipartForm::new).field_with_type(
+            name,
+            value,
+            content_type,
+        );
     }
 
     /// Add a file to the multipart form.
@@ -1578,6 +1591,15 @@ impl Easy {
         self.ftp_account = Some(account.to_string());
     }
 
+    /// Set a time condition for FTP downloads (`-z` flag).
+    ///
+    /// When set, FTP downloads use MDTM to check file modification time.
+    /// `negate=false`: download if file is newer than `timestamp`.
+    /// `negate=true`: download if file is older than `timestamp`.
+    pub const fn ftp_time_condition(&mut self, timestamp: i64, negate: bool) {
+        self.ftp_time_condition = Some((timestamp, negate));
+    }
+
     /// Set the path to an SSH private key for SFTP/SCP authentication.
     ///
     /// When set, public key authentication is used instead of password.
@@ -2133,6 +2155,8 @@ impl Easy {
             nobody: effective_method == "HEAD",
             pre_quote: self.ftp_pre_quote.clone(),
             post_quote: self.ftp_post_quote.clone(),
+            time_condition: self.ftp_time_condition,
+            range_end: None,
         };
 
         let dns_resolver = self.build_dns_resolver();
@@ -2374,11 +2398,15 @@ async fn perform_transfer(
 
         // Build headers, stripping auth on cross-origin redirects unless unrestricted
         let mut request_headers = headers.to_vec();
-        if redirects_followed > 0 && !unrestricted_auth {
+        if redirects_followed > 0 {
             let orig_host = original_url.host_str().unwrap_or("");
             let cur_host = current_url.host_str().unwrap_or("");
             if !orig_host.eq_ignore_ascii_case(cur_host) {
-                request_headers.retain(|(k, _)| !k.eq_ignore_ascii_case("authorization"));
+                if !unrestricted_auth {
+                    request_headers.retain(|(k, _)| !k.eq_ignore_ascii_case("authorization"));
+                }
+                // Drop custom Host header on cross-host redirect (curl compat: test 184)
+                request_headers.retain(|(k, _)| !k.eq_ignore_ascii_case("host"));
             }
         }
         if let Some(ref jar) = cookie_jar {
@@ -2392,21 +2420,28 @@ async fn perform_transfer(
             let path = current_url.path();
             let is_secure = current_url.scheme() == "https";
             if let Some(cookie_header) = jar.cookie_header(cookie_host, path, is_secure) {
-                // Only add if user hasn't set a Cookie header
-                if !request_headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("cookie")) {
+                // Merge with existing Cookie header if user set one (curl compat: -b file -b "k=v")
+                if let Some(existing) =
+                    request_headers.iter_mut().find(|(k, _)| k.eq_ignore_ascii_case("cookie"))
+                {
+                    existing.1 = format!("{}; {}", cookie_header, existing.1);
+                } else {
                     request_headers.push(("Cookie".to_string(), cookie_header));
                 }
             }
         }
 
-        // For Digest/AnyAuth, don't send body on initial request — it will be
+        // For Digest, don't send body on initial request — it will be
         // rejected with 401 anyway. Send body only on the retry with credentials.
         // Send Content-Length: 0 for PUT/POST to match curl behavior.
-        // For NTLM, add Authorization: NTLM Type1 to the first request.
-        let is_challenge_response = auth_credentials
-            .as_ref()
-            .is_some_and(|a| matches!(a.method, AuthMethod::Digest | AuthMethod::AnyAuth));
-        let initial_body = if is_challenge_response {
+        // For AnyAuth, send the full body on the first request (it's a "try without auth"
+        // approach — if the server responds 200, we're done).
+        // For NTLM, send Content-Length: 0 (body will be sent after Type3).
+        let is_challenge_response =
+            auth_credentials.as_ref().is_some_and(|a| matches!(a.method, AuthMethod::Digest));
+        let is_ntlm_probe =
+            auth_credentials.as_ref().is_some_and(|a| matches!(a.method, AuthMethod::Ntlm));
+        let initial_body = if is_challenge_response || is_ntlm_probe {
             if current_body.is_some() {
                 Some(&[] as &[u8]) // Empty body → sends Content-Length: 0
             } else {
@@ -2501,6 +2536,88 @@ async fn perform_transfer(
         // Store latest response for error recovery (timeout, max-redirects, etc.)
         if let Ok(mut guard) = last_resp_store.lock() {
             *guard = Some(response.clone());
+        }
+
+        // For Digest/NTLM: if we sent an empty-body probe and the server didn't
+        // challenge us (response is not 401), re-send the request with the full body.
+        // This handles the case where --digest/--ntlm is used but the server doesn't
+        // require auth (curl tests 175, 176).
+        if (is_challenge_response || is_ntlm_probe) && response.status() != 401 {
+            if let Some(body) = current_body.as_deref() {
+                if !body.is_empty() {
+                    redirect_chain.push(response.clone());
+                    // Re-send without auth headers (server didn't ask for any)
+                    let mut retry_headers = request_headers.clone();
+                    // Remove any auth headers added by the probe
+                    retry_headers.retain(|(k, _)| !k.eq_ignore_ascii_case("authorization"));
+                    response = Box::pin(do_single_request(
+                        &current_url,
+                        &current_method,
+                        &retry_headers,
+                        current_body.as_deref(),
+                        verbose,
+                        accept_encoding,
+                        connect_timeout,
+                        effective_proxy,
+                        proxy_credentials,
+                        resolve_overrides,
+                        tls_config,
+                        tcp_nodelay,
+                        tcp_keepalive,
+                        unix_socket,
+                        interface,
+                        local_port,
+                        dns_shuffle,
+                        dns_cache,
+                        pool,
+                        #[cfg(feature = "http2")]
+                        h2_pool,
+                        http_version,
+                        expect_100_timeout,
+                        happy_eyeballs_timeout,
+                        ignore_content_length,
+                        speed_limits,
+                        ftp_ssl_mode,
+                        ssh_key_path,
+                        proxy_tls_config,
+                        alt_svc_cache,
+                        #[cfg(feature = "http2")]
+                        h2_config,
+                        dns_resolver,
+                        custom_request_target,
+                        tftp_blksize,
+                        tftp_no_options,
+                        #[cfg(feature = "ssh")]
+                        ssh_host_key_policy,
+                        mail_from,
+                        mail_rcpt,
+                        fresh_connect,
+                        forbid_reuse,
+                        ftp_config,
+                        proxy_headers,
+                        connect_to,
+                        path_as_is,
+                        #[cfg(feature = "ssh")]
+                        ssh_public_keyfile,
+                        #[cfg(not(feature = "ssh"))]
+                        None,
+                        #[cfg(feature = "ssh")]
+                        ssh_auth_types,
+                        #[cfg(not(feature = "ssh"))]
+                        None,
+                        mail_auth,
+                        sasl_authzid,
+                        sasl_ir,
+                        haproxy_protocol,
+                        abstract_unix_socket,
+                        chunked_upload,
+                        deadline,
+                        http_proxy_tunnel,
+                        proxy_http_10,
+                    ))
+                    .await?;
+                }
+            }
         }
 
         // Handle 401: Digest, NTLM, and AnyAuth challenge-response flows.
@@ -2624,6 +2741,105 @@ async fn perform_transfer(
                                 proxy_http_10,
                             ))
                             .await?;
+
+                            // Check for stale=true: server wants us to retry with a new nonce
+                            if response.status() == 401 {
+                                let stale_challenge = response
+                                    .headers_ordered()
+                                    .iter()
+                                    .filter(|(k, _)| k.eq_ignore_ascii_case("www-authenticate"))
+                                    .find_map(|(_, v)| {
+                                        let clean = strip_raw_header_value(v);
+                                        crate::auth::digest::DigestChallenge::parse(clean).ok()
+                                    })
+                                    .filter(|c| c.stale);
+
+                                if let Some(new_challenge) = stale_challenge {
+                                    redirect_chain.push(response.clone());
+                                    let uri = resolve_request_target(
+                                        custom_request_target,
+                                        &current_url,
+                                        path_as_is,
+                                    );
+                                    let cnonce = crate::auth::digest::generate_cnonce();
+                                    let auth_header = new_challenge.respond(
+                                        &auth.username,
+                                        &auth.password,
+                                        &current_method,
+                                        &uri,
+                                        1,
+                                        &cnonce,
+                                    );
+                                    let mut stale_headers = request_headers.clone();
+                                    stale_headers.push(("Authorization".to_string(), auth_header));
+                                    response = Box::pin(do_single_request(
+                                        &current_url,
+                                        &current_method,
+                                        &stale_headers,
+                                        current_body.as_deref(),
+                                        verbose,
+                                        accept_encoding,
+                                        connect_timeout,
+                                        effective_proxy,
+                                        proxy_credentials,
+                                        resolve_overrides,
+                                        tls_config,
+                                        tcp_nodelay,
+                                        tcp_keepalive,
+                                        unix_socket,
+                                        interface,
+                                        local_port,
+                                        dns_shuffle,
+                                        dns_cache,
+                                        pool,
+                                        #[cfg(feature = "http2")]
+                                        h2_pool,
+                                        http_version,
+                                        expect_100_timeout,
+                                        happy_eyeballs_timeout,
+                                        ignore_content_length,
+                                        speed_limits,
+                                        ftp_ssl_mode,
+                                        ssh_key_path,
+                                        proxy_tls_config,
+                                        alt_svc_cache,
+                                        #[cfg(feature = "http2")]
+                                        h2_config,
+                                        dns_resolver,
+                                        custom_request_target,
+                                        tftp_blksize,
+                                        tftp_no_options,
+                                        #[cfg(feature = "ssh")]
+                                        ssh_host_key_policy,
+                                        mail_from,
+                                        mail_rcpt,
+                                        fresh_connect,
+                                        forbid_reuse,
+                                        ftp_config,
+                                        proxy_headers,
+                                        connect_to,
+                                        path_as_is,
+                                        #[cfg(feature = "ssh")]
+                                        ssh_public_keyfile,
+                                        #[cfg(not(feature = "ssh"))]
+                                        None,
+                                        #[cfg(feature = "ssh")]
+                                        ssh_auth_types,
+                                        #[cfg(not(feature = "ssh"))]
+                                        None,
+                                        mail_auth,
+                                        sasl_authzid,
+                                        sasl_ir,
+                                        haproxy_protocol,
+                                        abstract_unix_socket,
+                                        chunked_upload,
+                                        deadline,
+                                        http_proxy_tunnel,
+                                        proxy_http_10,
+                                    ))
+                                    .await?;
+                                }
+                            }
                         }
                     }
                     Some(AuthMethod::Ntlm) => {
@@ -3152,24 +3368,47 @@ async fn do_single_request(
             } else {
                 ftp_ssl_mode
             };
-            // Extract resume offset from Range header (e.g., "bytes=42-" → 42)
-            let resume_offset = headers.iter().find_map(|(k, v)| {
+            // Extract resume/range from Range header for FTP.
+            // Formats: "bytes=42-" (resume from offset) or "bytes=4-16" (range).
+            let ftp_range = headers.iter().find_map(|(k, v)| {
                 if k.eq_ignore_ascii_case("range") {
-                    v.strip_prefix("bytes=")
-                        .and_then(|r| r.strip_suffix('-'))
-                        .and_then(|n| n.parse::<u64>().ok())
+                    v.strip_prefix("bytes=").map(ToString::to_string)
+                } else {
+                    None
+                }
+            });
+            let resume_offset = ftp_range.as_deref().and_then(|r| {
+                if r.ends_with('-') {
+                    // "42-" format: resume from offset 42
+                    r.strip_suffix('-').and_then(|n| n.parse::<u64>().ok())
+                } else if let Some((start, _end)) = r.split_once('-') {
+                    // "4-16" format: REST at start offset
+                    start.parse::<u64>().ok()
+                } else {
+                    None
+                }
+            });
+            // Extract end byte for range limit (for ABOR after partial read)
+            let ftp_range_end = ftp_range.as_deref().and_then(|r| {
+                if r.ends_with('-') {
+                    None // open-ended range
+                } else if let Some((_start, end)) = r.split_once('-') {
+                    end.parse::<u64>().ok()
                 } else {
                     None
                 }
             });
             let upload_data = if method == "PUT" { Some(body.unwrap_or(&[])) } else { None };
+            // Set range_end on ftp_config if needed
+            let mut ftp_config_with_range = ftp_config.clone();
+            ftp_config_with_range.range_end = ftp_range_end;
             return crate::protocol::ftp::perform(
                 url,
                 upload_data,
                 effective_ssl_mode,
                 tls_config,
                 resume_offset,
-                ftp_config,
+                &ftp_config_with_range,
                 None,
             )
             .await;
@@ -3915,10 +4154,16 @@ async fn do_single_request(
                 // Add proxy-specific headers for non-tunnel HTTP proxy requests
                 let mut proxy_effective_headers = effective_headers.clone();
                 if is_http_proxy {
+                    // Insert Proxy-Connection before Cookie header (curl compat: test 179)
+                    let cookie_pos = proxy_effective_headers
+                        .iter()
+                        .position(|(k, _)| k.eq_ignore_ascii_case("cookie"));
+                    let insert_pos = cookie_pos.unwrap_or(proxy_effective_headers.len());
+                    proxy_effective_headers.insert(
+                        insert_pos,
+                        ("Proxy-Connection".to_string(), "Keep-Alive".to_string()),
+                    );
                     proxy_effective_headers.extend_from_slice(proxy_headers);
-                    // curl sends Proxy-Connection: Keep-Alive for HTTP proxy requests
-                    proxy_effective_headers
-                        .push(("Proxy-Connection".to_string(), "Keep-Alive".to_string()));
                 }
 
                 let use_http10 = http_version == HttpVersion::Http10;

@@ -240,6 +240,7 @@ fn transfer_info_all_timing_fields() {
         speed_download: 1024.0,
         speed_upload: 512.0,
         size_upload: 2048,
+        num_retries: 0,
     };
 
     assert_eq!(info.time_namelookup, Duration::from_millis(5));
@@ -302,6 +303,7 @@ fn transfer_info_clone_preserves_all_fields() {
         speed_download: 8.0,
         speed_upload: 9.0,
         size_upload: 10,
+        num_retries: 0,
     };
     let cloned = info.clone();
     assert_eq!(cloned.time_namelookup, info.time_namelookup);

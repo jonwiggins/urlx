@@ -10,8 +10,8 @@ use crate::args::{
     ParseResult,
 };
 use crate::output::{
-    content_disposition_filename, format_headers, http_status_text, output_response,
-    write_trace_file,
+    content_disposition_filename, format_headers, format_write_out, http_status_text,
+    output_response, write_trace_file,
 };
 
 /// Substitute `#1`, `#2`, etc. in an output filename template with glob match values.
@@ -168,7 +168,7 @@ pub fn parse_loose_date(s: &str) -> Option<i64> {
     let month_names =
         ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
     let parts: Vec<&str> = s.split_whitespace().collect();
-    if parts.len() < 4 {
+    if parts.len() < 3 {
         return None;
     }
 
@@ -288,6 +288,87 @@ pub fn extract_hostname(url: &str) -> String {
         without_path.rfind('@').map_or(without_path, |pos| &without_path[pos + 1..]);
     // Strip port
     without_userinfo.rsplit_once(':').map_or(without_userinfo, |(host, _)| host).to_string()
+}
+
+/// Extract the username from a URL's userinfo, if present.
+///
+/// Returns `None` if no userinfo is in the URL.
+#[allow(clippy::option_if_let_else)]
+fn extract_url_username(url: &str) -> Option<String> {
+    let without_scheme = url.find("://").map_or(url, |pos| &url[pos + 3..]);
+    let without_path = without_scheme.split('/').next().unwrap_or(without_scheme);
+    if let Some(at_pos) = without_path.rfind('@') {
+        let userinfo = &without_path[..at_pos];
+        let user = userinfo.split(':').next().unwrap_or(userinfo);
+        if user.is_empty() {
+            None
+        } else {
+            // URL-decode the username
+            Some(url_decode(user))
+        }
+    } else {
+        None
+    }
+}
+
+/// Extract the password from a URL's userinfo, if present.
+///
+/// Returns `None` if no password is in the URL (user-only: `user@host`).
+#[allow(clippy::option_if_let_else)]
+fn extract_url_password(url: &str) -> Option<String> {
+    let without_scheme = url.find("://").map_or(url, |pos| &url[pos + 3..]);
+    let without_path = without_scheme.split('/').next().unwrap_or(without_scheme);
+    if let Some(at_pos) = without_path.rfind('@') {
+        let userinfo = &without_path[..at_pos];
+        if let Some((_user, pass)) = userinfo.split_once(':') {
+            Some(url_decode(pass))
+        } else {
+            None // user@host, no password
+        }
+    } else {
+        None
+    }
+}
+
+/// Strip credentials from a URL: `ftp://user:pass@host/` → `ftp://host/`.
+#[allow(clippy::option_if_let_else)]
+fn strip_url_credentials(url: &str) -> String {
+    let scheme_end = url.find("://").map_or(0, |p| p + 3);
+    let rest = &url[scheme_end..];
+    if let Some(at_pos) = rest.find('@') {
+        format!("{}{}", &url[..scheme_end], &rest[at_pos + 1..])
+    } else {
+        url.to_string()
+    }
+}
+
+/// URL-decode a percent-encoded string.
+fn url_decode(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.bytes();
+    while let Some(b) = chars.next() {
+        if b == b'%' {
+            let hi = chars.next();
+            let lo = chars.next();
+            if let (Some(h), Some(l)) = (hi, lo) {
+                let hex = [h, l];
+                if let Ok(hex_str) = std::str::from_utf8(&hex) {
+                    if let Ok(val) = u8::from_str_radix(hex_str, 16) {
+                        result.push(val as char);
+                        continue;
+                    }
+                }
+                result.push('%');
+                result.push(h as char);
+                result.push(l as char);
+            } else {
+                result.push('%');
+            }
+        } else {
+            result.push(b as char);
+        }
+    }
+    result
 }
 
 /// Append query parameters to a URL string.
@@ -517,36 +598,63 @@ pub fn run(args: &[String]) -> ExitCode {
         }
 
         // --netrc: load credentials from .netrc file for this URL
+        // Priority: -u overrides netrc, netrc overrides URL (for compulsory --netrc/-n),
+        // URL overrides netrc (for --netrc-optional) except when URL has user but no password.
         if opts.user_credentials.is_none() {
             if let Some(ref netrc_path) = opts.netrc_file {
                 match std::fs::read_to_string(netrc_path) {
                     Ok(contents) => {
                         let host = extract_hostname(&url);
-                        if let Some(entry) = liburlx::netrc::lookup(&contents, &host) {
-                            let user = entry.login.unwrap_or_default();
-                            let pass = entry.password.unwrap_or_default();
-                            // For FTP/FTPS, embed credentials in URL (FTP uses URL credentials)
-                            if url.starts_with("ftp://") || url.starts_with("ftps://") {
-                                let scheme_end = url.find("://").map_or(0, |p| p + 3);
-                                let new_url = format!(
-                                    "{}{}:{}@{}",
-                                    &url[..scheme_end],
-                                    percent_encode(&user),
-                                    percent_encode(&pass),
-                                    &url[scheme_end..]
-                                );
-                                if let Err(e) = opts.easy.url(&new_url) {
-                                    if !opts.silent || opts.show_error {
-                                        eprintln!(
-                                            "urlx: error parsing URL with netrc credentials: {e}"
-                                        );
-                                    }
-                                    return ExitCode::from(3);
-                                }
-                            } else if opts.use_digest {
-                                opts.easy.digest_auth(&user, &pass);
+                        let url_user = extract_url_username(&url);
+                        let url_pass = extract_url_password(&url);
+
+                        // Determine if we should use netrc
+                        let use_netrc = if opts.netrc_optional {
+                            // --netrc-optional: use netrc if URL has no credentials,
+                            // or if URL has user but no password (look up password)
+                            url_user.is_none() || url_pass.is_none()
+                        } else {
+                            // --netrc (compulsory): always use netrc (overrides URL)
+                            true
+                        };
+
+                        if use_netrc {
+                            // Look up in netrc: if URL has a username, search for that user
+                            #[allow(clippy::option_if_let_else)]
+                            let entry = if let Some(ref uname) = url_user {
+                                liburlx::netrc::lookup_user(&contents, &host, uname)
+                                    .or_else(|| liburlx::netrc::lookup(&contents, &host))
                             } else {
-                                opts.easy.basic_auth(&user, &pass);
+                                liburlx::netrc::lookup(&contents, &host)
+                            };
+
+                            if let Some(entry) = entry {
+                                let user = entry.login.unwrap_or_default();
+                                let pass = entry.password.unwrap_or_default();
+                                if url.starts_with("ftp://") || url.starts_with("ftps://") {
+                                    // Embed credentials in URL for FTP (don't percent-encode)
+                                    let base_url = strip_url_credentials(&url);
+                                    let scheme_end = base_url.find("://").map_or(0, |p| p + 3);
+                                    let new_url = format!(
+                                        "{}{}:{}@{}",
+                                        &base_url[..scheme_end],
+                                        user,
+                                        pass,
+                                        &base_url[scheme_end..],
+                                    );
+                                    if let Err(e) = opts.easy.url(&new_url) {
+                                        if !opts.silent || opts.show_error {
+                                            eprintln!(
+                                                "urlx: error parsing URL with netrc credentials: {e}"
+                                            );
+                                        }
+                                        return ExitCode::from(3);
+                                    }
+                                } else if opts.use_digest {
+                                    opts.easy.digest_auth(&user, &pass);
+                                } else {
+                                    opts.easy.basic_auth(&user, &pass);
+                                }
                             }
                         }
                     }
@@ -558,6 +666,28 @@ pub fn run(args: &[String]) -> ExitCode {
                             return ExitCode::FAILURE;
                         }
                     }
+                }
+            }
+        }
+
+        // For FTP: if -u was provided, embed credentials into the URL
+        // (FTP reads credentials from the URL, not from auth_credentials).
+        if let Some((ref user, ref pass)) = opts.user_credentials {
+            if url.starts_with("ftp://") || url.starts_with("ftps://") {
+                let base_url = strip_url_credentials(&url);
+                let scheme_end = base_url.find("://").map_or(0, |p| p + 3);
+                let new_url = format!(
+                    "{}{}:{}@{}",
+                    &base_url[..scheme_end],
+                    user,
+                    pass,
+                    &base_url[scheme_end..]
+                );
+                if let Err(e) = opts.easy.url(&new_url) {
+                    if !opts.silent || opts.show_error {
+                        eprintln!("urlx: error parsing URL with -u credentials: {e}");
+                    }
+                    return ExitCode::from(3);
                 }
             }
         }
@@ -692,7 +822,14 @@ pub fn run(args: &[String]) -> ExitCode {
                 None
             }
         };
-        if let Some(date) = date_val {
+        // For FTP, use MDTM-based time condition instead of HTTP headers
+        let is_ftp_url =
+            opts.urls.first().is_some_and(|u| u.starts_with("ftp://") || u.starts_with("ftps://"));
+        if is_ftp_url {
+            if let Some(ts) = opts.time_cond_ts {
+                opts.easy.ftp_time_condition(ts, negate);
+            }
+        } else if let Some(date) = date_val {
             if negate {
                 opts.easy.header("If-Unmodified-Since", &date);
             } else {
@@ -777,7 +914,9 @@ pub fn run(args: &[String]) -> ExitCode {
                     );
                     return exit;
                 }
-                if status != 206 {
+                // 200 with Content-Range is a valid resume response (curl compat: test 188)
+                let has_content_range = response.header("content-range").is_some();
+                if status != 206 && !(status == 200 && has_content_range) {
                     // Output headers but suppress body. When auto-resuming (-C -),
                     // don't write to the output file (it's the resume source).
                     let out_file =
@@ -914,6 +1053,16 @@ pub fn run(args: &[String]) -> ExitCode {
 
             // Body error: output was written, now return appropriate error exit code
             if let Some(body_err) = response.body_error() {
+                if body_err == "partial" {
+                    // FTP partial file — data was already output, return error 18
+                    return ExitCode::from(18); // CURLE_PARTIAL_FILE
+                }
+                if body_err.contains("negative_content_length") {
+                    if !opts.silent || opts.show_error {
+                        eprintln!("urlx: (8) Weird server reply");
+                    }
+                    return ExitCode::from(8);
+                }
                 if body_err.contains("timeout") {
                     if !opts.silent || opts.show_error {
                         let timeout_str = opts
@@ -976,6 +1125,21 @@ pub fn run(args: &[String]) -> ExitCode {
                         return ExitCode::SUCCESS;
                     }
                 }
+            }
+            // Process -w write-out even on error (curl compat: test 196)
+            if let Some(ref w) = opts.write_out {
+                use std::io::Write as _;
+                // Create a minimal response for write-out formatting
+                let wo = if let Some(resp) = opts.easy.last_response() {
+                    format_write_out(w, resp)
+                } else {
+                    // No response available — just process escape sequences
+                    let mut s = w.replace("\\n", "\n").replace("\\t", "\t").replace("\\r", "\r");
+                    s = s.replace("%{num_retries}", &opts.retry_attempts.to_string());
+                    s
+                };
+                let _ = std::io::stdout().write_all(wo.as_bytes());
+                let _ = std::io::stdout().flush();
             }
             if !opts.silent || opts.show_error {
                 eprintln!("urlx: {e}");
@@ -1098,7 +1262,7 @@ pub fn perform_with_retry(opts: &mut CliOptions) -> Result<liburlx::Response, li
         }
 
         match opts.easy.perform() {
-            Ok(response) => {
+            Ok(mut response) => {
                 // Retry on 408, 429, 500, 502, 503, 504 (or all errors with --retry-all-errors)
                 let should_retry = if opts.retry_all_errors {
                     response.status() >= 400
@@ -1106,6 +1270,15 @@ pub fn perform_with_retry(opts: &mut CliOptions) -> Result<liburlx::Response, li
                     is_retryable_status(response.status())
                 };
                 if should_retry && attempt < max_retries {
+                    // Output the failed response before retrying (curl compat: test 197)
+                    let _ = output_response(
+                        &response,
+                        opts.output_file.as_deref(),
+                        None, // no -w on intermediate retry responses
+                        opts.include_headers,
+                        opts.silent,
+                        false,
+                    );
                     last_err = Some(liburlx::Error::Http(format!(
                         "HTTP {} {}",
                         response.status(),
@@ -1113,10 +1286,17 @@ pub fn perform_with_retry(opts: &mut CliOptions) -> Result<liburlx::Response, li
                     )));
                     continue;
                 }
+                // Set num_retries on the final response
+                if attempt > 0 {
+                    let mut info = response.transfer_info().clone();
+                    info.num_retries = attempt;
+                    response.set_transfer_info(info);
+                }
                 return Ok(response);
             }
             Err(e) => {
                 last_err = Some(e);
+                opts.retry_attempts = attempt;
                 if attempt == max_retries {
                     break;
                 }

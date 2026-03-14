@@ -46,6 +46,8 @@ pub struct CliOptions {
     pub(crate) retry_count: u32,
     pub(crate) retry_delay_secs: u64,
     pub(crate) retry_max_time_secs: u64,
+    /// Number of retry attempts actually performed (for -w %{`num_retries`}).
+    pub(crate) retry_attempts: u32,
     pub(crate) parallel: bool,
     pub(crate) parallel_max: usize,
     pub(crate) cookie_jar_file: Option<String>,
@@ -389,6 +391,7 @@ fn parse_args_options(args: &[String]) -> Result<CliOptions, u8> {
         user_credentials: None,
         retry_count: 0,
         retry_delay_secs: 0,
+        retry_attempts: 0,
         retry_max_time_secs: 0,
         parallel: false,
         parallel_max: 50,
@@ -1147,7 +1150,7 @@ fn parse_args_options(args: &[String]) -> Result<CliOptions, u8> {
             "--no-keepalive" => {
                 opts.no_keepalive = true;
             }
-            "--netrc" => {
+            "-n" | "--netrc" => {
                 let home = std::env::var("HOME").unwrap_or_default();
                 opts.netrc_file = Some(format!("{home}/.netrc"));
             }
@@ -1862,20 +1865,35 @@ fn parse_form_field(easy: &mut liburlx::Easy, val: &str) -> Result<(), String> {
         // File upload — parse filepath and optional ;type= ;filename= modifiers
         let (filepath, modifiers) = parse_form_file_spec(rest);
 
-        let mut custom_type: Option<&str> = None;
+        let mut custom_type: Option<String> = None;
         let mut custom_filename: Option<String> = None;
 
         // Parse semicolon-separated modifiers
         for modifier in modifiers {
             if let Some(t) = modifier.strip_prefix("type=") {
-                custom_type = Some(t);
+                custom_type = Some(t.to_string());
             } else if let Some(f) = modifier.strip_prefix("filename=") {
                 custom_filename = Some(unescape_form_filename(f));
+            } else if let Some(f) = modifier.strip_prefix("format=") {
+                // format= appends to type: e.g., type=text/x-null;format=x-curl
+                if let Some(ref mut ct) = custom_type {
+                    ct.push_str(";format=");
+                    ct.push_str(f);
+                }
             }
         }
 
-        // Read the file
-        let data = std::fs::read(&filepath).map_err(|e| format!("error reading form file: {e}"))?;
+        // Read the file (or stdin for @-)
+        let data = if filepath == "-" {
+            use std::io::Read as _;
+            let mut buf = Vec::new();
+            let _bytes = std::io::stdin()
+                .read_to_end(&mut buf)
+                .map_err(|e| format!("error reading stdin: {e}"))?;
+            buf
+        } else {
+            std::fs::read(&filepath).map_err(|e| format!("error reading form file: {e}"))?
+        };
 
         let original_filename = std::path::Path::new(&filepath)
             .file_name()
@@ -1883,7 +1901,7 @@ fn parse_form_field(easy: &mut liburlx::Easy, val: &str) -> Result<(), String> {
             .unwrap_or_default();
         let display_filename = custom_filename.unwrap_or_else(|| original_filename.clone());
 
-        if let Some(ct) = custom_type {
+        if let Some(ref ct) = custom_type {
             easy.form_file_with_type(name, &display_filename, ct, &data);
         } else {
             // Guess content type from the original filepath, not the custom filename
@@ -1894,11 +1912,54 @@ fn parse_form_field(easy: &mut liburlx::Easy, val: &str) -> Result<(), String> {
                 &data,
             );
         }
+    } else if let Some(rest) = value.strip_prefix('<') {
+        // Read field value from file: name=<filepath or name=<filepath;type=mime
+        let (filepath, modifiers) = parse_form_file_spec(rest);
+
+        let mut custom_type: Option<&str> = None;
+        for modifier in &modifiers {
+            if let Some(t) = modifier.strip_prefix("type=") {
+                custom_type = Some(t);
+            }
+        }
+
+        let data = std::fs::read_to_string(&filepath)
+            .map_err(|e| format!("error reading form file: {e}"))?;
+
+        if let Some(ct) = custom_type {
+            easy.form_field_with_type(name, &data, ct);
+        } else {
+            easy.form_field(name, &data);
+        }
     } else {
-        easy.form_field(name, value);
+        // Text field — may have ;type= modifier (curl compat: -F "name=val;type=mime")
+        // Split on ;type= to extract the Content-Type. Everything after ;type= is the type
+        // (including sub-parameters like ;charset=X).
+        if let Some(type_pos) = find_type_modifier(value) {
+            let field_value = value[..type_pos].trim_start();
+            let content_type = &value[type_pos + 6..]; // skip ";type="
+            easy.form_field_with_type(name, field_value, content_type);
+        } else {
+            easy.form_field(name, value);
+        }
     }
 
     Ok(())
+}
+
+/// Find the position of `;type=` in a form field value, respecting quotes.
+///
+/// Returns the byte offset of the `;` before `type=`, or `None` if not found.
+fn find_type_modifier(value: &str) -> Option<usize> {
+    let bytes = value.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b';' && value[i + 1..].starts_with("type=") {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Split a modifier string on `;` while respecting quoted values.

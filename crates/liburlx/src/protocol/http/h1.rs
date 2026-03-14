@@ -325,6 +325,51 @@ where
         ph = parse_headers(&header_bytes)?;
     }
 
+    // Reject negative Content-Length (curl returns CURLE_WEIRD_SERVER_REPLY = 8).
+    // Return a response with body_error so the caller can detect it and return
+    // exit code 8 while still outputting the partial headers.
+    if let Some(cl) = ph.headers.get("content-length") {
+        if cl.starts_with('-') {
+            // Remove Content-Length and everything after from ordered headers
+            let mut trunc_ordered = Vec::new();
+            for (k, v) in &ph.headers_ordered {
+                if k.eq_ignore_ascii_case("content-length") {
+                    break;
+                }
+                trunc_ordered.push((k.clone(), v.clone()));
+            }
+
+            // Build raw header bytes truncated at Content-Length
+            let mut trunc_raw = Vec::new();
+            let line_ending: &[u8] = if ph.uses_crlf { b"\r\n" } else { b"\n" };
+            // Find status line in original header bytes
+            if let Some(first_line_end) =
+                header_bytes.windows(line_ending.len()).position(|w| w == line_ending)
+            {
+                trunc_raw.extend_from_slice(&header_bytes[..first_line_end]);
+                trunc_raw.extend_from_slice(line_ending);
+            }
+            for (k, v) in &trunc_ordered {
+                trunc_raw.extend_from_slice(k.as_bytes());
+                // raw values from extract_raw_header_values already include ": " prefix
+                trunc_raw.extend_from_slice(v.as_bytes());
+                trunc_raw.extend_from_slice(line_ending);
+            }
+
+            let trunc_headers: HashMap<String, String> =
+                trunc_ordered.iter().map(|(k, v)| (k.to_ascii_lowercase(), v.clone())).collect();
+
+            let mut resp = Response::new(ph.status, trunc_headers, Vec::new(), url.to_string());
+            resp.set_headers_ordered(trunc_ordered);
+            resp.set_status_reason(ph.reason);
+            resp.set_uses_crlf(ph.uses_crlf);
+            resp.set_http_version(ph.version);
+            resp.set_raw_headers(trunc_raw);
+            resp.set_body_error(Some("negative_content_length".to_string()));
+            return Ok((resp, true));
+        }
+    }
+
     // 204 and 304 responses have no body per HTTP spec.
     // Also skip body when a Range request got a non-206/416 response
     // (server doesn't support ranges — curl returns CURLE_RANGE_ERROR

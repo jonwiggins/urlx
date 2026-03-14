@@ -40,6 +40,19 @@ pub fn lookup(contents: &str, hostname: &str) -> Option<NetrcEntry> {
     entries.into_iter().find(|e| e.machine.is_none())
 }
 
+/// Parse a `.netrc` file and look up credentials for a host and specific user.
+///
+/// Returns the matching entry for the given hostname and login name, or `None`
+/// if no entry matches both host and user.
+#[must_use]
+pub fn lookup_user(contents: &str, hostname: &str, username: &str) -> Option<NetrcEntry> {
+    let entries = parse(contents);
+    entries.into_iter().find(|e| {
+        e.machine.as_ref().is_some_and(|m| m.eq_ignore_ascii_case(hostname))
+            && e.login.as_ref().is_some_and(|l| l == username)
+    })
+}
+
 /// Parse all entries from a `.netrc` file.
 fn parse(contents: &str) -> Vec<NetrcEntry> {
     let mut entries = Vec::new();

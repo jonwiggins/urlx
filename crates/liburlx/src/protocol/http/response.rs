@@ -67,6 +67,8 @@ pub struct TransferInfo {
     pub speed_upload: f64,
     /// Total bytes uploaded.
     pub size_upload: u64,
+    /// Number of retries performed.
+    pub num_retries: u32,
 }
 
 /// An HTTP response with status, headers, and body.

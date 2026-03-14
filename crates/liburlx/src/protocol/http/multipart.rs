@@ -46,6 +46,16 @@ impl MultipartForm {
         });
     }
 
+    /// Add a text field with explicit Content-Type to the form.
+    pub fn field_with_type(&mut self, name: &str, value: &str, content_type: &str) {
+        self.parts.push(Part {
+            name: name.to_string(),
+            filename: None,
+            content_type: Some(content_type.to_string()),
+            data: value.as_bytes().to_vec(),
+        });
+    }
+
     /// Add a file to the form by reading from the filesystem.
     ///
     /// The filename is derived from the path. The content type defaults
