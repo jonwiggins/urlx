@@ -181,6 +181,36 @@ impl Response {
         }
     }
 
+    /// Create a new response with pre-set raw header bytes.
+    ///
+    /// Used for CONNECT proxy responses that need to be included in `--include` output.
+    #[must_use]
+    pub fn with_raw_headers(
+        status: u16,
+        headers: HashMap<String, String>,
+        body: Vec<u8>,
+        effective_url: String,
+        raw_headers: Vec<u8>,
+    ) -> Self {
+        Self {
+            status,
+            status_reason: None,
+            http_version: ResponseHttpVersion::default(),
+            headers,
+            header_original_names: HashMap::new(),
+            headers_ordered: Vec::new(),
+            uses_crlf: true,
+            trailers: HashMap::new(),
+            body,
+            effective_url,
+            info: TransferInfo::default(),
+            pushed_responses: Vec::new(),
+            redirect_responses: Vec::new(),
+            body_error: None,
+            raw_headers: Some(raw_headers),
+        }
+    }
+
     /// Set the original header name casing map (lowercase → original).
     pub fn set_header_original_names(&mut self, names: HashMap<String, String>) {
         self.header_original_names = names;

@@ -702,6 +702,9 @@ fn parse_args_options(args: &[String]) -> Result<CliOptions, u8> {
                     if let Some((u, p)) = val.split_once(':') { (u, p) } else { (val, "") };
                 opts.proxy_user = Some((user.to_string(), pass.to_string()));
             }
+            "-p" | "--proxytunnel" => {
+                opts.easy.http_proxy_tunnel(true);
+            }
             "--proxy-digest" => {
                 opts.proxy_digest = true;
             }
@@ -1378,14 +1381,15 @@ fn parse_args_options(args: &[String]) -> Result<CliOptions, u8> {
                     return Err(1);
                 }
             }
-            "--proxy-1.0" => {
+            arg @ ("--proxy-1.0" | "--proxy1.0") => {
                 i += 1;
-                let val = require_arg(args, i, "--proxy-1.0")?;
+                let val = require_arg(args, i, arg)?;
                 if let Err(e) = opts.easy.proxy(val) {
                     eprintln!("urlx: invalid proxy URL: {e}");
                     return Err(1);
                 }
-                opts.easy.http_version(liburlx::HttpVersion::Http10);
+                // Use HTTP/1.0 for the CONNECT proxy request, not for the inner request
+                opts.easy.proxy_http_10(true);
             }
             "--preproxy" => {
                 i += 1;
@@ -1546,7 +1550,6 @@ fn parse_args_options(args: &[String]) -> Result<CliOptions, u8> {
             | "--socks5-gssapi-service"
             | "--ftp-pret"
             | "--ftp-ssl-ccc-mode"
-            | "--proxy1.0"
             | "--mail-rcpt-allowfails"
             | "--trace-config" => {
                 i += 1;
@@ -1564,7 +1567,19 @@ fn parse_args_options(args: &[String]) -> Result<CliOptions, u8> {
         i += 1;
     }
 
-    // Apply auth credentials after all flags are parsed
+    // Apply proxy auth credentials before site auth so Proxy-Authorization
+    // appears before Authorization in the header order (curl compat).
+    if let Some((ref user, ref pass)) = opts.proxy_user {
+        if opts.proxy_ntlm {
+            opts.easy.proxy_ntlm_auth(user, pass);
+        } else if opts.proxy_digest {
+            opts.easy.proxy_digest_auth(user, pass);
+        } else {
+            opts.easy.proxy_auth(user, pass);
+        }
+    }
+
+    // Apply auth credentials after proxy auth (for correct header ordering)
     if let Some((ref user, ref pass)) = opts.user_credentials {
         if opts.use_aws_sigv4 {
             opts.easy.aws_credentials(user, pass);
@@ -1577,17 +1592,6 @@ fn parse_args_options(args: &[String]) -> Result<CliOptions, u8> {
         }
     }
     // Note: netrc credential loading is deferred to run() where the URL is known
-
-    // Apply proxy auth credentials
-    if let Some((ref user, ref pass)) = opts.proxy_user {
-        if opts.proxy_ntlm {
-            opts.easy.proxy_ntlm_auth(user, pass);
-        } else if opts.proxy_digest {
-            opts.easy.proxy_digest_auth(user, pass);
-        } else {
-            opts.easy.proxy_auth(user, pass);
-        }
-    }
 
     // Apply accumulated inline cookies as a single Cookie header
     if !opts.inline_cookies.is_empty() {

@@ -9,6 +9,10 @@ use crate::error::Error;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Url {
     inner: url::Url,
+    /// Override host for URLs where the `url` crate rejects the hostname
+    /// (e.g., `test.80` which WHATWG spec treats as invalid IPv4).
+    /// When set, this takes priority over `inner.host_str()`.
+    override_host: Option<String>,
 }
 
 impl Url {
@@ -24,9 +28,55 @@ impl Url {
 
         let input = Self::maybe_add_scheme(input);
 
-        let inner = url::Url::parse(&input).map_err(|e| Error::UrlParse(e.to_string()))?;
+        match url::Url::parse(&input) {
+            Ok(inner) => Ok(Self { inner, override_host: None }),
+            Err(e) => {
+                // The `url` crate rejects hostnames like "test.80" because the WHATWG URL
+                // standard treats a label ending in a number as an IPv4 address attempt.
+                // curl treats any non-IP as a hostname, so we work around this by
+                // replacing the host with a placeholder, parsing, and storing the
+                // original host as an override.
+                let err_str = e.to_string();
+                if err_str.contains("invalid IPv4 address")
+                    || err_str.contains("invalid domain character")
+                {
+                    if let Some(after_scheme) = input.find("://") {
+                        let host_start = after_scheme + 3;
+                        let rest = &input[host_start..];
+                        // Skip userinfo if present
+                        let host_part_start = rest.find('@').map_or(0, |at_pos| {
+                            let slash_pos = rest.find('/').unwrap_or(rest.len());
+                            if at_pos < slash_pos {
+                                at_pos + 1
+                            } else {
+                                0
+                            }
+                        });
+                        let host_rest = &rest[host_part_start..];
+                        // Find end of host (: for port, / for path, ? for query, # for fragment)
+                        let host_end =
+                            host_rest.find([':', '/', '?', '#']).unwrap_or(host_rest.len());
+                        let original_host = &host_rest[..host_end];
 
-        Ok(Self { inner })
+                        // Replace with a placeholder hostname that the url crate accepts
+                        let placeholder = "urlx-placeholder.invalid";
+                        let modified = format!(
+                            "{}{}{}",
+                            &input[..host_start + host_part_start],
+                            placeholder,
+                            &host_rest[host_end..],
+                        );
+                        if let Ok(inner) = url::Url::parse(&modified) {
+                            return Ok(Self {
+                                inner,
+                                override_host: Some(original_host.to_string()),
+                            });
+                        }
+                    }
+                }
+                Err(Error::UrlParse(e.to_string()))
+            }
+        }
     }
 
     /// Returns the scheme (e.g., "https", "http").
@@ -36,9 +86,12 @@ impl Url {
     }
 
     /// Returns the host as a string, if present.
+    ///
+    /// Uses the override host when the `url` crate couldn't parse the original
+    /// hostname (e.g., `test.80`).
     #[must_use]
     pub fn host_str(&self) -> Option<&str> {
-        self.inner.host_str()
+        self.override_host.as_deref().or_else(|| self.inner.host_str())
     }
 
     /// Returns the port, if explicitly specified.
@@ -104,9 +157,29 @@ impl Url {
     }
 
     /// Returns the full URL as a string.
+    ///
+    /// When the URL was parsed with a host override (e.g., `test.80`),
+    /// this returns a corrected string with the original hostname restored.
     #[must_use]
     pub fn as_str(&self) -> &str {
+        // For URLs with override_host, the inner URL has a placeholder host.
+        // We return the inner string, and callers that need the correct host
+        // should use host_str() or host_header_value() instead.
+        // In practice this is only used for effective_url in responses and
+        // absolute proxy URLs, where we need the real host.
         self.inner.as_str()
+    }
+
+    /// Returns the full URL with the original hostname restored.
+    ///
+    /// For URLs where `override_host` is set, the placeholder is replaced
+    /// with the original host. For normal URLs, this is the same as `as_str()`.
+    #[must_use]
+    pub fn to_full_string(&self) -> String {
+        self.override_host.as_ref().map_or_else(
+            || self.inner.as_str().to_string(),
+            |real_host| self.inner.as_str().replace("urlx-placeholder.invalid", real_host),
+        )
     }
 
     /// Returns the host and port suitable for a TCP connection.

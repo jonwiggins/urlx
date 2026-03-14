@@ -98,6 +98,10 @@ pub struct Easy {
     forbid_reuse: bool,
     proxy_credentials: Option<ProxyAuthCredentials>,
     proxy_tls_config: Option<TlsConfig>,
+    /// Force HTTP CONNECT tunnel even for HTTP URLs (curl `--proxytunnel` / `-p`).
+    http_proxy_tunnel: bool,
+    /// Use HTTP/1.0 for CONNECT requests (curl `--proxy1.0`).
+    proxy_http_10: bool,
     infilesize: Option<u64>,
     happy_eyeballs_timeout: Option<Duration>,
     dns_cache_timeout: Option<Duration>,
@@ -358,6 +362,8 @@ impl Clone for Easy {
             forbid_reuse: self.forbid_reuse,
             proxy_credentials: self.proxy_credentials.clone(),
             proxy_tls_config: self.proxy_tls_config.clone(),
+            http_proxy_tunnel: self.http_proxy_tunnel,
+            proxy_http_10: self.proxy_http_10,
             infilesize: self.infilesize,
             happy_eyeballs_timeout: self.happy_eyeballs_timeout,
             dns_cache_timeout: self.dns_cache_timeout,
@@ -468,6 +474,8 @@ impl Easy {
             forbid_reuse: false,
             proxy_credentials: None,
             proxy_tls_config: None,
+            http_proxy_tunnel: false,
+            proxy_http_10: false,
             infilesize: None,
             happy_eyeballs_timeout: None,
             dns_cache_timeout: None,
@@ -803,15 +811,22 @@ impl Easy {
     ///
     /// Returns [`Error::UrlParse`] if the proxy URL is invalid.
     pub fn proxy(&mut self, proxy_url: &str) -> Result<(), Error> {
+        // If no scheme is present, add http:// (curl behavior for bare host:port)
+        let normalized = if proxy_url.contains("://") {
+            proxy_url.to_string()
+        } else {
+            format!("http://{proxy_url}")
+        };
+
         // Extract userinfo credentials from proxy URL (e.g., http://user:pass@host:port/)
-        if let Ok(parsed) = url::Url::parse(proxy_url) {
+        if let Ok(parsed) = url::Url::parse(&normalized) {
             let user = parsed.username();
             let pass = parsed.password().unwrap_or("");
             if !user.is_empty() {
                 self.proxy_auth(user, pass);
             }
         }
-        self.proxy = Some(Url::parse(proxy_url)?);
+        self.proxy = Some(Url::parse(&normalized)?);
         Ok(())
     }
 
@@ -992,6 +1007,24 @@ impl Easy {
             method: ProxyAuthMethod::Ntlm,
             domain,
         });
+    }
+
+    /// Force HTTP CONNECT tunnel even for HTTP URLs.
+    ///
+    /// When enabled, all HTTP requests through a proxy use the CONNECT method
+    /// to establish a tunnel, instead of sending the request directly to the proxy.
+    /// This is equivalent to curl's `--proxytunnel` / `-p` option.
+    pub const fn http_proxy_tunnel(&mut self, enable: bool) {
+        self.http_proxy_tunnel = enable;
+    }
+
+    /// Use HTTP/1.0 for CONNECT proxy requests.
+    ///
+    /// When enabled, the CONNECT request to the proxy uses HTTP/1.0 instead
+    /// of HTTP/1.1. This only affects the proxy handshake, not the actual
+    /// request to the target server. Equivalent to `--proxy1.0`.
+    pub const fn proxy_http_10(&mut self, enable: bool) {
+        self.proxy_http_10 = enable;
     }
 
     /// Set proxy TLS configuration for HTTPS proxies.
@@ -2081,6 +2114,8 @@ impl Easy {
             self.haproxy_protocol,
             self.abstract_unix_socket.as_deref(),
             self.chunked_upload,
+            self.http_proxy_tunnel,
+            self.proxy_http_10,
         );
 
         // Apply total transfer timeout if set.
@@ -2222,6 +2257,8 @@ async fn perform_transfer(
     haproxy_protocol: bool,
     abstract_unix_socket: Option<&str>,
     chunked_upload: bool,
+    http_proxy_tunnel: bool,
+    proxy_http_10: bool,
 ) -> Result<Response, Error> {
     let transfer_start = Instant::now();
     let original_url = url.clone();
@@ -2338,6 +2375,8 @@ async fn perform_transfer(
             abstract_unix_socket,
             chunked_upload,
             deadline,
+            http_proxy_tunnel,
+            proxy_http_10,
         ))
         .await?;
 
@@ -2446,6 +2485,8 @@ async fn perform_transfer(
                                 abstract_unix_socket,
                                 chunked_upload,
                                 deadline,
+                                http_proxy_tunnel,
+                                proxy_http_10,
                             ))
                             .await?;
                         }
@@ -2664,6 +2705,8 @@ async fn do_single_request(
     #[cfg_attr(not(unix), allow(unused_variables))] abstract_unix_socket: Option<&str>,
     chunked_upload: bool,
     deadline: Option<tokio::time::Instant>,
+    http_proxy_tunnel: bool,
+    proxy_http_10: bool,
 ) -> Result<Response, Error> {
     // Handle non-HTTP schemes directly
     match url.scheme() {
@@ -3219,7 +3262,7 @@ async fn do_single_request(
                         }
                     }
 
-                    let tunnel_stream = establish_connect_tunnel(
+                    let (tunnel_stream, _raw_connect) = establish_connect_tunnel(
                         proxy_tls_stream,
                         &host,
                         port,
@@ -3227,6 +3270,7 @@ async fn do_single_request(
                         proxy_credentials,
                         proxy_headers,
                         verbose,
+                        proxy_http_10,
                     )
                     .await?;
 
@@ -3277,7 +3321,7 @@ async fn do_single_request(
                             eprintln!("* Establishing tunnel to {host}:{port} via proxy");
                         }
                     }
-                    establish_connect_tunnel(
+                    let (tun, _raw_connect) = establish_connect_tunnel(
                         tcp_stream,
                         &host,
                         port,
@@ -3285,8 +3329,10 @@ async fn do_single_request(
                         proxy_credentials,
                         proxy_headers,
                         verbose,
+                        proxy_http_10,
                     )
-                    .await?
+                    .await?;
+                    tun
                 } else {
                     tcp_stream
                 };
@@ -3380,66 +3426,140 @@ async fn do_single_request(
             }
         }
         "http" => {
-            // Custom request target overrides; otherwise, for HTTP proxy use absolute URL
-            #[allow(clippy::option_if_let_else)]
-            let request_target = if let Some(target) = custom_request_target {
-                target.to_string()
-            } else if proxy.is_some() && !is_socks_proxy {
-                // Strip fragment from proxy request URL (curl behavior)
-                let full = url.as_str();
-                full.split_once('#').map_or_else(|| full.to_string(), |(base, _)| base.to_string())
-            } else if path_as_is {
-                extract_path_and_query(url.as_str())
-            } else {
-                url.request_target()
-            };
-
-            // Add proxy-specific headers for non-tunnel HTTP proxy requests
             let is_http_proxy = proxy.is_some() && !is_socks_proxy;
-            let mut proxy_effective_headers = effective_headers.clone();
-            if is_http_proxy {
-                proxy_effective_headers.extend_from_slice(proxy_headers);
-                // curl sends Proxy-Connection: Keep-Alive for HTTP proxy requests
-                proxy_effective_headers
-                    .push(("Proxy-Connection".to_string(), "Keep-Alive".to_string()));
+            // Use CONNECT tunnel for HTTP if --proxytunnel / -p is set
+            let use_tunnel = is_http_proxy && http_proxy_tunnel;
+
+            if use_tunnel {
+                // HTTP over CONNECT tunnel: establish tunnel, then send plain request
+                if verbose {
+                    #[allow(clippy::print_stderr)]
+                    {
+                        eprintln!("* Establishing tunnel to {host}:{port} via proxy");
+                    }
+                }
+                let (tunnel_stream, raw_connect) = establish_connect_tunnel(
+                    tcp_stream,
+                    &host,
+                    port,
+                    &effective_headers,
+                    proxy_credentials,
+                    proxy_headers,
+                    verbose,
+                    proxy_http_10,
+                )
+                .await?;
+
+                let request_target = resolve_request_target(custom_request_target, url, path_as_is);
+                let use_http10 = http_version == HttpVersion::Http10;
+                let time_pretransfer = request_start.elapsed();
+                let mut stream = PooledStream::Tcp(tunnel_stream);
+                // Strip proxy-related headers from inner request (they belong in the CONNECT)
+                let tunnel_headers: Vec<(String, String)> = effective_headers
+                    .iter()
+                    .filter(|(k, _)| !k.eq_ignore_ascii_case("proxy-authorization"))
+                    .cloned()
+                    .collect();
+                let (resp, _can_reuse) = crate::protocol::http::h1::request(
+                    &mut stream,
+                    method,
+                    &host_header,
+                    &request_target,
+                    &tunnel_headers,
+                    body,
+                    url.as_str(),
+                    true, // Suppress Connection: close (tunneled request acts like direct)
+                    use_http10,
+                    expect_100_timeout,
+                    ignore_content_length,
+                    speed_limits,
+                    chunked_upload,
+                    deadline,
+                )
+                .await?;
+                let time_starttransfer = request_start.elapsed();
+
+                let mut resp = resp;
+                // Prepend CONNECT response as a redirect response for --include output
+                if !raw_connect.is_empty() {
+                    let connect_resp = Response::with_raw_headers(
+                        200,
+                        std::collections::HashMap::new(),
+                        Vec::new(),
+                        url.as_str().to_string(),
+                        raw_connect,
+                    );
+                    resp.push_redirect_response(connect_resp);
+                }
+                let mut info = resp.transfer_info().clone();
+                info.time_namelookup = time_namelookup;
+                info.time_connect = time_connect;
+                info.time_pretransfer = time_pretransfer;
+                info.time_starttransfer = time_starttransfer;
+                resp.set_transfer_info(info);
+                resp
+            } else {
+                // Direct or non-tunnel proxy HTTP request
+                // Custom request target overrides; otherwise, for HTTP proxy use absolute URL
+                #[allow(clippy::option_if_let_else)]
+                let request_target = if let Some(target) = custom_request_target {
+                    target.to_string()
+                } else if is_http_proxy {
+                    // Strip fragment from proxy request URL (curl behavior)
+                    let full = url.to_full_string();
+                    full.split_once('#').map_or_else(|| full.clone(), |(base, _)| base.to_string())
+                } else if path_as_is {
+                    extract_path_and_query(url.as_str())
+                } else {
+                    url.request_target()
+                };
+
+                // Add proxy-specific headers for non-tunnel HTTP proxy requests
+                let mut proxy_effective_headers = effective_headers.clone();
+                if is_http_proxy {
+                    proxy_effective_headers.extend_from_slice(proxy_headers);
+                    // curl sends Proxy-Connection: Keep-Alive for HTTP proxy requests
+                    proxy_effective_headers
+                        .push(("Proxy-Connection".to_string(), "Keep-Alive".to_string()));
+                }
+
+                let use_http10 = http_version == HttpVersion::Http10;
+                let time_pretransfer = request_start.elapsed();
+                let mut stream = PooledStream::Tcp(tcp_stream);
+                // For HTTP proxy: use keep_alive=true to suppress Connection: close
+                let proxy_keep_alive = if is_http_proxy { true } else { use_pool };
+                let (resp, can_reuse) = crate::protocol::http::h1::request(
+                    &mut stream,
+                    method,
+                    &host_header,
+                    &request_target,
+                    &proxy_effective_headers,
+                    body,
+                    url.as_str(),
+                    proxy_keep_alive,
+                    use_http10,
+                    expect_100_timeout,
+                    ignore_content_length,
+                    speed_limits,
+                    chunked_upload,
+                    deadline,
+                )
+                .await?;
+                let time_starttransfer = request_start.elapsed();
+
+                if can_reuse && use_pool && !forbid_reuse {
+                    pool.put(&host, port, is_tls, stream);
+                }
+
+                let mut resp = resp;
+                let mut info = resp.transfer_info().clone();
+                info.time_namelookup = time_namelookup;
+                info.time_connect = time_connect;
+                info.time_pretransfer = time_pretransfer;
+                info.time_starttransfer = time_starttransfer;
+                resp.set_transfer_info(info);
+                resp
             }
-
-            let use_http10 = http_version == HttpVersion::Http10;
-            let time_pretransfer = request_start.elapsed();
-            let mut stream = PooledStream::Tcp(tcp_stream);
-            // For HTTP proxy: use keep_alive=true to suppress Connection: close
-            let proxy_keep_alive = if is_http_proxy { true } else { use_pool };
-            let (resp, can_reuse) = crate::protocol::http::h1::request(
-                &mut stream,
-                method,
-                &host_header,
-                &request_target,
-                &proxy_effective_headers,
-                body,
-                url.as_str(),
-                proxy_keep_alive,
-                use_http10,
-                expect_100_timeout,
-                ignore_content_length,
-                speed_limits,
-                chunked_upload,
-                deadline,
-            )
-            .await?;
-            let time_starttransfer = request_start.elapsed();
-
-            if can_reuse && use_pool && !forbid_reuse {
-                pool.put(&host, port, is_tls, stream);
-            }
-
-            let mut resp = resp;
-            let mut info = resp.transfer_info().clone();
-            info.time_namelookup = time_namelookup;
-            info.time_connect = time_connect;
-            info.time_pretransfer = time_pretransfer;
-            info.time_starttransfer = time_starttransfer;
-            resp.set_transfer_info(info);
-            resp
         }
         scheme => return Err(Error::UnsupportedProtocol(scheme.to_string())),
     };
@@ -3474,7 +3594,7 @@ fn maybe_decompress(response: Response, accept_encoding: bool) -> Result<Respons
 ///
 /// The stream type is generic to support both plain TCP (HTTP proxy) and
 /// TLS-wrapped streams (HTTPS proxy).
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn establish_connect_tunnel<S>(
     mut stream: S,
     target_host: &str,
@@ -3483,17 +3603,25 @@ async fn establish_connect_tunnel<S>(
     proxy_credentials: Option<&ProxyAuthCredentials>,
     proxy_headers: &[(String, String)],
     verbose: bool,
-) -> Result<S, Error>
+    proxy_http_10: bool,
+) -> Result<(S, Vec<u8>), Error>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     // Send initial CONNECT request
-    let (status, response_headers) =
-        send_connect_request(&mut stream, target_host, target_port, headers, None, proxy_headers)
-            .await?;
+    let (status, response_headers, raw_connect) = send_connect_request(
+        &mut stream,
+        target_host,
+        target_port,
+        headers,
+        None,
+        proxy_headers,
+        proxy_http_10,
+    )
+    .await?;
 
     if status == 200 {
-        return Ok(stream);
+        return Ok((stream, raw_connect));
     }
 
     // Handle 407 Proxy Authentication Required
@@ -3528,18 +3656,19 @@ where
                                 &cnonce,
                             );
 
-                            let (retry_status, _) = send_connect_request(
+                            let (retry_status, _, raw_retry) = send_connect_request(
                                 &mut stream,
                                 target_host,
                                 target_port,
                                 headers,
                                 Some(&format!("Proxy-Authorization: {auth_value}")),
                                 proxy_headers,
+                                proxy_http_10,
                             )
                             .await?;
 
                             if retry_status == 200 {
-                                return Ok(stream);
+                                return Ok((stream, raw_retry));
                             }
 
                             return Err(Error::Http(format!(
@@ -3560,13 +3689,14 @@ where
                     }
 
                     // Send CONNECT with Type 1
-                    let (status2, headers2) = send_connect_request(
+                    let (status2, headers2, _) = send_connect_request(
                         &mut stream,
                         target_host,
                         target_port,
                         headers,
                         Some(&format!("Proxy-Authorization: NTLM {type1}")),
                         proxy_headers,
+                        proxy_http_10,
                     )
                     .await?;
 
@@ -3584,18 +3714,19 @@ where
                                 );
 
                                 // Send CONNECT with Type 3
-                                let (status3, _) = send_connect_request(
+                                let (status3, _, raw3) = send_connect_request(
                                     &mut stream,
                                     target_host,
                                     target_port,
                                     headers,
                                     Some(&format!("Proxy-Authorization: NTLM {type3}")),
                                     proxy_headers,
+                                    proxy_http_10,
                                 )
                                 .await?;
 
                                 if status3 == 200 {
-                                    return Ok(stream);
+                                    return Ok((stream, raw3));
                                 }
 
                                 return Err(Error::Http(format!(
@@ -3604,7 +3735,7 @@ where
                             }
                         }
                     } else if status2 == 200 {
-                        return Ok(stream);
+                        return Ok((stream, Vec::new()));
                     }
 
                     return Err(Error::Http(format!(
@@ -3627,7 +3758,7 @@ where
 
 /// Send a CONNECT request and read the response status + headers.
 ///
-/// Returns `(status_code, response_headers)`.
+/// Returns `(status_code, response_headers, raw_response_bytes)`.
 async fn send_connect_request<S>(
     stream: &mut S,
     target_host: &str,
@@ -3635,14 +3766,16 @@ async fn send_connect_request<S>(
     headers: &[(String, String)],
     extra_header: Option<&str>,
     proxy_headers: &[(String, String)],
-) -> Result<(u16, Vec<(String, String)>), Error>
+    proxy_http_10: bool,
+) -> Result<(u16, Vec<(String, String)>, Vec<u8>), Error>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    let http_version = if proxy_http_10 { "HTTP/1.0" } else { "HTTP/1.1" };
     let mut connect_req = format!(
-        "CONNECT {target_host}:{target_port} HTTP/1.1\r\n\
+        "CONNECT {target_host}:{target_port} {http_version}\r\n\
          Host: {target_host}:{target_port}\r\n"
     );
 
@@ -3654,17 +3787,36 @@ where
         }
     }
 
+    // Add extra auth header (overrides forwarded one, e.g., Digest/NTLM retry)
+    if let Some(extra) = extra_header {
+        use std::fmt::Write as _;
+        let _ = write!(connect_req, "{extra}\r\n");
+    }
+
+    // Forward User-Agent from request headers (curl sends UA in CONNECT requests)
+    // An empty value (from -A "") suppresses the header entirely.
+    let custom_ua = headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("user-agent"));
+    match custom_ua {
+        Some((_, value)) if value.is_empty() => {
+            // -A "" suppresses User-Agent entirely
+        }
+        Some((name, value)) => {
+            use std::fmt::Write as _;
+            let _ = write!(connect_req, "{name}: {value}\r\n");
+        }
+        None => {
+            connect_req.push_str("User-Agent: urlx/0.1.0\r\n");
+        }
+    }
+
     // Add proxy-specific headers (--proxy-header / CURLOPT_PROXYHEADER)
     for (name, value) in proxy_headers {
         use std::fmt::Write as _;
         let _ = write!(connect_req, "{name}: {value}\r\n");
     }
 
-    // Add extra auth header (overrides forwarded one)
-    if let Some(extra) = extra_header {
-        use std::fmt::Write as _;
-        let _ = write!(connect_req, "{extra}\r\n");
-    }
+    // curl always sends Proxy-Connection: Keep-Alive in CONNECT requests
+    connect_req.push_str("Proxy-Connection: Keep-Alive\r\n");
 
     connect_req.push_str("\r\n");
 
@@ -3718,7 +3870,9 @@ where
                 }
             }
 
-            return Ok((status, response_headers));
+            // Return the raw response bytes for --include output
+            let raw_bytes = buf[..end].to_vec();
+            return Ok((status, response_headers, raw_bytes));
         }
 
         if total >= buf.len() {
