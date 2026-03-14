@@ -61,8 +61,14 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let http_ver = if use_http10 { "HTTP/1.0" } else { "HTTP/1.1" };
+    // Check if user provided a custom Host header
+    let custom_host = custom_headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("host"));
     // Build the request line
-    let mut req = format!("{method} {request_target} {http_ver}\r\nHost: {host}\r\n");
+    let mut req = if custom_host {
+        format!("{method} {request_target} {http_ver}\r\n")
+    } else {
+        format!("{method} {request_target} {http_ver}\r\nHost: {host}\r\n")
+    };
 
     // Deduplicate custom headers: among set-entries (non-empty values),
     // last one wins per header name. Removal markers (empty in removed_headers)
@@ -75,6 +81,16 @@ where
             keep[i] = false;
         } else {
             seen_set.push(name_lower);
+        }
+    }
+
+    // Emit custom Host header immediately (if user provided one via -H)
+    if custom_host {
+        for (i, (name, value)) in custom_headers.iter().enumerate() {
+            if keep[i] && name.eq_ignore_ascii_case("host") {
+                let _ = write!(req, "{name}: {value}\r\n");
+                break;
+            }
         }
     }
 
@@ -141,6 +157,7 @@ where
         if keep[i]
             && !priority_headers.iter().any(|p| name.eq_ignore_ascii_case(p))
             && !name.eq_ignore_ascii_case("user-agent")
+            && !name.eq_ignore_ascii_case("host")
         {
             if value.is_empty() {
                 // Empty value from -H "Name;" → send header with no value
@@ -240,6 +257,7 @@ where
                     resp.set_status_reason(ph.reason);
                     resp.set_uses_crlf(ph.uses_crlf);
                     resp.set_http_version(ph.version);
+                    resp.set_raw_headers(header_bytes);
                     if !trailers.is_empty() {
                         resp.set_trailers(trailers);
                     }
@@ -286,8 +304,27 @@ where
         ph = parse_headers(&header_bytes)?;
     }
 
-    // 204 and 304 responses have no body per HTTP spec
-    let no_body = is_head || ph.status == 204 || ph.status == 304;
+    // 204 and 304 responses have no body per HTTP spec.
+    // Also skip body when a Range request got a non-206/416 response
+    // (server doesn't support ranges — curl returns CURLE_RANGE_ERROR
+    // without consuming the body).
+    // Skip body when a Range request got a non-206/416 response AND there's
+    // no Content-Length/chunked (would hang reading to EOF if server doesn't close).
+    let sent_range = custom_headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("range"));
+    let has_body_framing = ph.headers.contains_key("content-length")
+        || ph.headers.get("transfer-encoding").is_some_and(|te| te.eq_ignore_ascii_case("chunked"));
+    let range_failed = sent_range && ph.status != 206 && ph.status != 416 && !has_body_framing;
+    // For 3xx redirects without Content-Length/chunked, skip body read to avoid
+    // hanging when the server says Connection: close but doesn't actually close.
+    let is_redirect_no_cl = (300..400).contains(&ph.status)
+        && ph.headers.get("location").is_some_and(|v| !v.trim().is_empty())
+        && !ph.headers.contains_key("content-length")
+        && !ph
+            .headers
+            .get("transfer-encoding")
+            .is_some_and(|te| te.eq_ignore_ascii_case("chunked"));
+    let no_body =
+        is_head || ph.status == 204 || ph.status == 304 || range_failed || is_redirect_no_cl;
 
     // Read body with download rate limiting
     let mut recv_limiter = RateLimiter::for_recv(speed_limits);
@@ -333,6 +370,7 @@ where
     resp.set_status_reason(ph.reason);
     resp.set_uses_crlf(ph.uses_crlf);
     resp.set_http_version(ph.version);
+    resp.set_raw_headers(header_bytes);
     if !trailers.is_empty() {
         resp.set_trailers(trailers);
     }
@@ -437,15 +475,15 @@ where
 /// Returns `(position, length)` where position is the start of the terminator
 /// and length is the terminator's byte count (4 for CRLF, 2 for LF).
 fn find_header_end(buf: &[u8]) -> Option<(usize, usize)> {
-    // Prefer \r\n\r\n (standard)
-    if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-        return Some((pos, 4));
-    }
-    // Fall back to \n\n (bare LF — some servers omit \r)
-    if let Some(pos) = buf.windows(2).position(|w| w == b"\n\n") {
-        return Some((pos, 2));
-    }
-    None
+    // Find the earliest occurrence of any header terminator pattern:
+    // \r\n\r\n (standard), \n\r\n (mixed), or \n\n (bare LF).
+    // Return the one at the lowest position.
+    let candidates = [
+        buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| (p, 4)),
+        buf.windows(3).position(|w| w == b"\n\r\n").map(|p| (p, 3)),
+        buf.windows(2).position(|w| w == b"\n\n").map(|p| (p, 2)),
+    ];
+    candidates.into_iter().flatten().min_by_key(|(pos, _)| *pos)
 }
 
 async fn read_response_headers<S>(stream: &mut S) -> Result<(Vec<u8>, Vec<u8>), Error>
@@ -645,16 +683,12 @@ fn extract_raw_header_values(header_data: &[u8]) -> Vec<String> {
         if line.is_empty() {
             break;
         }
-        // Extract value after first ":"
+        // Extract value after first ":" — include the colon separator and any
+        // following whitespace so that format_headers can reconstruct the wire
+        // format exactly (e.g., "Set-Cookie:value" vs "Set-Cookie: value").
         if let Some(colon_pos) = line.find(':') {
-            // Value starts right after the colon — preserve leading whitespace except
-            // the single space that's part of ": " convention. Actually, curl preserves
-            // everything after ": " literally. The convention is "Name: value" with one
-            // space. But if there are extra spaces, curl preserves them.
-            // So we take everything after the colon, strip exactly one leading space.
-            let raw = &line[colon_pos + 1..];
-            let value = raw.strip_prefix(' ').unwrap_or(raw);
-            values.push(value.to_string());
+            let raw = &line[colon_pos..]; // includes ":" and everything after
+            values.push(raw.to_string());
         }
     }
     values

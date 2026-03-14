@@ -20,6 +20,7 @@ CURL_SRC="$PROJECT_ROOT/vendor/curl"
 TESTS_DIR="$CURL_BUILD/tests"
 WRAPPER="$SCRIPT_DIR/urlx-as-curl"
 URLX="$PROJECT_ROOT/target/release/urlx"
+export URLX_BIN="$URLX"
 
 # Verify prerequisites
 if [ ! -x "$URLX" ]; then

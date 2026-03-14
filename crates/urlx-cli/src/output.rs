@@ -11,15 +11,21 @@ use std::process::ExitCode;
 /// Preserves original header ordering, casing, and duplicates from the server.
 /// Uses the server's original reason phrase when available.
 pub fn format_headers(response: &liburlx::Response) -> String {
+    // If raw header bytes are available, use them directly to preserve
+    // exact wire format (line endings, whitespace, header name casing).
+    // The raw bytes include the trailing blank line separator (\r\n\r\n or \n\n).
+    if let Some(raw) = response.raw_headers() {
+        return String::from_utf8_lossy(raw).into_owned();
+    }
+
+    // Fallback: reconstruct from parsed data
     let version = http_version_string(response);
     let version_label = match version.as_str() {
         "2" => "2".to_string(),
         "3" => "3".to_string(),
         v => v.to_string(),
     };
-    // Preserve original line endings from the server (curl does this)
     let eol = if response.uses_crlf() { "\r\n" } else { "\n" };
-    // Use server's original reason phrase, fall back to standard text
     let reason = response.status_reason().unwrap_or_else(|| http_status_text(response.status()));
     let mut result = if reason.is_empty() {
         format!("HTTP/{version_label} {}{eol}", response.status())
@@ -29,7 +35,6 @@ pub fn format_headers(response: &liburlx::Response) -> String {
 
     let ordered = response.headers_ordered();
     if ordered.is_empty() {
-        // Fallback for non-HTTP protocols or responses without ordered headers
         let original_names = response.header_original_names();
         for (name, value) in response.headers() {
             let display_name = original_names.get(name).map_or(name.as_str(), String::as_str);
@@ -39,11 +44,12 @@ pub fn format_headers(response: &liburlx::Response) -> String {
             result.push_str(eol);
         }
     } else {
-        // Use wire-order headers (preserves order, casing, and duplicates)
-        for (name, value) in ordered {
+        for (name, raw_value) in ordered {
             result.push_str(name);
-            result.push_str(": ");
-            result.push_str(value);
+            if !raw_value.starts_with(':') {
+                result.push_str(": ");
+            }
+            result.push_str(raw_value);
             result.push_str(eol);
         }
     }
@@ -233,6 +239,7 @@ pub fn output_response(
     write_out: Option<&str>,
     include_headers: bool,
     silent: bool,
+    suppress_body: bool,
 ) -> ExitCode {
     // Build all header text including redirect chain (for -L --include)
     let all_headers = if include_headers {
@@ -246,6 +253,8 @@ pub fn output_response(
         None
     };
 
+    let body = if suppress_body { &[] as &[u8] } else { response.body() };
+
     // "-" means stdout (curl compat)
     let effective_output = output_file.filter(|p| *p != "-");
 
@@ -255,7 +264,7 @@ pub fn output_response(
         if let Some(ref headers) = all_headers {
             data.extend_from_slice(headers.as_bytes());
         }
-        data.extend_from_slice(response.body());
+        data.extend_from_slice(body);
         if let Err(e) = std::fs::write(path, &data) {
             if !silent {
                 eprintln!("urlx: error writing to {path}: {e}");
@@ -272,7 +281,7 @@ pub fn output_response(
                 return ExitCode::FAILURE;
             }
         }
-        if let Err(e) = std::io::stdout().write_all(response.body()) {
+        if let Err(e) = std::io::stdout().write_all(body) {
             if !silent {
                 eprintln!("urlx: write error: {e}");
             }

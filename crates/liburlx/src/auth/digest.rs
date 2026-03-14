@@ -20,6 +20,8 @@ pub struct DigestChallenge {
     pub opaque: Option<String>,
     /// Whether the nonce is stale (client should retry with new nonce).
     pub stale: bool,
+    /// Whether the server explicitly specified an algorithm in the challenge.
+    pub algorithm_specified: bool,
 }
 
 /// Supported Digest hash algorithms.
@@ -62,6 +64,7 @@ impl DigestChallenge {
         let mut nonce = None;
         let mut qop = None;
         let mut algorithm = DigestAlgorithm::Md5; // Default per RFC
+        let mut algorithm_specified = false;
         let mut opaque = None;
         let mut stale = false;
 
@@ -74,6 +77,7 @@ impl DigestChallenge {
                 "nonce" => nonce = Some(value.to_string()),
                 "qop" => qop = Some(value.to_string()),
                 "algorithm" => {
+                    algorithm_specified = true;
                     algorithm = match value.to_uppercase().as_str() {
                         "SHA-256" => DigestAlgorithm::Sha256,
                         _ => DigestAlgorithm::Md5,
@@ -90,7 +94,7 @@ impl DigestChallenge {
         let nonce =
             nonce.ok_or_else(|| Error::Http("Digest challenge missing nonce".to_string()))?;
 
-        Ok(Self { realm, nonce, qop, algorithm, opaque, stale })
+        Ok(Self { realm, nonce, qop, algorithm, opaque, stale, algorithm_specified })
     }
 
     /// Compute the Digest authorization header value.
@@ -143,9 +147,11 @@ impl DigestChallenge {
             let _ = write!(header, ", opaque=\"{opaque}\"");
         }
 
-        match self.algorithm {
-            DigestAlgorithm::Sha256 => header.push_str(", algorithm=SHA-256"),
-            DigestAlgorithm::Md5 => header.push_str(", algorithm=MD5"),
+        if self.algorithm_specified {
+            match self.algorithm {
+                DigestAlgorithm::Sha256 => header.push_str(", algorithm=SHA-256"),
+                DigestAlgorithm::Md5 => header.push_str(", algorithm=MD5"),
+            }
         }
 
         header
@@ -262,6 +268,7 @@ mod tests {
             algorithm: DigestAlgorithm::Md5,
             opaque: Some("5ccc069c403ebaf9f0171e9517f40e41".to_string()),
             stale: false,
+            algorithm_specified: true,
         };
 
         let response =
@@ -288,6 +295,7 @@ mod tests {
             algorithm: DigestAlgorithm::Md5,
             opaque: None,
             stale: false,
+            algorithm_specified: false,
         };
 
         let response =
@@ -311,6 +319,7 @@ mod tests {
             algorithm: DigestAlgorithm::Md5,
             opaque: None,
             stale: false,
+            algorithm_specified: false,
         };
 
         let response = challenge.respond("user", "pass", "GET", "/", 1, "cnonce");
@@ -330,6 +339,7 @@ mod tests {
             algorithm: DigestAlgorithm::Sha256,
             opaque: None,
             stale: false,
+            algorithm_specified: true,
         };
 
         let response = challenge.respond("user", "pass", "GET", "/", 1, "cnonce");

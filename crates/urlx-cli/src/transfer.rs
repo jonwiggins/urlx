@@ -556,21 +556,28 @@ pub fn run(args: &[String]) -> ExitCode {
     if let Some(ref cond) = opts.time_cond {
         let (negate, date_str) =
             cond.strip_prefix('-').map_or((false, cond.as_str()), |stripped| (true, stripped));
+        opts.time_cond_negate = negate;
         // Try to parse as a file path first (use file mtime), then as a date string
         let date_val = if std::path::Path::new(date_str).exists() {
-            std::fs::metadata(date_str).ok().and_then(|m| m.modified().ok()).map(format_http_date)
+            let mtime = std::fs::metadata(date_str).ok().and_then(|m| m.modified().ok());
+            if let Some(ref t) = mtime {
+                #[allow(clippy::cast_possible_wrap)]
+                let ts = t.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).ok();
+                opts.time_cond_ts = ts;
+            }
+            mtime.map(format_http_date)
         } else {
             // Try parsing as RFC 7231 first, then loose date format
-            if parse_http_date(date_str).is_some() {
+            if let Some(ts) = parse_http_date(date_str) {
+                opts.time_cond_ts = Some(ts);
                 Some(date_str.to_string())
-            } else {
-                parse_loose_date(date_str).and_then(|ts| {
-                    u64::try_from(ts).ok().map(|secs| {
-                        format_http_date(
-                            std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs),
-                        )
-                    })
+            } else if let Some(ts) = parse_loose_date(date_str) {
+                opts.time_cond_ts = Some(ts);
+                u64::try_from(ts).ok().map(|secs| {
+                    format_http_date(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
                 })
+            } else {
+                None
             }
         };
         if let Some(date) = date_val {
@@ -716,12 +723,27 @@ pub fn run(args: &[String]) -> ExitCode {
                 eprintln!("{c_code}");
             }
 
+            // -z/--time-cond body suppression: if the response has Last-Modified
+            // and the condition is not met, suppress body output (curl compat).
+            let suppress_body = opts.time_cond_ts.is_some_and(|cond_ts| {
+                response.header("last-modified").and_then(parse_http_date).is_some_and(|lm_ts| {
+                    if opts.time_cond_negate {
+                        // -z -date: If-Unmodified-Since — suppress if doc IS newer
+                        lm_ts > cond_ts
+                    } else {
+                        // -z date: If-Modified-Since — suppress if doc is NOT newer
+                        lm_ts <= cond_ts
+                    }
+                })
+            });
+
             let exit = output_response(
                 &response,
                 opts.output_file.as_deref(),
                 opts.write_out.as_deref(),
                 opts.include_headers,
                 opts.silent,
+                suppress_body,
             );
 
             // --remote-time: set output file's modification time from Last-Modified
@@ -791,6 +813,7 @@ pub fn run(args: &[String]) -> ExitCode {
                         opts.write_out.as_deref(),
                         opts.include_headers,
                         opts.silent,
+                        false,
                     );
                 }
             }
@@ -1005,8 +1028,14 @@ pub fn run_multi(
                 }
                 // First URL uses --output file if specified; rest go to stdout
                 let file_for_this = if i == 0 { output_file } else { None };
-                let exit =
-                    output_response(&response, file_for_this, write_out, include_headers, silent);
+                let exit = output_response(
+                    &response,
+                    file_for_this,
+                    write_out,
+                    include_headers,
+                    silent,
+                    false,
+                );
                 if exit != ExitCode::SUCCESS {
                     any_failed = true;
                 }
@@ -1073,8 +1102,14 @@ fn run_multi_parallel(
                     continue;
                 }
                 let file_for_this = if i == 0 { output_file } else { None };
-                let exit =
-                    output_response(&response, file_for_this, write_out, include_headers, silent);
+                let exit = output_response(
+                    &response,
+                    file_for_this,
+                    write_out,
+                    include_headers,
+                    silent,
+                    false,
+                );
                 if exit != ExitCode::SUCCESS {
                     any_failed = true;
                 }

@@ -4,7 +4,7 @@
 # 2. Strips flags that urlx doesn't support yet (e.g. -q)
 # 3. Overrides default User-Agent to match curl's format
 
-URLX="${URLX_BIN:-$(dirname "$0")/../target/debug/urlx}"
+URLX="${URLX_BIN:-$(dirname "$0")/../target/release/urlx}"
 VERSION="0.1.0"
 
 if [ "$1" = "--version" ]; then

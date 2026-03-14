@@ -44,7 +44,10 @@ pub enum SameSite {
 struct Cookie {
     name: String,
     value: String,
+    /// Domain for matching (lowercase, no leading dot).
     domain: String,
+    /// Domain as it should appear in jar output (preserves original case and dot prefix).
+    domain_display: String,
     path: String,
     expires: Option<SystemTime>,
     secure: bool,
@@ -56,6 +59,8 @@ struct Cookie {
     same_site: SameSite,
     /// Monotonically increasing counter for creation order (curl compat sorting).
     creation_index: u64,
+    /// Whether the cookie applies to subdomains (TRUE in Netscape format).
+    include_subdomains: bool,
 }
 
 impl CookieJar {
@@ -265,8 +270,14 @@ impl CookieJar {
                 continue; // Malformed line — need at least domain, flag, path, secure, expires, name
             }
 
-            let domain = fields[0].strip_prefix('.').unwrap_or(fields[0]).to_lowercase();
-            // fields[1] is the "include subdomains" flag — we derive domain matching from the domain itself
+            let raw_domain = fields[0];
+            let domain = raw_domain.strip_prefix('.').unwrap_or(raw_domain).to_lowercase();
+            let include_subdomains = fields[1].eq_ignore_ascii_case("TRUE");
+            let domain_display = if include_subdomains && !raw_domain.starts_with('.') {
+                format!(".{raw_domain}")
+            } else {
+                raw_domain.to_string()
+            };
             let path = fields[2].to_string();
             let secure = fields[3].eq_ignore_ascii_case("TRUE");
             let expires = fields[4].parse::<u64>().ok().and_then(|ts| {
@@ -290,12 +301,14 @@ impl CookieJar {
                 name,
                 value,
                 domain,
+                domain_display,
                 path,
                 expires,
                 secure,
                 http_only,
                 same_site: SameSite::default(),
                 creation_index: idx,
+                include_subdomains,
             });
         }
         self.rebuild_index();
@@ -333,12 +346,11 @@ impl CookieJar {
 
         for cookie in sorted {
             let domain_str = if cookie.http_only {
-                format!("#HttpOnly_{}", cookie.domain)
+                format!("#HttpOnly_{}", cookie.domain_display)
             } else {
-                cookie.domain.clone()
+                cookie.domain_display.clone()
             };
-            // "include subdomains" flag — FALSE for host-only cookies (curl default)
-            let flag = "FALSE";
+            let flag = if cookie.include_subdomains { "TRUE" } else { "FALSE" };
             let secure_str = if cookie.secure { "TRUE" } else { "FALSE" };
             let expires_ts = cookie
                 .expires
@@ -356,6 +368,7 @@ impl CookieJar {
     }
 
     /// Parse a single Set-Cookie header value and store it.
+    #[allow(clippy::too_many_lines)]
     fn parse_set_cookie(&mut self, header: &str, request_host: &str, request_path: &str) {
         let parts: Vec<&str> = header.splitn(2, ';').collect();
         let name_value = parts[0].trim();
@@ -457,6 +470,47 @@ impl CookieJar {
             return;
         }
 
+        // Validate domain against request host (RFC 6265 §5.3 step 6):
+        // The domain must domain-match the request host.
+        if has_explicit_domain && !request_host.is_empty() {
+            let req_lower = request_host.to_ascii_lowercase();
+            if !domain_matches(&req_lower, &domain) {
+                return; // Reject: domain doesn't match request host
+            }
+        }
+
+        // Build display domain for jar output
+        let (domain_display, include_subdomains) = if has_explicit_domain {
+            // Explicit domain: add dot prefix, set include_subdomains=TRUE
+            // Preserve the original case from the Set-Cookie header
+            let raw = if parts.len() > 1 {
+                parts[1]
+                    .split(';')
+                    .find_map(|attr| {
+                        let attr = attr.trim();
+                        attr.split_once('=').and_then(|(k, v)| {
+                            if k.trim().eq_ignore_ascii_case("domain") {
+                                let v = v.trim().strip_prefix('.').unwrap_or_else(|| v.trim());
+                                if v.is_empty() {
+                                    None
+                                } else {
+                                    Some(v.to_string())
+                                }
+                            } else {
+                                None
+                            }
+                        })
+                    })
+                    .unwrap_or_else(|| domain.clone())
+            } else {
+                domain.clone()
+            };
+            (format!(".{raw}"), true)
+        } else {
+            // Host-only: no dot prefix, include_subdomains=FALSE
+            (domain.clone(), false)
+        };
+
         // Replace existing cookie with same name+domain+path
         self.cookies.retain(|c| !(c.name == name && c.domain == domain && c.path == path));
 
@@ -466,12 +520,14 @@ impl CookieJar {
             name,
             value,
             domain,
+            domain_display,
             path,
             expires,
             secure,
             http_only,
             same_site,
             creation_index: idx,
+            include_subdomains,
         });
 
         // Rebuild the index (retain may have invalidated indices)

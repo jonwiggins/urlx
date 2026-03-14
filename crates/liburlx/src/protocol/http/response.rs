@@ -103,6 +103,10 @@ pub struct Response {
     /// When set, the response is partial — headers are valid but the body
     /// may be incomplete. Used to output partial data on error (curl compat).
     body_error: Option<String>,
+    /// Raw header bytes as received from the wire (for `--include` output).
+    /// Includes the status line and all headers with original line endings.
+    /// Does NOT include the trailing blank line separator.
+    raw_headers: Option<Vec<u8>>,
 }
 
 /// An HTTP/2 server-pushed response.
@@ -145,6 +149,7 @@ impl Response {
             pushed_responses: Vec::new(),
             redirect_responses: Vec::new(),
             body_error: None,
+            raw_headers: None,
         }
     }
 
@@ -172,6 +177,7 @@ impl Response {
             pushed_responses: Vec::new(),
             redirect_responses: Vec::new(),
             body_error: None,
+            raw_headers: None,
         }
     }
 
@@ -213,6 +219,17 @@ impl Response {
     /// Set trailer headers on this response.
     pub fn set_trailers(&mut self, trailers: HashMap<String, String>) {
         self.trailers = trailers;
+    }
+
+    /// Set raw header bytes as received from the wire.
+    pub fn set_raw_headers(&mut self, raw: Vec<u8>) {
+        self.raw_headers = Some(raw);
+    }
+
+    /// Returns raw header bytes if available.
+    #[must_use]
+    pub fn raw_headers(&self) -> Option<&[u8]> {
+        self.raw_headers.as_deref()
     }
 
     /// Returns the HTTP status code.

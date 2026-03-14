@@ -85,6 +85,10 @@ pub struct CliOptions {
     pub(crate) no_progress_meter: bool,
     pub(crate) location_trusted: bool,
     pub(crate) time_cond: Option<String>,
+    /// Parsed time condition timestamp (seconds since epoch) for body suppression.
+    pub(crate) time_cond_ts: Option<i64>,
+    /// Whether the time condition is negated (`-z -date` = If-Unmodified-Since).
+    pub(crate) time_cond_negate: bool,
     /// `-G` / `--get`: convert POST data to GET query string.
     pub(crate) get_mode: bool,
     /// `-C -` auto-resume: determine offset from output file size.
@@ -108,7 +112,7 @@ pub struct CliOptions {
 /// Matches curl's `--version` output format: name, version, and feature list.
 pub fn print_version() {
     println!("urlx {}", env!("CARGO_PKG_VERSION"));
-    println!("Features: http https http2 http3 ftp ftps sftp scp mqtt ws wss smtp imap pop3");
+    println!("Features: alt-svc AsynchDNS cookies crypto Digest HSTS HTTP2 HTTP3 HTTPS-proxy IPv6 Largefile libz Mime NTLM proxy SSL UnixSockets");
     println!("Protocols: dict file ftp ftps http https imap imaps mqtt pop3 pop3s scp sftp smtp smtps ws wss");
 }
 
@@ -404,6 +408,8 @@ fn parse_args_options(args: &[String]) -> Result<CliOptions, u8> {
         no_progress_meter: false,
         location_trusted: false,
         time_cond: None,
+        time_cond_ts: None,
+        time_cond_negate: false,
         get_mode: false,
         auto_resume: false,
         resume_check: false,
@@ -1702,12 +1708,22 @@ pub fn parse_config_file(contents: &str) -> Vec<String> {
         }
 
         // Bare word (no leading dash) → treat as --longflag (curl config convention)
-        let parts: Vec<&str> = trimmed.splitn(2, char::is_whitespace).collect();
-        args.push(format!("--{}", parts[0]));
-        if parts.len() > 1 {
-            let value = parts[1].trim();
+        // Handle both `flag value` and `flag = value` syntax (with optional = separator)
+        if let Some(eq_pos) = trimmed.find('=') {
+            let flag = trimmed[..eq_pos].trim();
+            let value = trimmed[eq_pos + 1..].trim();
+            args.push(format!("--{flag}"));
             if !value.is_empty() {
                 args.push(unquote(value));
+            }
+        } else {
+            let parts: Vec<&str> = trimmed.splitn(2, char::is_whitespace).collect();
+            args.push(format!("--{}", parts[0]));
+            if parts.len() > 1 {
+                let value = parts[1].trim();
+                if !value.is_empty() {
+                    args.push(unquote(value));
+                }
             }
         }
     }
