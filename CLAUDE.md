@@ -15,7 +15,7 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 ## Current Status
 
 **Version:** v0.1.0 published (crates.io + GitHub Releases + Homebrew)
-**curl test suite:** 97/97 passing (tests 1-99, excluding test 79 FTP-over-proxy hang, test 96 TrackMemory skip)
+**curl test suite:** 128/128 passing (tests 1-130, excluding test 79 FTP-over-proxy hang, test 96 TrackMemory skip)
 **Rust test count:** ~2,596
 **Blockers:** None — infrastructure is live
 
@@ -107,16 +107,15 @@ Document every skip with a reason. Skips without rationale are not allowed.
 
 ---
 
-## Active Batch: FTP-1 (tests 100-130)
+## Active Batch: HTTP-5 / FTP-2 (tests 131-199)
 
-**Status:** Not yet started
-**Prerequisite:** Tests 1-99 pass (97/97)
+**Status:** 28/67 passing — in progress
+**Prerequisite:** Tests 1-130 pass (128/128)
 
 ### Batch Queue
 
 | Batch | Tests | Category | Notes |
 |-------|-------|----------|-------|
-| FTP-1 | 100-130 | FTP basics | LIST, RETR, STOR, login, passive mode |
 | FILE | 200-250 | file:// | Local file transfers |
 | HTTPS | 300-350 | HTTPS/TLS | Certificate handling, SNI, client certs |
 | PROXY | 400-450 | Proxies | HTTP proxy, CONNECT tunnel, SOCKS |
@@ -142,7 +141,10 @@ All 20 tests pass.
 All 20 tests pass.
 
 ### HTTP-4 (tests 61-99) — COMPLETE
-All 39 tests pass (97/97 for 1-99; test 79 FTP-over-proxy hang, test 96 TrackMemory skip excluded). Fixed: Digest auth URL encoding, NTLM challenge-response, --anyauth negotiation, HTTP/0.9 responses, http_proxy env var, CONNECT proxy tunneling, globbing output templates, cookie jar domain/path/secure handling.
+All 39 tests pass. Fixed: Digest auth, NTLM, --anyauth, HTTP/0.9, http_proxy env, CONNECT tunneling, globbing, cookies.
+
+### FTP-1 (tests 100-130) — COMPLETE
+All 31 tests pass. Complete FTP protocol rewrite: USER/PASS/PWD/CWD/EPSV/TYPE/LIST|RETR|STOR|APPE/QUIT, active mode, resume, quote commands, --crlf, .netrc.
 
 ---
 
