@@ -15,7 +15,7 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 ## Current Status
 
 **Version:** v0.1.0 published (crates.io + GitHub Releases + Homebrew)
-**curl test suite:** 59/60 passing (tests 1-60, excluding test 31 cookie jar) — batch HTTP-2 in progress
+**curl test suite:** 69/98 passing (tests 1-99, excluding test 31 cookie jar, test 79 hang, test 96 skip) — batch HTTP-4 in progress
 **Rust test count:** ~2,596
 **Blockers:** None — infrastructure is live
 
