@@ -15,7 +15,7 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 ## Current Status
 
 **Version:** v0.1.0 published (crates.io + GitHub Releases + Homebrew)
-**curl test suite:** 69/98 passing (tests 1-99, excluding test 31 cookie jar, test 79 hang, test 96 skip) — batch HTTP-4 in progress
+**curl test suite:** 97/97 passing (tests 1-99, excluding test 79 FTP-over-proxy hang, test 96 TrackMemory skip)
 **Rust test count:** ~2,596
 **Blockers:** None — infrastructure is live
 
@@ -107,30 +107,22 @@ Document every skip with a reason. Skips without rationale are not allowed.
 
 ---
 
-## Active Batch: HTTP-2 (tests 61-99)
+## Active Batch: FTP-1 (tests 100-130)
 
 **Status:** Not yet started
-**Prerequisite:** Tests 1-60 pass (59/59, test 31 deferred to COOKIE batch)
-
-### Test 31 (deferred)
-
-Test 31 (cookie jar storage with weirdly formatted cookies) is deferred to the COOKIE batch (700-750). The test passes data checks but the cookie jar output has issues:
-- Secure cookies should be excluded from jar output for non-HTTPS connections
-- Cookie paths need trailing slash normalization (curl strips trailing `/`)
-- Cookie `overwrite` with paths `/overwrite/` and `/overwrite` should be treated as same cookie
+**Prerequisite:** Tests 1-99 pass (97/97)
 
 ### Batch Queue
 
 | Batch | Tests | Category | Notes |
 |-------|-------|----------|-------|
-| HTTP-4 | 61-99 | HTTP advanced | Compression, chunked, pipelining |
 | FTP-1 | 100-130 | FTP basics | LIST, RETR, STOR, login, passive mode |
 | FILE | 200-250 | file:// | Local file transfers |
 | HTTPS | 300-350 | HTTPS/TLS | Certificate handling, SNI, client certs |
 | PROXY | 400-450 | Proxies | HTTP proxy, CONNECT tunnel, SOCKS |
 | POST | 500-550 | POST variants | Multipart, chunked POST, expect-100 |
 | AUTH | 600-650 | Authentication | Basic, Digest, NTLM, Negotiate |
-| COOKIE | 700-750 | Cookies | Jar files, domain matching, expiry (includes test 31) |
+| COOKIE | 700-750 | Cookies | Jar files, domain matching, expiry |
 | SSH | 800-850 | SSH/SFTP/SCP | Key auth, known_hosts, transfers |
 | MAIL | 900-950 | SMTP/IMAP/POP3 | Email protocols |
 | H2 | 1000-1050 | HTTP/2 | Multiplexing, server push, ALPN |
@@ -141,13 +133,16 @@ Test 31 (cookie jar storage with weirdly formatted cookies) is deferred to the C
 ## Completed Batches
 
 ### HTTP-1 (tests 1-20) — COMPLETE
-All 20 tests pass. Fixed: `--include`+`--output` interaction, response header ordering, cookie parsing, HEAD hang, redirect following, proxy headers, config file parsing.
+All 20 tests pass.
 
 ### HTTP-2 (tests 21-40) — COMPLETE
-All 20 tests pass. Fixed: partial output on timeout, chunked errors, resume handling, connection reuse.
+All 20 tests pass.
 
 ### HTTP-3 (tests 41-60) — COMPLETE
-All 20 tests pass. Fixed: cookies, redirects, exit codes, connection reuse, raw header preservation, mixed line endings, body hang avoidance for range failures and 3xx redirects.
+All 20 tests pass.
+
+### HTTP-4 (tests 61-99) — COMPLETE
+All 39 tests pass (97/97 for 1-99; test 79 FTP-over-proxy hang, test 96 TrackMemory skip excluded). Fixed: Digest auth URL encoding, NTLM challenge-response, --anyauth negotiation, HTTP/0.9 responses, http_proxy env var, CONNECT proxy tunneling, globbing output templates, cookie jar domain/path/secure handling.
 
 ---
 
