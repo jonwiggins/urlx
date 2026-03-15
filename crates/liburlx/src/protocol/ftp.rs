@@ -1760,8 +1760,10 @@ pub async fn perform(
         let complete_resp = read_response(&mut session.reader).await?;
         if !complete_resp.is_complete() {
             let _ = session.quit().await;
+            // 452/552 = disk full (curl returns CURLE_REMOTE_DISK_FULL = 70)
+            let code = if complete_resp.code == 452 || complete_resp.code == 552 { 70 } else { 25 };
             return Err(Error::Transfer {
-                code: 25,
+                code,
                 message: format!(
                     "FTP upload failed: {} {}",
                     complete_resp.code, complete_resp.message
