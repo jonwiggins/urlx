@@ -129,11 +129,7 @@ fn host_matches_pattern(hostname: &str, pattern: &str) -> bool {
     }
     // Strip port brackets: [hostname]:port
     let pattern = if pattern.starts_with('[') {
-        if let Some(bracket_end) = pattern.find(']') {
-            &pattern[1..bracket_end]
-        } else {
-            pattern
-        }
+        pattern.find(']').map_or(pattern, |bracket_end| &pattern[1..bracket_end])
     } else {
         pattern
     };
@@ -212,6 +208,7 @@ fn hmac_sha1(key: &[u8], message: &[u8]) -> [u8; 20] {
 ///
 /// Not used for security purposes — only for hostname hash verification
 /// in `known_hosts` files (`OpenSSH` format).
+#[allow(clippy::many_single_char_names)]
 fn sha1_hash(data: &[u8]) -> [u8; 20] {
     let mut h0: u32 = 0x6745_2301;
     let mut h1: u32 = 0xEFCD_AB89;
@@ -497,6 +494,8 @@ impl SshSession {
         data: &[u8],
         mode: Option<u32>,
     ) -> Result<(), Error> {
+        use tokio::io::AsyncWriteExt;
+
         let channel = self
             .handle
             .channel_open_session()
@@ -511,7 +510,12 @@ impl SshSession {
             .await
             .map_err(|e| Error::Ssh(format!("SFTP session init failed: {e}")))?;
 
-        sftp.write(path, data)
+        // Use create() to create/truncate the file, then write data
+        let mut file = sftp
+            .create(path)
+            .await
+            .map_err(|e| Error::Ssh(format!("SFTP create '{path}' failed: {e}")))?;
+        file.write_all(data)
             .await
             .map_err(|e| Error::Ssh(format!("SFTP write '{path}' failed: {e}")))?;
 
@@ -843,10 +847,11 @@ pub async fn download(
     };
     let _ = session.close().await;
 
-    let mut headers = HashMap::new();
-    let _old = headers.insert("content-length".to_string(), data.len().to_string());
-
-    Ok(Response::new(200, headers, data, url.as_str().to_string()))
+    let headers = HashMap::new();
+    let mut resp = Response::new(200, headers, data, url.as_str().to_string());
+    // SSH responses have no HTTP headers — set empty raw headers to suppress output
+    resp.set_raw_headers(Vec::new());
+    Ok(resp)
 }
 
 /// Upload a file via SFTP and return a Response.
@@ -906,6 +911,7 @@ const SSH_AUTH_PASSWORD: u32 = 2;
 /// - bit 3 (8): host-based
 ///
 /// When `None`, all available methods are attempted (default behavior).
+#[allow(clippy::too_many_arguments)]
 async fn connect_session(
     host: &str,
     port: u16,
@@ -918,8 +924,8 @@ async fn connect_session(
 ) -> Result<SshSession, Error> {
     let effective_user = if user.is_empty() { "root" } else { user };
 
-    let allow_pubkey = ssh_auth_types.map_or(true, |mask| mask & SSH_AUTH_PUBLICKEY != 0);
-    let allow_password = ssh_auth_types.map_or(true, |mask| mask & SSH_AUTH_PASSWORD != 0);
+    let allow_pubkey = ssh_auth_types.is_none_or(|mask| mask & SSH_AUTH_PUBLICKEY != 0);
+    let allow_password = ssh_auth_types.is_none_or(|mask| mask & SSH_AUTH_PASSWORD != 0);
 
     if allow_pubkey {
         if let Some(key_path) = ssh_key_path {
@@ -1061,6 +1067,7 @@ mod tests {
     #[test]
     fn ssh_host_key_policy_clone() {
         let policy = SshHostKeyPolicy::Sha256Fingerprint("test".to_string());
+        #[allow(clippy::redundant_clone)]
         let cloned = policy.clone();
         assert!(matches!(cloned, SshHostKeyPolicy::Sha256Fingerprint(s) if s == "test"));
     }
@@ -1124,7 +1131,11 @@ mod tests {
     fn sha1_hash_empty() {
         // SHA-1("") = da39a3ee5e6b4b0d3255bfef95601890afd80709
         let hash = sha1_hash(b"");
-        let hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
+        let hex = hash.iter().fold(String::new(), |mut s, b| {
+            use std::fmt::Write;
+            let _ = write!(s, "{b:02x}");
+            s
+        });
         assert_eq!(hex, "da39a3ee5e6b4b0d3255bfef95601890afd80709");
     }
 
@@ -1132,7 +1143,11 @@ mod tests {
     fn sha1_hash_abc() {
         // SHA-1("abc") = a9993e364706816aba3e25717850c26c9cd0d89d
         let hash = sha1_hash(b"abc");
-        let hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
+        let hex = hash.iter().fold(String::new(), |mut s, b| {
+            use std::fmt::Write;
+            let _ = write!(s, "{b:02x}");
+            s
+        });
         assert_eq!(hex, "a9993e364706816aba3e25717850c26c9cd0d89d");
     }
 
@@ -1143,7 +1158,11 @@ mod tests {
         let key = [0x0bu8; 20];
         let data = b"Hi There";
         let result = hmac_sha1(&key, data);
-        let hex: String = result.iter().map(|b| format!("{b:02x}")).collect();
+        let hex = result.iter().fold(String::new(), |mut s, b| {
+            use std::fmt::Write;
+            let _ = write!(s, "{b:02x}");
+            s
+        });
         assert_eq!(hex, "b617318655057264e28bc0b6fb378c8ef146be00");
     }
 
@@ -1294,8 +1313,8 @@ mod tests {
     fn ssh_auth_types_none_allows_all() {
         // When auth_types is None, all methods should be allowed
         let auth_types: Option<u32> = None;
-        let allow_pubkey = auth_types.map_or(true, |mask| mask & SSH_AUTH_PUBLICKEY != 0);
-        let allow_password = auth_types.map_or(true, |mask| mask & SSH_AUTH_PASSWORD != 0);
+        let allow_pubkey = auth_types.is_none_or(|mask| mask & SSH_AUTH_PUBLICKEY != 0);
+        let allow_password = auth_types.is_none_or(|mask| mask & SSH_AUTH_PASSWORD != 0);
         assert!(allow_pubkey);
         assert!(allow_password);
     }

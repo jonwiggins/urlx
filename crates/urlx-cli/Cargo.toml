@@ -19,5 +19,5 @@ workspace = true
 
 [dependencies]
 filetime = "0.2"
-liburlx = { path = "../liburlx", version = "0.1.0" }
+liburlx = { path = "../liburlx", version = "0.1.0", features = ["ssh"] }
 tokio = { version = "1", features = ["rt"] }

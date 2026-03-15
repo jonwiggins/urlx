@@ -684,8 +684,12 @@ pub fn run(args: &[String]) -> ExitCode {
                                         .or_else(|| url_user.clone())
                                         .unwrap_or_default();
                                     let pass = entry.password.unwrap_or_default();
-                                    if url.starts_with("ftp://") || url.starts_with("ftps://") {
-                                        // Embed credentials in URL for FTP (don't percent-encode)
+                                    if url.starts_with("ftp://")
+                                        || url.starts_with("ftps://")
+                                        || url.starts_with("sftp://")
+                                        || url.starts_with("scp://")
+                                    {
+                                        // Embed credentials in URL for FTP/SSH (don't percent-encode)
                                         let base_url = strip_url_credentials(&url);
                                         let scheme_end = base_url.find("://").map_or(0, |p| p + 3);
                                         let new_url = format!(
@@ -734,10 +738,14 @@ pub fn run(args: &[String]) -> ExitCode {
             }
         }
 
-        // For FTP: if -u was provided, embed credentials into the URL
-        // (FTP reads credentials from the URL, not from auth_credentials).
+        // For FTP/SSH: if -u was provided, embed credentials into the URL
+        // (FTP and SSH read credentials from the URL, not from auth_credentials).
         if let Some((ref user, ref pass)) = opts.user_credentials {
-            if url.starts_with("ftp://") || url.starts_with("ftps://") {
+            if url.starts_with("ftp://")
+                || url.starts_with("ftps://")
+                || url.starts_with("sftp://")
+                || url.starts_with("scp://")
+            {
                 let base_url = strip_url_credentials(&url);
                 let scheme_end = base_url.find("://").map_or(0, |p| p + 3);
                 let new_url = format!(
@@ -1394,7 +1402,20 @@ pub fn error_to_exit_code(err: &liburlx::Error) -> ExitCode {
         }
         liburlx::Error::FileError(_) => ExitCode::from(37), // CURLE_FILE_COULDNT_READ_FILE
         liburlx::Error::Io(_) => ExitCode::from(23),        // CURLE_WRITE_ERROR
-        liburlx::Error::Ssh(_) => ExitCode::from(67),       // CURLE_LOGIN_DENIED
+        liburlx::Error::Ssh(msg) => {
+            if msg.contains("No such file")
+                || msg.contains("not found")
+                || msg.contains("does not exist")
+            {
+                ExitCode::from(78) // CURLE_REMOTE_FILE_NOT_FOUND
+            } else if msg.contains("permission denied") || msg.contains("Permission denied") {
+                ExitCode::from(9) // CURLE_REMOTE_ACCESS_DENIED
+            } else if msg.contains("quote") || msg.contains("Quote") {
+                ExitCode::from(21) // CURLE_QUOTE_ERROR
+            } else {
+                ExitCode::from(67) // CURLE_LOGIN_DENIED
+            }
+        }
         liburlx::Error::Transfer { code, .. } => {
             ExitCode::from(u8::try_from(*code).map_or(1, |c| c))
         }
