@@ -48,6 +48,13 @@ for f in "$CURL_SRC/tests/"*.pm "$CURL_SRC/tests/"*.pl; do
     base=$(basename "$f")
     [ ! -e "$base" ] && ln -sf "$f" "$base"
 done
+# Symlink libtest .pl scripts for SSH postcheck tests
+if [ -d libtest ] && [ -d "$CURL_SRC/tests/libtest" ]; then
+    for f in "$CURL_SRC/tests/libtest/"*.pl; do
+        base=$(basename "$f")
+        [ ! -e "libtest/$base" ] && ln -sf "$f" "libtest/$base"
+    done
+fi
 
 # Run the tests
 # -a = continue after failures

@@ -3416,6 +3416,14 @@ async fn do_single_request(
         }
         #[cfg(feature = "ssh")]
         "sftp" | "scp" => {
+            // Extract byte range for SFTP
+            let sftp_range = headers.iter().find_map(|(k, v)| {
+                if k.eq_ignore_ascii_case("range") {
+                    v.strip_prefix("bytes=").map(ToString::to_string)
+                } else {
+                    None
+                }
+            });
             return if method == "PUT" {
                 let upload_data = body.unwrap_or(&[]);
                 crate::protocol::ssh::upload(
@@ -3425,6 +3433,21 @@ async fn do_single_request(
                     ssh_host_key_policy,
                     ssh_public_keyfile,
                     ssh_auth_types,
+                    &ftp_config.pre_quote,
+                    &ftp_config.post_quote,
+                    ftp_config.create_dirs,
+                )
+                .await
+            } else if method == "HEAD" {
+                // -I with SFTP: just run quote commands, no download
+                crate::protocol::ssh::head(
+                    url,
+                    ssh_key_path,
+                    ssh_host_key_policy,
+                    ssh_public_keyfile,
+                    ssh_auth_types,
+                    &ftp_config.pre_quote,
+                    &ftp_config.post_quote,
                 )
                 .await
             } else {
@@ -3434,6 +3457,9 @@ async fn do_single_request(
                     ssh_host_key_policy,
                     ssh_public_keyfile,
                     ssh_auth_types,
+                    &ftp_config.pre_quote,
+                    &ftp_config.post_quote,
+                    sftp_range.as_deref(),
                 )
                 .await
             };

@@ -539,6 +539,42 @@ impl SshSession {
         Ok(())
     }
 
+    /// Recursively create directories for an SFTP path (like mkdir -p).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Ssh`] if the SFTP session initialization fails.
+    pub async fn sftp_mkdir_p(&self, path: &str) -> Result<(), Error> {
+        let channel = self
+            .handle
+            .channel_open_session()
+            .await
+            .map_err(|e| Error::Ssh(format!("failed to open SSH channel: {e}")))?;
+        channel
+            .request_subsystem(true, "sftp")
+            .await
+            .map_err(|e| Error::Ssh(format!("failed to request sftp subsystem: {e}")))?;
+        let sftp = russh_sftp::client::SftpSession::new(channel.into_stream())
+            .await
+            .map_err(|e| Error::Ssh(format!("SFTP session init failed: {e}")))?;
+
+        // Build path components and create each level
+        let mut current = String::new();
+        for component in path.split('/') {
+            if component.is_empty() {
+                current.push('/');
+                continue;
+            }
+            if !current.ends_with('/') {
+                current.push('/');
+            }
+            current.push_str(component);
+            // Try to create; ignore "already exists" errors
+            let _ = sftp.create_dir(&current).await;
+        }
+        Ok(())
+    }
+
     /// List a directory via SFTP.
     ///
     /// Returns the listing as UTF-8 text with one entry per line.
@@ -817,12 +853,16 @@ async fn resolve_sftp_symlinks(
 /// # Errors
 ///
 /// Returns an error if connection, authentication, or file transfer fails.
+#[allow(clippy::too_many_arguments)]
 pub async fn download(
     url: &crate::url::Url,
     ssh_key_path: Option<&str>,
     policy: &SshHostKeyPolicy,
     ssh_public_keyfile: Option<&str>,
     ssh_auth_types: Option<u32>,
+    pre_quote: &[String],
+    post_quote: &[String],
+    range: Option<&str>,
 ) -> Result<Response, Error> {
     let (host, port) = url.host_and_port()?;
     let (user, pass) = url.credentials().unwrap_or(("", ""));
@@ -840,16 +880,31 @@ pub async fn download(
     )
     .await?;
 
-    let data = if url.scheme() == "scp" {
+    // Execute pre-quote commands
+    if !pre_quote.is_empty() && url.scheme() == "sftp" {
+        execute_sftp_quotes(&session, pre_quote).await?;
+    }
+
+    let mut data = if url.scheme() == "scp" {
         session.scp_download(path).await?
     } else {
         session.sftp_download(path).await?
     };
+
+    // Apply byte range if specified (SFTP only)
+    if let Some(range_str) = range {
+        data = apply_byte_range(&data, range_str);
+    }
+
+    // Execute post-quote commands
+    if !post_quote.is_empty() && url.scheme() == "sftp" {
+        execute_sftp_quotes(&session, post_quote).await?;
+    }
+
     let _ = session.close().await;
 
     let headers = HashMap::new();
     let mut resp = Response::new(200, headers, data, url.as_str().to_string());
-    // SSH responses have no HTTP headers — set empty raw headers to suppress output
     resp.set_raw_headers(Vec::new());
     Ok(resp)
 }
@@ -859,6 +914,7 @@ pub async fn download(
 /// # Errors
 ///
 /// Returns an error if connection, authentication, or file transfer fails.
+#[allow(clippy::too_many_arguments)]
 pub async fn upload(
     url: &crate::url::Url,
     data: &[u8],
@@ -866,6 +922,9 @@ pub async fn upload(
     policy: &SshHostKeyPolicy,
     ssh_public_keyfile: Option<&str>,
     ssh_auth_types: Option<u32>,
+    pre_quote: &[String],
+    post_quote: &[String],
+    create_dirs: bool,
 ) -> Result<Response, Error> {
     let (host, port) = url.host_and_port()?;
     let (user, pass) = url.credentials().unwrap_or(("", ""));
@@ -883,15 +942,152 @@ pub async fn upload(
     )
     .await?;
 
+    // Execute pre-quote commands
+    if !pre_quote.is_empty() && url.scheme() == "sftp" {
+        execute_sftp_quotes(&session, pre_quote).await?;
+    }
+
+    // --ftp-create-dirs: create parent directories for upload path
+    if create_dirs && url.scheme() == "sftp" {
+        if let Some(parent) = std::path::Path::new(path).parent() {
+            let parent_str = parent.to_string_lossy();
+            if !parent_str.is_empty() && parent_str != "/" {
+                session.sftp_mkdir_p(&parent_str).await?;
+            }
+        }
+    }
+
     if url.scheme() == "scp" {
         session.scp_upload(path, data).await?;
     } else {
         session.sftp_upload(path, data).await?;
     }
+
+    // Execute post-quote commands
+    if !post_quote.is_empty() && url.scheme() == "sftp" {
+        execute_sftp_quotes(&session, post_quote).await?;
+    }
+
     let _ = session.close().await;
 
     let headers = HashMap::new();
     Ok(Response::new(200, headers, Vec::new(), url.as_str().to_string()))
+}
+
+/// HEAD request for SSH (run quote commands, no file transfer).
+///
+/// # Errors
+///
+/// Returns an error if connection, authentication, or quote commands fail.
+#[allow(clippy::too_many_arguments)]
+pub async fn head(
+    url: &crate::url::Url,
+    ssh_key_path: Option<&str>,
+    policy: &SshHostKeyPolicy,
+    ssh_public_keyfile: Option<&str>,
+    ssh_auth_types: Option<u32>,
+    pre_quote: &[String],
+    post_quote: &[String],
+) -> Result<Response, Error> {
+    let (host, port) = url.host_and_port()?;
+    let (user, pass) = url.credentials().unwrap_or(("", ""));
+
+    let session = connect_session(
+        &host,
+        port,
+        user,
+        pass,
+        ssh_key_path,
+        policy,
+        ssh_public_keyfile,
+        ssh_auth_types,
+    )
+    .await?;
+
+    if !pre_quote.is_empty() && url.scheme() == "sftp" {
+        execute_sftp_quotes(&session, pre_quote).await?;
+    }
+    if !post_quote.is_empty() && url.scheme() == "sftp" {
+        execute_sftp_quotes(&session, post_quote).await?;
+    }
+
+    let _ = session.close().await;
+
+    let headers = HashMap::new();
+    let mut resp = Response::new(200, headers, Vec::new(), url.as_str().to_string());
+    resp.set_raw_headers(Vec::new());
+    Ok(resp)
+}
+
+/// Execute SFTP quote commands (rename, rm, mkdir, rmdir).
+async fn execute_sftp_quotes(session: &SshSession, commands: &[String]) -> Result<(), Error> {
+    let channel = session
+        .handle
+        .channel_open_session()
+        .await
+        .map_err(|e| Error::Ssh(format!("failed to open SSH channel for quote: {e}")))?;
+    channel
+        .request_subsystem(true, "sftp")
+        .await
+        .map_err(|e| Error::Ssh(format!("failed to request sftp subsystem: {e}")))?;
+    let sftp = russh_sftp::client::SftpSession::new(channel.into_stream())
+        .await
+        .map_err(|e| Error::Ssh(format!("SFTP session init failed: {e}")))?;
+
+    for cmd in commands {
+        let parts: Vec<&str> = cmd.splitn(2, ' ').collect();
+        let op = parts[0].to_lowercase();
+        let args = parts.get(1).copied().unwrap_or("");
+        match op.as_str() {
+            "rename" => {
+                let rename_parts: Vec<&str> = args.splitn(2, ' ').collect();
+                if rename_parts.len() < 2 {
+                    return Err(Error::Ssh("SFTP quote rename: need old and new path".to_string()));
+                }
+                sftp.rename(rename_parts[0], rename_parts[1])
+                    .await
+                    .map_err(|e| Error::Ssh(format!("SFTP quote rename failed: {e}")))?;
+            }
+            "rm" | "remove" => {
+                sftp.remove_file(args)
+                    .await
+                    .map_err(|e| Error::Ssh(format!("SFTP quote rm failed: {e}")))?;
+            }
+            "mkdir" => {
+                sftp.create_dir(args)
+                    .await
+                    .map_err(|e| Error::Ssh(format!("SFTP quote mkdir failed: {e}")))?;
+            }
+            "rmdir" => {
+                sftp.remove_dir(args)
+                    .await
+                    .map_err(|e| Error::Ssh(format!("SFTP quote rmdir failed: {e}")))?;
+            }
+            _ => {
+                return Err(Error::Ssh(format!("SFTP quote: unsupported command '{op}'")));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Apply a byte range (e.g., "5-9") to downloaded data.
+fn apply_byte_range(data: &[u8], range: &str) -> Vec<u8> {
+    if let Some((start_str, end_str)) = range.split_once('-') {
+        let start = start_str.parse::<usize>().unwrap_or(0);
+        let end = if end_str.is_empty() {
+            data.len().saturating_sub(1)
+        } else {
+            end_str.parse::<usize>().unwrap_or_else(|_| data.len().saturating_sub(1))
+        };
+        if start >= data.len() {
+            return Vec::new();
+        }
+        let end = end.min(data.len().saturating_sub(1));
+        data[start..=end].to_vec()
+    } else {
+        data.to_vec()
+    }
 }
 
 /// SSH auth type bitmask: public key authentication.
