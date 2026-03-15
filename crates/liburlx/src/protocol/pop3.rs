@@ -87,6 +87,47 @@ pub async fn read_multiline<S: AsyncRead + Unpin>(
     Ok(lines)
 }
 
+/// Read the POP3 server greeting, skipping any banner lines.
+///
+/// The greeting must start with `+OK` or `-ERR`.
+///
+/// # Errors
+///
+/// Returns an error if the connection drops before a greeting is found.
+async fn read_greeting<S: AsyncRead + Unpin>(
+    stream: &mut BufReader<S>,
+) -> Result<Pop3Response, Error> {
+    loop {
+        let mut line = String::new();
+        let bytes_read = stream
+            .read_line(&mut line)
+            .await
+            .map_err(|e| Error::Http(format!("POP3 greeting read error: {e}")))?;
+
+        if bytes_read == 0 {
+            return Err(Error::Http("POP3 connection closed before greeting".to_string()));
+        }
+
+        let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
+        if trimmed.starts_with("+OK") || trimmed.starts_with("-ERR") {
+            return read_response_line(trimmed);
+        }
+        // Skip non-greeting lines (server banners)
+    }
+}
+
+/// Parse a single POP3 response line (already read).
+fn read_response_line(trimmed: &str) -> Result<Pop3Response, Error> {
+    #[allow(clippy::option_if_let_else)]
+    if let Some(msg) = trimmed.strip_prefix("+OK") {
+        Ok(Pop3Response { ok: true, message: msg.trim_start().to_string() })
+    } else if let Some(msg) = trimmed.strip_prefix("-ERR") {
+        Ok(Pop3Response { ok: false, message: msg.trim_start().to_string() })
+    } else {
+        Err(Error::Http(format!("POP3 unexpected response: {trimmed}")))
+    }
+}
+
 /// Send a POP3 command.
 ///
 /// # Errors
@@ -116,11 +157,16 @@ pub async fn send_command<S: AsyncWrite + Unpin>(
 ///
 /// Returns an error if login fails or the message cannot be retrieved.
 #[allow(clippy::too_many_lines)]
-pub async fn retrieve(url: &crate::url::Url) -> Result<Response, Error> {
+pub async fn retrieve(
+    url: &crate::url::Url,
+    credentials: Option<(&str, &str)>,
+    custom_request: Option<&str>,
+) -> Result<Response, Error> {
     let (host, port) = url.host_and_port()?;
-    let (user, pass) = url
-        .credentials()
-        .ok_or_else(|| Error::Http("POP3 requires credentials in the URL".to_string()))?;
+    let url_creds = url.credentials();
+    let (user, pass) = url_creds
+        .or(credentials)
+        .ok_or_else(|| Error::Http("POP3 requires credentials".to_string()))?;
 
     let path = url.path();
     let msg_num: Option<u32> = path.trim_start_matches('/').parse().ok();
@@ -130,33 +176,65 @@ pub async fn retrieve(url: &crate::url::Url) -> Result<Response, Error> {
     let (reader, mut writer) = tokio::io::split(tcp);
     let mut reader = BufReader::new(reader);
 
-    // Read greeting
-    let greeting = read_response(&mut reader).await?;
+    // Read greeting — skip banner lines until we find +OK or -ERR
+    let greeting = read_greeting(&mut reader).await?;
     if !greeting.ok {
         return Err(Error::Http(format!("POP3 server rejected: {}", greeting.message)));
+    }
+
+    // CAPA (curl always sends this before auth)
+    send_command(&mut writer, "CAPA").await?;
+    let capa_resp = read_response(&mut reader).await?;
+    if capa_resp.ok {
+        // Read the multi-line CAPA response
+        let _ = read_multiline(&mut reader).await?;
     }
 
     // USER
     send_command(&mut writer, &format!("USER {user}")).await?;
     let user_resp = read_response(&mut reader).await?;
     if !user_resp.ok {
-        return Err(Error::Http(format!("POP3 USER failed: {}", user_resp.message)));
+        return Err(Error::Transfer {
+            code: 67,
+            message: format!("POP3 USER failed: {}", user_resp.message),
+        });
     }
 
     // PASS
     send_command(&mut writer, &format!("PASS {pass}")).await?;
     let pass_resp = read_response(&mut reader).await?;
     if !pass_resp.ok {
-        return Err(Error::Http(format!("POP3 login failed: {}", pass_resp.message)));
+        return Err(Error::Transfer {
+            code: 67,
+            message: format!("POP3 login failed: {}", pass_resp.message),
+        });
     }
 
-    if let Some(num) = msg_num {
+    // If custom request is set (e.g. -X NOOP), send that instead
+    if let Some(cmd) = custom_request {
+        send_command(&mut writer, cmd).await?;
+        let cmd_resp = read_response(&mut reader).await?;
+        if !cmd_resp.ok {
+            return Err(Error::Http(format!("POP3 {cmd} failed: {}", cmd_resp.message)));
+        }
+        // Don't try to read multiline for simple commands
+    } else if let Some(num) = msg_num {
         // RETR specific message
         send_command(&mut writer, &format!("RETR {num}")).await?;
         let retr_resp = read_response(&mut reader).await?;
         if !retr_resp.ok {
             return Err(Error::Http(format!("POP3 RETR failed: {}", retr_resp.message)));
         }
+        let lines = read_multiline(&mut reader).await?;
+        let body = lines.join("\r\n").into_bytes();
+
+        // QUIT
+        send_command(&mut writer, "QUIT").await?;
+        let _ = read_response(&mut reader).await;
+
+        let mut headers = std::collections::HashMap::new();
+        let _old = headers.insert("content-length".to_string(), body.len().to_string());
+        return Ok(Response::new(200, headers, body, url.as_str().to_string()));
     } else {
         // LIST all messages
         send_command(&mut writer, "LIST").await?;
@@ -164,17 +242,24 @@ pub async fn retrieve(url: &crate::url::Url) -> Result<Response, Error> {
         if !list_resp.ok {
             return Err(Error::Http(format!("POP3 LIST failed: {}", list_resp.message)));
         }
+        let lines = read_multiline(&mut reader).await?;
+        let body = lines.join("\r\n").into_bytes();
+
+        // QUIT
+        send_command(&mut writer, "QUIT").await?;
+        let _ = read_response(&mut reader).await;
+
+        let mut headers = std::collections::HashMap::new();
+        let _old = headers.insert("content-length".to_string(), body.len().to_string());
+        return Ok(Response::new(200, headers, body, url.as_str().to_string()));
     }
-    let lines = read_multiline(&mut reader).await?;
-    let body = lines.join("\r\n").into_bytes();
 
     // QUIT
     send_command(&mut writer, "QUIT").await?;
+    let _ = read_response(&mut reader).await;
 
-    let mut headers = std::collections::HashMap::new();
-    let _old = headers.insert("content-length".to_string(), body.len().to_string());
-
-    Ok(Response::new(200, headers, body, url.as_str().to_string()))
+    let headers = std::collections::HashMap::new();
+    Ok(Response::new(200, headers, Vec::new(), url.as_str().to_string()))
 }
 
 #[cfg(test)]

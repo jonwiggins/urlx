@@ -3530,10 +3530,28 @@ async fn do_single_request(
             .await;
         }
         "imap" | "imaps" => {
-            return crate::protocol::imap::fetch(url).await;
+            // Extract credentials from URL or Authorization header
+            let header_creds = extract_basic_auth_from_headers(headers);
+            let creds_tuple = header_creds.as_ref().map(|(u, p)| (u.as_str(), p.as_str()));
+            // -X sets method to a custom IMAP command (e.g. EXAMINE, NOOP)
+            let custom_cmd = match method {
+                "GET" | "POST" | "PUT" | "HEAD" | "DELETE" | "PATCH" | "OPTIONS" => {
+                    custom_request_target
+                }
+                _ => Some(method),
+            };
+            return crate::protocol::imap::fetch(url, creds_tuple, custom_cmd).await;
         }
         "pop3" | "pop3s" => {
-            return crate::protocol::pop3::retrieve(url).await;
+            let header_creds = extract_basic_auth_from_headers(headers);
+            let creds_tuple = header_creds.as_ref().map(|(u, p)| (u.as_str(), p.as_str()));
+            let custom_cmd = match method {
+                "GET" | "POST" | "PUT" | "HEAD" | "DELETE" | "PATCH" | "OPTIONS" => {
+                    custom_request_target
+                }
+                _ => Some(method),
+            };
+            return crate::protocol::pop3::retrieve(url, creds_tuple, custom_cmd).await;
         }
         "mqtt" => {
             return if method == "POST" || method == "PUT" {
@@ -4673,6 +4691,19 @@ where
 /// Find a header value by name (case-insensitive).
 fn find_header(headers: &[(String, String)], name: &str) -> Option<String> {
     headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.clone())
+}
+
+/// Extract username and password from an Authorization: Basic header.
+///
+/// Returns `None` if no Authorization header or not Basic auth.
+fn extract_basic_auth_from_headers(headers: &[(String, String)]) -> Option<(String, String)> {
+    use base64::Engine;
+    let auth_val = find_header(headers, "authorization")?;
+    let encoded = auth_val.strip_prefix("Basic ")?;
+    let decoded = base64::engine::general_purpose::STANDARD.decode(encoded.trim()).ok()?;
+    let decoded_str = String::from_utf8(decoded).ok()?;
+    let (user, pass) = decoded_str.split_once(':').unwrap_or((&decoded_str, ""));
+    Some((user.to_string(), pass.to_string()))
 }
 
 /// Find the end of HTTP headers (\r\n\r\n) in a buffer.
@@ -6582,8 +6613,13 @@ mod tests {
         // Greeting
         writer.write_all(b"+OK POP3 mock ready\r\n").await.unwrap();
 
-        // USER
+        // CAPA
         let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        writer.write_all(b"+OK\r\nUSER\r\n.\r\n").await.unwrap();
+
+        // USER
+        line.clear();
         reader.read_line(&mut line).await.unwrap();
         writer.write_all(b"+OK\r\n").await.unwrap();
 
@@ -6628,23 +6664,35 @@ mod tests {
         // Greeting
         writer.write_all(b"* OK IMAP4rev1 mock ready\r\n").await.unwrap();
 
-        // LOGIN
+        // CAPABILITY
         let mut line = String::new();
         reader.read_line(&mut line).await.unwrap();
         let tag = line.split_whitespace().next().unwrap_or("A001").to_string();
+        writer
+            .write_all(
+                format!("* CAPABILITY IMAP4rev1 AUTH=PLAIN\r\n{tag} OK CAPABILITY completed\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+
+        // LOGIN
+        line.clear();
+        reader.read_line(&mut line).await.unwrap();
+        let tag = line.split_whitespace().next().unwrap_or("A002").to_string();
         writer.write_all(format!("{tag} OK logged in\r\n").as_bytes()).await.unwrap();
 
         // SELECT INBOX
         line.clear();
         reader.read_line(&mut line).await.unwrap();
-        let tag = line.split_whitespace().next().unwrap_or("A002").to_string();
+        let tag = line.split_whitespace().next().unwrap_or("A003").to_string();
         writer.write_all(b"* 1 EXISTS\r\n* 0 RECENT\r\n").await.unwrap();
         writer.write_all(format!("{tag} OK SELECT completed\r\n").as_bytes()).await.unwrap();
 
         // FETCH
         line.clear();
         reader.read_line(&mut line).await.unwrap();
-        let tag = line.split_whitespace().next().unwrap_or("A003").to_string();
+        let tag = line.split_whitespace().next().unwrap_or("A004").to_string();
         writer.write_all(b"* 1 FETCH (FLAGS (\\Seen) INTERNALDATE \"01-Jan-2026 00:00:00 +0000\" ENVELOPE (\"test\"))\r\n").await.unwrap();
         writer.write_all(format!("{tag} OK FETCH completed\r\n").as_bytes()).await.unwrap();
 

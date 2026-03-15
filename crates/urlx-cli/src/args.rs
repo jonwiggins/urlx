@@ -467,6 +467,9 @@ fn parse_args_options(args: &[String]) -> Result<CliOptions, u8> {
                 i += 1;
                 let val = require_arg(args, i, "-X")?;
                 opts.easy.method(val);
+                // Also store as custom_request_target for non-HTTP protocols
+                // (IMAP/POP3/SMTP use -X as custom protocol command)
+                opts.easy.custom_request_target(val);
             }
             "-H" | "--header" => {
                 i += 1;

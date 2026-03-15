@@ -113,21 +113,31 @@ async fn send_command<S: AsyncWrite + Unpin>(
 
 /// Read the untagged greeting sent by the server upon connection.
 ///
+/// The server may send banner lines before the `* OK` greeting.
+/// We keep reading until we find a line starting with `* OK` or `* PREAUTH`.
+///
 /// # Errors
 ///
-/// Returns an error if the connection drops.
+/// Returns an error if the connection drops or no greeting is found.
 async fn read_greeting<S: AsyncRead + Unpin>(stream: &mut BufReader<S>) -> Result<String, Error> {
-    let mut line = String::new();
-    let bytes_read = stream
-        .read_line(&mut line)
-        .await
-        .map_err(|e| Error::Http(format!("IMAP greeting read error: {e}")))?;
+    loop {
+        let mut line = String::new();
+        let bytes_read = stream
+            .read_line(&mut line)
+            .await
+            .map_err(|e| Error::Http(format!("IMAP greeting read error: {e}")))?;
 
-    if bytes_read == 0 {
-        return Err(Error::Http("IMAP connection closed before greeting".to_string()));
+        if bytes_read == 0 {
+            return Err(Error::Http("IMAP connection closed before greeting".to_string()));
+        }
+
+        let trimmed = line.trim();
+        // The greeting is an untagged response: "* OK ..." or "* PREAUTH ..."
+        if trimmed.starts_with("* OK") || trimmed.starts_with("* PREAUTH") {
+            return Ok(trimmed.to_string());
+        }
+        // Skip non-greeting lines (server banners, etc.)
     }
-
-    Ok(line.trim().to_string())
 }
 
 /// Fetch email from an IMAP server.
@@ -137,19 +147,27 @@ async fn read_greeting<S: AsyncRead + Unpin>(stream: &mut BufReader<S>) -> Resul
 /// If a UID is specified, fetches that specific message. Otherwise,
 /// returns a listing of the mailbox.
 ///
+/// Credentials can come from the URL or be passed via `credentials` parameter
+/// (from `-u` flag). URL credentials take priority.
+///
 /// # Errors
 ///
 /// Returns an error if login fails, the mailbox doesn't exist, or the fetch fails.
 #[allow(clippy::too_many_lines)]
-pub async fn fetch(url: &crate::url::Url) -> Result<Response, Error> {
+pub async fn fetch(
+    url: &crate::url::Url,
+    credentials: Option<(&str, &str)>,
+    custom_request: Option<&str>,
+) -> Result<Response, Error> {
     let (host, port) = url.host_and_port()?;
-    let (user, pass) = url
-        .credentials()
-        .ok_or_else(|| Error::Http("IMAP requires credentials in the URL".to_string()))?;
+    let url_creds = url.credentials();
+    let (user, pass) = url_creds
+        .or(credentials)
+        .ok_or_else(|| Error::Http("IMAP requires credentials".to_string()))?;
 
     let path = url.path();
-    // Parse mailbox and optional UID from path: /INBOX/;UID=123
-    let (mailbox, uid) = parse_imap_path(path);
+    // Parse mailbox and optional params from path: /INBOX/;UID=123 or /INBOX/;MAILINDEX=1
+    let (mailbox, params) = parse_imap_path(path);
 
     let addr = format!("{host}:{port}");
     let tcp = tokio::net::TcpStream::connect(&addr).await.map_err(Error::Connect)?;
@@ -163,34 +181,62 @@ pub async fn fetch(url: &crate::url::Url) -> Result<Response, Error> {
         return Err(Error::Http(format!("IMAP server rejected: {greeting}")));
     }
 
-    // LOGIN
+    // CAPABILITY (curl always sends this first)
     let tag = tags.next_tag();
-    send_command(&mut writer, &tag, &format!("LOGIN {user} {pass}")).await?;
+    send_command(&mut writer, &tag, "CAPABILITY").await?;
+    let _ = read_response(&mut reader, &tag).await?;
+
+    // LOGIN with properly quoted credentials
+    let tag = tags.next_tag();
+    let quoted_user = imap_quote(user);
+    let quoted_pass = imap_quote(pass);
+    send_command(&mut writer, &tag, &format!("LOGIN {quoted_user} {quoted_pass}")).await?;
     let login_resp = read_response(&mut reader, &tag).await?;
     if !login_resp.is_ok() {
-        return Err(Error::Http(format!(
-            "IMAP LOGIN failed: {} {}",
-            login_resp.status, login_resp.message
-        )));
+        // LOGOUT on login failure
+        let ltag = tags.next_tag();
+        send_command(&mut writer, &ltag, "LOGOUT").await?;
+        return Err(Error::Transfer {
+            code: 67,
+            message: format!("IMAP LOGIN failed: {} {}", login_resp.status, login_resp.message),
+        });
     }
 
     let mailbox_name = if mailbox.is_empty() { "INBOX" } else { &mailbox };
 
-    // SELECT mailbox
+    // If custom request is set (e.g. -X EXAMINE), use that instead of SELECT
+    let select_cmd = custom_request.unwrap_or("SELECT");
+
+    // SELECT (or custom command like EXAMINE) mailbox
     let tag = tags.next_tag();
-    send_command(&mut writer, &tag, &format!("SELECT {mailbox_name}")).await?;
+    send_command(&mut writer, &tag, &format!("{select_cmd} {mailbox_name}")).await?;
     let select_resp = read_response(&mut reader, &tag).await?;
     if !select_resp.is_ok() {
+        let ltag = tags.next_tag();
+        send_command(&mut writer, &ltag, "LOGOUT").await?;
         return Err(Error::Http(format!(
-            "IMAP SELECT failed: {} {}",
+            "IMAP {select_cmd} failed: {} {}",
             select_resp.status, select_resp.message
         )));
     }
 
     let tag = tags.next_tag();
-    let body = if let Some(uid_num) = uid {
+    let body = if let Some(uid) = params.uid {
         // FETCH specific message by UID
-        send_command(&mut writer, &tag, &format!("UID FETCH {uid_num} BODY[]")).await?;
+        let section = params.section.as_deref().unwrap_or("BODY[]");
+        send_command(&mut writer, &tag, &format!("UID FETCH {uid} {section}")).await?;
+        let fetch_resp = read_response(&mut reader, &tag).await?;
+        if !fetch_resp.is_ok() {
+            return Err(Error::Http(format!(
+                "IMAP FETCH failed: {} {}",
+                fetch_resp.status, fetch_resp.message
+            )));
+        }
+        fetch_resp.data.join("\r\n").into_bytes()
+    } else if let Some(index) = params.mailindex {
+        // FETCH by message number (MAILINDEX)
+        let section = params.section.as_deref().unwrap_or("BODY[]");
+        send_command(&mut writer, &tag, &format!("FETCH {index} {section}")).await?;
         let fetch_resp = read_response(&mut reader, &tag).await?;
         if !fetch_resp.is_ok() {
             return Err(Error::Http(format!(
@@ -200,7 +246,7 @@ pub async fn fetch(url: &crate::url::Url) -> Result<Response, Error> {
         }
         fetch_resp.data.join("\r\n").into_bytes()
     } else {
-        // LIST messages in mailbox
+        // No specific message - just do a search or list
         send_command(&mut writer, &tag, "FETCH 1:* (FLAGS INTERNALDATE ENVELOPE)").await?;
         let fetch_resp = read_response(&mut reader, &tag).await?;
         fetch_resp.data.join("\r\n").into_bytes()
@@ -209,6 +255,7 @@ pub async fn fetch(url: &crate::url::Url) -> Result<Response, Error> {
     // LOGOUT
     let tag = tags.next_tag();
     send_command(&mut writer, &tag, "LOGOUT").await?;
+    let _ = read_response(&mut reader, &tag).await;
 
     let mut headers = std::collections::HashMap::new();
     let _old = headers.insert("content-length".to_string(), body.len().to_string());
@@ -216,23 +263,58 @@ pub async fn fetch(url: &crate::url::Url) -> Result<Response, Error> {
     Ok(Response::new(200, headers, body, url.as_str().to_string()))
 }
 
-/// Parse an IMAP path into mailbox name and optional UID.
+/// Quote an IMAP string value, escaping backslashes and double quotes.
+fn imap_quote(s: &str) -> String {
+    // If the string contains special characters, quote it
+    if s.contains('"') || s.contains('\\') || s.contains(' ') || s.contains('{') {
+        let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
+        format!("\"{escaped}\"")
+    } else {
+        s.to_string()
+    }
+}
+
+/// Parsed IMAP URL parameters.
+#[derive(Debug, Default)]
+struct ImapParams {
+    /// UID for UID FETCH.
+    uid: Option<u32>,
+    /// MAILINDEX for FETCH by message number.
+    mailindex: Option<u32>,
+    /// SECTION override (e.g., `BODY[TEXT]`).
+    section: Option<String>,
+}
+
+/// Parse an IMAP path into mailbox name and parameters.
 ///
 /// Examples:
-/// - `/INBOX` → (`"INBOX"`, `None`)
-/// - `/INBOX/;UID=123` → (`"INBOX"`, `Some(123)`)
-/// - `/` → (`""`, `None`)
-fn parse_imap_path(path: &str) -> (String, Option<u32>) {
+/// - `/INBOX` → (`"INBOX"`, default params)
+/// - `/INBOX/;UID=123` → (`"INBOX"`, uid=123)
+/// - `/INBOX/;MAILINDEX=1` → (`"INBOX"`, mailindex=1)
+/// - `/INBOX/;UID=1;SECTION=BODY[TEXT]` → with section
+/// - `/` → (`""`, default params)
+fn parse_imap_path(path: &str) -> (String, ImapParams) {
     let path = path.trim_start_matches('/');
+    let mut params = ImapParams::default();
 
-    if let Some((mailbox, params)) = path.split_once("/;") {
-        let uid = params
-            .strip_prefix("UID=")
-            .or_else(|| params.strip_prefix("uid="))
-            .and_then(|s| s.parse().ok());
-        (mailbox.to_string(), uid)
+    if let Some((mailbox, param_str)) = path.split_once("/;") {
+        // Parse semicolon-separated parameters
+        for param in param_str.split(';') {
+            if let Some(val) = param.strip_prefix("UID=").or_else(|| param.strip_prefix("uid=")) {
+                params.uid = val.parse().ok();
+            } else if let Some(val) =
+                param.strip_prefix("MAILINDEX=").or_else(|| param.strip_prefix("mailindex="))
+            {
+                params.mailindex = val.parse().ok();
+            } else if let Some(val) =
+                param.strip_prefix("SECTION=").or_else(|| param.strip_prefix("section="))
+            {
+                params.section = Some(val.to_string());
+            }
+        }
+        (mailbox.to_string(), params)
     } else {
-        (path.to_string(), None)
+        (path.to_string(), params)
     }
 }
 
@@ -243,23 +325,31 @@ mod tests {
 
     #[test]
     fn parse_imap_path_inbox() {
-        let (mailbox, uid) = parse_imap_path("/INBOX");
+        let (mailbox, params) = parse_imap_path("/INBOX");
         assert_eq!(mailbox, "INBOX");
-        assert!(uid.is_none());
+        assert!(params.uid.is_none());
+        assert!(params.mailindex.is_none());
     }
 
     #[test]
     fn parse_imap_path_with_uid() {
-        let (mailbox, uid) = parse_imap_path("/INBOX/;UID=42");
+        let (mailbox, params) = parse_imap_path("/INBOX/;UID=42");
         assert_eq!(mailbox, "INBOX");
-        assert_eq!(uid, Some(42));
+        assert_eq!(params.uid, Some(42));
+    }
+
+    #[test]
+    fn parse_imap_path_with_mailindex() {
+        let (mailbox, params) = parse_imap_path("/INBOX/;MAILINDEX=1");
+        assert_eq!(mailbox, "INBOX");
+        assert_eq!(params.mailindex, Some(1));
     }
 
     #[test]
     fn parse_imap_path_root() {
-        let (mailbox, uid) = parse_imap_path("/");
+        let (mailbox, params) = parse_imap_path("/");
         assert_eq!(mailbox, "");
-        assert!(uid.is_none());
+        assert!(params.uid.is_none());
     }
 
     #[test]
