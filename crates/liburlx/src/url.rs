@@ -31,7 +31,13 @@ impl Url {
         let input = Self::maybe_add_scheme(input);
 
         match url::Url::parse(&input) {
-            Ok(inner) => Ok(Self { inner, override_host: None, raw_input: Some(input.clone()) }),
+            Ok(inner) => {
+                // Reject hostnames > 255 chars (curl returns CURLE_URL_MALFORMAT: test 399)
+                if inner.host_str().is_some_and(|h| h.len() > 255) {
+                    return Err(Error::UrlParse("hostname too long".to_string()));
+                }
+                Ok(Self { inner, override_host: None, raw_input: Some(input.clone()) })
+            }
             Err(e) => {
                 // The `url` crate rejects hostnames like "test.80" because the WHATWG URL
                 // standard treats a label ending in a number as an IPv4 address attempt.

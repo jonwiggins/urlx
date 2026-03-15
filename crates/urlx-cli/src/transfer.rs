@@ -839,7 +839,10 @@ pub fn run(args: &[String]) -> ExitCode {
 
     // -C - auto-resume: determine offset from existing output file size
     if opts.auto_resume {
-        if let Some(ref path) = opts.output_file {
+        if opts.is_upload {
+            // FTP upload with -C -: signal resume (SIZE will be sent, test 362)
+            opts.easy.resume_from(0);
+        } else if let Some(ref path) = opts.output_file {
             if let Ok(meta) = std::fs::metadata(path) {
                 let size = meta.len();
                 if size > 0 {

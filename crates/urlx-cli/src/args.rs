@@ -1560,6 +1560,7 @@ fn parse_args_options(args: &[String]) -> Result<CliOptions, u8> {
             | "--cert-status"
             | "--false-start"
             | "--compressed-ssh"
+            | "--tr-encoding"
             | "--doh-cert-status"
             | "--ftp-pasv"
             | "--styled-output"

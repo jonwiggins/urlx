@@ -1534,7 +1534,12 @@ pub async fn perform(
         let trimmed = effective_path.trim_start_matches('/');
         let trimmed = trimmed.trim_end_matches('/');
         if trimmed.is_empty() {
-            (Vec::new(), String::new())
+            // Root directory: CWD / (curl compat: tests 350, 352)
+            if config.method == FtpMethod::NoCwd {
+                (Vec::new(), String::new())
+            } else {
+                (vec!["/"], String::new())
+            }
         } else {
             let components: Vec<&str> = trimmed.split('/').collect();
             (components, String::new())
@@ -1705,9 +1710,24 @@ pub async fn perform(
             });
         }
 
+        // SIZE before upload for resume offset detection (curl compat: test 362)
+        // If SIZE fails (file doesn't exist), fall back to STOR instead of APPE
+        let mut use_appe_effective = use_appe;
+        if resume_from.is_some() || use_appe {
+            send_command(&mut session.writer, &format!("SIZE {filename}")).await?;
+            let size_resp = read_response(&mut session.reader).await?;
+            if !size_resp.is_complete() {
+                // File doesn't exist — use STOR instead of APPE
+                use_appe_effective = false;
+            }
+        }
+
         // STOR or APPE
-        let stor_cmd =
-            if use_appe { format!("APPE {filename}") } else { format!("STOR {filename}") };
+        let stor_cmd = if use_appe_effective {
+            format!("APPE {filename}")
+        } else {
+            format!("STOR {filename}")
+        };
         send_command(&mut session.writer, &stor_cmd).await?;
         let stor_resp = read_response(&mut session.reader).await?;
         if !stor_resp.is_preliminary() && !stor_resp.is_complete() {
@@ -1793,9 +1813,19 @@ pub async fn perform(
             });
         }
 
-        // LIST or NLST
-        let list_cmd = if config.list_only { "NLST" } else { "LIST" };
-        send_command(&mut session.writer, list_cmd).await?;
+        // LIST or NLST — for NoCwd, include path in the command (test 351)
+        let list_base = if config.list_only { "NLST" } else { "LIST" };
+        let list_cmd = if config.method == FtpMethod::NoCwd {
+            let path = effective_path.trim_end_matches('/');
+            if path.is_empty() {
+                format!("{list_base} /")
+            } else {
+                format!("{list_base} {path}")
+            }
+        } else {
+            list_base.to_string()
+        };
+        send_command(&mut session.writer, &list_cmd).await?;
         let list_resp = read_response(&mut session.reader).await?;
         if !list_resp.is_preliminary() && !list_resp.is_complete() {
             let _ = session.quit().await;
