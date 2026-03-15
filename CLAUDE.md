@@ -15,7 +15,7 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 ## Current Status
 
 **Version:** v0.1.0 published (crates.io + GitHub Releases + Homebrew)
-**curl test suite:** 246 tests passing (tests 1-500 range; 246/344 run, 71% pass rate)
+**curl test suite:** 260 tests passing (tests 1-700 range; 260/358 run, 72% pass rate)
 **Rust test count:** ~2,596
 **Blockers:** None — infrastructure is live
 
@@ -107,24 +107,21 @@ Document every skip with a reason. Skips without rationale are not allowed.
 
 ---
 
-## Active Batch: HTTPS / Proxy / POST (tests 300-500)
+## Active Batch: Cookies / HSTS / HTTP misc (tests 700-800)
 
-**Status:** 55/141 passing — remaining failures mostly HTTPS cert handling, proxy Digest/NTLM, POST edge cases
-**Prerequisite:** Tests 1-300 pass (191/195 run)
+**Status:** Starting — tests 1-700 covered (260/358 pass)
+**Prerequisite:** Tests 1-700 pass (260/358 run)
 
-### Remaining failures in 300-500
+### Remaining known failures in 550-700
 
-- **HTTPS/TLS** (300-350): ~20 failures — certificate verification, client certs, SNI, pinning
-- **HTTP proxy** (350-450): ~30 failures — proxy Digest/NTLM auth, CONNECT variations, SOCKS
-- **POST/multipart** (450-500): ~15 failures — chunked POST, expect-100, form upload edge cases
-- **Scattered** (131-199): 10 remaining — FTP PORT mode, proxy auth, 100-Continue
+- **SFTP/SCP** (600-665): ~40 failures — SSH server test infrastructure needed
+- **SMTP/IMAP** (646-649): ~4 failures — multipart MIME with mail protocols
+- **FTP connection reuse** (698): FTP multi-URL connection pooling needed
 
 ### Batch Queue
 
 | Batch | Tests | Category | Notes |
 |-------|-------|----------|-------|
-| POST | 500-550 | POST variants | Multipart, chunked POST, expect-100 |
-| AUTH | 600-650 | Authentication | Basic, Digest, NTLM, Negotiate |
 | COOKIE | 700-750 | Cookies | Jar files, domain matching, expiry |
 | SSH | 800-850 | SSH/SFTP/SCP | Key auth, known_hosts, transfers |
 | MAIL | 900-950 | SMTP/IMAP/POP3 | Email protocols |
@@ -155,6 +152,9 @@ All 31 tests pass. Complete FTP protocol rewrite: USER/PASS/PWD/CWD/EPSV/TYPE/LI
 
 ### FILE / HTTPS / PROXY (tests 200-500) — PARTIAL
 62/149 pass (additional tests beyond previously passing). Fixed: file:// read/write/resume, decompression preserving raw_headers, null byte detection, chunked premature close, bare-LF chunked, --json @file, --etag-save/compare, --dump-header validation, --max-filesize Content-Length, --fail-with-body interaction, URL credential extraction for HTTP.
+
+### HTTP-6 / NETRC / MISC (tests 550-700) — PARTIAL
+14/63 pass (tests 500-550 are all libtests/skipped). Fixed: chunked transfer with mixed \r\n/\n line endings, netrc quoted password parsing with escape sequences, --remote-name-all/--no-remote-name, --next exit code, -O trailing slash defaults to "curl_response", --output-dir with -O, --create-dirs for --etag-save, SOCKS4 proxy Connection header, redirect query string space encoding via proxy, multipart Content-Type boundary merging, FTP 332 ACCT response, URL credentials in multi-URL mode. Remaining: SFTP/SCP tests (600-665, need SSH server), FTP connection reuse (698).
 
 ---
 
