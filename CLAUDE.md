@@ -15,7 +15,7 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 ## Current Status
 
 **Version:** v0.1.0 published (crates.io + GitHub Releases + Homebrew)
-**curl test suite:** 128/128 passing (tests 1-130, excluding test 79 FTP-over-proxy hang, test 96 TrackMemory skip)
+**curl test suite:** 246 tests passing (tests 1-500 range; 246/344 run, 71% pass rate)
 **Rust test count:** ~2,596
 **Blockers:** None — infrastructure is live
 
@@ -107,18 +107,22 @@ Document every skip with a reason. Skips without rationale are not allowed.
 
 ---
 
-## Active Batch: HTTP-5 / FTP-2 (tests 131-199)
+## Active Batch: HTTPS / Proxy / POST (tests 300-500)
 
-**Status:** 28/67 passing — in progress
-**Prerequisite:** Tests 1-130 pass (128/128)
+**Status:** 55/141 passing — remaining failures mostly HTTPS cert handling, proxy Digest/NTLM, POST edge cases
+**Prerequisite:** Tests 1-300 pass (191/195 run)
+
+### Remaining failures in 300-500
+
+- **HTTPS/TLS** (300-350): ~20 failures — certificate verification, client certs, SNI, pinning
+- **HTTP proxy** (350-450): ~30 failures — proxy Digest/NTLM auth, CONNECT variations, SOCKS
+- **POST/multipart** (450-500): ~15 failures — chunked POST, expect-100, form upload edge cases
+- **Scattered** (131-199): 10 remaining — FTP PORT mode, proxy auth, 100-Continue
 
 ### Batch Queue
 
 | Batch | Tests | Category | Notes |
 |-------|-------|----------|-------|
-| FILE | 200-250 | file:// | Local file transfers |
-| HTTPS | 300-350 | HTTPS/TLS | Certificate handling, SNI, client certs |
-| PROXY | 400-450 | Proxies | HTTP proxy, CONNECT tunnel, SOCKS |
 | POST | 500-550 | POST variants | Multipart, chunked POST, expect-100 |
 | AUTH | 600-650 | Authentication | Basic, Digest, NTLM, Negotiate |
 | COOKIE | 700-750 | Cookies | Jar files, domain matching, expiry |
@@ -145,6 +149,12 @@ All 39 tests pass. Fixed: Digest auth, NTLM, --anyauth, HTTP/0.9, http_proxy env
 
 ### FTP-1 (tests 100-130) — COMPLETE
 All 31 tests pass. Complete FTP protocol rewrite: USER/PASS/PWD/CWD/EPSV/TYPE/LIST|RETR|STOR|APPE/QUIT, active mode, resume, quote commands, --crlf, .netrc.
+
+### HTTP-5 / FTP-2 (tests 131-199) — COMPLETE
+57/67 pass. Fixed: FTP credentials (URL > -u > netrc), --ftp-create-dirs, byte ranges, MDTM time conditions, -I head mode, --anyauth pre-auth suppression, Digest stale=true, -F type= parsing, --retry, inline cookies, negative Content-Length, Range across redirects.
+
+### FILE / HTTPS / PROXY (tests 200-500) — PARTIAL
+62/149 pass (additional tests beyond previously passing). Fixed: file:// read/write/resume, decompression preserving raw_headers, null byte detection, chunked premature close, bare-LF chunked, --json @file, --etag-save/compare, --dump-header validation, --max-filesize Content-Length, --fail-with-body interaction, URL credential extraction for HTTP.
 
 ---
 
