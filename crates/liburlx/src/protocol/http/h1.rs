@@ -188,6 +188,8 @@ where
     }
 
     // Emit deferred Content-Type or auto-add it for POST (curl compat: test 669).
+    // Note: for custom methods with -d (form data), Content-Type is added by the
+    // Easy handle layer (see easy.rs form_data handling), not here.
     if let Some((name, value)) = deferred_content_type {
         let _ = write!(req, "{name}: {value}\r\n");
     } else if method.eq_ignore_ascii_case("POST") && body.is_some() {
@@ -330,10 +332,47 @@ where
         ph = parse_headers(&header_bytes)?;
     }
 
-    // Reject negative Content-Length (curl returns CURLE_WEIRD_SERVER_REPLY = 8).
+    // Validate Content-Length header (curl returns CURLE_WEIRD_SERVER_REPLY = 8).
     // Return a response with body_error so the caller can detect it and return
     // exit code 8 while still outputting the partial headers.
-    if let Some(cl) = ph.headers.get("content-length") {
+    if let Some(cl) = ph.headers.get("content-length").cloned() {
+        // Reject trailing non-numeric characters (curl compat: test 768)
+        let trimmed = cl.trim().to_string();
+        if !trimmed.is_empty() && !trimmed.starts_with('-') && trimmed.parse::<u64>().is_err() {
+            // Check if it's a comma-separated list (valid per HTTP spec: test 770)
+            let parts: Vec<&str> = trimmed.split(',').map(str::trim).collect();
+            let parsed_values: Vec<Option<u64>> =
+                parts.iter().map(|p| p.parse::<u64>().ok()).collect();
+            if parsed_values.iter().any(Option::is_none) {
+                // Non-numeric content-length value
+                let mut resp =
+                    Response::new(ph.status, ph.headers.clone(), Vec::new(), url.to_string());
+                resp.set_headers_ordered(ph.headers_ordered);
+                resp.set_status_reason(ph.reason);
+                resp.set_uses_crlf(ph.uses_crlf);
+                resp.set_http_version(ph.version);
+                resp.set_raw_headers(header_bytes.clone());
+                resp.set_body_error(Some("invalid_content_length".to_string()));
+                return Ok((resp, true));
+            }
+            // All values must be equal (test 771: different values = error)
+            let first = parsed_values[0];
+            if !parsed_values.iter().all(|v| v == &first) {
+                let mut resp =
+                    Response::new(ph.status, ph.headers.clone(), Vec::new(), url.to_string());
+                resp.set_headers_ordered(ph.headers_ordered);
+                resp.set_status_reason(ph.reason);
+                resp.set_uses_crlf(ph.uses_crlf);
+                resp.set_http_version(ph.version);
+                resp.set_raw_headers(header_bytes.clone());
+                resp.set_body_error(Some("conflicting_content_length".to_string()));
+                return Ok((resp, true));
+            }
+            // Replace comma-separated value with single value for downstream parsing
+            if let Some(val) = first {
+                let _ = ph.headers.insert("content-length".to_string(), val.to_string());
+            }
+        }
         if cl.starts_with('-') {
             // Remove Content-Length and everything after from ordered headers
             let mut trunc_ordered = Vec::new();
@@ -371,6 +410,21 @@ where
             resp.set_http_version(ph.version);
             resp.set_raw_headers(trunc_raw);
             resp.set_body_error(Some("negative_content_length".to_string()));
+            return Ok((resp, true));
+        }
+    }
+
+    // Reject duplicate Location headers (curl compat: test 772)
+    if let Some(loc) = ph.headers.get("location") {
+        if loc.contains('\x00') {
+            let mut resp =
+                Response::new(ph.status, ph.headers.clone(), Vec::new(), url.to_string());
+            resp.set_headers_ordered(ph.headers_ordered);
+            resp.set_status_reason(ph.reason);
+            resp.set_uses_crlf(ph.uses_crlf);
+            resp.set_http_version(ph.version);
+            resp.set_raw_headers(header_bytes.clone());
+            resp.set_body_error(Some("duplicate_location".to_string()));
             return Ok((resp, true));
         }
     }
@@ -738,6 +792,24 @@ fn parse_headers(data: &[u8]) -> Result<ParsedHeaders, Error> {
                     existing.push_str(&value);
                 })
                 .or_insert(value);
+        } else if name == "content-length" {
+            // Track duplicate Content-Length: if values differ, mark as conflicting
+            let _entry = headers
+                .entry(name)
+                .and_modify(|existing: &mut String| {
+                    if existing.trim() != value.trim() {
+                        // Mark conflicting by appending with comma
+                        existing.push(',');
+                        existing.push_str(&value);
+                    }
+                })
+                .or_insert(value);
+        } else if name == "location" && headers.contains_key("location") {
+            // Duplicate Location headers: mark as error (curl compat: test 772)
+            let _entry = headers.entry(name).and_modify(|existing: &mut String| {
+                existing.push('\x00'); // sentinel for duplicate detection
+                existing.push_str(&value);
+            });
         } else {
             let _old = headers.insert(name, value);
         }

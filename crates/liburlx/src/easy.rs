@@ -2086,6 +2086,19 @@ impl Easy {
             effective_method = self.method.clone().unwrap_or_else(|| "GET".to_string());
         }
 
+        // Auto-add Content-Type for form data with custom method (curl compat: test 796)
+        // POST gets Content-Type from h1.rs; custom methods with -d need it here.
+        if self.form_data
+            && effective_body.is_some()
+            && !effective_method.eq_ignore_ascii_case("POST")
+            && !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+        {
+            headers.push((
+                "Content-Type".to_string(),
+                "application/x-www-form-urlencoded".to_string(),
+            ));
+        }
+
         // Add Range header if set
         if let Some(ref range) = self.range {
             if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("range")) {
@@ -2429,6 +2442,7 @@ async fn perform_transfer(
     let mut current_body = body.map(<[u8]>::to_vec);
     let mut redirects_followed: u32 = 0;
     let mut redirect_chain: Vec<Response> = Vec::new();
+    let mut body_dropped_on_redirect = false;
 
     loop {
         // Determine effective proxy for this URL
@@ -2436,6 +2450,10 @@ async fn perform_transfer(
 
         // Build headers, stripping auth on cross-origin redirects unless unrestricted
         let mut request_headers = headers.to_vec();
+        // Remove Content-Type on redirect when body was dropped (302→GET, curl compat: test 796)
+        if body_dropped_on_redirect {
+            request_headers.retain(|(k, _)| !k.eq_ignore_ascii_case("content-type"));
+        }
         if redirects_followed > 0 {
             let orig_host = original_url.host_str().unwrap_or("");
             let cur_host = current_url.host_str().unwrap_or("");
@@ -3263,13 +3281,17 @@ async fn perform_transfer(
                 // 303: change to GET unless --post303 preserves POST
                 // 301/302: change POST to GET (curl compat) unless --post301/--post302
                 let status = response.status();
+                // On 303: always change to GET (unless --post303 preserves POST)
+                // On 301/302: change to GET when body was sent (POST or custom -X with -d)
+                //   unless --post301/--post302 preserves POST
+                let has_body = current_body.is_some();
                 let should_change_to_get = (status == 303
                     && !(post303 && current_method == "POST"))
-                    || ((status == 301 && !post301 || status == 302 && !post302)
-                        && current_method == "POST");
+                    || ((status == 301 && !post301 || status == 302 && !post302) && has_body);
                 if should_change_to_get {
                     current_method = "GET".to_string();
                     current_body = None;
+                    body_dropped_on_redirect = true;
                 }
 
                 // Capture intermediate redirect response for -L --include output

@@ -1075,6 +1075,17 @@ pub fn run(args: &[String]) -> ExitCode {
 
             // --fail / --fail-with-body: exit 22 on HTTP error status codes
             if opts.fail_on_error && response.status() >= 400 && !opts.fail_with_body {
+                // Output headers (but not body) before returning error (curl compat: test 752)
+                if opts.include_headers {
+                    let _ = output_response(
+                        &response,
+                        opts.output_file.as_deref(),
+                        None,
+                        true, // include headers
+                        opts.silent,
+                        true, // headers only, suppress body
+                    );
+                }
                 if !opts.silent || opts.show_error {
                     eprintln!("urlx: (22) The requested URL returned error: {}", response.status(),);
                 }
@@ -1211,7 +1222,11 @@ pub fn run(args: &[String]) -> ExitCode {
                     }
                     return ExitCode::from(61); // CURLE_BAD_CONTENT_ENCODING
                 }
-                if body_err.contains("negative_content_length") {
+                if body_err.contains("negative_content_length")
+                    || body_err.contains("invalid_content_length")
+                    || body_err.contains("conflicting_content_length")
+                    || body_err.contains("duplicate_location")
+                {
                     if !opts.silent || opts.show_error {
                         eprintln!("urlx: (8) Weird server reply");
                     }

@@ -533,7 +533,7 @@ fn parse_args_options(args: &[String]) -> Result<CliOptions, u8> {
                 }
                 opts.easy.set_form_data(true);
             }
-            "-L" | "--location" => {
+            "-L" | "--location" | "--follow" => {
                 opts.easy.follow_redirects(true);
             }
             "--location-trusted" => {
@@ -1186,8 +1186,13 @@ fn parse_args_options(args: &[String]) -> Result<CliOptions, u8> {
                 opts.no_keepalive = true;
             }
             "-n" | "--netrc" => {
-                let home = std::env::var("HOME").unwrap_or_default();
-                opts.netrc_file = Some(format!("{home}/.netrc"));
+                // Check $NETRC env var first (curl compat: test 755)
+                if let Ok(netrc_path) = std::env::var("NETRC") {
+                    opts.netrc_file = Some(netrc_path);
+                } else {
+                    let home = std::env::var("HOME").unwrap_or_default();
+                    opts.netrc_file = Some(format!("{home}/.netrc"));
+                }
             }
             "--netrc-file" => {
                 i += 1;
