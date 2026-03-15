@@ -426,6 +426,14 @@ impl Response {
     pub fn set_body_error(&mut self, error: Option<String>) {
         self.body_error = error;
     }
+
+    /// Replace the response body bytes.
+    ///
+    /// Used for decompression and other body transformations that should
+    /// preserve all other response metadata (headers, status, `raw_headers`, etc.).
+    pub fn set_body(&mut self, body: Vec<u8>) {
+        self.body = body;
+    }
 }
 
 #[cfg(test)]

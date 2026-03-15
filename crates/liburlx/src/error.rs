@@ -70,6 +70,10 @@ pub enum Error {
     #[error("could not resolve host: {0}")]
     DnsResolve(String),
 
+    /// A file:// protocol read or write failed.
+    #[error("file read/write error: {0}")]
+    FileError(String),
+
     /// Body read failed with partial data available.
     /// The `partial_body` contains whatever was successfully decoded before
     /// the error (e.g., valid chunks before an invalid chunk size).

@@ -103,6 +103,8 @@ pub struct CliOptions {
     pub(crate) resume_check: bool,
     /// Explicit resume offset from `-C <offset>` (not `-C -`).
     pub(crate) resume_offset: Option<u64>,
+    /// Whether `-d` / `--data` was used (POST data).
+    pub(crate) has_post_data: bool,
     /// Whether `-T` upload was used (PUT).
     pub(crate) is_upload: bool,
     /// Whether `-T -` (stdin upload) was used.
@@ -442,6 +444,7 @@ fn parse_args_options(args: &[String]) -> Result<CliOptions, u8> {
         auto_resume: false,
         resume_check: false,
         resume_offset: None,
+        has_post_data: false,
         is_upload: false,
         is_stdin_upload: false,
         upload_filename: None,
@@ -481,6 +484,14 @@ fn parse_args_options(args: &[String]) -> Result<CliOptions, u8> {
             "-d" | "--data" => {
                 i += 1;
                 let val = require_arg(args, i, "-d")?;
+                // Check for -T + -d conflict (curl compat: test 378)
+                if opts.is_upload {
+                    eprintln!(
+                        "Warning: You can only select one HTTP request method! You asked for both PUT "
+                    );
+                    eprintln!("Warning: (-T, --upload-file) and POST (-d, --data).");
+                    return Err(2);
+                }
                 // Support @filename to read from file, @- for stdin
                 if let Some(path) = val.strip_prefix('@') {
                     match read_data_source(path) {
@@ -493,6 +504,7 @@ fn parse_args_options(args: &[String]) -> Result<CliOptions, u8> {
                 } else {
                     opts.easy.body(val.as_bytes());
                 }
+                opts.has_post_data = true;
                 if opts.easy.method_is_default() {
                     opts.easy.method("POST");
                 }
@@ -502,6 +514,7 @@ fn parse_args_options(args: &[String]) -> Result<CliOptions, u8> {
                 i += 1;
                 let val = require_arg(args, i, "--data-raw")?;
                 opts.easy.body(val.as_bytes());
+                opts.has_post_data = true;
                 if opts.easy.method_is_default() {
                     opts.easy.method("POST");
                 }
@@ -511,6 +524,7 @@ fn parse_args_options(args: &[String]) -> Result<CliOptions, u8> {
                 i += 1;
                 let val = require_arg(args, i, "--data-ascii")?;
                 opts.easy.body(val.as_bytes());
+                opts.has_post_data = true;
                 if opts.easy.method_is_default() {
                     opts.easy.method("POST");
                 }
@@ -661,7 +675,12 @@ fn parse_args_options(args: &[String]) -> Result<CliOptions, u8> {
             "-r" | "--range" => {
                 i += 1;
                 let val = require_arg(args, i, "-r")?;
-                opts.easy.range(val);
+                // curl appends '-' if range is just a number (e.g., "4" → "4-")
+                if val.contains('-') {
+                    opts.easy.range(val);
+                } else {
+                    opts.easy.range(&format!("{val}-"));
+                }
             }
             "-C" | "--continue-at" => {
                 i += 1;
@@ -821,6 +840,14 @@ fn parse_args_options(args: &[String]) -> Result<CliOptions, u8> {
             "-T" | "--upload-file" => {
                 i += 1;
                 let val = require_arg(args, i, "-T")?;
+                // Check for -d + -T conflict before reading file (curl compat: test 378)
+                if opts.has_post_data {
+                    eprintln!(
+                        "Warning: You can only select one HTTP request method! You asked for both PUT "
+                    );
+                    eprintln!("Warning: (-T, --upload-file) and POST (-d, --data).");
+                    return Err(2);
+                }
                 if val == "-" {
                     // Read from stdin
                     use std::io::Read;
@@ -891,6 +918,7 @@ fn parse_args_options(args: &[String]) -> Result<CliOptions, u8> {
                 } else {
                     opts.easy.body(val.as_bytes());
                 }
+                opts.has_post_data = true;
                 if opts.easy.method_is_default() {
                     opts.easy.method("POST");
                 }
@@ -900,6 +928,7 @@ fn parse_args_options(args: &[String]) -> Result<CliOptions, u8> {
                 let val = require_arg(args, i, "--data-urlencode")?;
                 let encoded = urlencoded(val);
                 opts.easy.body(encoded.as_bytes());
+                opts.has_post_data = true;
                 if opts.easy.method_is_default() {
                     opts.easy.method("POST");
                 }
@@ -1222,7 +1251,28 @@ fn parse_args_options(args: &[String]) -> Result<CliOptions, u8> {
             "--json" => {
                 i += 1;
                 let val = require_arg(args, i, "--json")?;
-                opts.easy.body(val.as_bytes());
+                // Read data from file/stdin if @-prefixed (like -d)
+                #[allow(clippy::items_after_statements)]
+                let json_data = if let Some(path) = val.strip_prefix('@') {
+                    if path == "-" {
+                        let mut buf = Vec::new();
+                        use std::io::Read;
+                        let _ = std::io::stdin().read_to_end(&mut buf);
+                        buf
+                    } else {
+                        match std::fs::read(path) {
+                            Ok(data) => data,
+                            Err(e) => {
+                                eprintln!("urlx: can't read file '{path}': {e}");
+                                return Err(1);
+                            }
+                        }
+                    }
+                } else {
+                    val.as_bytes().to_vec()
+                };
+                // Multiple --json flags: append data (curl compat: test 385)
+                opts.easy.append_body(&json_data);
                 opts.easy.header("Content-Type", "application/json");
                 opts.easy.header("Accept", "application/json");
                 if opts.easy.method_is_default() {
@@ -1611,9 +1661,14 @@ fn parse_args_options(args: &[String]) -> Result<CliOptions, u8> {
                 let _val = require_arg(args, i, &args[i - 1].clone())?;
                 // Accepted for compatibility; not implemented
             }
+            arg if arg.starts_with("--no-") => {
+                // --no- prefix used on a non-boolean option (curl returns exit code 2)
+                eprintln!("urlx: option {arg}: is unknown");
+                return Err(2);
+            }
             arg if arg.starts_with('-') => {
                 eprintln!("urlx: unknown option: {arg}");
-                return Err(1);
+                return Err(2);
             }
             url => {
                 opts.urls.push(url.to_string());

@@ -260,12 +260,28 @@ impl Url {
     }
 
     /// curl defaults to HTTP if no scheme is provided.
+    /// Known URL schemes that we recognize without `://`.
+    ///
+    /// These schemes work with single-colon syntax (e.g., `file:/path`).
+    const KNOWN_SCHEMES: &'static [&'static str] = &[
+        "file", "ftp", "ftps", "http", "https", "sftp", "scp", "dict", "tftp", "mqtt", "ws", "wss",
+        "smtp", "smtps", "imap", "imaps", "pop3", "pop3s", "telnet", "ldap", "ldaps", "gopher",
+        "gophers",
+    ];
+
     fn maybe_add_scheme(input: &str) -> String {
         if input.contains("://") {
-            input.to_string()
-        } else {
-            format!("http://{input}")
+            return input.to_string();
         }
+        // Check for scheme:<something> patterns (e.g., file:/path)
+        // Only match known URL schemes to avoid confusing hostname:port
+        if let Some(colon_pos) = input.find(':') {
+            let before_colon = &input[..colon_pos];
+            if Self::KNOWN_SCHEMES.iter().any(|s| s.eq_ignore_ascii_case(before_colon)) {
+                return input.to_string();
+            }
+        }
+        format!("http://{input}")
     }
 }
 

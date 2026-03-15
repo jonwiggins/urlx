@@ -593,12 +593,34 @@ impl Easy {
         {
             return;
         }
+        // For most headers, replace existing entry in-place to preserve ordering
+        // (curl compat: test 385 — Content-Type override must keep its position).
+        // Exception: Set-Cookie and other multi-value headers should not be replaced.
+        let lower = name.to_ascii_lowercase();
+        if lower != "set-cookie" && lower != "cookie" {
+            if let Some(pos) = self.headers.iter().position(|(k, _)| k.eq_ignore_ascii_case(name)) {
+                self.headers[pos] = (name.to_string(), value.to_string());
+                return;
+            }
+        }
         self.headers.push((name.to_string(), value.to_string()));
     }
 
     /// Set the request body.
     pub fn body(&mut self, data: &[u8]) {
         self.body = Some(data.to_vec());
+    }
+
+    /// Append data to the request body (used for multiple --json flags).
+    ///
+    /// If no body exists yet, this creates a new one. Otherwise, it appends
+    /// to the existing body.
+    pub fn append_body(&mut self, data: &[u8]) {
+        if let Some(ref mut existing) = self.body {
+            existing.extend_from_slice(data);
+        } else {
+            self.body = Some(data.to_vec());
+        }
     }
 
     /// Take the request body, removing it from the easy handle.
@@ -647,6 +669,13 @@ impl Easy {
     pub fn has_header(&self, name: &str) -> bool {
         self.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case(name))
             || self.removed_headers.iter().any(|k| k.eq_ignore_ascii_case(name))
+    }
+
+    /// Returns true if an Authorization header has been set.
+    #[must_use]
+    pub fn has_auth_header(&self) -> bool {
+        self.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("Authorization"))
+            || self.auth_credentials.is_some()
     }
 
     /// Set the expected upload size in bytes.
@@ -848,10 +877,10 @@ impl Easy {
 
         // Extract userinfo credentials from proxy URL (e.g., http://user:pass@host:port/)
         if let Ok(parsed) = url::Url::parse(&normalized) {
-            let user = parsed.username();
-            let pass = parsed.password().unwrap_or("");
+            let user = percent_decode_str(parsed.username());
+            let pass = parsed.password().map_or_else(String::new, percent_decode_str);
             if !user.is_empty() {
-                self.proxy_auth(user, pass);
+                self.proxy_auth(&user, &pass);
             }
         }
         self.proxy = Some(Url::parse(&normalized)?);
@@ -3333,7 +3362,22 @@ async fn do_single_request(
 ) -> Result<Response, Error> {
     // Handle non-HTTP schemes directly
     match url.scheme() {
-        "file" => return crate::protocol::file::read_file(url),
+        "file" => {
+            if method == "PUT" {
+                let upload_data = body.unwrap_or(&[]);
+                return crate::protocol::file::write_file(url, upload_data);
+            }
+            // Extract resume offset from Range header if present (e.g. "bytes=10-")
+            let resume_offset = headers.iter().find_map(|(k, v)| {
+                if k.eq_ignore_ascii_case("range") {
+                    v.strip_prefix("bytes=")
+                        .and_then(|r| r.strip_suffix('-').and_then(|n| n.parse::<u64>().ok()))
+                } else {
+                    None
+                }
+            });
+            return crate::protocol::file::read_file(url, resume_offset);
+        }
         "tftp" => {
             return crate::protocol::tftp::download(url, tftp_blksize, tftp_no_options).await;
         }
@@ -3501,7 +3545,7 @@ async fn do_single_request(
                         if !forbid_reuse {
                             h2_pool.put(&host, port, h2_client);
                         }
-                        return maybe_decompress(resp, accept_encoding);
+                        return Ok(maybe_decompress(resp, accept_encoding));
                     }
                     Err(_) => {
                         if verbose {
@@ -3551,7 +3595,7 @@ async fn do_single_request(
                     if can_reuse && !forbid_reuse {
                         pool.put(&host, port, is_tls, stream);
                     }
-                    return maybe_decompress(response, accept_encoding);
+                    return Ok(maybe_decompress(response, accept_encoding));
                 }
                 Err(_) => {
                     // Pooled connection was stale — fall through to create new one
@@ -3663,7 +3707,7 @@ async fn do_single_request(
         .await?;
         let time_starttransfer = request_start.elapsed();
 
-        let mut resp = maybe_decompress(resp, accept_encoding)?;
+        let mut resp = maybe_decompress(resp, accept_encoding);
         let mut info = resp.transfer_info().clone();
         info.time_namelookup = time_namelookup;
         info.time_connect = time_connect;
@@ -3858,7 +3902,7 @@ async fn do_single_request(
                     )
                     .await?;
                     let time_starttransfer = request_start.elapsed();
-                    let mut resp = maybe_decompress(resp, accept_encoding)?;
+                    let mut resp = maybe_decompress(resp, accept_encoding);
                     let mut info = resp.transfer_info().clone();
                     info.time_namelookup = time_namelookup;
                     info.time_connect = time_connect;
@@ -3939,7 +3983,7 @@ async fn do_single_request(
                     .await?;
                     let time_starttransfer = request_start.elapsed();
 
-                    let mut resp = maybe_decompress(resp, accept_encoding)?;
+                    let mut resp = maybe_decompress(resp, accept_encoding);
                     let mut info = resp.transfer_info().clone();
                     info.time_namelookup = time_namelookup;
                     info.time_connect = time_connect;
@@ -4009,7 +4053,7 @@ async fn do_single_request(
                         h2_pool.put(&host, port, h2_client);
                     }
                     let time_starttransfer = request_start.elapsed();
-                    let mut resp = maybe_decompress(resp, accept_encoding)?;
+                    let mut resp = maybe_decompress(resp, accept_encoding);
                     let mut info = resp.transfer_info().clone();
                     info.time_namelookup = time_namelookup;
                     info.time_connect = time_connect;
@@ -4207,26 +4251,59 @@ async fn do_single_request(
         scheme => return Err(Error::UnsupportedProtocol(scheme.to_string())),
     };
 
-    maybe_decompress(response, accept_encoding)
+    Ok(maybe_decompress(response, accept_encoding))
 }
 
 /// Decompress response body if Content-Encoding is present and decompression was requested.
-fn maybe_decompress(response: Response, accept_encoding: bool) -> Result<Response, Error> {
+/// Decode percent-encoded characters in a string.
+fn percent_decode_str(input: &str) -> String {
+    let mut result = Vec::with_capacity(input.len());
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = bytes[i + 1];
+            let lo = bytes[i + 2];
+            if let (Some(h), Some(l)) = (hex_val(hi), hex_val(lo)) {
+                result.push(h << 4 | l);
+                i += 3;
+                continue;
+            }
+        }
+        result.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&result).to_string()
+}
+
+/// Convert a hex ASCII byte to its numeric value.
+const fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn maybe_decompress(mut response: Response, accept_encoding: bool) -> Response {
     if accept_encoding {
         if let Some(encoding) = response.header("content-encoding") {
-            if encoding != "identity" {
-                let decompressed =
-                    crate::protocol::http::decompress::decompress(response.body(), encoding)?;
-                return Ok(Response::new(
-                    response.status(),
-                    response.headers().clone(),
-                    decompressed,
-                    response.effective_url().to_string(),
-                ));
+            if encoding != "identity" && !encoding.eq_ignore_ascii_case("none") {
+                if let Ok(decompressed) =
+                    crate::protocol::http::decompress::decompress(response.body(), encoding)
+                {
+                    response.set_body(decompressed);
+                } else {
+                    // Decompression failed: preserve headers, clear body,
+                    // set body_error for exit code handling (curl compat).
+                    response.set_body(Vec::new());
+                    response.set_body_error(Some("bad_content_encoding".to_string()));
+                }
             }
         }
     }
-    Ok(response)
+    response
 }
 
 /// Establish an HTTP CONNECT tunnel through a proxy.

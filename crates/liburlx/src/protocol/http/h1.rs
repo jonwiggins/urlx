@@ -664,6 +664,19 @@ struct ParsedHeaders {
 
 /// Parse raw header bytes into structured response headers.
 fn parse_headers(data: &[u8]) -> Result<ParsedHeaders, Error> {
+    // Find the end of headers (double CRLF or double LF)
+    let header_end = data
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|p| p + 4)
+        .or_else(|| data.windows(2).position(|w| w == b"\n\n").map(|p| p + 2))
+        .unwrap_or(data.len());
+
+    // Reject headers containing null bytes (curl compat: CURLE_WEIRD_SERVER_REPLY)
+    if data[..header_end].contains(&0) {
+        return Err(Error::Http("Weird server reply: binary zero in headers".to_string()));
+    }
+
     let mut headers_buf = [httparse::EMPTY_HEADER; 64];
     let mut parsed = httparse::Response::new(&mut headers_buf);
 
@@ -1009,12 +1022,17 @@ where
                 Err(e) => return Err(Error::Http(format!("chunked read failed: {e}"))),
             };
             if n == 0 {
-                return Ok((decoded, HashMap::new()));
+                // Connection closed before seeing the terminal 0-chunk.
+                // This is a premature close — return partial body error.
+                return Err(Error::PartialBody {
+                    message: "transfer closed with outstanding read data remaining".to_string(),
+                    partial_body: decoded,
+                });
             }
             buf.extend_from_slice(&tmp[..n]);
         }
 
-        let line_end = find_crlf(&buf, pos)
+        let (line_end, eol_len) = find_line_ending(&buf, pos)
             .ok_or_else(|| Error::Http("incomplete chunked encoding".into()))?;
 
         let size_str =
@@ -1028,7 +1046,7 @@ where
             partial_body: decoded.clone(),
         })?;
 
-        pos = line_end + 2;
+        pos = line_end + eol_len;
 
         if chunk_size == 0 {
             // Read trailers + final CRLF after last chunk
@@ -1050,7 +1068,9 @@ where
                     }
                     buf.extend_from_slice(&tmp[..n]);
                 }
-                let Some(line_end) = find_crlf(&buf, pos) else { break };
+                let Some((line_end, trailer_eol_len)) = find_line_ending(&buf, pos) else {
+                    break;
+                };
                 if line_end == pos {
                     // Empty line — end of trailers
                     break;
@@ -1062,14 +1082,15 @@ where
                             trailers.insert(name.trim().to_lowercase(), value.trim().to_string());
                     }
                 }
-                pos = line_end + 2;
+                pos = line_end + trailer_eol_len;
             }
             return Ok((decoded, trailers));
         }
 
-        // Ensure we have the full chunk data + trailing \r\n
-        let needed = pos + chunk_size + 2;
-        while buf.len() < needed {
+        // Ensure we have the full chunk data + trailing line ending (\r\n or \n)
+        // We need at least chunk_size + 1 bytes (for bare \n) to safely check
+        let needed_min = pos + chunk_size + 1;
+        while buf.len() < needed_min {
             let mut tmp = [0u8; 4096];
             let n = match stream.read(&mut tmp).await {
                 Ok(n) => n,
@@ -1077,16 +1098,26 @@ where
                 Err(e) => return Err(Error::Http(format!("chunk data read failed: {e}"))),
             };
             if n == 0 {
-                // Partial chunk — take what we have
+                // Partial chunk — take what we have and signal error
                 let available = buf.len().saturating_sub(pos).min(chunk_size);
                 decoded.extend_from_slice(&buf[pos..pos + available]);
-                return Ok((decoded, HashMap::new()));
+                return Err(Error::PartialBody {
+                    message: "transfer closed with outstanding read data remaining".to_string(),
+                    partial_body: decoded,
+                });
             }
             buf.extend_from_slice(&tmp[..n]);
         }
 
         decoded.extend_from_slice(&buf[pos..pos + chunk_size]);
-        pos += chunk_size + 2;
+        pos += chunk_size;
+        // Skip trailing line ending after chunk data (\r\n or bare \n)
+        if pos < buf.len() && buf[pos] == b'\r' {
+            pos += 1;
+        }
+        if pos < buf.len() && buf[pos] == b'\n' {
+            pos += 1;
+        }
 
         // Apply rate limiting after each decoded chunk
         if limiter.is_active() {
@@ -1141,11 +1172,28 @@ fn decode_chunked(data: &[u8]) -> Result<Vec<u8>, Error> {
 }
 
 /// Find the position of `\r\n` starting at `offset`.
-fn find_crlf(data: &[u8], offset: usize) -> Option<usize> {
-    if data.len() < offset + 2 {
+/// Find the position of a line ending (\r\n or bare \n) starting from `offset`.
+///
+/// Returns the position of the start of the line ending and the length of the
+/// line ending (2 for CRLF, 1 for bare LF). Returns `None` if no line ending
+/// is found.
+fn find_line_ending(data: &[u8], offset: usize) -> Option<(usize, usize)> {
+    if data.len() <= offset {
         return None;
     }
-    data[offset..].windows(2).position(|w| w == b"\r\n").map(|p| offset + p)
+    // Check for \r\n first, then bare \n
+    if let Some(p) = data[offset..].windows(2).position(|w| w == b"\r\n") {
+        return Some((offset + p, 2));
+    }
+    // Also accept bare \n (lenient parsing, curl compat)
+    data[offset..].iter().position(|&b| b == b'\n').map(|p| (offset + p, 1))
+}
+
+/// Find the position of a CRLF or bare LF starting from `offset`.
+///
+/// Wrapper for backward compatibility. Returns the position of the line ending start.
+fn find_crlf(data: &[u8], offset: usize) -> Option<usize> {
+    find_line_ending(data, offset).map(|(pos, _)| pos)
 }
 
 /// Parse a raw HTTP/1.1 response into a `Response`.

@@ -10,12 +10,13 @@ use crate::protocol::http::response::Response;
 /// Read a local file and return it as a response.
 ///
 /// The URL path is used as the filesystem path. Percent-encoded characters
-/// are decoded (e.g., `%20` → space).
+/// are decoded (e.g., `%20` → space). If `resume_offset` is specified, the
+/// file is read starting from that byte offset.
 ///
 /// # Errors
 ///
-/// Returns [`Error::Http`] if the file cannot be read.
-pub fn read_file(url: &crate::url::Url) -> Result<Response, Error> {
+/// Returns [`Error::FileError`] if the file cannot be read.
+pub fn read_file(url: &crate::url::Url, resume_offset: Option<u64>) -> Result<Response, Error> {
     let path = url.path();
 
     // Decode percent-encoded characters in the path
@@ -27,12 +28,46 @@ pub fn read_file(url: &crate::url::Url) -> Result<Response, Error> {
     let decoded_path = strip_windows_leading_slash(&decoded_path);
 
     let data = std::fs::read(&decoded_path)
-        .map_err(|e| Error::Http(format!("file read failed: {decoded_path}: {e}")))?;
+        .map_err(|e| Error::FileError(format!("{decoded_path}: {e}")))?;
+
+    // Apply resume offset (skip first N bytes)
+    let data = if let Some(offset) = resume_offset {
+        #[allow(clippy::cast_possible_truncation)]
+        let offset = offset as usize;
+        if offset < data.len() {
+            data[offset..].to_vec()
+        } else {
+            Vec::new()
+        }
+    } else {
+        data
+    };
 
     let mut headers = HashMap::new();
     let _old = headers.insert("content-length".to_string(), data.len().to_string());
 
     Ok(Response::new(200, headers, data, url.as_str().to_string()))
+}
+
+/// Write data to a local file (file:// upload / PUT).
+///
+/// The URL path is used as the filesystem path. Percent-encoded characters
+/// are decoded.
+///
+/// # Errors
+///
+/// Returns [`Error::FileError`] if the file cannot be written.
+pub fn write_file(url: &crate::url::Url, data: &[u8]) -> Result<Response, Error> {
+    let path = url.path();
+    let decoded_path = percent_decode(path);
+
+    #[cfg(windows)]
+    let decoded_path = strip_windows_leading_slash(&decoded_path);
+
+    std::fs::write(&decoded_path, data).map_err(Error::Io)?;
+
+    let headers = HashMap::new();
+    Ok(Response::new(200, headers, Vec::new(), url.as_str().to_string()))
 }
 
 /// Strip the leading slash from Windows drive-letter paths.
@@ -110,6 +145,6 @@ mod tests {
     #[test]
     fn read_file_nonexistent() {
         let url = crate::url::Url::parse("file:///nonexistent/path").unwrap();
-        assert!(read_file(&url).is_err());
+        assert!(read_file(&url, None).is_err());
     }
 }

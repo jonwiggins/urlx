@@ -311,6 +311,23 @@ fn extract_url_username(url: &str) -> Option<String> {
     }
 }
 
+/// Extract the username from a URL, including empty usernames.
+///
+/// Unlike [`extract_url_username`], this returns `Some("")` for `http://:pass@host/`.
+/// Used for HTTP auth where empty username is valid (curl compat: test 367).
+#[allow(clippy::option_if_let_else)]
+fn extract_url_username_raw(url: &str) -> Option<String> {
+    let without_scheme = url.find("://").map_or(url, |pos| &url[pos + 3..]);
+    let without_path = without_scheme.split('/').next().unwrap_or(without_scheme);
+    if let Some(at_pos) = without_path.rfind('@') {
+        let userinfo = &without_path[..at_pos];
+        let user = userinfo.split(':').next().unwrap_or(userinfo);
+        Some(url_decode(user))
+    } else {
+        None
+    }
+}
+
 /// Extract the password from a URL's userinfo, if present.
 ///
 /// Returns `None` if no password is in the URL (user-only: `user@host`).
@@ -452,6 +469,18 @@ pub fn run(args: &[String]) -> ExitCode {
         }
     };
 
+    // --fail-with-body + --fail: --fail wins (curl compat: test 360)
+    if opts.fail_with_body && opts.fail_on_error && !opts.has_post_data {
+        // Check if both explicit --fail and --fail-with-body were used
+        // (--fail-with-body also sets fail_on_error internally)
+        // Only warn when --fail was explicitly also passed
+        let has_explicit_fail = args.iter().any(|a| a == "-f" || a == "--fail");
+        if has_explicit_fail {
+            eprintln!("Warning: --fail deselects --fail-with-body here");
+            opts.fail_with_body = false;
+        }
+    }
+
     // Check for conflicting request method flags (curl returns exit code 2)
     {
         let has_head = opts.easy.method_str() == Some("HEAD");
@@ -459,6 +488,18 @@ pub fn run(args: &[String]) -> ExitCode {
         let has_multipart = opts.easy.has_multipart();
         if has_head && has_body && has_multipart {
             eprintln!("urlx: (2) Mutually exclusive options detected");
+            return ExitCode::from(2);
+        }
+        // -T (upload/PUT) and -d (POST data) conflict (curl compat: test 378)
+        if opts.is_upload && opts.has_post_data {
+            eprintln!(
+                "Warning: You can only select one HTTP request method! You asked for both PUT "
+            );
+            eprintln!("Warning: (-T, --upload-file) and POST (-d, --data).");
+            return ExitCode::from(2);
+        }
+        // -d (POST data) and -C (resume/continue-at) conflict (curl compat: test 426)
+        if opts.has_post_data && (opts.resume_check || opts.auto_resume) {
             return ExitCode::from(2);
         }
     }
@@ -692,6 +733,28 @@ pub fn run(args: &[String]) -> ExitCode {
             }
         }
 
+        // For HTTP: if -u was NOT provided and no netrc was loaded,
+        // extract credentials from URL userinfo (http://user:pass@host/)
+        // and set basic auth. Empty username is valid (curl compat: test 367).
+        if opts.user_credentials.is_none()
+            && !url.starts_with("ftp://")
+            && !url.starts_with("ftps://")
+        {
+            let url_user = extract_url_username_raw(&url);
+            let url_pass = extract_url_password(&url);
+            if url_user.is_some() || url_pass.is_some() {
+                let user = url_user.unwrap_or_default();
+                let pass = url_pass.unwrap_or_default();
+                if !opts.easy.has_auth_header() {
+                    if opts.use_digest {
+                        opts.easy.digest_auth(&user, &pass);
+                    } else {
+                        opts.easy.basic_auth(&user, &pass);
+                    }
+                }
+            }
+        }
+
         // -O/--remote-name: derive output filename from URL
         if opts.remote_name && opts.output_file.is_none() {
             opts.output_file = Some(remote_name_from_url(&url));
@@ -862,6 +925,30 @@ pub fn run(args: &[String]) -> ExitCode {
         opts.include_headers = false;
     }
 
+    // -D/--dump-header: validate directory exists before transfer (curl compat: test 419)
+    if let Some(ref path) = opts.dump_header {
+        if let Some(parent) = std::path::Path::new(path).parent() {
+            if !parent.as_os_str().is_empty() && !parent.exists() {
+                if !opts.silent || opts.show_error {
+                    eprintln!("urlx: (23) Failed creating file '{path}'");
+                }
+                return ExitCode::from(23); // CURLE_WRITE_ERROR
+            }
+        }
+    }
+
+    // --etag-save: validate directory exists before transfer (curl compat: test 370)
+    if let Some(ref path) = opts.etag_save_file {
+        if let Some(parent) = std::path::Path::new(path).parent() {
+            if !parent.as_os_str().is_empty() && !parent.exists() {
+                if !opts.silent || opts.show_error {
+                    eprintln!("urlx: (26) Failed to open/read local data from file/application");
+                }
+                return ExitCode::from(26); // CURLE_READ_ERROR
+            }
+        }
+    }
+
     let result = perform_with_retry(&mut opts);
 
     // Save cookie jar after transfer (even on error)
@@ -882,9 +969,17 @@ pub fn run(args: &[String]) -> ExitCode {
             // --etag-save: save ETag from response header
             if let Some(ref path) = opts.etag_save_file {
                 if let Some(etag) = response.header("etag") {
-                    if let Err(e) = std::fs::write(path, etag) {
-                        if !opts.silent || opts.show_error {
-                            eprintln!("urlx: error saving ETag to '{path}': {e}");
+                    let trimmed = etag.trim();
+                    if trimmed.is_empty() {
+                        // Blank ETag: create an empty file (curl compat: test 347)
+                        let _ = std::fs::write(path, "");
+                    } else {
+                        // curl writes the etag followed by a newline
+                        let content = format!("{trimmed}\n");
+                        if let Err(e) = std::fs::write(path, content) {
+                            if !opts.silent || opts.show_error {
+                                eprintln!("urlx: error saving ETag to '{path}': {e}");
+                            }
                         }
                     }
                 }
@@ -900,7 +995,8 @@ pub fn run(args: &[String]) -> ExitCode {
                 .urls
                 .first()
                 .is_some_and(|u| u.starts_with("ftp://") || u.starts_with("ftps://"));
-            if opts.resume_check && !opts.is_upload && !is_ftp {
+            let is_file = opts.urls.first().is_some_and(|u| u.starts_with("file:"));
+            if opts.resume_check && !opts.is_upload && !is_ftp && !is_file {
                 let status = response.status();
                 if status == 416 {
                     // File already complete — output headers only, exit success
@@ -944,14 +1040,17 @@ pub fn run(args: &[String]) -> ExitCode {
                 return ExitCode::from(22);
             }
 
-            // --max-filesize: check response body size
+            // --max-filesize: check Content-Length header and actual body size
             if let Some(max_size) = opts.max_filesize {
-                if response.body().len() as u64 > max_size {
+                // Check Content-Length first (before download, curl compat: test 393)
+                let cl_header = response.header("content-length");
+                // If Content-Length is present but unparseable (e.g., too large), treat as exceeded
+                let cl_exceeded =
+                    cl_header.is_some_and(|v| v.parse::<u64>().map_or(true, |cl| cl > max_size));
+                let exceeded = cl_exceeded || response.body().len() as u64 > max_size;
+                if exceeded {
                     if !opts.silent || opts.show_error {
-                        eprintln!(
-                            "urlx: maximum file size exceeded ({} > {max_size} bytes)",
-                            response.body().len(),
-                        );
+                        eprintln!("urlx: maximum file size exceeded",);
                     }
                     return ExitCode::from(63);
                 }
@@ -1057,6 +1156,20 @@ pub fn run(args: &[String]) -> ExitCode {
                     // FTP partial file — data was already output, return error 18
                     return ExitCode::from(18); // CURLE_PARTIAL_FILE
                 }
+                if body_err.contains("transfer closed")
+                    || body_err.contains("outstanding read data")
+                {
+                    if !opts.silent || opts.show_error {
+                        eprintln!("urlx: (18) {body_err}");
+                    }
+                    return ExitCode::from(18); // CURLE_PARTIAL_FILE
+                }
+                if body_err.contains("bad_content_encoding") {
+                    if !opts.silent || opts.show_error {
+                        eprintln!("urlx: (61) Unrecognized or bad content encoding");
+                    }
+                    return ExitCode::from(61); // CURLE_BAD_CONTENT_ENCODING
+                }
                 if body_err.contains("negative_content_length") {
                     if !opts.silent || opts.show_error {
                         eprintln!("urlx: (8) Weird server reply");
@@ -1115,6 +1228,19 @@ pub fn run(args: &[String]) -> ExitCode {
                         opts.silent,
                         suppress,
                     );
+                }
+            }
+
+            // --max-filesize: if the error was caused by an oversized Content-Length,
+            // return exit code 63 instead of the transport error (curl compat: test 393)
+            if let Some(max_size) = opts.max_filesize {
+                if let Some(resp) = opts.easy.last_response() {
+                    if let Some(cl_str) = resp.header("content-length") {
+                        // If Content-Length is unparseable or exceeds max, it's a size error
+                        if cl_str.parse::<u64>().map_or(true, |cl| cl > max_size) {
+                            return ExitCode::from(63); // CURLE_FILESIZE_EXCEEDED
+                        }
+                    }
                 }
             }
 
@@ -1180,7 +1306,10 @@ pub fn error_to_exit_code(err: &liburlx::Error) -> ExitCode {
             }
         }
         liburlx::Error::Http(msg) => {
-            if msg.contains("range not satisfiable") || msg.contains("Range not satisfiable") {
+            if msg.contains("Weird server reply") || msg.contains("binary zero") {
+                ExitCode::from(8) // CURLE_WEIRD_SERVER_REPLY
+            } else if msg.contains("range not satisfiable") || msg.contains("Range not satisfiable")
+            {
                 ExitCode::from(33) // CURLE_RANGE_ERROR
             } else if msg.contains("empty response") || msg.contains("Empty response") {
                 ExitCode::from(52) // CURLE_GOT_NOTHING
@@ -1207,8 +1336,9 @@ pub fn error_to_exit_code(err: &liburlx::Error) -> ExitCode {
         liburlx::Error::Timeout(_) | liburlx::Error::SpeedLimit { .. } => {
             ExitCode::from(28) // CURLE_OPERATION_TIMEDOUT
         }
-        liburlx::Error::Io(_) => ExitCode::from(23), // CURLE_WRITE_ERROR
-        liburlx::Error::Ssh(_) => ExitCode::from(67), // CURLE_LOGIN_DENIED
+        liburlx::Error::FileError(_) => ExitCode::from(37), // CURLE_FILE_COULDNT_READ_FILE
+        liburlx::Error::Io(_) => ExitCode::from(23),        // CURLE_WRITE_ERROR
+        liburlx::Error::Ssh(_) => ExitCode::from(67),       // CURLE_LOGIN_DENIED
         liburlx::Error::Transfer { code, .. } => {
             ExitCode::from(u8::try_from(*code).map_or(1, |c| c))
         }
@@ -1221,11 +1351,13 @@ pub fn error_to_exit_code(err: &liburlx::Error) -> ExitCode {
 pub fn perform_with_retry(opts: &mut CliOptions) -> Result<liburlx::Response, liburlx::Error> {
     // --etag-compare: send If-None-Match header from saved ETag
     if let Some(ref path) = opts.etag_compare_file {
-        if let Ok(etag) = std::fs::read_to_string(path) {
-            let etag = etag.trim().to_string();
-            if !etag.is_empty() {
-                opts.easy.header("If-None-Match", &etag);
-            }
+        let etag =
+            std::fs::read_to_string(path).ok().map(|s| s.trim().to_string()).unwrap_or_default();
+        if etag.is_empty() {
+            // curl sends empty quotes when etag file is missing or empty
+            opts.easy.header("If-None-Match", "\"\"");
+        } else {
+            opts.easy.header("If-None-Match", &etag);
         }
     }
 
