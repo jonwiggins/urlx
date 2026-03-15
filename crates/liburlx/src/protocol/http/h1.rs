@@ -345,9 +345,11 @@ where
     // Return a response with body_error so the caller can detect it and return
     // exit code 8 while still outputting the partial headers.
     if let Some(cl) = ph.headers.get("content-length").cloned() {
-        // Reject trailing non-numeric characters (curl compat: test 768)
+        // Validate Content-Length: reject non-numeric, check comma-separated duplicates
         let trimmed = cl.trim().to_string();
-        if !trimmed.is_empty() && !trimmed.starts_with('-') && trimmed.parse::<u64>().is_err() {
+        let has_non_digit = trimmed.bytes().any(|b| !b.is_ascii_digit() && b != b',' && b != b' ');
+        let has_comma = trimmed.contains(',');
+        if !trimmed.is_empty() && !trimmed.starts_with('-') && (has_non_digit || has_comma) {
             // Check if it's a comma-separated list (valid per HTTP spec: test 770)
             let parts: Vec<&str> = trimmed.split(',').map(str::trim).collect();
             let parsed_values: Vec<Option<u64>> =
@@ -986,10 +988,23 @@ where
         }
     } else if !ignore_content_length && headers.contains_key("content-length") {
         let cl = &headers["content-length"];
-        let content_length: usize =
-            cl.parse().map_err(|e| Error::Http(format!("invalid Content-Length: {e}")))?;
-        let body = read_exact_body(stream, content_length, body_prefix, limiter).await?;
-        Ok((body, false, HashMap::new()))
+        if let Ok(content_length) = cl.parse::<usize>() {
+            let body = read_exact_body(stream, content_length, body_prefix, limiter).await?;
+            Ok((body, false, HashMap::new()))
+        } else {
+            // Content-Length overflows usize — read to EOF (curl compat: test 395)
+            let mut body = body_prefix;
+            let mut tmp = [0u8; 8192];
+            loop {
+                match stream.read(&mut tmp).await {
+                    Ok(0) => break,
+                    Ok(n) => body.extend_from_slice(&tmp[..n]),
+                    Err(e) if is_close_notify_error(&e) => break,
+                    Err(e) => return Err(Error::Http(format!("body read failed: {e}"))),
+                }
+            }
+            Ok((body, true, HashMap::new()))
+        }
     } else if keep_alive && !ignore_content_length {
         // No Content-Length, no chunked, but keep-alive → assume empty body
         Ok((body_prefix, false, HashMap::new()))

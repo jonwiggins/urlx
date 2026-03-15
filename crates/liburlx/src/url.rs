@@ -13,6 +13,8 @@ pub struct Url {
     /// (e.g., `test.80` which WHATWG spec treats as invalid IPv4).
     /// When set, this takes priority over `inner.host_str()`.
     override_host: Option<String>,
+    /// Raw input URL before parsing (preserves dot segments for --path-as-is).
+    raw_input: Option<String>,
 }
 
 impl Url {
@@ -29,7 +31,7 @@ impl Url {
         let input = Self::maybe_add_scheme(input);
 
         match url::Url::parse(&input) {
-            Ok(inner) => Ok(Self { inner, override_host: None }),
+            Ok(inner) => Ok(Self { inner, override_host: None, raw_input: Some(input.clone()) }),
             Err(e) => {
                 // The `url` crate rejects hostnames like "test.80" because the WHATWG URL
                 // standard treats a label ending in a number as an IPv4 address attempt.
@@ -70,6 +72,7 @@ impl Url {
                             return Ok(Self {
                                 inner,
                                 override_host: Some(original_host.to_string()),
+                                raw_input: Some(input.clone()),
                             });
                         }
                     }
@@ -203,6 +206,17 @@ impl Url {
     pub fn host_header_value(&self) -> String {
         let host = self.host_str().unwrap_or("");
         self.inner.port().map_or_else(|| host.to_string(), |port| format!("{host}:{port}"))
+    }
+
+    /// Returns the raw input URL string (before normalization).
+    #[must_use]
+    pub fn raw_input(&self) -> Option<&str> {
+        self.raw_input.as_deref()
+    }
+
+    /// Clear the raw input (e.g., for redirect URLs that should use normalized paths).
+    pub fn clear_raw_input(&mut self) {
+        self.raw_input = None;
     }
 
     /// Returns the path and query suitable for an HTTP request line.

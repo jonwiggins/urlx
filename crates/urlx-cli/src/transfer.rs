@@ -1509,7 +1509,19 @@ pub fn perform_with_retry(opts: &mut CliOptions) -> Result<liburlx::Response, li
                 } else {
                     is_retryable_status(response.status())
                 };
-                if should_retry && attempt < max_retries {
+                // Check Retry-After header against --retry-max-time (test 366)
+                let retry_after_too_long = if should_retry {
+                    if let (Some(max), Some(ra)) = (max_time, response.header("retry-after")) {
+                        ra.trim().parse::<u64>().ok().is_some_and(|secs| {
+                            start.elapsed() + std::time::Duration::from_secs(secs) > max
+                        })
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                if should_retry && !retry_after_too_long && attempt < max_retries {
                     // Output the failed response before retrying (curl compat: test 197)
                     let _ = output_response(
                         &response,

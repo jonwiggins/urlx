@@ -3250,7 +3250,7 @@ async fn perform_transfer(
 
             if let Some(location) = response.header("location") {
                 // Resolve relative URLs against current URL
-                let next_url =
+                let mut next_url =
                     if location.starts_with("http://") || location.starts_with("https://") {
                         Url::parse(location)?
                     } else {
@@ -3258,6 +3258,8 @@ async fn perform_transfer(
                         let base = current_url.as_str();
                         Url::parse(&resolve_relative(base, location))?
                     };
+                // Clear raw_input so redirect uses normalized path (not user's original)
+                next_url.clear_raw_input();
 
                 // Check redirect protocol restriction
                 if let Some(allowed) = redir_protocols {
@@ -4229,7 +4231,8 @@ async fn do_single_request(
                         full
                     }
                 } else if path_as_is {
-                    extract_path_and_query(url.as_str())
+                    // Use raw URL to preserve dot segments (curl compat: test 391)
+                    extract_path_and_query(url.raw_input().unwrap_or_else(|| url.as_str()))
                 } else {
                     url.request_target()
                 };
@@ -4701,10 +4704,9 @@ fn resolve_request_target(custom: Option<&str>, url: &Url, path_as_is: bool) -> 
         return c.to_string();
     }
     if path_as_is {
-        // Extract path+query directly from the URL string to avoid double normalization.
-        // The url crate already normalizes during parse, so this preserves
-        // whatever the parsed representation is without further processing.
-        extract_path_and_query(url.as_str())
+        // Use the raw URL string (before url crate normalization) to preserve
+        // dot segments like /../ (curl compat: test 391)
+        extract_path_and_query(url.raw_input().unwrap_or_else(|| url.as_str()))
     } else {
         url.request_target()
     }
@@ -6996,11 +6998,9 @@ mod tests {
         // With path_as_is=false, we get the normalized path
         let result = super::resolve_request_target(None, &url, false);
         assert_eq!(result, "/a/c");
-        // With path_as_is=true, we get the path from url.as_str() which is also
-        // normalized by the url crate, but the flag is passed through
+        // With path_as_is=true, we use raw_input to preserve dot segments
         let result = super::resolve_request_target(None, &url, true);
-        // The url crate already normalized it during parse, so both are /a/c
-        assert_eq!(result, "/a/c");
+        assert_eq!(result, "/a/b/../c");
     }
 
     #[test]
