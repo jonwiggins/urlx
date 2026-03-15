@@ -156,17 +156,26 @@ where
     }
 
     // Emit remaining custom headers (non-priority, non-user-agent) in command-line order.
-    // Content-Type is deferred to after Content-Length (curl header ordering).
+    // Multipart Content-Type is deferred to after Content-Length (curl header ordering).
     let mut deferred_content_type: Option<(String, String)> = None;
+    let mut content_type_emitted = false;
     for (i, (name, value)) in custom_headers.iter().enumerate() {
         if keep[i]
             && !priority_headers.iter().any(|p| name.eq_ignore_ascii_case(p))
             && !name.eq_ignore_ascii_case("user-agent")
             && !name.eq_ignore_ascii_case("host")
         {
-            if name.eq_ignore_ascii_case("content-type") {
+            // Defer form/multipart Content-Type to after Content-Length (curl compat)
+            // Keep other Content-Types (like application/json) in place (test 383)
+            if name.eq_ignore_ascii_case("content-type")
+                && (value.contains("boundary=")
+                    || value.contains("application/x-www-form-urlencoded"))
+            {
                 deferred_content_type = Some((name.clone(), value.clone()));
                 continue;
+            }
+            if name.eq_ignore_ascii_case("content-type") {
+                content_type_emitted = true;
             }
             if value.is_empty() {
                 // Empty value from -H "Name;" → send header with no value
@@ -192,7 +201,7 @@ where
     // Easy handle layer (see easy.rs form_data handling), not here.
     if let Some((name, value)) = deferred_content_type {
         let _ = write!(req, "{name}: {value}\r\n");
-    } else if method.eq_ignore_ascii_case("POST") && body.is_some() {
+    } else if !content_type_emitted && method.eq_ignore_ascii_case("POST") && body.is_some() {
         req.push_str("Content-Type: application/x-www-form-urlencoded\r\n");
     }
 
@@ -745,7 +754,7 @@ fn parse_headers(data: &[u8]) -> Result<ParsedHeaders, Error> {
             return Err(Error::Http("incomplete response headers".to_string()));
         }
         Err(e) => {
-            return Err(Error::Http(format!("failed to parse response: {e}")));
+            return Err(Error::Http(format!("Weird server reply: {e}")));
         }
     };
 
@@ -1293,7 +1302,7 @@ pub fn parse_response(data: &[u8], effective_url: &str, is_head: bool) -> Result
             return Err(Error::Http("incomplete response headers".to_string()));
         }
         Err(e) => {
-            return Err(Error::Http(format!("failed to parse response: {e}")));
+            return Err(Error::Http(format!("Weird server reply: {e}")));
         }
     };
 

@@ -111,6 +111,8 @@ pub struct CliOptions {
     pub(crate) is_stdin_upload: bool,
     /// Filename from `-T` for appending to URL path.
     pub(crate) upload_filename: Option<String>,
+    /// File path from `-T` for deferred reading at transfer time.
+    pub(crate) upload_file_path: Option<String>,
     /// Accumulated inline cookie values from `-b` (joined with "; " before sending).
     pub(crate) inline_cookies: Vec<String>,
     /// Whether `--next` was seen without a following URL (parse error if true at end).
@@ -452,6 +454,7 @@ fn parse_args_options(args: &[String]) -> Result<CliOptions, u8> {
         is_upload: false,
         is_stdin_upload: false,
         upload_filename: None,
+        upload_file_path: None,
         inline_cookies: Vec::new(),
         next_needs_url: false,
         variables: Vec::new(),
@@ -872,6 +875,12 @@ fn parse_args_options(args: &[String]) -> Result<CliOptions, u8> {
                         opts.easy.method("PUT");
                     }
                 } else {
+                    // Mark as upload (defer file read to transfer time for -T/-d
+                    // conflict detection: test 378)
+                    opts.is_upload = true;
+                    if opts.easy.method_is_default() {
+                        opts.easy.method("PUT");
+                    }
                     // Append filename to URL path if URL ends with /
                     let filename = std::path::Path::new(val)
                         .file_name()
@@ -880,19 +889,8 @@ fn parse_args_options(args: &[String]) -> Result<CliOptions, u8> {
                     if !filename.is_empty() {
                         opts.upload_filename = Some(filename);
                     }
-                    match std::fs::read(val) {
-                        Ok(data) => {
-                            opts.easy.body(&data);
-                            opts.is_upload = true;
-                            if opts.easy.method_is_default() {
-                                opts.easy.method("PUT");
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("urlx: can't read file '{val}': {e}");
-                            return Err(1);
-                        }
-                    }
+                    // Store file path; read at transfer time
+                    opts.upload_file_path = Some(val.to_string());
                 }
             }
             "-b" | "--cookie" => {
@@ -1755,6 +1753,10 @@ fn parse_args_options(args: &[String]) -> Result<CliOptions, u8> {
     // Set output_file from the first collected output file (each -o pairs with a URL by position)
     if !opts.output_files.is_empty() {
         opts.output_file = Some(opts.output_files[0].clone());
+        // Warn if more -o options than URLs (curl compat: test 371)
+        if opts.output_files.len() > opts.urls.len().max(1) {
+            eprintln!("Warning: Got more output options than URLs");
+        }
     }
 
     Ok(opts)

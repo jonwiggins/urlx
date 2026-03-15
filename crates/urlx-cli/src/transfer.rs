@@ -998,6 +998,21 @@ pub fn run(args: &[String]) -> ExitCode {
         }
     }
 
+    // Deferred -T file read (file path stored at parse time for -T/-d conflict detection)
+    if let Some(ref path) = opts.upload_file_path {
+        match std::fs::read(path) {
+            Ok(data) => {
+                opts.easy.body(&data);
+            }
+            Err(e) => {
+                if !opts.silent || opts.show_error {
+                    eprintln!("urlx: can't read file '{path}': {e}");
+                }
+                return ExitCode::from(26); // CURLE_READ_ERROR
+            }
+        }
+    }
+
     let result = perform_with_retry(&mut opts);
 
     // Save cookie jar after transfer (even on error)
@@ -1212,6 +1227,14 @@ pub fn run(args: &[String]) -> ExitCode {
 
             // Body error: output was written, now return appropriate error exit code
             if let Some(body_err) = response.body_error() {
+                // --remove-on-error: delete output file on body error
+                if opts.remove_on_error {
+                    if let Some(ref path) = opts.output_file {
+                        if path != "-" {
+                            let _ = std::fs::remove_file(path);
+                        }
+                    }
+                }
                 if body_err == "partial" {
                     // FTP partial file — data was already output, return error 18
                     return ExitCode::from(18); // CURLE_PARTIAL_FILE
@@ -1333,6 +1356,14 @@ pub fn run(args: &[String]) -> ExitCode {
             }
             if !opts.silent || opts.show_error {
                 eprintln!("urlx: {e}");
+            }
+            // --remove-on-error: delete output file on transfer failure
+            if opts.remove_on_error {
+                if let Some(ref path) = opts.output_file {
+                    if path != "-" {
+                        let _ = std::fs::remove_file(path);
+                    }
+                }
             }
             error_to_exit_code(&e)
         }
