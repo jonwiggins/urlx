@@ -115,6 +115,8 @@ pub struct CliOptions {
     pub(crate) inline_cookies: Vec<String>,
     /// Whether `--next` was seen without a following URL (parse error if true at end).
     pub(crate) next_needs_url: bool,
+    /// Variables set via `--variable` for `--expand-*` expansion.
+    pub(crate) variables: Vec<(String, String)>,
 }
 
 /// Print version information to stdout.
@@ -452,6 +454,7 @@ fn parse_args_options(args: &[String]) -> Result<CliOptions, u8> {
         upload_filename: None,
         inline_cookies: Vec::new(),
         next_needs_url: false,
+        variables: Vec::new(),
     };
 
     let mut i = 1;
@@ -1533,6 +1536,23 @@ fn parse_args_options(args: &[String]) -> Result<CliOptions, u8> {
                 // rustls doesn't support CA directories — load all certs from directory
                 opts.easy.ssl_ca_cert(std::path::Path::new(val));
             }
+            "--variable" => {
+                i += 1;
+                let val = require_arg(args, i, "--variable")?;
+                let (name, value) = parse_variable(val)?;
+                opts.variables.push((name, value));
+            }
+            "--expand-data" => {
+                i += 1;
+                let val = require_arg(args, i, "--expand-data")?;
+                let expanded = expand_variables(val, &opts.variables);
+                opts.easy.body(expanded.as_bytes());
+                opts.has_post_data = true;
+                if opts.easy.method_is_default() {
+                    opts.easy.method("POST");
+                }
+                opts.easy.set_form_data(true);
+            }
             // No-op flags for compatibility (accepted but not implemented)
             "-N"
             | "--no-buffer"
@@ -2161,6 +2181,121 @@ pub fn is_protocol_allowed(url: &str, proto_list: &str) -> bool {
 
     let list = proto_list.strip_prefix('=').unwrap_or(proto_list);
     list.split(',').any(|p| p.trim().eq_ignore_ascii_case(&scheme))
+}
+
+/// Parse a `--variable` argument.
+///
+/// Formats:
+///   - `name=value` — direct assignment
+///   - `name@file` — load from file
+///   - `name@-` — load from stdin
+///   - `name[start-end]=value` — byte range from direct value
+///   - `name[start-end]@file` — byte range from file
+///   - `name[start-]@file` — byte range from start to end of data
+///
+/// Returns `(name, value)` after applying byte range if specified.
+fn parse_variable(spec: &str) -> Result<(String, String), u8> {
+    // Parse optional byte range: name[start-end]
+    let (name, byte_range, rest) = if let Some(bracket_start) = spec.find('[') {
+        let bracket_end = spec[bracket_start..].find(']').map(|p| bracket_start + p);
+        if let Some(bracket_end) = bracket_end {
+            let name = &spec[..bracket_start];
+            let range_str = &spec[bracket_start + 1..bracket_end];
+            let rest = &spec[bracket_end + 1..];
+            // Parse range: "start-end" or "start-"
+            let range = if let Some((s, e)) = range_str.split_once('-') {
+                let start: usize = s.parse().map_err(|_| {
+                    eprintln!("urlx: invalid byte range start: {s}");
+                    2
+                })?;
+                let end: Option<usize> = if e.is_empty() {
+                    None
+                } else {
+                    Some(e.parse().map_err(|_| {
+                        eprintln!("urlx: invalid byte range end: {e}");
+                        2
+                    })?)
+                };
+                Some((start, end))
+            } else {
+                eprintln!("urlx: invalid byte range: {range_str}");
+                return Err(2);
+            };
+            (name.to_string(), range, rest)
+        } else {
+            (spec.to_string(), None, "")
+        }
+    } else {
+        (spec.to_string(), None, "")
+    };
+
+    // Parse value source: =value or @file
+    let raw_value = if let Some(rest) = rest.strip_prefix('=') {
+        rest.to_string()
+    } else if let Some(rest) = rest.strip_prefix('@') {
+        if rest == "-" {
+            use std::io::Read as _;
+            let mut buf = String::new();
+            let _ = std::io::stdin().read_to_string(&mut buf);
+            buf
+        } else {
+            std::fs::read_to_string(rest).map_err(|e| {
+                eprintln!("urlx: can't read variable file '{rest}': {e}");
+                2
+            })?
+        }
+    } else if byte_range.is_none() {
+        // No range and no = or @ — check the original spec for = or @
+        if let Some(eq_pos) = name.find('=') {
+            let (n, v) = name.split_at(eq_pos);
+            return Ok((n.to_string(), v[1..].to_string()));
+        }
+        if let Some(at_pos) = name.find('@') {
+            let (n, f) = name.split_at(at_pos);
+            let file = &f[1..];
+            let content = if file == "-" {
+                use std::io::Read as _;
+                let mut buf = String::new();
+                let _ = std::io::stdin().read_to_string(&mut buf);
+                buf
+            } else {
+                std::fs::read_to_string(file).map_err(|e| {
+                    eprintln!("urlx: can't read variable file '{file}': {e}");
+                    2
+                })?
+            };
+            return Ok((n.to_string(), content));
+        }
+        // No value source specified — empty value
+        String::new()
+    } else {
+        String::new()
+    };
+
+    // Apply byte range
+    let value = if let Some((start, end)) = byte_range {
+        let bytes = raw_value.as_bytes();
+        if start >= bytes.len() {
+            String::new()
+        } else {
+            let end = end.map_or(bytes.len() - 1, |e| e.min(bytes.len() - 1));
+            String::from_utf8_lossy(&bytes[start..=end]).to_string()
+        }
+    } else {
+        raw_value
+    };
+
+    Ok((name, value))
+}
+
+/// Expand `{{variable}}` placeholders in a string using the provided variables.
+fn expand_variables(template: &str, variables: &[(String, String)]) -> String {
+    let mut result = template.to_string();
+    for (name, value) in variables {
+        let placeholder = format!("{{{{{name}}}}}");
+        result = result.replace(&placeholder, value);
+    }
+    result
 }
 
 #[cfg(test)]
