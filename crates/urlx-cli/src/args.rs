@@ -113,6 +113,8 @@ pub struct CliOptions {
     pub(crate) upload_filename: Option<String>,
     /// Accumulated inline cookie values from `-b` (joined with "; " before sending).
     pub(crate) inline_cookies: Vec<String>,
+    /// Whether `--next` was seen without a following URL (parse error if true at end).
+    pub(crate) next_needs_url: bool,
 }
 
 /// Print version information to stdout.
@@ -449,6 +451,7 @@ fn parse_args_options(args: &[String]) -> Result<CliOptions, u8> {
         is_stdin_upload: false,
         upload_filename: None,
         inline_cookies: Vec::new(),
+        next_needs_url: false,
     };
 
     let mut i = 1;
@@ -556,8 +559,11 @@ fn parse_args_options(args: &[String]) -> Result<CliOptions, u8> {
                 let val = require_arg(args, i, "-o")?;
                 opts.output_files.push(val.to_string());
             }
-            "-O" | "--remote-name" => {
+            "-O" | "--remote-name" | "--remote-name-all" => {
                 opts.remote_name = true;
+            }
+            "--no-remote-name" => {
+                opts.remote_name = false;
             }
             "-e" | "--referer" => {
                 i += 1;
@@ -1532,7 +1538,6 @@ fn parse_args_options(args: &[String]) -> Result<CliOptions, u8> {
             | "--false-start"
             | "--compressed-ssh"
             | "--doh-cert-status"
-            | "--next"
             | "--ftp-pasv"
             | "--styled-output"
             | "--no-styled-output"
@@ -1661,6 +1666,10 @@ fn parse_args_options(args: &[String]) -> Result<CliOptions, u8> {
                 let _val = require_arg(args, i, &args[i - 1].clone())?;
                 // Accepted for compatibility; not implemented
             }
+            "--next" => {
+                // --next separates URL groups; mark that we need a URL for the next group
+                opts.next_needs_url = true;
+            }
             arg if arg.starts_with("--no-") => {
                 // --no- prefix used on a non-boolean option (curl returns exit code 2)
                 eprintln!("urlx: option {arg}: is unknown");
@@ -1672,9 +1681,16 @@ fn parse_args_options(args: &[String]) -> Result<CliOptions, u8> {
             }
             url => {
                 opts.urls.push(url.to_string());
+                opts.next_needs_url = false;
             }
         }
         i += 1;
+    }
+
+    // --next at the end with no URL is a parse error (curl returns exit code 2)
+    if opts.next_needs_url {
+        eprintln!("urlx: (2) no URL specified after --next");
+        return Err(2);
     }
 
     // Apply proxy auth credentials before site auth so Proxy-Authorization
@@ -3224,12 +3240,12 @@ mod tests {
 
     #[test]
     fn remote_name_from_url_no_filename() {
-        assert_eq!(remote_name_from_url("http://example.com/"), "index.html");
+        assert_eq!(remote_name_from_url("http://example.com/"), "curl_response");
     }
 
     #[test]
     fn remote_name_from_url_root() {
-        assert_eq!(remote_name_from_url("http://example.com"), "index.html");
+        assert_eq!(remote_name_from_url("http://example.com"), "curl_response");
     }
 
     #[test]

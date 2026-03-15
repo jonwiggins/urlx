@@ -116,6 +116,12 @@ impl MultipartForm {
         format!("multipart/form-data; boundary={}", self.boundary)
     }
 
+    /// Get the boundary string.
+    #[must_use]
+    pub fn boundary(&self) -> &str {
+        &self.boundary
+    }
+
     /// Build the encoded multipart body.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {

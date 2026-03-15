@@ -2067,7 +2067,16 @@ impl Easy {
         if let Some(ref multipart) = self.multipart {
             // Multipart form: encode body and set content-type header
             effective_body = Some(multipart.encode());
-            if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("content-type")) {
+            let ct_idx = headers.iter().position(|(k, _)| k.eq_ignore_ascii_case("content-type"));
+            if let Some(idx) = ct_idx {
+                // User provided Content-Type: extract value, remove it, and re-add
+                // with proper casing and boundary appended (curl compat: test 669)
+                let mut ct_value = headers.remove(idx).1;
+                if !ct_value.contains("boundary=") {
+                    ct_value = format!("{ct_value}; boundary={}", multipart.boundary());
+                }
+                headers.push(("Content-Type".to_string(), ct_value));
+            } else {
                 headers.push(("Content-Type".to_string(), multipart.content_type()));
             }
             // Default to POST for multipart
@@ -4188,7 +4197,15 @@ async fn do_single_request(
                 } else if is_http_proxy {
                     // Strip fragment from proxy request URL (curl behavior)
                     let full = url.to_full_string();
-                    full.split_once('#').map_or_else(|| full.clone(), |(base, _)| base.to_string())
+                    let full = full
+                        .split_once('#')
+                        .map_or_else(|| full.clone(), |(base, _)| base.to_string());
+                    // Replace %20 with + in query string (curl compat: space encoding)
+                    if let Some((base, query)) = full.split_once('?') {
+                        format!("{base}?{}", query.replace("%20", "+"))
+                    } else {
+                        full
+                    }
                 } else if path_as_is {
                     extract_path_and_query(url.as_str())
                 } else {
@@ -4214,7 +4231,8 @@ async fn do_single_request(
                 let time_pretransfer = request_start.elapsed();
                 let mut stream = PooledStream::Tcp(tcp_stream);
                 // For HTTP proxy: use keep_alive=true to suppress Connection: close
-                let proxy_keep_alive = if is_http_proxy { true } else { use_pool };
+                // Suppress Connection: close when going through any proxy (HTTP or SOCKS)
+                let proxy_keep_alive = if proxy.is_some() { true } else { use_pool };
                 let (resp, can_reuse) = crate::protocol::http::h1::request(
                     &mut stream,
                     method,

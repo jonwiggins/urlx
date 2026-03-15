@@ -56,7 +56,10 @@ pub fn substitute_glob_template(template: &str, glob_values: &[String]) -> Strin
     result
 }
 
-/// Takes the last path segment. Falls back to `"index.html"` if no filename.
+/// Takes the last path segment. Falls back to `"curl_response"` if no filename.
+///
+/// Matches curl 8.10+ behavior: when URL ends with `/`, tries to extract the
+/// last directory component. Falls back to `"curl_response"` when empty.
 pub fn remote_name_from_url(url: &str) -> String {
     // Strip scheme (e.g., "http://")
     let without_scheme = url.find("://").map_or(url, |pos| &url[pos + 3..]);
@@ -73,15 +76,16 @@ pub fn remote_name_from_url(url: &str) -> String {
     // Find the path part (after the first '/')
     if let Some(slash_pos) = without_query.find('/') {
         let path = &without_query[slash_pos..];
-        if let Some(name) = path.rsplit('/').next() {
-            if name.is_empty() {
-                return "index.html".to_string();
+        // Strip trailing slashes and find last segment
+        let trimmed = path.trim_end_matches('/');
+        if let Some(name) = trimmed.rsplit('/').next() {
+            if !name.is_empty() {
+                return name.to_string();
             }
-            return name.to_string();
         }
     }
 
-    "index.html".to_string()
+    "curl_response".to_string()
 }
 
 /// Set a file's modification time from an HTTP `Last-Modified` header value.
@@ -663,48 +667,67 @@ pub fn run(args: &[String]) -> ExitCode {
                             // Look up in netrc: if URL has a username, search for that user
                             #[allow(clippy::option_if_let_else)]
                             let entry = if let Some(ref uname) = url_user {
-                                liburlx::netrc::lookup_user(&contents, &host, uname)
-                                    .or_else(|| liburlx::netrc::lookup(&contents, &host))
+                                match liburlx::netrc::lookup_user(&contents, &host, uname) {
+                                    Ok(Some(e)) => Ok(Some(e)),
+                                    Ok(None) => liburlx::netrc::lookup(&contents, &host),
+                                    Err(e) => Err(e),
+                                }
                             } else {
                                 liburlx::netrc::lookup(&contents, &host)
                             };
 
-                            if let Some(entry) = entry {
-                                let user = entry.login.unwrap_or_default();
-                                let pass = entry.password.unwrap_or_default();
-                                if url.starts_with("ftp://") || url.starts_with("ftps://") {
-                                    // Embed credentials in URL for FTP (don't percent-encode)
-                                    let base_url = strip_url_credentials(&url);
-                                    let scheme_end = base_url.find("://").map_or(0, |p| p + 3);
-                                    let new_url = format!(
-                                        "{}{}:{}@{}",
-                                        &base_url[..scheme_end],
-                                        user,
-                                        pass,
-                                        &base_url[scheme_end..],
-                                    );
-                                    if let Err(e) = opts.easy.url(&new_url) {
-                                        if !opts.silent || opts.show_error {
-                                            eprintln!(
-                                                "urlx: error parsing URL with netrc credentials: {e}"
-                                            );
+                            match entry {
+                                Ok(Some(entry)) => {
+                                    // Use URL username if netrc has no login
+                                    let user = entry
+                                        .login
+                                        .or_else(|| url_user.clone())
+                                        .unwrap_or_default();
+                                    let pass = entry.password.unwrap_or_default();
+                                    if url.starts_with("ftp://") || url.starts_with("ftps://") {
+                                        // Embed credentials in URL for FTP (don't percent-encode)
+                                        let base_url = strip_url_credentials(&url);
+                                        let scheme_end = base_url.find("://").map_or(0, |p| p + 3);
+                                        let new_url = format!(
+                                            "{}{}:{}@{}",
+                                            &base_url[..scheme_end],
+                                            user,
+                                            pass,
+                                            &base_url[scheme_end..],
+                                        );
+                                        if let Err(e) = opts.easy.url(&new_url) {
+                                            if !opts.silent || opts.show_error {
+                                                eprintln!(
+                                                    "urlx: error parsing URL with netrc credentials: {e}"
+                                                );
+                                            }
+                                            return ExitCode::from(3);
                                         }
-                                        return ExitCode::from(3);
+                                    } else if opts.use_digest {
+                                        opts.easy.digest_auth(&user, &pass);
+                                    } else {
+                                        opts.easy.basic_auth(&user, &pass);
                                     }
-                                } else if opts.use_digest {
-                                    opts.easy.digest_auth(&user, &pass);
-                                } else {
-                                    opts.easy.basic_auth(&user, &pass);
+                                }
+                                Ok(None) => {}
+                                Err(_) => {
+                                    // Syntax error in netrc (e.g., unterminated quote)
+                                    if !opts.silent || opts.show_error {
+                                        eprintln!("urlx: bad syntax in netrc file '{netrc_path}'");
+                                    }
+                                    return ExitCode::from(26);
                                 }
                             }
                         }
                     }
-                    Err(e) => {
+                    Err(_) => {
                         if !opts.netrc_optional {
+                            // Missing netrc file: curl returns CURLE_FAILED_INIT (2)
+                            // when --netrc is used but the file doesn't exist
                             if !opts.silent || opts.show_error {
-                                eprintln!("urlx: can't read netrc file '{netrc_path}': {e}");
+                                eprintln!("urlx: (2) could not read netrc file '{netrc_path}'");
                             }
-                            return ExitCode::FAILURE;
+                            return ExitCode::from(2);
                         }
                     }
                 }
@@ -757,7 +780,14 @@ pub fn run(args: &[String]) -> ExitCode {
 
         // -O/--remote-name: derive output filename from URL
         if opts.remote_name && opts.output_file.is_none() {
-            opts.output_file = Some(remote_name_from_url(&url));
+            let name = remote_name_from_url(&url);
+            // --output-dir: prepend directory to filename
+            if let Some(ref dir) = opts.output_dir {
+                opts.output_file =
+                    Some(std::path::Path::new(dir).join(&name).to_string_lossy().to_string());
+            } else {
+                opts.output_file = Some(name);
+            }
         }
     }
 
@@ -937,14 +967,25 @@ pub fn run(args: &[String]) -> ExitCode {
         }
     }
 
-    // --etag-save: validate directory exists before transfer (curl compat: test 370)
+    // --etag-save: validate/create directory before transfer
     if let Some(ref path) = opts.etag_save_file {
         if let Some(parent) = std::path::Path::new(path).parent() {
             if !parent.as_os_str().is_empty() && !parent.exists() {
-                if !opts.silent || opts.show_error {
-                    eprintln!("urlx: (26) Failed to open/read local data from file/application");
+                if opts.create_dirs {
+                    if let Err(e) = std::fs::create_dir_all(parent) {
+                        if !opts.silent || opts.show_error {
+                            eprintln!("urlx: error creating directories for etag file: {e}");
+                        }
+                        return ExitCode::FAILURE;
+                    }
+                } else {
+                    if !opts.silent || opts.show_error {
+                        eprintln!(
+                            "urlx: (26) Failed to open/read local data from file/application"
+                        );
+                    }
+                    return ExitCode::from(26); // CURLE_READ_ERROR
                 }
-                return ExitCode::from(26); // CURLE_READ_ERROR
             }
         }
     }
@@ -1495,6 +1536,19 @@ pub fn run_multi(
             return ExitCode::FAILURE;
         }
 
+        // Extract credentials from URL userinfo (user:pass@host) for each URL
+        {
+            let url_user = extract_url_username_raw(url);
+            let url_pass = extract_url_password(url);
+            if url_user.is_some() || url_pass.is_some() {
+                let user = url_user.unwrap_or_default();
+                let pass = url_pass.unwrap_or_default();
+                // Remove old auth header and set new one per URL
+                easy.remove_header("Authorization");
+                easy.basic_auth(&user, &pass);
+            }
+        }
+
         match rt.block_on(easy.perform_async()) {
             Ok(response) => {
                 if fail_on_error && response.status() >= 400 {
@@ -1652,7 +1706,7 @@ mod tests {
 
     #[test]
     fn remote_name_from_url_trailing_slash() {
-        assert_eq!(remote_name_from_url("http://example.com/"), "index.html");
+        assert_eq!(remote_name_from_url("http://example.com/"), "curl_response");
     }
 
     #[test]

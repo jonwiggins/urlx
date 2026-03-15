@@ -505,7 +505,8 @@ impl FtpSession {
             // 331 = User name OK, need password
             send_command(&mut self.writer, &format!("PASS {pass}")).await?;
             let pass_resp = read_response(&mut self.reader).await?;
-            if !pass_resp.is_complete() {
+            // 332 = Need account for login (ACCT will be sent separately)
+            if !pass_resp.is_complete() && pass_resp.code != 332 {
                 return Err(Error::Transfer {
                     code: 67,
                     message: format!("Access denied: {} {}", pass_resp.code, pass_resp.message),

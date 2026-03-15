@@ -156,12 +156,18 @@ where
     }
 
     // Emit remaining custom headers (non-priority, non-user-agent) in command-line order.
+    // Content-Type is deferred to after Content-Length (curl header ordering).
+    let mut deferred_content_type: Option<(String, String)> = None;
     for (i, (name, value)) in custom_headers.iter().enumerate() {
         if keep[i]
             && !priority_headers.iter().any(|p| name.eq_ignore_ascii_case(p))
             && !name.eq_ignore_ascii_case("user-agent")
             && !name.eq_ignore_ascii_case("host")
         {
+            if name.eq_ignore_ascii_case("content-type") {
+                deferred_content_type = Some((name.clone(), value.clone()));
+                continue;
+            }
             if value.is_empty() {
                 // Empty value from -H "Name;" → send header with no value
                 let _ = write!(req, "{name}:\r\n");
@@ -171,7 +177,7 @@ where
         }
     }
 
-    // Add auto Content-Length for bodies (after custom headers).
+    // Add auto Content-Length for bodies (after custom headers, before Content-Type).
     if let Some(body_data) = body {
         if !use_chunked && !has_content_length && !has_transfer_encoding {
             let _ = write!(req, "Content-Length: {}\r\n", body_data.len());
@@ -181,11 +187,10 @@ where
         req.push_str("Expect: 100-continue\r\n");
     }
 
-    // Auto-add Content-Type for POST with body if not explicitly set (curl compat).
-    // This goes AFTER Content-Length, matching curl's header ordering for -d data.
-    let has_content_type =
-        custom_headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("content-type"));
-    if !has_content_type && method.eq_ignore_ascii_case("POST") && body.is_some() {
+    // Emit deferred Content-Type or auto-add it for POST (curl compat: test 669).
+    if let Some((name, value)) = deferred_content_type {
+        let _ = write!(req, "{name}: {value}\r\n");
+    } else if method.eq_ignore_ascii_case("POST") && body.is_some() {
         req.push_str("Content-Type: application/x-www-form-urlencoded\r\n");
     }
 
@@ -1181,12 +1186,14 @@ fn find_line_ending(data: &[u8], offset: usize) -> Option<(usize, usize)> {
     if data.len() <= offset {
         return None;
     }
-    // Check for \r\n first, then bare \n
-    if let Some(p) = data[offset..].windows(2).position(|w| w == b"\r\n") {
-        return Some((offset + p, 2));
+    // Find the first \n (whether preceded by \r or not)
+    let p = data[offset..].iter().position(|&b| b == b'\n')?;
+    // Check if it's \r\n (CRLF) or bare \n (LF)
+    if p > 0 && data[offset + p - 1] == b'\r' {
+        Some((offset + p - 1, 2))
+    } else {
+        Some((offset + p, 1))
     }
-    // Also accept bare \n (lenient parsing, curl compat)
-    data[offset..].iter().position(|&b| b == b'\n').map(|p| (offset + p, 1))
 }
 
 /// Find the position of a CRLF or bare LF starting from `offset`.
