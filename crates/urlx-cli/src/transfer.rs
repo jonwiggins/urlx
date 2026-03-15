@@ -853,6 +853,22 @@ pub fn run(args: &[String]) -> ExitCode {
         }
     }
 
+    // Deferred -T file read: load upload file BEFORE Content-Range handling
+    // so that take_body() has data to slice for resumed uploads (test 33).
+    if let Some(ref path) = opts.upload_file_path {
+        match std::fs::read(path) {
+            Ok(data) => {
+                opts.easy.body(&data);
+            }
+            Err(e) => {
+                if !opts.silent || opts.show_error {
+                    eprintln!("urlx: can't read file '{path}': {e}");
+                }
+                return ExitCode::from(26); // CURLE_READ_ERROR
+            }
+        }
+    }
+
     // PUT with -C offset: handle HTTP vs FTP resume differently
     if opts.is_upload {
         if let Some(offset) = opts.resume_offset {
@@ -997,21 +1013,6 @@ pub fn run(args: &[String]) -> ExitCode {
                     }
                     return ExitCode::from(26); // CURLE_READ_ERROR
                 }
-            }
-        }
-    }
-
-    // Deferred -T file read (file path stored at parse time for -T/-d conflict detection)
-    if let Some(ref path) = opts.upload_file_path {
-        match std::fs::read(path) {
-            Ok(data) => {
-                opts.easy.body(&data);
-            }
-            Err(e) => {
-                if !opts.silent || opts.show_error {
-                    eprintln!("urlx: can't read file '{path}': {e}");
-                }
-                return ExitCode::from(26); // CURLE_READ_ERROR
             }
         }
     }

@@ -15,7 +15,7 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 ## Current Status
 
 **Version:** v0.1.0 published (crates.io + GitHub Releases + Homebrew)
-**curl test suite:** ~320 tests passing (tests 1-800+ range + SSH + HTTPS; ~320/500 run, 64% pass rate)
+**curl test suite:** 581 pass / 568 fail / 47 skip out of 1196 tests (50.6% pass rate, tests 1-1400)
 **Rust test count:** ~2,596
 **Blockers:** None — infrastructure is live
 
@@ -107,26 +107,29 @@ Document every skip with a reason. Skips without rationale are not allowed.
 
 ---
 
-## Active Batch: Cookies / HSTS / HTTP misc (tests 700-800)
+## Remaining Work: Root Cause Analysis (as of 2026-03-15)
 
-**Status:** Starting — tests 1-700 covered (260/358 pass)
-**Prerequisite:** Tests 1-700 pass (260/358 run)
+Full test suite run: 581 pass / 568 fail / 47 skip (tests 1-1400, 30s timeout).
 
-### Remaining known failures in 550-700
+### Failure Root Causes (ordered by ROI)
 
-- **SFTP/SCP** (600-665): ~40 failures — SSH server test infrastructure needed
-- **SMTP/IMAP** (646-649): ~4 failures — multipart MIME with mail protocols
-- **FTP connection reuse** (698): FTP multi-URL connection pooling needed
+| # | Root Cause | ~Tests Fixable | Effort | Details |
+|---|-----------|---------------|--------|---------|
+| 1 | **IMAP/POP3 greeting/connection failure** | ~92 | 2-3 days | Every test returns error 56 — can't parse test server greeting |
+| 2 | **SMTP EHLO hostname + missing QUIT** | ~30 | 2 hours | Sends `EHLO 127.0.0.1` instead of `EHLO <url-hostname>` |
+| 3 | **FTP spurious `CWD /`** | ~22 | 1 hour | Extra `CWD /` when URL path is root and PWD already returned `/` |
+| 4 | **FTPS post-TLS pipeline broken** | ~20 | 3-4 days | Commands stop after `PBSZ 0` — TLS stream wrapping issue |
+| 5 | **SMTP SASL auth** (PLAIN/LOGIN/NTLM/XOAUTH2) | ~50 | 2 days | No AUTH commands sent at all |
+| 6 | **FTP connection reuse** | ~15 | 1-2 days | New connection per URL instead of reusing control connection |
+| 7 | **NTLM proxy auth Type 3 response** | ~15 | 1-2 days | Repeats Type 1 instead of computing Type 3 from challenge |
+| 8 | **HTTP upload resume (Content-Range)** | ~10 | 0.5 day | Missing `Content-Range` header for `-C` PUT/POST uploads |
+| 9 | **`--expand-data` variable expansion** | ~10 | 1 day | `{{var:func}}` sent literally instead of expanded |
+| 10 | **Cookie count cap + header size limit** | ~5 | 1 day | Off-by-one (151 vs 150 per domain), no 8KB header limit |
+| 11 | **Auth credential stripping on redirect** | ~5 | 0.5 day | Leaks `Authorization` header when redirecting cross-host |
+| 12 | **Expect: 100-continue body deferral** | ~5 | 0.5 day | Body sent immediately without waiting, Content-Length off-by-1 |
+| 13 | **`--next` header reset** | ~3 | 0.5 day | Headers from prior request leak into next request |
 
-### Batch Queue
-
-| Batch | Tests | Category | Notes |
-|-------|-------|----------|-------|
-| COOKIE | 700-750 | Cookies | Jar files, domain matching, expiry |
-| SSH | 800-850 | SSH/SFTP/SCP | Key auth, known_hosts, transfers |
-| MAIL | 900-950 | SMTP/IMAP/POP3 | Email protocols |
-| H2 | 1000-1050 | HTTP/2 | Multiplexing, server push, ALPN |
-| MISC | 1200-1300 | DICT, TFTP, etc. | Minor protocols |
+**Total fixable: ~280 tests → would raise pass rate from 50.6% to ~75%**
 
 ---
 

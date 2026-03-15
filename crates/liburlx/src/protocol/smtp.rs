@@ -163,12 +163,22 @@ pub async fn send_mail(
         )));
     }
 
-    // Send EHLO
-    send_command(&mut writer, &format!("EHLO {host}")).await?;
+    // Send EHLO — curl uses the URL path (without leading /) as the EHLO argument.
+    // For smtp://host:port/900, EHLO argument is "900".
+    // If no path, fall back to the host.
+    let ehlo_arg = {
+        let p = url.path().trim_start_matches('/');
+        if p.is_empty() {
+            host.clone()
+        } else {
+            p.to_string()
+        }
+    };
+    send_command(&mut writer, &format!("EHLO {ehlo_arg}")).await?;
     let ehlo_resp = read_response(&mut reader).await?;
     if !ehlo_resp.is_ok() {
         // Fall back to HELO
-        send_command(&mut writer, &format!("HELO {host}")).await?;
+        send_command(&mut writer, &format!("HELO {ehlo_arg}")).await?;
         let helo_resp = read_response(&mut reader).await?;
         if !helo_resp.is_ok() {
             return Err(Error::Http(format!(
@@ -295,8 +305,9 @@ pub async fn send_mail(
         )));
     }
 
-    // QUIT
+    // QUIT — read response so the server logs the command before we disconnect
     send_command(&mut writer, "QUIT").await?;
+    let _ = read_response(&mut reader).await;
 
     let headers = std::collections::HashMap::new();
     Ok(crate::protocol::http::response::Response::new(

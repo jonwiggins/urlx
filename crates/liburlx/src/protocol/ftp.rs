@@ -1534,8 +1534,10 @@ pub async fn perform(
         let trimmed = effective_path.trim_start_matches('/');
         let trimmed = trimmed.trim_end_matches('/');
         if trimmed.is_empty() {
-            // Root directory: CWD / (curl compat: tests 350, 352)
-            if config.method == FtpMethod::NoCwd {
+            // Root directory listing.
+            // ftp://host/ (single slash) = relative root, no CWD needed (test 101)
+            // ftp://host// (double slash) = absolute path to /, CWD / needed (tests 350, 352)
+            if config.method == FtpMethod::NoCwd || !effective_path.starts_with("//") {
                 (Vec::new(), String::new())
             } else {
                 (vec!["/"], String::new())
