@@ -293,10 +293,12 @@ pub async fn send_mail(
         }
         let auth_resp = read_response(&mut reader).await?;
         if !auth_resp.is_ok() {
-            return Err(Error::Http(format!(
-                "SMTP AUTH failed: {} {}",
-                auth_resp.code, auth_resp.message
-            )));
+            send_command(&mut writer, "QUIT").await?;
+            let _ = read_response(&mut reader).await;
+            return Err(Error::Transfer {
+                code: 67,
+                message: format!("SMTP AUTH failed: {} {}", auth_resp.code, auth_resp.message),
+            });
         }
     }
 
@@ -354,10 +356,11 @@ pub async fn send_mail(
     if !mail_resp.is_ok() {
         send_command(&mut writer, "QUIT").await?;
         let _ = read_response(&mut reader).await;
-        return Err(Error::Http(format!(
-            "SMTP MAIL FROM failed: {} {}",
-            mail_resp.code, mail_resp.message
-        )));
+        // CURLE_SEND_ERROR (55) for SMTP command failures
+        return Err(Error::Transfer {
+            code: 55,
+            message: format!("SMTP MAIL FROM failed: {} {}", mail_resp.code, mail_resp.message),
+        });
     }
 
     // RCPT TO
@@ -367,10 +370,10 @@ pub async fn send_mail(
         if !rcpt_resp.is_ok() {
             send_command(&mut writer, "QUIT").await?;
             let _ = read_response(&mut reader).await;
-            return Err(Error::Http(format!(
-                "SMTP RCPT TO failed: {} {}",
-                rcpt_resp.code, rcpt_resp.message
-            )));
+            return Err(Error::Transfer {
+                code: 55,
+                message: format!("SMTP RCPT TO failed: {} {}", rcpt_resp.code, rcpt_resp.message),
+            });
         }
     }
 
@@ -380,10 +383,10 @@ pub async fn send_mail(
     if !data_resp.is_intermediate() {
         send_command(&mut writer, "QUIT").await?;
         let _ = read_response(&mut reader).await;
-        return Err(Error::Http(format!(
-            "SMTP DATA failed: {} {}",
-            data_resp.code, data_resp.message
-        )));
+        return Err(Error::Transfer {
+            code: 55,
+            message: format!("SMTP DATA failed: {} {}", data_resp.code, data_resp.message),
+        });
     }
 
     // Send message body as raw bytes, escaping leading dots per RFC 5321.
@@ -420,10 +423,10 @@ pub async fn send_mail(
     if !end_resp.is_ok() {
         send_command(&mut writer, "QUIT").await?;
         let _ = read_response(&mut reader).await;
-        return Err(Error::Http(format!(
-            "SMTP message rejected: {} {}",
-            end_resp.code, end_resp.message
-        )));
+        return Err(Error::Transfer {
+            code: 55,
+            message: format!("SMTP message rejected: {} {}", end_resp.code, end_resp.message),
+        });
     }
 
     // QUIT
