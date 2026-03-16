@@ -1481,6 +1481,9 @@ pub fn error_to_exit_code(err: &liburlx::Error) -> ExitCode {
             ExitCode::from(u8::try_from(*code).map_or(1, |c| c))
         }
         liburlx::Error::PartialBody { .. } => ExitCode::from(56), // CURLE_RECV_ERROR
+        liburlx::Error::SmtpAuth(_) => ExitCode::from(67),        // CURLE_LOGIN_DENIED
+        liburlx::Error::SmtpSend(_) => ExitCode::from(55),        // CURLE_SEND_ERROR
+        liburlx::Error::Protocol(code) => ExitCode::from(u8::try_from(*code).map_or(1, |c| c)),
         _ => ExitCode::FAILURE,
     }
 }

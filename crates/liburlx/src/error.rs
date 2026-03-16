@@ -85,6 +85,18 @@ pub enum Error {
         partial_body: Vec<u8>,
     },
 
+    /// An SMTP authentication error (maps to `CURLE_LOGIN_DENIED` = 67).
+    #[error("SMTP auth error: {0}")]
+    SmtpAuth(String),
+
+    /// An SMTP send error (maps to `CURLE_SEND_ERROR` = 55).
+    #[error("SMTP send error: {0}")]
+    SmtpSend(String),
+
+    /// A generic protocol error with a curl error code.
+    #[error("protocol error (code {0})")]
+    Protocol(u32),
+
     /// A URL glob pattern error with position info (curl-compatible format).
     /// Formats as:
     /// ```text

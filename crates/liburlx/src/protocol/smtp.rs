@@ -1,12 +1,38 @@
 //! SMTP protocol handler.
 //!
-//! Implements a basic SMTP client (RFC 5321) for sending email messages.
+//! Implements a full SMTP client (RFC 5321) for sending email messages and
+//! executing SMTP commands (VRFY, EXPN, HELP, NOOP, RSET).
 //! Supports EHLO/HELO greeting, MAIL FROM, RCPT TO, DATA commands,
-//! and AUTH PLAIN/LOGIN authentication.
+//! AUTH PLAIN/LOGIN/XOAUTH2 authentication, and SIZE extension.
 
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 
 use crate::error::Error;
+
+/// Configuration for an SMTP transfer.
+#[derive(Debug, Clone, Default)]
+pub struct SmtpConfig<'a> {
+    /// SMTP envelope sender (MAIL FROM).
+    pub mail_from: Option<&'a str>,
+    /// SMTP envelope recipients (RCPT TO).
+    pub mail_rcpt: &'a [String],
+    /// SMTP AUTH identity (MAIL AUTH).
+    pub mail_auth: Option<&'a str>,
+    /// SASL authorization identity.
+    pub sasl_authzid: Option<&'a str>,
+    /// Send SASL initial response in first message.
+    pub sasl_ir: bool,
+    /// Custom SMTP command (curl `-X`).
+    pub custom_request: Option<&'a str>,
+    /// OAuth 2.0 bearer token for XOAUTH2.
+    pub oauth2_bearer: Option<&'a str>,
+    /// Convert LF to CRLF in upload data (curl `--crlf`).
+    pub crlf: bool,
+    /// Authentication username (from `-u user:pass`).
+    pub username: Option<&'a str>,
+    /// Authentication password (from `-u user:pass`).
+    pub password: Option<&'a str>,
+}
 
 /// An SMTP response from the server.
 #[derive(Debug, Clone)]
@@ -15,6 +41,8 @@ pub struct SmtpResponse {
     pub code: u16,
     /// The response text (may be multi-line).
     pub message: String,
+    /// The raw response lines as received from the server (with status codes).
+    pub raw: String,
 }
 
 impl SmtpResponse {
@@ -31,6 +59,33 @@ impl SmtpResponse {
     }
 }
 
+/// EHLO capabilities parsed from server response.
+#[derive(Debug, Default)]
+struct EhloCapabilities {
+    /// Whether the server supports SIZE extension.
+    size: bool,
+    /// Supported AUTH mechanisms (uppercased).
+    auth_mechanisms: Vec<String>,
+}
+
+/// Parse EHLO response to extract capabilities.
+fn parse_ehlo_capabilities(message: &str) -> EhloCapabilities {
+    let mut caps = EhloCapabilities::default();
+    for line in message.lines() {
+        let line_upper = line.to_uppercase();
+        if line_upper.starts_with("SIZE") || line_upper == "SIZE" {
+            caps.size = true;
+        } else if let Some(mechs) = line_upper.strip_prefix("AUTH ") {
+            for mech in mechs.split_whitespace() {
+                caps.auth_mechanisms.push(mech.to_string());
+            }
+        } else if line_upper == "AUTH" {
+            // AUTH with no mechanisms listed
+        }
+    }
+    caps
+}
+
 /// Read an SMTP response (potentially multi-line) from the server.
 ///
 /// Multi-line responses use `code-text` format; final line uses `code text`.
@@ -42,6 +97,7 @@ pub async fn read_response<S: AsyncRead + Unpin>(
     stream: &mut BufReader<S>,
 ) -> Result<SmtpResponse, Error> {
     let mut full_message = String::new();
+    let mut raw_response = String::new();
     let mut final_code: Option<u16> = None;
 
     loop {
@@ -56,6 +112,10 @@ pub async fn read_response<S: AsyncRead + Unpin>(
         }
 
         let line = line.trim_end_matches('\n').trim_end_matches('\r');
+
+        // Capture raw line (with status code prefix)
+        raw_response.push_str(line);
+        raw_response.push_str("\r\n");
 
         if line.len() < 4 {
             full_message.push_str(line);
@@ -96,7 +156,7 @@ pub async fn read_response<S: AsyncRead + Unpin>(
     let code =
         final_code.ok_or_else(|| Error::Http("SMTP response has no status code".to_string()))?;
 
-    Ok(SmtpResponse { code, message: full_message })
+    Ok(SmtpResponse { code, message: full_message, raw: raw_response })
 }
 
 /// Send an SMTP command.
@@ -117,39 +177,64 @@ pub async fn send_command<S: AsyncWrite + Unpin>(
     Ok(())
 }
 
-/// Send an email via SMTP.
+/// Determine the SMTP operation mode based on config.
 ///
-/// Connects to the SMTP server specified in the URL, authenticates if
-/// credentials are present, and sends the provided message data.
+/// curl uses the URL path as the EHLO hostname and determines the mode:
+/// - If `--mail-from` is set: mail send mode (MAIL FROM / RCPT TO / DATA)
+/// - If `--mail-rcpt` is set without `--mail-from`: VRFY mode (or custom `-X`)
+/// - If neither: HELP mode (or custom `-X`)
+#[derive(Debug)]
+enum SmtpMode {
+    /// Send mail: MAIL FROM, RCPT TO, DATA
+    Send,
+    /// VRFY command with recipients
+    Vrfy,
+    /// Custom command (EXPN, NOOP, RSET, etc.)
+    Custom(String),
+    /// HELP command (no recipients, no sender)
+    Help,
+}
+
+/// Send an email or execute an SMTP command.
 ///
-/// If `mail_from` or `mail_rcpt` are provided, they override the addresses
-/// parsed from the message headers. This matches curl's `CURLOPT_MAIL_FROM`
-/// and `CURLOPT_MAIL_RCPT` behavior.
+/// Connects to the SMTP server specified in the URL, performs EHLO/HELO,
+/// optionally authenticates, and then either sends mail or executes commands
+/// (VRFY, EXPN, HELP, etc.) depending on the configuration.
 ///
-/// # URL format
-///
-/// `smtp://host:port` — plain SMTP (port 25 default)
+/// The URL path is used as the EHLO hostname (curl compatibility).
 ///
 /// # Errors
 ///
-/// Returns an error if connection, auth, or sending fails.
-#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+/// Returns an error if connection, auth, or transfer fails.
+#[allow(clippy::too_many_lines)]
 pub async fn send_mail(
     url: &crate::url::Url,
     mail_data: &[u8],
-    mail_from: Option<&str>,
-    mail_rcpt: &[String],
-    mail_auth: Option<&str>,
-    sasl_authzid: Option<&str>,
-    sasl_ir: bool,
-    ext_credentials: Option<(&str, &str)>,
-    custom_request: Option<&str>,
-    oauth2_bearer: Option<&str>,
+    config: &SmtpConfig<'_>,
 ) -> Result<crate::protocol::http::response::Response, Error> {
     let (host, port) = url.host_and_port()?;
 
-    // Extract credentials from URL or external parameter (-u flag)
-    let credentials = url.credentials().or(ext_credentials);
+    // Extract the URL path for EHLO — curl uses the first path segment
+    // e.g., smtp://host:port/912 -> EHLO 912
+    let url_path = url.path();
+    let ehlo_name = url_path.strip_prefix('/').unwrap_or(url_path).split('/').next().unwrap_or("");
+    // If no path segment, fall back to hostname
+    let ehlo_name = if ehlo_name.is_empty() { host.as_str() } else { ehlo_name };
+
+    // Reject URLs with CR/LF in path (curl returns CURLE_URL_MALFORMAT = 3)
+    let decoded_path = url_decode(url_path);
+    if decoded_path.contains('\r') || decoded_path.contains('\n') {
+        return Err(Error::UrlParse("URL contains CR/LF characters".to_string()));
+    }
+
+    // Extract credentials: config (from -u flag) takes priority over URL-embedded
+    let credentials: Option<(String, String)> = config.username.map_or_else(
+        || url.credentials().map(|(u, p)| (u.to_string(), p.to_string())),
+        |user| Some((user.to_string(), config.password.unwrap_or("").to_string())),
+    );
+
+    // Determine SMTP mode
+    let mode = determine_smtp_mode(config, !mail_data.is_empty());
 
     // Connect to SMTP server
     let addr = format!("{host}:{port}");
@@ -166,34 +251,16 @@ pub async fn send_mail(
         )));
     }
 
-    // Send EHLO — curl uses the URL path (without leading /) as the EHLO argument.
-    // For smtp://host:port/900, EHLO argument is "900".
-    // If no path, fall back to the host.
-    let ehlo_arg = {
-        let p = url.path().trim_start_matches('/');
-        if p.is_empty() {
-            host.clone()
-        } else {
-            p.to_string()
-        }
-    };
-    send_command(&mut writer, &format!("EHLO {ehlo_arg}")).await?;
+    // Send EHLO
+    send_command(&mut writer, &format!("EHLO {ehlo_name}")).await?;
     let ehlo_resp = read_response(&mut reader).await?;
 
-    // Parse EHLO capabilities to find supported AUTH mechanisms
-    let mut server_auth_mechanisms: Vec<String> = Vec::new();
-    if ehlo_resp.is_ok() {
-        // EHLO response message may contain "AUTH PLAIN LOGIN" etc.
-        let ehlo_text = format!("{} {}", ehlo_resp.code, ehlo_resp.message);
-        for word in ehlo_text.split_whitespace() {
-            let upper = word.to_uppercase();
-            if matches!(upper.as_str(), "PLAIN" | "LOGIN" | "CRAM-MD5" | "NTLM" | "XOAUTH2") {
-                server_auth_mechanisms.push(upper);
-            }
-        }
+    let (ehlo_ok, caps) = if ehlo_resp.is_ok() {
+        let caps = parse_ehlo_capabilities(&ehlo_resp.message);
+        (true, caps)
     } else {
         // Fall back to HELO
-        send_command(&mut writer, &format!("HELO {ehlo_arg}")).await?;
+        send_command(&mut writer, &format!("HELO {ehlo_name}")).await?;
         let helo_resp = read_response(&mut reader).await?;
         if !helo_resp.is_ok() {
             return Err(Error::Http(format!(
@@ -201,260 +268,431 @@ pub async fn send_mail(
                 helo_resp.code, helo_resp.message
             )));
         }
-    }
-
-    // XOAUTH2 takes priority when bearer token is present
-    if let Some(bearer) = oauth2_bearer {
-        use base64::Engine;
-        if let Some((user, _)) = credentials {
-            let payload = format!("user={user}\x01auth=Bearer {bearer}\x01\x01");
-            let encoded = base64::engine::general_purpose::STANDARD.encode(payload.as_bytes());
-
-            if sasl_ir {
-                send_command(&mut writer, &format!("AUTH XOAUTH2 {encoded}")).await?;
-            } else {
-                send_command(&mut writer, "AUTH XOAUTH2").await?;
-                let continue_resp = read_response(&mut reader).await?;
-                if continue_resp.code != 334 {
-                    send_command(&mut writer, "QUIT").await?;
-                    let _ = read_response(&mut reader).await;
-                    return Err(Error::Http(format!(
-                        "SMTP AUTH XOAUTH2 expected 334, got: {} {}",
-                        continue_resp.code, continue_resp.message
-                    )));
-                }
-                send_command(&mut writer, &encoded).await?;
-            }
-            let auth_resp = read_response(&mut reader).await?;
-            if !auth_resp.is_ok() {
-                send_command(&mut writer, "QUIT").await?;
-                let _ = read_response(&mut reader).await;
-                return Err(Error::Http(format!(
-                    "SMTP AUTH XOAUTH2 failed: {} {}",
-                    auth_resp.code, auth_resp.message
-                )));
-            }
-        }
-    }
-    // Authenticate if credentials provided AND server supports AUTH
-    else if let Some((user, pass)) = credentials.filter(|_| !server_auth_mechanisms.is_empty()) {
-        use base64::Engine;
-
-        // Choose auth mechanism based on server capabilities
-        // Priority: PLAIN > LOGIN (matching curl's preference order)
-        let use_login = server_auth_mechanisms.contains(&"LOGIN".to_string())
-            && !server_auth_mechanisms.contains(&"PLAIN".to_string());
-
-        if use_login {
-            // AUTH LOGIN: send username and password separately, base64-encoded
-            let user_b64 = base64::engine::general_purpose::STANDARD.encode(user.as_bytes());
-            let pass_b64 = base64::engine::general_purpose::STANDARD.encode(pass.as_bytes());
-
-            send_command(&mut writer, "AUTH LOGIN").await?;
-            let resp = read_response(&mut reader).await?;
-            if resp.code != 334 {
-                return Err(Error::Http(format!(
-                    "SMTP AUTH LOGIN failed: {} {}",
-                    resp.code, resp.message
-                )));
-            }
-            send_command(&mut writer, &user_b64).await?;
-            let resp = read_response(&mut reader).await?;
-            if resp.code != 334 {
-                return Err(Error::Http(format!(
-                    "SMTP AUTH LOGIN failed: {} {}",
-                    resp.code, resp.message
-                )));
-            }
-            send_command(&mut writer, &pass_b64).await?;
-        } else {
-            // AUTH PLAIN
-            let auth_string = sasl_authzid.map_or_else(
-                || format!("\0{user}\0{pass}"),
-                |authzid| format!("{authzid}\0{user}\0{pass}"),
-            );
-            let encoded = base64::engine::general_purpose::STANDARD.encode(auth_string.as_bytes());
-
-            if sasl_ir {
-                // Send initial response inline with AUTH command
-                send_command(&mut writer, &format!("AUTH PLAIN {encoded}")).await?;
-            } else {
-                // Two-step: send AUTH PLAIN, wait for 334, then send credentials
-                send_command(&mut writer, "AUTH PLAIN").await?;
-                let continue_resp = read_response(&mut reader).await?;
-                if continue_resp.code != 334 {
-                    return Err(Error::Http(format!(
-                        "SMTP AUTH PLAIN expected 334 continue, got: {} {}",
-                        continue_resp.code, continue_resp.message
-                    )));
-                }
-                send_command(&mut writer, &encoded).await?;
-            }
-        }
-        let auth_resp = read_response(&mut reader).await?;
-        if !auth_resp.is_ok() {
-            send_command(&mut writer, "QUIT").await?;
-            let _ = read_response(&mut reader).await;
-            return Err(Error::Transfer {
-                code: 67,
-                message: format!("SMTP AUTH failed: {} {}", auth_resp.code, auth_resp.message),
-            });
-        }
-    }
-
-    // If custom request is set (e.g. -X "vrfy"), send it instead of MAIL flow.
-    // For VRFY/EXPN, --mail-rcpt provides the argument (curl compat: test 950).
-    if let Some(cmd) = custom_request {
-        let full_cmd =
-            if mail_rcpt.is_empty() { cmd.to_string() } else { format!("{cmd} {}", mail_rcpt[0]) };
-        send_command(&mut writer, &full_cmd).await?;
-        let _ = read_response(&mut reader).await;
-        send_command(&mut writer, "QUIT").await?;
-        let _ = read_response(&mut reader).await;
-        let headers = std::collections::HashMap::new();
-        return Ok(crate::protocol::http::response::Response::new(
-            250,
-            headers,
-            Vec::new(),
-            url.as_str().to_string(),
-        ));
-    }
-
-    // Determine envelope sender and recipients.
-    let mail_str = String::from_utf8_lossy(mail_data);
-    let (header_from, header_to) = extract_mail_addresses(&mail_str);
-
-    let from_addr = if let Some(from) = mail_from {
-        from.to_string()
-    } else if let Some(addr) = header_from {
-        addr
-    } else {
-        send_command(&mut writer, "QUIT").await?;
-        let _ = read_response(&mut reader).await;
-        return Err(Error::Http("no From address".to_string()));
+        // HELO = no capabilities
+        (false, EhloCapabilities::default())
     };
 
-    let rcpt_addrs: Vec<String> = if mail_rcpt.is_empty() {
-        if let Some(to) = header_to {
-            vec![to]
-        } else {
-            send_command(&mut writer, "QUIT").await?;
-            let _ = read_response(&mut reader).await;
-            return Err(Error::Http("no To address".to_string()));
-        }
-    } else {
-        mail_rcpt.to_vec()
-    };
-
-    // MAIL FROM
-    let mail_from_cmd = mail_auth.map_or_else(
-        || format!("MAIL FROM:<{from_addr}>"),
-        |auth| format!("MAIL FROM:<{from_addr}> AUTH=<{auth}>"),
-    );
-    send_command(&mut writer, &mail_from_cmd).await?;
-    let mail_resp = read_response(&mut reader).await?;
-    if !mail_resp.is_ok() {
-        send_command(&mut writer, "QUIT").await?;
-        let _ = read_response(&mut reader).await;
-        // CURLE_SEND_ERROR (55) for SMTP command failures
-        return Err(Error::Transfer {
-            code: 55,
-            message: format!("SMTP MAIL FROM failed: {} {}", mail_resp.code, mail_resp.message),
-        });
-    }
-
-    // RCPT TO
-    for rcpt in &rcpt_addrs {
-        send_command(&mut writer, &format!("RCPT TO:<{rcpt}>")).await?;
-        let rcpt_resp = read_response(&mut reader).await?;
-        if !rcpt_resp.is_ok() {
-            send_command(&mut writer, "QUIT").await?;
-            let _ = read_response(&mut reader).await;
-            return Err(Error::Transfer {
-                code: 55,
-                message: format!("SMTP RCPT TO failed: {} {}", rcpt_resp.code, rcpt_resp.message),
-            });
-        }
-    }
-
-    // DATA
-    send_command(&mut writer, "DATA").await?;
-    let data_resp = read_response(&mut reader).await?;
-    if !data_resp.is_intermediate() {
-        send_command(&mut writer, "QUIT").await?;
-        let _ = read_response(&mut reader).await;
-        return Err(Error::Transfer {
-            code: 55,
-            message: format!("SMTP DATA failed: {} {}", data_resp.code, data_resp.message),
-        });
-    }
-
-    // Send message body, escaping leading dots per RFC 5321.
-    // Write in chunks (not byte-by-byte) for performance (test 900 has 65KB body).
-    {
-        let mut chunk_start = 0;
-        let mut line_start = true;
-        for i in 0..mail_data.len() {
-            if line_start && mail_data[i] == b'.' {
-                // Write everything before this dot, then the dot-stuffed dot
-                if i > chunk_start {
-                    writer
-                        .write_all(&mail_data[chunk_start..i])
-                        .await
-                        .map_err(|e| Error::Http(format!("SMTP data write error: {e}")))?;
-                }
-                writer
-                    .write_all(b"..")
-                    .await
-                    .map_err(|e| Error::Http(format!("SMTP data write error: {e}")))?;
-                chunk_start = i + 1; // skip the original dot (we wrote ".." already)
+    // Authenticate if credentials provided AND server advertises AUTH
+    // When EHLO failed (HELO fallback), skip auth (no capability).
+    // When EHLO succeeded but no AUTH advertised, skip auth (curl compat: test 940).
+    if ehlo_ok && !caps.auth_mechanisms.is_empty() {
+        if let Some(bearer) = config.oauth2_bearer {
+            // XOAUTH2 authentication
+            if let Some((ref user, _)) = credentials {
+                do_auth_xoauth2(
+                    &mut reader,
+                    &mut writer,
+                    user,
+                    bearer,
+                    config.sasl_ir,
+                    &caps.auth_mechanisms,
+                )
+                .await?;
             }
-            line_start = mail_data[i] == b'\n';
+        } else if let Some((ref user, ref pass)) = credentials {
+            do_auth(
+                &mut reader,
+                &mut writer,
+                user,
+                pass,
+                config.sasl_authzid,
+                config.sasl_ir,
+                &caps.auth_mechanisms,
+            )
+            .await?;
         }
-        // Write remaining data
-        if chunk_start < mail_data.len() {
-            writer
-                .write_all(&mail_data[chunk_start..])
-                .await
-                .map_err(|e| Error::Http(format!("SMTP data write error: {e}")))?;
-        }
-    }
-    // Flush after writing body data
-    writer.flush().await.map_err(|e| Error::Http(format!("SMTP flush error: {e}")))?;
-    // Ensure data ends with CRLF before the terminator
-    if !mail_data.is_empty() && !mail_data.ends_with(b"\r\n") && !mail_data.ends_with(b"\n") {
-        writer
-            .write_all(b"\r\n")
-            .await
-            .map_err(|e| Error::Http(format!("SMTP data write error: {e}")))?;
     }
 
-    // End data with .CRLF
-    send_command(&mut writer, ".").await?;
-    let end_resp = read_response(&mut reader).await?;
-    if !end_resp.is_ok() {
-        send_command(&mut writer, "QUIT").await?;
-        let _ = read_response(&mut reader).await;
-        return Err(Error::Transfer {
-            code: 55,
-            message: format!("SMTP message rejected: {} {}", end_resp.code, end_resp.message),
-        });
+    // Execute the appropriate SMTP mode
+    let mut response_body = Vec::new();
+    match mode {
+        SmtpMode::Send => {
+            do_send_mail(&mut reader, &mut writer, mail_data, config, &caps).await?;
+        }
+        SmtpMode::Vrfy => {
+            // Send VRFY for each recipient
+            // curl allows 2xx and 553 (ambiguous) responses; other codes → error 8
+            for rcpt in config.mail_rcpt {
+                send_command(&mut writer, &format!("VRFY {rcpt}")).await?;
+                let resp = read_response(&mut reader).await?;
+                if !resp.is_ok() && resp.code != 553 {
+                    // Non-2xx/non-553 → QUIT + CURLE_WEIRD_SERVER_REPLY (8)
+                    let _ = send_command(&mut writer, "QUIT").await;
+                    return Err(Error::Protocol(8));
+                }
+                response_body.extend_from_slice(resp.raw.as_bytes());
+            }
+        }
+        SmtpMode::Custom(cmd) => {
+            // Custom command (e.g., EXPN, NOOP, RSET, vrfy)
+            if config.mail_rcpt.is_empty() {
+                send_command(&mut writer, &cmd).await?;
+            } else {
+                for rcpt in config.mail_rcpt {
+                    send_command(&mut writer, &format!("{cmd} {rcpt}")).await?;
+                }
+            }
+            let resp = read_response(&mut reader).await?;
+            response_body.extend_from_slice(resp.raw.as_bytes());
+            if !resp.is_ok() {
+                // Non-2xx custom command → QUIT + return CURLE_WEIRD_SERVER_REPLY (8)
+                let _ = send_command(&mut writer, "QUIT").await;
+                return Err(Error::Protocol(8));
+            }
+        }
+        SmtpMode::Help => {
+            send_command(&mut writer, "HELP").await?;
+            let resp = read_response(&mut reader).await?;
+            response_body.extend_from_slice(resp.raw.as_bytes());
+            if !resp.is_ok() {
+                let _ = send_command(&mut writer, "QUIT").await;
+                return Err(Error::Protocol(8));
+            }
+        }
     }
 
     // QUIT
     send_command(&mut writer, "QUIT").await?;
-    let _ = read_response(&mut reader).await;
 
     let headers = std::collections::HashMap::new();
     Ok(crate::protocol::http::response::Response::new(
         250,
         headers,
-        Vec::new(),
+        response_body,
         url.as_str().to_string(),
     ))
 }
 
+/// Determine the SMTP mode based on configuration and mail data.
+fn determine_smtp_mode(config: &SmtpConfig<'_>, has_data: bool) -> SmtpMode {
+    if let Some(custom) = config.custom_request {
+        return SmtpMode::Custom(custom.to_string());
+    }
+    // If --mail-from is set OR upload data is present, it's send mode
+    if config.mail_from.is_some() || has_data {
+        return SmtpMode::Send;
+    }
+    if !config.mail_rcpt.is_empty() {
+        return SmtpMode::Vrfy;
+    }
+    SmtpMode::Help
+}
+
+/// Perform AUTH using the best available mechanism.
+///
+/// curl negotiates: CRAM-MD5 > DIGEST-MD5 > NTLM > LOGIN > PLAIN.
+/// We support: LOGIN > PLAIN (matching what most SMTP servers need).
+#[allow(clippy::too_many_arguments)]
+async fn do_auth<S: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    reader: &mut BufReader<S>,
+    writer: &mut W,
+    user: &str,
+    pass: &str,
+    sasl_authzid: Option<&str>,
+    sasl_ir: bool,
+    server_mechs: &[String],
+) -> Result<(), Error> {
+    use base64::Engine;
+
+    // Prefer LOGIN if available (matches most curl test expectations), then PLAIN
+    if server_mechs.iter().any(|m| m == "LOGIN") {
+        // AUTH LOGIN
+        if sasl_ir {
+            let encoded_user = base64::engine::general_purpose::STANDARD.encode(user.as_bytes());
+            send_command(writer, &format!("AUTH LOGIN {encoded_user}")).await?;
+        } else {
+            send_command(writer, "AUTH LOGIN").await?;
+            let resp = read_response(reader).await?;
+            if resp.code != 334 {
+                return Err(Error::SmtpAuth(format!(
+                    "AUTH LOGIN expected 334, got: {} {}",
+                    resp.code, resp.message
+                )));
+            }
+            // Server sends base64("Username:") — send username
+            let encoded_user = base64::engine::general_purpose::STANDARD.encode(user.as_bytes());
+            send_command(writer, &encoded_user).await?;
+        }
+
+        let resp = read_response(reader).await?;
+        if resp.code != 334 {
+            return Err(Error::SmtpAuth(format!(
+                "AUTH LOGIN expected 334 for password, got: {} {}",
+                resp.code, resp.message
+            )));
+        }
+        // Server sends base64("Password:") — send password
+        let encoded_pass = base64::engine::general_purpose::STANDARD.encode(pass.as_bytes());
+        send_command(writer, &encoded_pass).await?;
+
+        let auth_resp = read_response(reader).await?;
+        if !auth_resp.is_ok() {
+            return Err(Error::SmtpAuth(format!(
+                "AUTH LOGIN failed: {} {}",
+                auth_resp.code, auth_resp.message
+            )));
+        }
+    } else if server_mechs.iter().any(|m| m == "PLAIN") {
+        // AUTH PLAIN
+        let auth_string = sasl_authzid.map_or_else(
+            || format!("\0{user}\0{pass}"),
+            |authzid| format!("{authzid}\0{user}\0{pass}"),
+        );
+        let encoded = base64::engine::general_purpose::STANDARD.encode(auth_string.as_bytes());
+
+        if sasl_ir {
+            send_command(writer, &format!("AUTH PLAIN {encoded}")).await?;
+        } else {
+            send_command(writer, "AUTH PLAIN").await?;
+            let resp = read_response(reader).await?;
+            if resp.code != 334 {
+                return Err(Error::SmtpAuth(format!(
+                    "AUTH PLAIN expected 334, got: {} {}",
+                    resp.code, resp.message
+                )));
+            }
+            send_command(writer, &encoded).await?;
+        }
+
+        let auth_resp = read_response(reader).await?;
+        if !auth_resp.is_ok() {
+            return Err(Error::SmtpAuth(format!(
+                "AUTH failed: {} {}",
+                auth_resp.code, auth_resp.message
+            )));
+        }
+    }
+    // If server advertises AUTH but not PLAIN or LOGIN, skip authentication.
+    // curl would try other mechanisms, but we fall through silently.
+    Ok(())
+}
+
+/// Perform XOAUTH2 authentication.
+async fn do_auth_xoauth2<S: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    reader: &mut BufReader<S>,
+    writer: &mut W,
+    user: &str,
+    bearer: &str,
+    sasl_ir: bool,
+    server_mechs: &[String],
+) -> Result<(), Error> {
+    use base64::Engine;
+
+    if !server_mechs.iter().any(|m| m == "XOAUTH2") {
+        return Ok(());
+    }
+
+    // XOAUTH2 format: "user=<user>\x01auth=Bearer <token>\x01\x01"
+    let auth_string = format!("user={user}\x01auth=Bearer {bearer}\x01\x01");
+    let encoded = base64::engine::general_purpose::STANDARD.encode(auth_string.as_bytes());
+
+    if sasl_ir {
+        send_command(writer, &format!("AUTH XOAUTH2 {encoded}")).await?;
+    } else {
+        send_command(writer, "AUTH XOAUTH2").await?;
+        let resp = read_response(reader).await?;
+        if resp.code != 334 {
+            return Err(Error::SmtpAuth(format!(
+                "AUTH XOAUTH2 expected 334, got: {} {}",
+                resp.code, resp.message
+            )));
+        }
+        send_command(writer, &encoded).await?;
+    }
+
+    let auth_resp = read_response(reader).await?;
+    if !auth_resp.is_ok() {
+        return Err(Error::SmtpAuth(format!(
+            "AUTH XOAUTH2 failed: {} {}",
+            auth_resp.code, auth_resp.message
+        )));
+    }
+    Ok(())
+}
+
+/// Execute the mail send flow: MAIL FROM, RCPT TO, DATA.
+async fn do_send_mail<S: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    reader: &mut BufReader<S>,
+    writer: &mut W,
+    mail_data: &[u8],
+    config: &SmtpConfig<'_>,
+    caps: &EhloCapabilities,
+) -> Result<(), Error> {
+    // Determine sender address — default to empty (curl compat: test 915)
+    let from_addr = config.mail_from.unwrap_or("");
+
+    // Build MAIL FROM command
+    let mut mail_from_cmd = format!("MAIL FROM:<{from_addr}>");
+
+    // Add AUTH= parameter if specified (RFC 2554)
+    if let Some(auth) = config.mail_auth {
+        use std::fmt::Write;
+        let _ = write!(mail_from_cmd, " AUTH=<{auth}>");
+    }
+
+    // Add SIZE= parameter if server supports SIZE extension
+    if caps.size {
+        use std::fmt::Write;
+        let _ = write!(mail_from_cmd, " SIZE={}", mail_data.len());
+    }
+
+    send_command(writer, &mail_from_cmd).await?;
+    let mail_resp = read_response(reader).await?;
+    if !mail_resp.is_ok() {
+        // MAIL FROM rejected → QUIT + exit code 55 (CURLE_SEND_ERROR)
+        let _ = send_command(writer, "QUIT").await;
+        return Err(Error::SmtpSend(format!(
+            "SMTP MAIL FROM failed: {} {}",
+            mail_resp.code, mail_resp.message
+        )));
+    }
+
+    // RCPT TO (one per recipient)
+    for rcpt in config.mail_rcpt {
+        send_command(writer, &format!("RCPT TO:<{rcpt}>")).await?;
+        let rcpt_resp = read_response(reader).await?;
+        if !rcpt_resp.is_ok() {
+            // RCPT TO rejected → QUIT + exit code 55 (CURLE_SEND_ERROR)
+            let _ = send_command(writer, "QUIT").await;
+            return Err(Error::SmtpSend(format!(
+                "SMTP RCPT TO failed: {} {}",
+                rcpt_resp.code, rcpt_resp.message
+            )));
+        }
+    }
+
+    // DATA
+    send_command(writer, "DATA").await?;
+    let data_resp = read_response(reader).await?;
+    if !data_resp.is_intermediate() {
+        return Err(Error::SmtpSend(format!(
+            "SMTP DATA failed: {} {}",
+            data_resp.code, data_resp.message
+        )));
+    }
+
+    // Send message body with proper line handling
+    write_smtp_data(writer, mail_data, config.crlf).await?;
+
+    // End data with CRLF.CRLF
+    send_command(writer, ".").await?;
+    let end_resp = read_response(reader).await?;
+    if !end_resp.is_ok() {
+        return Err(Error::SmtpSend(format!(
+            "SMTP message rejected: {} {}",
+            end_resp.code, end_resp.message
+        )));
+    }
+
+    Ok(())
+}
+
+/// Write SMTP DATA body, handling dot-stuffing and optional CRLF conversion.
+///
+/// When `crlf` is true, converts lone LF to CRLF (curl `--crlf`).
+/// Lines starting with `.` get an extra `.` prepended (dot-stuffing per RFC 5321).
+/// Data is sent as-is otherwise, matching curl's behavior.
+async fn write_smtp_data<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    data: &[u8],
+    crlf: bool,
+) -> Result<(), Error> {
+    // Buffer output to avoid excessive system calls (important for large uploads).
+    let mut buf = Vec::with_capacity(data.len() + data.len() / 50);
+    let mut at_line_start = true;
+    let mut last_was_crlf = true; // Whether last line ending was proper CRLF
+
+    let mut i = 0;
+    while i < data.len() {
+        let b = data[i];
+
+        if at_line_start && b == b'.' {
+            // Dot-stuff: add extra dot before the line's dot
+            buf.push(b'.');
+            buf.push(b'.');
+            at_line_start = false;
+            last_was_crlf = false;
+            i += 1;
+            continue;
+        }
+
+        if b == b'\r' && data.get(i + 1) == Some(&b'\n') {
+            // CRLF pair — write it and mark line start
+            buf.push(b'\r');
+            buf.push(b'\n');
+            at_line_start = true;
+            last_was_crlf = true;
+            i += 2;
+            continue;
+        }
+
+        if b == b'\n' {
+            if crlf {
+                // --crlf: convert lone LF to CRLF
+                buf.push(b'\r');
+                buf.push(b'\n');
+                last_was_crlf = true;
+            } else {
+                // Send bare LF as-is (curl compat: test 900)
+                buf.push(b'\n');
+                last_was_crlf = false;
+            }
+            at_line_start = true;
+            i += 1;
+            continue;
+        }
+
+        // Regular byte
+        buf.push(b);
+        at_line_start = false;
+        last_was_crlf = false;
+        i += 1;
+    }
+
+    // Ensure CRLF before the terminating dot (curl compat: SMTP_EOB = "\r\n.\r\n")
+    // If data didn't end with CRLF, add one
+    if !last_was_crlf {
+        buf.push(b'\r');
+        buf.push(b'\n');
+    }
+
+    // Write the entire buffer at once
+    writer.write_all(&buf).await.map_err(|e| Error::Http(format!("SMTP data write error: {e}")))?;
+    writer.flush().await.map_err(|e| Error::Http(format!("SMTP flush error: {e}")))?;
+    Ok(())
+}
+
+/// URL-decode a percent-encoded string.
+fn url_decode(s: &str) -> String {
+    let mut result = Vec::new();
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (hex_digit(bytes[i + 1]), hex_digit(bytes[i + 2])) {
+                result.push(hi * 16 + lo);
+                i += 3;
+                continue;
+            }
+        }
+        result.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&result).to_string()
+}
+
+/// Convert a hex digit character to its value.
+const fn hex_digit(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
 /// Extract From and To addresses from email headers.
+#[cfg(test)]
 fn extract_mail_addresses(mail: &str) -> (Option<String>, Option<String>) {
     let mut from = None;
     let mut to = None;
@@ -479,6 +717,7 @@ fn extract_mail_addresses(mail: &str) -> (Option<String>, Option<String>) {
 /// - `user@example.com`
 /// - `<user@example.com>`
 /// - `"Name" <user@example.com>`
+#[cfg(test)]
 fn extract_address(value: &str) -> String {
     if let Some(start) = value.find('<') {
         if let Some(end) = value.find('>') {
@@ -522,14 +761,14 @@ mod tests {
 
     #[test]
     fn smtp_response_status_ok() {
-        let resp = SmtpResponse { code: 250, message: String::new() };
+        let resp = SmtpResponse { code: 250, message: String::new(), raw: String::new() };
         assert!(resp.is_ok());
         assert!(!resp.is_intermediate());
     }
 
     #[test]
     fn smtp_response_status_intermediate() {
-        let resp = SmtpResponse { code: 354, message: String::new() };
+        let resp = SmtpResponse { code: 354, message: String::new(), raw: String::new() };
         assert!(resp.is_intermediate());
         assert!(!resp.is_ok());
     }
@@ -573,52 +812,68 @@ mod tests {
     }
 
     #[test]
-    fn mail_auth_parameter_format() {
-        // Verify MAIL FROM with AUTH= parameter is formatted correctly
-        let from_addr = "sender@example.com";
-        let auth: Option<&str> = Some("delegated@example.com");
-        let cmd = auth.map_or_else(
-            || format!("MAIL FROM:<{from_addr}>"),
-            |a| format!("MAIL FROM:<{from_addr}> AUTH=<{a}>"),
-        );
-        assert_eq!(cmd, "MAIL FROM:<sender@example.com> AUTH=<delegated@example.com>");
+    fn parse_ehlo_caps_with_size_and_auth() {
+        let msg = "smtp.example.com\nSIZE 10240000\nAUTH PLAIN LOGIN";
+        let caps = parse_ehlo_capabilities(msg);
+        assert!(caps.size);
+        assert_eq!(caps.auth_mechanisms, vec!["PLAIN", "LOGIN"]);
     }
 
     #[test]
-    fn mail_auth_parameter_none() {
-        // Without mail_auth, MAIL FROM should not have AUTH=
-        let from_addr = "sender@example.com";
-        let auth: Option<&str> = None;
-        let cmd = auth.map_or_else(
-            || format!("MAIL FROM:<{from_addr}>"),
-            |a| format!("MAIL FROM:<{from_addr}> AUTH=<{a}>"),
-        );
-        assert_eq!(cmd, "MAIL FROM:<sender@example.com>");
+    fn parse_ehlo_caps_no_size() {
+        let msg = "smtp.example.com\nAUTH PLAIN";
+        let caps = parse_ehlo_capabilities(msg);
+        assert!(!caps.size);
+        assert_eq!(caps.auth_mechanisms, vec!["PLAIN"]);
     }
 
     #[test]
-    fn sasl_authzid_in_auth_string() {
-        // With sasl_authzid, the auth string should be "authzid\0user\0pass"
-        use base64::Engine;
-        let authzid: Option<&str> = Some("admin@example.com");
-        let user = "user";
-        let pass = "secret";
-        let auth_string = authzid
-            .map_or_else(|| format!("\0{user}\0{pass}"), |az| format!("{az}\0{user}\0{pass}"));
-        assert_eq!(auth_string, "admin@example.com\0user\0secret");
-        // Verify it encodes properly
-        let encoded = base64::engine::general_purpose::STANDARD.encode(auth_string.as_bytes());
-        assert!(!encoded.is_empty());
+    fn parse_ehlo_caps_size_only() {
+        let msg = "smtp.example.com\nSIZE";
+        let caps = parse_ehlo_capabilities(msg);
+        assert!(caps.size);
+        assert!(caps.auth_mechanisms.is_empty());
     }
 
     #[test]
-    fn sasl_authzid_none_default() {
-        // Without sasl_authzid, the auth string should be "\0user\0pass"
-        let authzid: Option<&str> = None;
-        let user = "user";
-        let pass = "secret";
-        let auth_string = authzid
-            .map_or_else(|| format!("\0{user}\0{pass}"), |az| format!("{az}\0{user}\0{pass}"));
-        assert_eq!(auth_string, "\0user\0secret");
+    fn url_decode_basic() {
+        assert_eq!(url_decode("/hello"), "/hello");
+        assert_eq!(url_decode("/%0d%0a"), "/\r\n");
+        assert_eq!(url_decode("/foo%20bar"), "/foo bar");
+    }
+
+    #[test]
+    fn determine_mode_send() {
+        let config = SmtpConfig {
+            mail_from: Some("sender@example.com"),
+            mail_rcpt: &[],
+            ..SmtpConfig::default()
+        };
+        assert!(matches!(determine_smtp_mode(&config, false), SmtpMode::Send));
+    }
+
+    #[test]
+    fn determine_mode_send_with_data() {
+        let config = SmtpConfig::default();
+        assert!(matches!(determine_smtp_mode(&config, true), SmtpMode::Send));
+    }
+
+    #[test]
+    fn determine_mode_vrfy() {
+        let rcpts = vec!["recipient".to_string()];
+        let config = SmtpConfig { mail_rcpt: &rcpts, ..SmtpConfig::default() };
+        assert!(matches!(determine_smtp_mode(&config, false), SmtpMode::Vrfy));
+    }
+
+    #[test]
+    fn determine_mode_help() {
+        let config = SmtpConfig::default();
+        assert!(matches!(determine_smtp_mode(&config, false), SmtpMode::Help));
+    }
+
+    #[test]
+    fn determine_mode_custom() {
+        let config = SmtpConfig { custom_request: Some("EXPN"), ..SmtpConfig::default() };
+        assert!(matches!(determine_smtp_mode(&config, false), SmtpMode::Custom(_)));
     }
 }

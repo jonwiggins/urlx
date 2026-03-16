@@ -3551,23 +3551,19 @@ async fn do_single_request(
         "smtp" | "smtps" => {
             let mail_data = body.unwrap_or(&[]);
             let header_creds = extract_basic_auth_from_headers(headers);
-            let creds_tuple = header_creds.as_ref().map(|(u, p)| (u.as_str(), p.as_str()));
-            // For SMTP, -X sets the custom command (e.g. "vrfy").
-            // custom_request_target preserves original case (unlike method which uppercases).
-            let smtp_custom_cmd = custom_request_target;
-            return crate::protocol::smtp::send_mail(
-                url,
-                mail_data,
+            let smtp_config = crate::protocol::smtp::SmtpConfig {
                 mail_from,
                 mail_rcpt,
                 mail_auth,
                 sasl_authzid,
                 sasl_ir,
-                creds_tuple,
-                smtp_custom_cmd,
+                custom_request: custom_request_target,
                 oauth2_bearer,
-            )
-            .await;
+                crlf: false,
+                username: header_creds.as_ref().map(|(u, _)| u.as_str()),
+                password: header_creds.as_ref().map(|(_, p)| p.as_str()),
+            };
+            return crate::protocol::smtp::send_mail(url, mail_data, &smtp_config).await;
         }
         "imap" | "imaps" => {
             return crate::protocol::imap::fetch(
