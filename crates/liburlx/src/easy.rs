@@ -2528,18 +2528,23 @@ async fn perform_transfer(
             }
         }
 
-        // For proxy NTLM, send Proxy-Authorization: NTLM Type1 on the first request
-        if let Some(pcreds) = proxy_credentials {
-            if pcreds.method == ProxyAuthMethod::Ntlm {
-                let type1 = crate::auth::ntlm::create_type1_message();
-                request_headers.push(("Proxy-Authorization".to_string(), format!("NTLM {type1}")));
-            }
+        // For proxy NTLM on CONNECT tunnels, the auth is handled by
+        // establish_connect_tunnel. For non-CONNECT proxy NTLM, send Type 1 here.
+        let is_proxy_ntlm =
+            proxy_credentials.is_some_and(|pcreds| pcreds.method == ProxyAuthMethod::Ntlm);
+        let is_connect_tunnel = effective_proxy.is_some() && http_proxy_tunnel;
+        if is_proxy_ntlm && !is_connect_tunnel {
+            let type1 = crate::auth::ntlm::create_type1_message();
+            request_headers.push(("Proxy-Authorization".to_string(), format!("NTLM {type1}")));
         }
+        // Suppress body during NTLM Type 1 negotiation (Content-Length: 0, test 239)
+        let ntlm_initial_body =
+            if is_proxy_ntlm && !is_connect_tunnel { None } else { initial_body };
         let mut response = Box::pin(do_single_request(
             &current_url,
             &current_method,
             &request_headers,
-            initial_body,
+            ntlm_initial_body,
             verbose,
             accept_encoding,
             connect_timeout,
@@ -4475,13 +4480,28 @@ async fn establish_connect_tunnel<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    // Send initial CONNECT request
+    // For NTLM proxy auth, send Type 1 in the initial CONNECT (curl compat: test 209)
+    let initial_auth = proxy_credentials.and_then(|creds| match creds.method {
+        ProxyAuthMethod::Ntlm => {
+            let type1 = crate::auth::ntlm::create_type1_message();
+            Some(format!("Proxy-Authorization: NTLM {type1}"))
+        }
+        ProxyAuthMethod::Basic => {
+            use base64::Engine;
+            let encoded = base64::engine::general_purpose::STANDARD
+                .encode(format!("{}:{}", creds.username, creds.password).as_bytes());
+            Some(format!("Proxy-Authorization: Basic {encoded}"))
+        }
+        _ => None,
+    });
+
+    // Send initial CONNECT request (with auth if NTLM/Basic)
     let (status, response_headers, raw_connect) = send_connect_request(
         &mut stream,
         target_host,
         target_port,
         headers,
-        None,
+        initial_auth.as_deref(),
         proxy_headers,
         proxy_http_10,
     )
@@ -4545,69 +4565,44 @@ where
                     }
                 }
                 ProxyAuthMethod::Ntlm => {
-                    // NTLM Type 1 → Type 2 → Type 3 handshake
-                    let type1 = crate::auth::ntlm::create_type1_message();
+                    // NTLM: Type 1 was sent in the initial CONNECT.
+                    // The 407 response contains the Type 2 challenge.
+                    if let Some(ref auth_val) = proxy_auth_header {
+                        if let Some(type2_data) = auth_val.strip_prefix("NTLM ") {
+                            let challenge = crate::auth::ntlm::parse_type2_message(type2_data)?;
+                            let domain = creds.domain.as_deref().unwrap_or("");
+                            let type3 = crate::auth::ntlm::create_type3_message(
+                                &challenge,
+                                &creds.username,
+                                &creds.password,
+                                domain,
+                            );
 
-                    if verbose {
-                        #[allow(clippy::print_stderr)]
-                        {
-                            eprintln!("* Proxy auth using NTLM");
-                        }
-                    }
+                            // Send CONNECT with Type 3
+                            let (status3, _, raw3) = send_connect_request(
+                                &mut stream,
+                                target_host,
+                                target_port,
+                                headers,
+                                Some(&format!("Proxy-Authorization: NTLM {type3}")),
+                                proxy_headers,
+                                proxy_http_10,
+                            )
+                            .await?;
 
-                    // Send CONNECT with Type 1
-                    let (status2, headers2, _) = send_connect_request(
-                        &mut stream,
-                        target_host,
-                        target_port,
-                        headers,
-                        Some(&format!("Proxy-Authorization: NTLM {type1}")),
-                        proxy_headers,
-                        proxy_http_10,
-                    )
-                    .await?;
-
-                    if status2 == 407 {
-                        // Look for Type 2 challenge in response
-                        if let Some(auth2) = find_header(&headers2, "proxy-authenticate") {
-                            if let Some(type2_data) = auth2.strip_prefix("NTLM ") {
-                                let challenge = crate::auth::ntlm::parse_type2_message(type2_data)?;
-                                let domain = creds.domain.as_deref().unwrap_or("");
-                                let type3 = crate::auth::ntlm::create_type3_message(
-                                    &challenge,
-                                    &creds.username,
-                                    &creds.password,
-                                    domain,
-                                );
-
-                                // Send CONNECT with Type 3
-                                let (status3, _, raw3) = send_connect_request(
-                                    &mut stream,
-                                    target_host,
-                                    target_port,
-                                    headers,
-                                    Some(&format!("Proxy-Authorization: NTLM {type3}")),
-                                    proxy_headers,
-                                    proxy_http_10,
-                                )
-                                .await?;
-
-                                if status3 == 200 {
-                                    return Ok((stream, raw3));
-                                }
-
-                                return Err(Error::Http(format!(
-                                    "proxy CONNECT NTLM auth failed with status {status3}"
-                                )));
+                            if status3 == 200 {
+                                return Ok((stream, raw3));
                             }
+
+                            return Err(Error::Http(format!(
+                                "proxy CONNECT NTLM auth failed with status {status3}"
+                            )));
                         }
-                    } else if status2 == 200 {
-                        return Ok((stream, Vec::new()));
                     }
 
-                    return Err(Error::Http(format!(
-                        "proxy CONNECT NTLM handshake failed with status {status2}"
-                    )));
+                    return Err(Error::Http(
+                        "proxy CONNECT NTLM: no Type 2 challenge in 407".to_string(),
+                    ));
                 }
                 ProxyAuthMethod::Basic => {
                     // Basic auth should have been in the initial headers already.
@@ -4646,18 +4641,18 @@ where
          Host: {target_host}:{target_port}\r\n"
     );
 
-    // Forward Proxy-Authorization header if present in original headers
-    for (name, value) in headers {
-        if name.eq_ignore_ascii_case("proxy-authorization") {
-            use std::fmt::Write as _;
-            let _ = write!(connect_req, "{name}: {value}\r\n");
-        }
-    }
-
-    // Add extra auth header (overrides forwarded one, e.g., Digest/NTLM retry)
+    // Add auth header: use extra_header if provided (Digest/NTLM retry),
+    // otherwise forward Proxy-Authorization from original headers.
     if let Some(extra) = extra_header {
         use std::fmt::Write as _;
         let _ = write!(connect_req, "{extra}\r\n");
+    } else {
+        for (name, value) in headers {
+            if name.eq_ignore_ascii_case("proxy-authorization") {
+                use std::fmt::Write as _;
+                let _ = write!(connect_req, "{name}: {value}\r\n");
+            }
+        }
     }
 
     // Forward User-Agent from request headers (curl sends UA in CONNECT requests)
