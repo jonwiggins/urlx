@@ -389,32 +389,44 @@ pub async fn send_mail(
         });
     }
 
-    // Send message body as raw bytes, escaping leading dots per RFC 5321.
-    // Write raw bytes (not line-by-line via .lines()) to preserve long lines (test 900).
-    let mut line_start = true;
-    for &byte in mail_data {
-        if line_start && byte == b'.' {
+    // Send message body, escaping leading dots per RFC 5321.
+    // Write in chunks (not byte-by-byte) for performance (test 900 has 65KB body).
+    {
+        let mut chunk_start = 0;
+        let mut line_start = true;
+        for i in 0..mail_data.len() {
+            if line_start && mail_data[i] == b'.' {
+                // Write everything before this dot, then the dot-stuffed dot
+                if i > chunk_start {
+                    writer
+                        .write_all(&mail_data[chunk_start..i])
+                        .await
+                        .map_err(|e| Error::Http(format!("SMTP data write error: {e}")))?;
+                }
+                writer
+                    .write_all(b"..")
+                    .await
+                    .map_err(|e| Error::Http(format!("SMTP data write error: {e}")))?;
+                chunk_start = i + 1; // skip the original dot (we wrote ".." already)
+            }
+            line_start = mail_data[i] == b'\n';
+        }
+        // Write remaining data
+        if chunk_start < mail_data.len() {
             writer
-                .write_all(b".")
+                .write_all(&mail_data[chunk_start..])
                 .await
                 .map_err(|e| Error::Http(format!("SMTP data write error: {e}")))?;
         }
+    }
+    // Flush after writing body data
+    writer.flush().await.map_err(|e| Error::Http(format!("SMTP flush error: {e}")))?;
+    // Ensure data ends with CRLF before the terminator
+    if !mail_data.is_empty() && !mail_data.ends_with(b"\r\n") && !mail_data.ends_with(b"\n") {
         writer
-            .write_all(&[byte])
+            .write_all(b"\r\n")
             .await
             .map_err(|e| Error::Http(format!("SMTP data write error: {e}")))?;
-        line_start = byte == b'\n';
-    }
-    // Ensure data ends with CRLF before the terminator
-    if !mail_data.is_empty() && !mail_data.ends_with(b"\r\n") {
-        if mail_data.ends_with(b"\n") {
-            // already has LF, no extra needed (server will handle)
-        } else {
-            writer
-                .write_all(b"\r\n")
-                .await
-                .map_err(|e| Error::Http(format!("SMTP data write error: {e}")))?;
-        }
     }
 
     // End data with .CRLF
