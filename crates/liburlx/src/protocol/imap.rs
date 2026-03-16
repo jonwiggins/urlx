@@ -316,7 +316,13 @@ pub async fn fetch(
                 fetch_resp.status, fetch_resp.message
             )));
         }
-        fetch_resp.data.join("\r\n").into_bytes()
+        {
+            let mut body = fetch_resp.data.join("\r\n");
+            if !body.is_empty() {
+                body.push_str("\r\n");
+            }
+            body.into_bytes()
+        }
     } else if let Some(index) = params.mailindex {
         // FETCH by message number (MAILINDEX)
         let section = params.section.as_deref().unwrap_or("BODY[]");
@@ -328,12 +334,24 @@ pub async fn fetch(
                 fetch_resp.status, fetch_resp.message
             )));
         }
-        fetch_resp.data.join("\r\n").into_bytes()
+        {
+            let mut body = fetch_resp.data.join("\r\n");
+            if !body.is_empty() {
+                body.push_str("\r\n");
+            }
+            body.into_bytes()
+        }
     } else {
         // No specific message - just do a search or list
         send_command(&mut writer, &tag, "FETCH 1:* (FLAGS INTERNALDATE ENVELOPE)").await?;
         let fetch_resp = read_response(&mut reader, &tag).await?;
-        fetch_resp.data.join("\r\n").into_bytes()
+        {
+            let mut body = fetch_resp.data.join("\r\n");
+            if !body.is_empty() {
+                body.push_str("\r\n");
+            }
+            body.into_bytes()
+        }
     };
 
     // LOGOUT

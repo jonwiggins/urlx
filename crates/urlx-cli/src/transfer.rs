@@ -982,9 +982,20 @@ pub fn run(args: &[String]) -> ExitCode {
         }));
     }
 
-    // FTP/FTPS: --include doesn't output HTTP headers (curl compat).
-    // Suppress include_headers for FTP URLs so all output paths skip headers.
-    if opts.urls.first().is_some_and(|u| u.starts_with("ftp://") || u.starts_with("ftps://")) {
+    // Non-HTTP protocols: --include doesn't output HTTP headers (curl compat).
+    // Suppress include_headers for FTP/IMAP/POP3/SMTP/MQTT URLs.
+    if opts.urls.first().is_some_and(|u| {
+        let lower = u.to_lowercase();
+        lower.starts_with("ftp://")
+            || lower.starts_with("ftps://")
+            || lower.starts_with("imap://")
+            || lower.starts_with("imaps://")
+            || lower.starts_with("pop3://")
+            || lower.starts_with("pop3s://")
+            || lower.starts_with("smtp://")
+            || lower.starts_with("smtps://")
+            || lower.starts_with("mqtt://")
+    }) {
         opts.include_headers = false;
     }
 

@@ -259,7 +259,11 @@ pub async fn retrieve(
             return Err(Error::Http(format!("POP3 RETR failed: {}", retr_resp.message)));
         }
         let lines = read_multiline(&mut reader).await?;
-        let body = lines.join("\r\n").into_bytes();
+        let mut body_str = lines.join("\r\n");
+        if !body_str.is_empty() {
+            body_str.push_str("\r\n");
+        }
+        let body = body_str.into_bytes();
 
         // QUIT
         send_command(&mut writer, "QUIT").await?;
@@ -276,7 +280,11 @@ pub async fn retrieve(
             return Err(Error::Http(format!("POP3 LIST failed: {}", list_resp.message)));
         }
         let lines = read_multiline(&mut reader).await?;
-        let body = lines.join("\r\n").into_bytes();
+        let mut body_str = lines.join("\r\n");
+        if !body_str.is_empty() {
+            body_str.push_str("\r\n");
+        }
+        let body = body_str.into_bytes();
 
         // QUIT
         send_command(&mut writer, "QUIT").await?;
