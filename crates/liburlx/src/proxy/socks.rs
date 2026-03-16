@@ -8,6 +8,11 @@ use tokio::net::TcpStream;
 
 use crate::error::Error;
 
+/// Create a SOCKS proxy error (maps to `CURLE_PROXY`, exit code 97).
+const fn proxy_err(msg: String) -> Error {
+    Error::Transfer { code: 97, message: msg }
+}
+
 /// Connect to a target host through a SOCKS5 proxy.
 ///
 /// Performs the SOCKS5 handshake with optional username/password authentication,
@@ -34,17 +39,17 @@ pub async fn connect_socks5(
     proxy_stream
         .write_all(&methods)
         .await
-        .map_err(|e| Error::Http(format!("SOCKS5 greeting write error: {e}")))?;
+        .map_err(|e| proxy_err(format!("SOCKS5 greeting write error: {e}")))?;
 
     // Step 2: Read server's chosen method
     let mut response = [0u8; 2];
     let _n = proxy_stream
         .read_exact(&mut response)
         .await
-        .map_err(|e| Error::Http(format!("SOCKS5 greeting read error: {e}")))?;
+        .map_err(|e| proxy_err(format!("SOCKS5 greeting read error: {e}")))?;
 
     if response[0] != 0x05 {
-        return Err(Error::Http(format!("SOCKS5 unexpected version: {:#x}", response[0])));
+        return Err(proxy_err(format!("SOCKS5 unexpected version: {:#x}", response[0])));
     }
 
     match response[1] {
@@ -54,7 +59,7 @@ pub async fn connect_socks5(
         0x02 => {
             // Username/password authentication (RFC 1929)
             let (user, pass) = auth.ok_or_else(|| {
-                Error::Http("SOCKS5 server requires auth but none provided".to_string())
+                proxy_err("SOCKS5 server requires auth but none provided".to_string())
             })?;
 
             let mut auth_request = Vec::new();
@@ -75,23 +80,23 @@ pub async fn connect_socks5(
             proxy_stream
                 .write_all(&auth_request)
                 .await
-                .map_err(|e| Error::Http(format!("SOCKS5 auth write error: {e}")))?;
+                .map_err(|e| proxy_err(format!("SOCKS5 auth write error: {e}")))?;
 
             let mut auth_response = [0u8; 2];
             let _n = proxy_stream
                 .read_exact(&mut auth_response)
                 .await
-                .map_err(|e| Error::Http(format!("SOCKS5 auth read error: {e}")))?;
+                .map_err(|e| proxy_err(format!("SOCKS5 auth read error: {e}")))?;
 
             if auth_response[1] != 0x00 {
-                return Err(Error::Http("SOCKS5 authentication failed".to_string()));
+                return Err(proxy_err("SOCKS5 authentication failed".to_string()));
             }
         }
         0xFF => {
-            return Err(Error::Http("SOCKS5 no acceptable auth method".to_string()));
+            return Err(proxy_err("SOCKS5 no acceptable auth method".to_string()));
         }
         method => {
-            return Err(Error::Http(format!("SOCKS5 unsupported auth method: {method:#x}")));
+            return Err(proxy_err(format!("SOCKS5 unsupported auth method: {method:#x}")));
         }
     }
 
@@ -108,17 +113,17 @@ pub async fn connect_socks5(
     proxy_stream
         .write_all(&connect_request)
         .await
-        .map_err(|e| Error::Http(format!("SOCKS5 connect write error: {e}")))?;
+        .map_err(|e| proxy_err(format!("SOCKS5 connect write error: {e}")))?;
 
     // Step 4: Read connection response
     let mut connect_response = [0u8; 4];
     let _n = proxy_stream
         .read_exact(&mut connect_response)
         .await
-        .map_err(|e| Error::Http(format!("SOCKS5 connect read error: {e}")))?;
+        .map_err(|e| proxy_err(format!("SOCKS5 connect read error: {e}")))?;
 
     if connect_response[0] != 0x05 {
-        return Err(Error::Http(format!(
+        return Err(proxy_err(format!(
             "SOCKS5 unexpected version in response: {:#x}",
             connect_response[0]
         )));
@@ -136,7 +141,7 @@ pub async fn connect_socks5(
             0x08 => "address type not supported",
             _ => "unknown error",
         };
-        return Err(Error::Http(format!(
+        return Err(proxy_err(format!(
             "SOCKS5 connection failed: {reason} (code {:#x})",
             connect_response[1]
         )));
@@ -150,7 +155,7 @@ pub async fn connect_socks5(
             let _n = proxy_stream
                 .read_exact(&mut skip)
                 .await
-                .map_err(|e| Error::Http(format!("SOCKS5 skip addr error: {e}")))?;
+                .map_err(|e| proxy_err(format!("SOCKS5 skip addr error: {e}")))?;
         }
         0x03 => {
             // Domain: 1 byte length + domain + 2 bytes port
@@ -158,12 +163,12 @@ pub async fn connect_socks5(
             let _n = proxy_stream
                 .read_exact(&mut len_buf)
                 .await
-                .map_err(|e| Error::Http(format!("SOCKS5 skip domain len error: {e}")))?;
+                .map_err(|e| proxy_err(format!("SOCKS5 skip domain len error: {e}")))?;
             let mut skip = vec![0u8; usize::from(len_buf[0]) + 2];
             let _n = proxy_stream
                 .read_exact(&mut skip)
                 .await
-                .map_err(|e| Error::Http(format!("SOCKS5 skip domain error: {e}")))?;
+                .map_err(|e| proxy_err(format!("SOCKS5 skip domain error: {e}")))?;
         }
         0x04 => {
             // IPv6 (16 bytes) + port (2 bytes)
@@ -171,10 +176,10 @@ pub async fn connect_socks5(
             let _n = proxy_stream
                 .read_exact(&mut skip)
                 .await
-                .map_err(|e| Error::Http(format!("SOCKS5 skip ipv6 error: {e}")))?;
+                .map_err(|e| proxy_err(format!("SOCKS5 skip ipv6 error: {e}")))?;
         }
         addr_type => {
-            return Err(Error::Http(format!("SOCKS5 unknown address type: {addr_type:#x}")));
+            return Err(proxy_err(format!("SOCKS5 unknown address type: {addr_type:#x}")));
         }
     }
 
@@ -216,13 +221,13 @@ pub async fn connect_socks4(
     proxy_stream
         .write_all(&request)
         .await
-        .map_err(|e| Error::Http(format!("SOCKS4 write error: {e}")))?;
+        .map_err(|e| proxy_err(format!("SOCKS4 write error: {e}")))?;
 
     let mut response = [0u8; 8];
     let _n = proxy_stream
         .read_exact(&mut response)
         .await
-        .map_err(|e| Error::Http(format!("SOCKS4 read error: {e}")))?;
+        .map_err(|e| proxy_err(format!("SOCKS4 read error: {e}")))?;
 
     if response[1] != 0x5A {
         let reason = match response[1] {
@@ -231,7 +236,7 @@ pub async fn connect_socks4(
             0x5D => "request failed because client's identd could not confirm the user ID",
             _ => "unknown error",
         };
-        return Err(Error::Http(format!(
+        return Err(proxy_err(format!(
             "SOCKS4 connection failed: {reason} (code {:#x})",
             response[1]
         )));
