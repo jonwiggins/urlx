@@ -109,7 +109,7 @@ Document every skip with a reason. Skips without rationale are not allowed.
 
 ## Remaining Work: Failure Analysis (as of 2026-03-15)
 
-Full test suite run: 681 pass / 468 fail / 47 skip (tests 1-1400, 30s timeout).
+Full test suite run: 681 pass / 468 fail / 47 skip (tests 1-1400, 30s timeout). (+100 from session start of 581).
 
 **78% of failures are bugs in existing features. 22% need new/incomplete features.**
 
