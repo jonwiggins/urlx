@@ -403,28 +403,10 @@ pub fn format_write_out(fmt: &str, response: &liburlx::Response) -> String {
     result = result.replace("%{errormsg}", "");
     result = result.replace("%{exitcode}", "0");
     result = result.replace("%{num_retries}", &info.num_retries.to_string());
-    // Connection info: extract from effective URL as approximation
-    // (actual peer address requires threading through transfer stack)
-    let effective = response.effective_url();
-    let url_host = effective
-        .find("://")
-        .map_or(effective, |p| &effective[p + 3..])
-        .split('/')
-        .next()
-        .unwrap_or("")
-        .split(':')
-        .next()
-        .unwrap_or("");
-    let url_port = effective
-        .find("://")
-        .map_or(effective, |p| &effective[p + 3..])
-        .split('/')
-        .next()
-        .unwrap_or("")
-        .rsplit(':')
-        .next()
-        .and_then(|p| p.parse::<u16>().ok())
-        .unwrap_or(0);
+    // Connection info: use parsed URL components
+    let (_, _, _, rip_host, rip_port, _, _, _) = parse_url_components(response.effective_url());
+    let url_host = rip_host.as_str();
+    let url_port: u16 = rip_port.parse().unwrap_or(0);
     // Resolve hostname to IP for %{remote_ip}
     let resolved_ip = std::net::ToSocketAddrs::to_socket_addrs(&(url_host, url_port))
         .ok()
