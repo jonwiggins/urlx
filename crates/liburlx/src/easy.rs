@@ -3570,22 +3570,7 @@ async fn do_single_request(
             .await;
         }
         "imap" | "imaps" => {
-            let header_creds = extract_basic_auth_from_headers(headers);
-            let creds_tuple = header_creds.as_ref().map(|(u, p)| (u.as_str(), p.as_str()));
-            let custom_cmd = match method {
-                "GET" | "POST" | "PUT" | "HEAD" | "DELETE" | "PATCH" | "OPTIONS" => {
-                    custom_request_target
-                }
-                _ => Some(method),
-            };
-            return crate::protocol::imap::fetch(
-                url,
-                creds_tuple,
-                custom_cmd,
-                sasl_ir,
-                oauth2_bearer,
-            )
-            .await;
+            return crate::protocol::imap::fetch(url, method, body, custom_request_target).await;
         }
         "pop3" | "pop3s" => {
             let header_creds = extract_basic_auth_from_headers(headers);
@@ -6734,19 +6719,12 @@ mod tests {
         let tag = line.split_whitespace().next().unwrap_or("A002").to_string();
         writer.write_all(format!("{tag} OK logged in\r\n").as_bytes()).await.unwrap();
 
-        // SELECT INBOX
+        // LIST INBOX (the new handler sends LIST for /INBOX without UID/MAILINDEX)
         line.clear();
         reader.read_line(&mut line).await.unwrap();
         let tag = line.split_whitespace().next().unwrap_or("A003").to_string();
-        writer.write_all(b"* 1 EXISTS\r\n* 0 RECENT\r\n").await.unwrap();
-        writer.write_all(format!("{tag} OK SELECT completed\r\n").as_bytes()).await.unwrap();
-
-        // FETCH
-        line.clear();
-        reader.read_line(&mut line).await.unwrap();
-        let tag = line.split_whitespace().next().unwrap_or("A004").to_string();
-        writer.write_all(b"* 1 FETCH (FLAGS (\\Seen) INTERNALDATE \"01-Jan-2026 00:00:00 +0000\" ENVELOPE (\"test\"))\r\n").await.unwrap();
-        writer.write_all(format!("{tag} OK FETCH completed\r\n").as_bytes()).await.unwrap();
+        writer.write_all(b"* LIST (\\HasNoChildren) \".\" INBOX\r\n").await.unwrap();
+        writer.write_all(format!("{tag} OK LIST completed\r\n").as_bytes()).await.unwrap();
 
         // LOGOUT
         line.clear();
