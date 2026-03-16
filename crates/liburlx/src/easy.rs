@@ -73,6 +73,8 @@ pub struct Easy {
     progress_callback: Option<ProgressCallback>,
     fail_on_error: bool,
     auth_credentials: Option<AuthCredentials>,
+    /// `OAuth2` bearer token for SASL XOAUTH2 (IMAP/POP3/SMTP).
+    oauth2_bearer: Option<String>,
     tls_config: TlsConfig,
     aws_sigv4: Option<crate::auth::aws_sigv4::AwsSigV4Config>,
     aws_credentials: Option<(String, String)>,
@@ -244,6 +246,7 @@ impl std::fmt::Debug for Easy {
             .field("progress_callback", &self.progress_callback.as_ref().map(|_| "<callback>"))
             .field("fail_on_error", &self.fail_on_error)
             .field("auth_credentials", &self.auth_credentials.as_ref().map(|_| "<credentials>"))
+            .field("oauth2_bearer", &self.oauth2_bearer.as_ref().map(|_| "<token>"))
             .field("tls_config", &self.tls_config)
             .field("aws_sigv4", &self.aws_sigv4)
             .field("aws_credentials", &self.aws_credentials.as_ref().map(|_| "<credentials>"))
@@ -351,6 +354,7 @@ impl Clone for Easy {
             progress_callback: self.progress_callback.clone(),
             fail_on_error: self.fail_on_error,
             auth_credentials: self.auth_credentials.clone(),
+            oauth2_bearer: self.oauth2_bearer.clone(),
             tls_config: self.tls_config.clone(),
             aws_sigv4: self.aws_sigv4.clone(),
             aws_credentials: self.aws_credentials.clone(),
@@ -470,6 +474,7 @@ impl Easy {
             progress_callback: None,
             fail_on_error: false,
             auth_credentials: None,
+            oauth2_bearer: None,
             tls_config: TlsConfig::default(),
             aws_sigv4: None,
             aws_credentials: None,
@@ -791,6 +796,8 @@ impl Easy {
     /// Adds an `Authorization: Bearer <token>` header to the request.
     pub fn bearer_token(&mut self, token: &str) {
         self.header("Authorization", &format!("Bearer {token}"));
+        // Also store separately for SASL XOAUTH2 (IMAP/POP3/SMTP)
+        self.oauth2_bearer = Some(token.to_string());
     }
 
     /// Enable automatic Content-Encoding decompression.
@@ -2286,6 +2293,7 @@ impl Easy {
             self.mail_auth.as_deref(),
             self.sasl_authzid.as_deref(),
             self.sasl_ir,
+            self.oauth2_bearer.as_deref(),
             self.haproxy_protocol,
             self.abstract_unix_socket.as_deref(),
             self.chunked_upload,
@@ -2429,6 +2437,7 @@ async fn perform_transfer(
     mail_auth: Option<&str>,
     sasl_authzid: Option<&str>,
     sasl_ir: bool,
+    oauth2_bearer: Option<&str>,
     haproxy_protocol: bool,
     abstract_unix_socket: Option<&str>,
     chunked_upload: bool,
@@ -2584,6 +2593,7 @@ async fn perform_transfer(
             mail_auth,
             sasl_authzid,
             sasl_ir,
+            oauth2_bearer,
             haproxy_protocol,
             abstract_unix_socket,
             chunked_upload,
@@ -2668,6 +2678,7 @@ async fn perform_transfer(
                         mail_auth,
                         sasl_authzid,
                         sasl_ir,
+                        oauth2_bearer,
                         haproxy_protocol,
                         abstract_unix_socket,
                         chunked_upload,
@@ -2793,6 +2804,7 @@ async fn perform_transfer(
                                 mail_auth,
                                 sasl_authzid,
                                 sasl_ir,
+                                oauth2_bearer,
                                 haproxy_protocol,
                                 abstract_unix_socket,
                                 chunked_upload,
@@ -2890,6 +2902,7 @@ async fn perform_transfer(
                                         mail_auth,
                                         sasl_authzid,
                                         sasl_ir,
+                                        oauth2_bearer,
                                         haproxy_protocol,
                                         abstract_unix_socket,
                                         chunked_upload,
@@ -2973,6 +2986,7 @@ async fn perform_transfer(
                                 mail_auth,
                                 sasl_authzid,
                                 sasl_ir,
+                                oauth2_bearer,
                                 haproxy_protocol,
                                 abstract_unix_socket,
                                 chunked_upload,
@@ -3063,6 +3077,7 @@ async fn perform_transfer(
                                         mail_auth,
                                         sasl_authzid,
                                         sasl_ir,
+                                        oauth2_bearer,
                                         haproxy_protocol,
                                         abstract_unix_socket,
                                         chunked_upload,
@@ -3164,6 +3179,7 @@ async fn perform_transfer(
                                 mail_auth,
                                 sasl_authzid,
                                 sasl_ir,
+                                oauth2_bearer,
                                 haproxy_protocol,
                                 abstract_unix_socket,
                                 chunked_upload,
@@ -3390,6 +3406,7 @@ async fn do_single_request(
     mail_auth: Option<&str>,
     sasl_authzid: Option<&str>,
     sasl_ir: bool,
+    oauth2_bearer: Option<&str>,
     haproxy_protocol: bool,
     #[cfg_attr(not(unix), allow(unused_variables))] abstract_unix_socket: Option<&str>,
     chunked_upload: bool,
@@ -3548,21 +3565,27 @@ async fn do_single_request(
                 sasl_ir,
                 creds_tuple,
                 smtp_custom_cmd,
+                oauth2_bearer,
             )
             .await;
         }
         "imap" | "imaps" => {
-            // Extract credentials from URL or Authorization header
             let header_creds = extract_basic_auth_from_headers(headers);
             let creds_tuple = header_creds.as_ref().map(|(u, p)| (u.as_str(), p.as_str()));
-            // -X sets method to a custom IMAP command (e.g. EXAMINE, NOOP)
             let custom_cmd = match method {
                 "GET" | "POST" | "PUT" | "HEAD" | "DELETE" | "PATCH" | "OPTIONS" => {
                     custom_request_target
                 }
                 _ => Some(method),
             };
-            return crate::protocol::imap::fetch(url, creds_tuple, custom_cmd).await;
+            return crate::protocol::imap::fetch(
+                url,
+                creds_tuple,
+                custom_cmd,
+                sasl_ir,
+                oauth2_bearer,
+            )
+            .await;
         }
         "pop3" | "pop3s" => {
             let header_creds = extract_basic_auth_from_headers(headers);
@@ -3573,7 +3596,14 @@ async fn do_single_request(
                 }
                 _ => Some(method),
             };
-            return crate::protocol::pop3::retrieve(url, creds_tuple, custom_cmd).await;
+            return crate::protocol::pop3::retrieve(
+                url,
+                creds_tuple,
+                custom_cmd,
+                sasl_ir,
+                oauth2_bearer,
+            )
+            .await;
         }
         "mqtt" => {
             return if method == "POST" || method == "PUT" {

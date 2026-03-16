@@ -156,11 +156,13 @@ pub async fn send_command<S: AsyncWrite + Unpin>(
 /// # Errors
 ///
 /// Returns an error if login fails or the message cannot be retrieved.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub async fn retrieve(
     url: &crate::url::Url,
     credentials: Option<(&str, &str)>,
     custom_request: Option<&str>,
+    sasl_ir: bool,
+    oauth2_bearer: Option<&str>,
 ) -> Result<Response, Error> {
     let (host, port) = url.host_and_port()?;
     let url_creds = url.credentials();
@@ -190,24 +192,55 @@ pub async fn retrieve(
         let _ = read_multiline(&mut reader).await?;
     }
 
-    // USER
-    send_command(&mut writer, &format!("USER {user}")).await?;
-    let user_resp = read_response(&mut reader).await?;
-    if !user_resp.ok {
-        return Err(Error::Transfer {
-            code: 67,
-            message: format!("POP3 USER failed: {}", user_resp.message),
-        });
-    }
+    // Authenticate: XOAUTH2 if bearer token, otherwise USER/PASS
+    if let Some(bearer) = oauth2_bearer {
+        use base64::Engine;
+        let payload = format!("user={user}\x01auth=Bearer {bearer}\x01\x01");
+        let encoded = base64::engine::general_purpose::STANDARD.encode(payload.as_bytes());
 
-    // PASS
-    send_command(&mut writer, &format!("PASS {pass}")).await?;
-    let pass_resp = read_response(&mut reader).await?;
-    if !pass_resp.ok {
-        return Err(Error::Transfer {
-            code: 67,
-            message: format!("POP3 login failed: {}", pass_resp.message),
-        });
+        if sasl_ir {
+            send_command(&mut writer, &format!("AUTH XOAUTH2 {encoded}")).await?;
+        } else {
+            send_command(&mut writer, "AUTH XOAUTH2").await?;
+            // Read continuation (+)
+            let mut line = String::new();
+            let _ = reader.read_line(&mut line).await;
+            // Send encoded payload
+            writer
+                .write_all(format!("{encoded}\r\n").as_bytes())
+                .await
+                .map_err(|e| Error::Http(format!("POP3 write error: {e}")))?;
+            let _ = writer.flush().await;
+        }
+        let auth_resp = read_response(&mut reader).await?;
+        if !auth_resp.ok {
+            send_command(&mut writer, "QUIT").await?;
+            let _ = read_response(&mut reader).await;
+            return Err(Error::Transfer {
+                code: 67,
+                message: format!("POP3 AUTH XOAUTH2 failed: {}", auth_resp.message),
+            });
+        }
+    } else {
+        // USER/PASS authentication
+        send_command(&mut writer, &format!("USER {user}")).await?;
+        let user_resp = read_response(&mut reader).await?;
+        if !user_resp.ok {
+            return Err(Error::Transfer {
+                code: 67,
+                message: format!("POP3 USER failed: {}", user_resp.message),
+            });
+        }
+
+        // PASS
+        send_command(&mut writer, &format!("PASS {pass}")).await?;
+        let pass_resp = read_response(&mut reader).await?;
+        if !pass_resp.ok {
+            return Err(Error::Transfer {
+                code: 67,
+                message: format!("POP3 login failed: {}", pass_resp.message),
+            });
+        }
     }
 
     // If custom request is set (e.g. -X NOOP), send that instead

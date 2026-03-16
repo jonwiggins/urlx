@@ -153,12 +153,15 @@ async fn read_greeting<S: AsyncRead + Unpin>(stream: &mut BufReader<S>) -> Resul
 /// # Errors
 ///
 /// Returns an error if login fails, the mailbox doesn't exist, or the fetch fails.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub async fn fetch(
     url: &crate::url::Url,
     credentials: Option<(&str, &str)>,
     custom_request: Option<&str>,
+    sasl_ir: bool,
+    oauth2_bearer: Option<&str>,
 ) -> Result<Response, Error> {
+    use base64::Engine;
     let (host, port) = url.host_and_port()?;
     let url_creds = url.credentials();
     let (user, pass) = url_creds
@@ -184,22 +187,103 @@ pub async fn fetch(
     // CAPABILITY (curl always sends this first)
     let tag = tags.next_tag();
     send_command(&mut writer, &tag, "CAPABILITY").await?;
-    let _ = read_response(&mut reader, &tag).await?;
+    let cap_resp = read_response(&mut reader, &tag).await?;
 
-    // LOGIN with properly quoted credentials
-    let tag = tags.next_tag();
-    let quoted_user = imap_quote(user);
-    let quoted_pass = imap_quote(pass);
-    send_command(&mut writer, &tag, &format!("LOGIN {quoted_user} {quoted_pass}")).await?;
-    let login_resp = read_response(&mut reader, &tag).await?;
-    if !login_resp.is_ok() {
-        // LOGOUT on login failure
-        let ltag = tags.next_tag();
-        send_command(&mut writer, &ltag, "LOGOUT").await?;
-        return Err(Error::Transfer {
-            code: 67,
-            message: format!("IMAP LOGIN failed: {} {}", login_resp.status, login_resp.message),
-        });
+    // Parse AUTH mechanisms from CAPABILITY response
+    let mut server_auth_login = false;
+    let mut server_sasl_ir = false;
+    for line in &cap_resp.data {
+        for token in line.split_whitespace() {
+            if token.eq_ignore_ascii_case("AUTH=LOGIN") {
+                server_auth_login = true;
+            }
+            if token.eq_ignore_ascii_case("SASL-IR") {
+                server_sasl_ir = true;
+            }
+        }
+    }
+
+    // Authenticate: XOAUTH2 > AUTHENTICATE LOGIN > plain LOGIN
+    if let Some(bearer) = oauth2_bearer {
+        // XOAUTH2 authentication
+        let payload = format!("user={user}\x01auth=Bearer {bearer}\x01\x01");
+        let encoded = base64::engine::general_purpose::STANDARD.encode(payload.as_bytes());
+        let tag = tags.next_tag();
+
+        if sasl_ir && server_sasl_ir {
+            send_command(&mut writer, &tag, &format!("AUTHENTICATE XOAUTH2 {encoded}")).await?;
+        } else {
+            send_command(&mut writer, &tag, "AUTHENTICATE XOAUTH2").await?;
+            // Read continuation (+)
+            let mut challenge_line = String::new();
+            let _ = reader.read_line(&mut challenge_line).await;
+            // Send encoded payload
+            writer
+                .write_all(format!("{encoded}\r\n").as_bytes())
+                .await
+                .map_err(|e| Error::Http(format!("IMAP write error: {e}")))?;
+            let _ = writer.flush().await;
+        }
+        let auth_resp = read_response(&mut reader, &tag).await?;
+        if !auth_resp.is_ok() {
+            let ltag = tags.next_tag();
+            send_command(&mut writer, &ltag, "LOGOUT").await?;
+            return Err(Error::Transfer {
+                code: 67,
+                message: format!("IMAP XOAUTH2 failed: {} {}", auth_resp.status, auth_resp.message),
+            });
+        }
+    } else if server_auth_login {
+        // AUTHENTICATE LOGIN (SASL two-step)
+        let tag = tags.next_tag();
+        send_command(&mut writer, &tag, "AUTHENTICATE LOGIN").await?;
+        // Server sends + challenge for username
+        let mut line = String::new();
+        let _ = reader.read_line(&mut line).await;
+        // Send base64-encoded username
+        let user_b64 = base64::engine::general_purpose::STANDARD.encode(user.as_bytes());
+        writer
+            .write_all(format!("{user_b64}\r\n").as_bytes())
+            .await
+            .map_err(|e| Error::Http(format!("IMAP write error: {e}")))?;
+        let _ = writer.flush().await;
+        // Server sends + challenge for password
+        let mut line2 = String::new();
+        let _ = reader.read_line(&mut line2).await;
+        // Send base64-encoded password
+        let pass_b64 = base64::engine::general_purpose::STANDARD.encode(pass.as_bytes());
+        writer
+            .write_all(format!("{pass_b64}\r\n").as_bytes())
+            .await
+            .map_err(|e| Error::Http(format!("IMAP write error: {e}")))?;
+        let _ = writer.flush().await;
+        let auth_resp = read_response(&mut reader, &tag).await?;
+        if !auth_resp.is_ok() {
+            let ltag = tags.next_tag();
+            send_command(&mut writer, &ltag, "LOGOUT").await?;
+            return Err(Error::Transfer {
+                code: 67,
+                message: format!(
+                    "IMAP AUTHENTICATE LOGIN failed: {} {}",
+                    auth_resp.status, auth_resp.message
+                ),
+            });
+        }
+    } else {
+        // Plain LOGIN (not SASL)
+        let tag = tags.next_tag();
+        let quoted_user = imap_quote(user);
+        let quoted_pass = imap_quote(pass);
+        send_command(&mut writer, &tag, &format!("LOGIN {quoted_user} {quoted_pass}")).await?;
+        let login_resp = read_response(&mut reader, &tag).await?;
+        if !login_resp.is_ok() {
+            let ltag = tags.next_tag();
+            send_command(&mut writer, &ltag, "LOGOUT").await?;
+            return Err(Error::Transfer {
+                code: 67,
+                message: format!("IMAP LOGIN failed: {} {}", login_resp.status, login_resp.message),
+            });
+        }
     }
 
     let mailbox_name = if mailbox.is_empty() { "INBOX" } else { &mailbox };

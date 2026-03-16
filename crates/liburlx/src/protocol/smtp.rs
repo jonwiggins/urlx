@@ -144,6 +144,7 @@ pub async fn send_mail(
     sasl_ir: bool,
     ext_credentials: Option<(&str, &str)>,
     custom_request: Option<&str>,
+    oauth2_bearer: Option<&str>,
 ) -> Result<crate::protocol::http::response::Response, Error> {
     let (host, port) = url.host_and_port()?;
 
@@ -202,8 +203,41 @@ pub async fn send_mail(
         }
     }
 
+    // XOAUTH2 takes priority when bearer token is present
+    if let Some(bearer) = oauth2_bearer {
+        use base64::Engine;
+        if let Some((user, _)) = credentials {
+            let payload = format!("user={user}\x01auth=Bearer {bearer}\x01\x01");
+            let encoded = base64::engine::general_purpose::STANDARD.encode(payload.as_bytes());
+
+            if sasl_ir {
+                send_command(&mut writer, &format!("AUTH XOAUTH2 {encoded}")).await?;
+            } else {
+                send_command(&mut writer, "AUTH XOAUTH2").await?;
+                let continue_resp = read_response(&mut reader).await?;
+                if continue_resp.code != 334 {
+                    send_command(&mut writer, "QUIT").await?;
+                    let _ = read_response(&mut reader).await;
+                    return Err(Error::Http(format!(
+                        "SMTP AUTH XOAUTH2 expected 334, got: {} {}",
+                        continue_resp.code, continue_resp.message
+                    )));
+                }
+                send_command(&mut writer, &encoded).await?;
+            }
+            let auth_resp = read_response(&mut reader).await?;
+            if !auth_resp.is_ok() {
+                send_command(&mut writer, "QUIT").await?;
+                let _ = read_response(&mut reader).await;
+                return Err(Error::Http(format!(
+                    "SMTP AUTH XOAUTH2 failed: {} {}",
+                    auth_resp.code, auth_resp.message
+                )));
+            }
+        }
+    }
     // Authenticate if credentials provided AND server supports AUTH
-    if let Some((user, pass)) = credentials.filter(|_| !server_auth_mechanisms.is_empty()) {
+    else if let Some((user, pass)) = credentials.filter(|_| !server_auth_mechanisms.is_empty()) {
         use base64::Engine;
 
         // Choose auth mechanism based on server capabilities

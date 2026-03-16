@@ -745,6 +745,12 @@ pub fn run(args: &[String]) -> ExitCode {
                 || url.starts_with("ftps://")
                 || url.starts_with("sftp://")
                 || url.starts_with("scp://")
+                || url.starts_with("smtp://")
+                || url.starts_with("smtps://")
+                || url.starts_with("imap://")
+                || url.starts_with("imaps://")
+                || url.starts_with("pop3://")
+                || url.starts_with("pop3s://")
             {
                 let base_url = strip_url_credentials(&url);
                 let scheme_end = base_url.find("://").map_or(0, |p| p + 3);

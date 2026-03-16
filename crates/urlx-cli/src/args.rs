@@ -1751,7 +1751,9 @@ fn parse_args_options(args: &[String]) -> Result<CliOptions, u8> {
         }
     }
 
-    // Apply auth credentials after proxy auth (for correct header ordering)
+    // Apply auth credentials after proxy auth (for correct header ordering).
+    // Skip when --oauth2-bearer is set — the Bearer token is already in the headers
+    // and basic_auth would overwrite it.
     if let Some((ref user, ref pass)) = opts.user_credentials {
         if opts.use_aws_sigv4 {
             opts.easy.aws_credentials(user, pass);
@@ -1761,7 +1763,7 @@ fn parse_args_options(args: &[String]) -> Result<CliOptions, u8> {
             opts.easy.anyauth(user, pass);
         } else if opts.use_digest {
             opts.easy.digest_auth(user, pass);
-        } else {
+        } else if !opts.use_bearer {
             opts.easy.basic_auth(user, pass);
         }
     }
