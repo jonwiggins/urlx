@@ -344,11 +344,15 @@ pub async fn fetch(
 
     // Parse AUTH mechanisms from CAPABILITY
     let mut server_auth_login = false;
+    let mut server_auth_plain = false;
     let mut server_sasl_ir = false;
     for line in &cap_resp.data {
         for token in line.split_whitespace() {
             if token.eq_ignore_ascii_case("AUTH=LOGIN") {
                 server_auth_login = true;
+            }
+            if token.eq_ignore_ascii_case("AUTH=PLAIN") {
+                server_auth_plain = true;
             }
             if token.eq_ignore_ascii_case("SASL-IR") {
                 server_sasl_ir = true;
@@ -356,7 +360,7 @@ pub async fn fetch(
         }
     }
 
-    // Authenticate: XOAUTH2 > AUTHENTICATE LOGIN > plain LOGIN
+    // Authenticate: XOAUTH2 > AUTHENTICATE PLAIN > AUTHENTICATE LOGIN > plain LOGIN
     if let Some(bearer) = oauth2_bearer {
         // XOAUTH2
         let payload = format!("user={user}\x01auth=Bearer {bearer}\x01\x01");
@@ -380,15 +384,44 @@ pub async fn fetch(
                 message: format!("IMAP XOAUTH2 failed: {} {}", auth_resp.status, auth_resp.message),
             });
         }
-    } else if server_auth_login {
-        // AUTHENTICATE LOGIN (SASL two-step)
+    } else if server_auth_plain {
+        // AUTHENTICATE PLAIN
+        let auth_string = format!("\0{user}\0{pass}");
+        let encoded = base64::engine::general_purpose::STANDARD.encode(auth_string.as_bytes());
         let tag = tags.next_tag();
-        send_command(&mut writer, &tag, "AUTHENTICATE LOGIN").await?;
-        let _ = read_continuation(&mut reader).await?;
+        if sasl_ir || server_sasl_ir {
+            send_command(&mut writer, &tag, &format!("AUTHENTICATE PLAIN {encoded}")).await?;
+        } else {
+            send_command(&mut writer, &tag, "AUTHENTICATE PLAIN").await?;
+            let _ = read_continuation(&mut reader).await?;
+            send_raw(&mut writer, encoded.as_bytes()).await?;
+        }
+        let auth_resp = read_response(&mut reader, &tag).await?;
+        if !auth_resp.is_ok() {
+            let ltag = tags.next_tag();
+            let _ = send_command(&mut writer, &ltag, "LOGOUT").await;
+            return Err(Error::Transfer {
+                code: 67,
+                message: format!(
+                    "IMAP AUTHENTICATE PLAIN failed: {} {}",
+                    auth_resp.status, auth_resp.message
+                ),
+            });
+        }
+    } else if server_auth_login {
+        // AUTHENTICATE LOGIN
+        let tag = tags.next_tag();
         let user_b64 = base64::engine::general_purpose::STANDARD.encode(user.as_bytes());
-        send_raw(&mut writer, user_b64.as_bytes()).await?;
-        let _ = read_continuation(&mut reader).await?;
         let pass_b64 = base64::engine::general_purpose::STANDARD.encode(pass.as_bytes());
+        if sasl_ir || server_sasl_ir {
+            // SASL-IR: send username inline
+            send_command(&mut writer, &tag, &format!("AUTHENTICATE LOGIN {user_b64}")).await?;
+        } else {
+            send_command(&mut writer, &tag, "AUTHENTICATE LOGIN").await?;
+            let _ = read_continuation(&mut reader).await?;
+            send_raw(&mut writer, user_b64.as_bytes()).await?;
+        }
+        let _ = read_continuation(&mut reader).await?;
         send_raw(&mut writer, pass_b64.as_bytes()).await?;
         let auth_resp = read_response(&mut reader, &tag).await?;
         if !auth_resp.is_ok() {

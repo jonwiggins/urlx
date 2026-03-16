@@ -6721,11 +6721,16 @@ mod tests {
             .await
             .unwrap();
 
-        // LOGIN
+        // AUTHENTICATE PLAIN (two-step since mock doesn't advertise SASL-IR)
         line.clear();
         reader.read_line(&mut line).await.unwrap();
         let tag = line.split_whitespace().next().unwrap_or("A002").to_string();
-        writer.write_all(format!("{tag} OK logged in\r\n").as_bytes()).await.unwrap();
+        // Send continuation for PLAIN auth
+        writer.write_all(b"+ \r\n").await.unwrap();
+        // Read base64-encoded credentials
+        line.clear();
+        let _ = reader.read_line(&mut line).await;
+        writer.write_all(format!("{tag} OK authenticated\r\n").as_bytes()).await.unwrap();
 
         // LIST INBOX (the new handler sends LIST for /INBOX without UID/MAILINDEX)
         line.clear();
