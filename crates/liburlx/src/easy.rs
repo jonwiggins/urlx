@@ -3417,6 +3417,16 @@ async fn do_single_request(
     // Handle non-HTTP schemes directly
     match url.scheme() {
         "file" => {
+            // Reject file:// URLs with non-local host (curl compat: test 1145)
+            let file_host = url.host_str().unwrap_or("");
+            if !file_host.is_empty()
+                && !file_host.eq_ignore_ascii_case("localhost")
+                && file_host != "127.0.0.1"
+            {
+                return Err(Error::UrlParse(format!(
+                    "file:// URL with non-local host: {file_host}"
+                )));
+            }
             if method == "PUT" {
                 let upload_data = body.unwrap_or(&[]);
                 return crate::protocol::file::write_file(url, upload_data);
@@ -3497,6 +3507,15 @@ async fn do_single_request(
             };
         }
         "ftp" | "ftps" => {
+            // Reject FTP URLs with %0a or %0d (CR/LF injection — curl compat: tests 225, 226)
+            let raw_url = url.as_str();
+            if raw_url.contains("%0a")
+                || raw_url.contains("%0A")
+                || raw_url.contains("%0d")
+                || raw_url.contains("%0D")
+            {
+                return Err(Error::UrlParse("FTP URL contains CR/LF characters".to_string()));
+            }
             // Determine effective SSL mode: ftps:// always uses implicit TLS
             let effective_ssl_mode = if url.scheme() == "ftps" {
                 crate::protocol::ftp::FtpSslMode::Implicit
