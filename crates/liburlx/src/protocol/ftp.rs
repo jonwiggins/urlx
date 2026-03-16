@@ -1603,8 +1603,14 @@ pub async fn perform(
         }
     }
 
-    // HEAD/nobody mode: only get file metadata, no data transfer
+    // HEAD/nobody mode: only get file metadata, no data transfer.
+    // For directory listings (-I on a directory), just QUIT after CWD (curl compat: test 1000).
     if config.nobody {
+        if is_dir_list {
+            let _ = session.quit().await;
+            let headers = std::collections::HashMap::new();
+            return Ok(Response::new(200, headers, Vec::new(), url.as_str().to_string()));
+        }
         let mut last_modified: Option<String> = None;
         let mut content_length: Option<String> = None;
 

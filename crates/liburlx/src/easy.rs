@@ -3570,7 +3570,15 @@ async fn do_single_request(
             .await;
         }
         "imap" | "imaps" => {
-            return crate::protocol::imap::fetch(url, method, body, custom_request_target).await;
+            return crate::protocol::imap::fetch(
+                url,
+                method,
+                body,
+                custom_request_target,
+                sasl_ir,
+                oauth2_bearer,
+            )
+            .await;
         }
         "pop3" | "pop3s" => {
             let header_creds = extract_basic_auth_from_headers(headers);
