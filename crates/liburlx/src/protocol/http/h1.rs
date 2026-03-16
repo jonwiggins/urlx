@@ -94,18 +94,33 @@ where
         }
     }
 
-    // Headers that curl emits before User-Agent (priority headers)
-    let priority_headers: &[&str] =
-        &["authorization", "proxy-authorization", "range", "content-range"];
+    // Headers that curl emits before User-Agent (priority headers).
+    // curl emits Proxy-Authorization before User-Agent always.
+    // Auto-generated Authorization (Basic/Digest/NTLM/Bearer) is also prioritized.
+    // Custom -H "Authorization: ..." stays in its original position (curl compat: test 317).
+    let priority_order: &[&str] = &["proxy-authorization", "range", "content-range"];
+    let auto_auth_prefixes = ["Basic ", "Digest ", "NTLM ", "Bearer ", "Negotiate "];
 
     // Emit priority custom headers right after Host (curl compat order)
-    for (i, (name, value)) in custom_headers.iter().enumerate() {
-        if keep[i] && priority_headers.iter().any(|p| name.eq_ignore_ascii_case(p)) {
-            if value.is_empty() {
-                let _ = write!(req, "{name}:\r\n");
-            } else {
-                let _ = write!(req, "{name}: {value}\r\n");
+    for &prio_name in priority_order {
+        for (i, (name, value)) in custom_headers.iter().enumerate() {
+            if keep[i] && name.eq_ignore_ascii_case(prio_name) {
+                if value.is_empty() {
+                    let _ = write!(req, "{name}:\r\n");
+                } else {
+                    let _ = write!(req, "{name}: {value}\r\n");
+                }
             }
+        }
+    }
+    // Auto-generated Authorization headers (Basic/Digest/NTLM/Bearer) go in priority position.
+    // Custom -H "Authorization: custom" stays in normal position (curl compat: test 317).
+    for (i, (name, value)) in custom_headers.iter().enumerate() {
+        if keep[i]
+            && name.eq_ignore_ascii_case("authorization")
+            && auto_auth_prefixes.iter().any(|p| value.starts_with(p))
+        {
+            let _ = write!(req, "{name}: {value}\r\n");
         }
     }
 
@@ -160,11 +175,13 @@ where
     let mut deferred_content_type: Option<(String, String)> = None;
     let mut content_type_emitted = false;
     for (i, (name, value)) in custom_headers.iter().enumerate() {
-        if keep[i]
-            && !priority_headers.iter().any(|p| name.eq_ignore_ascii_case(p))
-            && !name.eq_ignore_ascii_case("user-agent")
-            && !name.eq_ignore_ascii_case("host")
-        {
+        // Skip priority headers, auto-auth, User-Agent, and Host (emitted elsewhere)
+        let is_priority = priority_order.iter().any(|p| name.eq_ignore_ascii_case(p));
+        let is_auto_auth = name.eq_ignore_ascii_case("authorization")
+            && auto_auth_prefixes.iter().any(|p| value.starts_with(p));
+        let is_ua = name.eq_ignore_ascii_case("user-agent");
+        let is_host = name.eq_ignore_ascii_case("host");
+        if keep[i] && !is_priority && !is_auto_auth && !is_ua && !is_host {
             // Defer form/multipart Content-Type to after Content-Length (curl compat)
             // Keep other Content-Types (like application/json) in place (test 383)
             if name.eq_ignore_ascii_case("content-type")

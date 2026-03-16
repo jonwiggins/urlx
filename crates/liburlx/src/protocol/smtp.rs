@@ -143,6 +143,7 @@ pub async fn send_mail(
     sasl_authzid: Option<&str>,
     sasl_ir: bool,
     ext_credentials: Option<(&str, &str)>,
+    custom_request: Option<&str>,
 ) -> Result<crate::protocol::http::response::Response, Error> {
     let (host, port) = url.host_and_port()?;
 
@@ -265,26 +266,51 @@ pub async fn send_mail(
         }
     }
 
+    // If custom request is set (e.g. -X "vrfy"), send it instead of MAIL flow.
+    // For VRFY/EXPN, --mail-rcpt provides the argument (curl compat: test 950).
+    if let Some(cmd) = custom_request {
+        let full_cmd =
+            if mail_rcpt.is_empty() { cmd.to_string() } else { format!("{cmd} {}", mail_rcpt[0]) };
+        send_command(&mut writer, &full_cmd).await?;
+        let _ = read_response(&mut reader).await;
+        send_command(&mut writer, "QUIT").await?;
+        let _ = read_response(&mut reader).await;
+        let headers = std::collections::HashMap::new();
+        return Ok(crate::protocol::http::response::Response::new(
+            250,
+            headers,
+            Vec::new(),
+            url.as_str().to_string(),
+        ));
+    }
+
     // Determine envelope sender and recipients.
-    // Explicit mail_from/mail_rcpt (from Easy handle) take priority over headers.
     let mail_str = String::from_utf8_lossy(mail_data);
     let (header_from, header_to) = extract_mail_addresses(&mail_str);
 
     let from_addr = if let Some(from) = mail_from {
         from.to_string()
+    } else if let Some(addr) = header_from {
+        addr
     } else {
-        header_from.ok_or_else(|| Error::Http("no From address found in message".to_string()))?
+        send_command(&mut writer, "QUIT").await?;
+        let _ = read_response(&mut reader).await;
+        return Err(Error::Http("no From address".to_string()));
     };
 
     let rcpt_addrs: Vec<String> = if mail_rcpt.is_empty() {
-        let to =
-            header_to.ok_or_else(|| Error::Http("no To address found in message".to_string()))?;
-        vec![to]
+        if let Some(to) = header_to {
+            vec![to]
+        } else {
+            send_command(&mut writer, "QUIT").await?;
+            let _ = read_response(&mut reader).await;
+            return Err(Error::Http("no To address".to_string()));
+        }
     } else {
         mail_rcpt.to_vec()
     };
 
-    // MAIL FROM (with optional AUTH= parameter per RFC 2554)
+    // MAIL FROM
     let mail_from_cmd = mail_auth.map_or_else(
         || format!("MAIL FROM:<{from_addr}>"),
         |auth| format!("MAIL FROM:<{from_addr}> AUTH=<{auth}>"),
@@ -292,17 +318,21 @@ pub async fn send_mail(
     send_command(&mut writer, &mail_from_cmd).await?;
     let mail_resp = read_response(&mut reader).await?;
     if !mail_resp.is_ok() {
+        send_command(&mut writer, "QUIT").await?;
+        let _ = read_response(&mut reader).await;
         return Err(Error::Http(format!(
             "SMTP MAIL FROM failed: {} {}",
             mail_resp.code, mail_resp.message
         )));
     }
 
-    // RCPT TO (one per recipient)
+    // RCPT TO
     for rcpt in &rcpt_addrs {
         send_command(&mut writer, &format!("RCPT TO:<{rcpt}>")).await?;
         let rcpt_resp = read_response(&mut reader).await?;
         if !rcpt_resp.is_ok() {
+            send_command(&mut writer, "QUIT").await?;
+            let _ = read_response(&mut reader).await;
             return Err(Error::Http(format!(
                 "SMTP RCPT TO failed: {} {}",
                 rcpt_resp.code, rcpt_resp.message
@@ -314,41 +344,55 @@ pub async fn send_mail(
     send_command(&mut writer, "DATA").await?;
     let data_resp = read_response(&mut reader).await?;
     if !data_resp.is_intermediate() {
+        send_command(&mut writer, "QUIT").await?;
+        let _ = read_response(&mut reader).await;
         return Err(Error::Http(format!(
             "SMTP DATA failed: {} {}",
             data_resp.code, data_resp.message
         )));
     }
 
-    // Send message body, escaping leading dots
-    for line in mail_str.lines() {
-        if line.starts_with('.') {
+    // Send message body as raw bytes, escaping leading dots per RFC 5321.
+    // Write raw bytes (not line-by-line via .lines()) to preserve long lines (test 900).
+    let mut line_start = true;
+    for &byte in mail_data {
+        if line_start && byte == b'.' {
             writer
                 .write_all(b".")
                 .await
                 .map_err(|e| Error::Http(format!("SMTP data write error: {e}")))?;
         }
         writer
-            .write_all(line.as_bytes())
+            .write_all(&[byte])
             .await
             .map_err(|e| Error::Http(format!("SMTP data write error: {e}")))?;
-        writer
-            .write_all(b"\r\n")
-            .await
-            .map_err(|e| Error::Http(format!("SMTP data write error: {e}")))?;
+        line_start = byte == b'\n';
+    }
+    // Ensure data ends with CRLF before the terminator
+    if !mail_data.is_empty() && !mail_data.ends_with(b"\r\n") {
+        if mail_data.ends_with(b"\n") {
+            // already has LF, no extra needed (server will handle)
+        } else {
+            writer
+                .write_all(b"\r\n")
+                .await
+                .map_err(|e| Error::Http(format!("SMTP data write error: {e}")))?;
+        }
     }
 
-    // End data with CRLF.CRLF
+    // End data with .CRLF
     send_command(&mut writer, ".").await?;
     let end_resp = read_response(&mut reader).await?;
     if !end_resp.is_ok() {
+        send_command(&mut writer, "QUIT").await?;
+        let _ = read_response(&mut reader).await;
         return Err(Error::Http(format!(
             "SMTP message rejected: {} {}",
             end_resp.code, end_resp.message
         )));
     }
 
-    // QUIT — read response so the server logs the command before we disconnect
+    // QUIT
     send_command(&mut writer, "QUIT").await?;
     let _ = read_response(&mut reader).await;
 

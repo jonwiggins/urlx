@@ -2459,7 +2459,11 @@ async fn perform_transfer(
             let cur_host = current_url.host_str().unwrap_or("");
             if !orig_host.eq_ignore_ascii_case(cur_host) {
                 if !unrestricted_auth {
-                    request_headers.retain(|(k, _)| !k.eq_ignore_ascii_case("authorization"));
+                    // Strip auth and sensitive headers on cross-host redirect
+                    request_headers.retain(|(k, _)| {
+                        !k.eq_ignore_ascii_case("authorization")
+                            && !k.eq_ignore_ascii_case("cookie")
+                    });
                 }
                 // Drop custom Host header on cross-host redirect (curl compat: test 184)
                 request_headers.retain(|(k, _)| !k.eq_ignore_ascii_case("host"));
@@ -3531,6 +3535,9 @@ async fn do_single_request(
             let mail_data = body.unwrap_or(&[]);
             let header_creds = extract_basic_auth_from_headers(headers);
             let creds_tuple = header_creds.as_ref().map(|(u, p)| (u.as_str(), p.as_str()));
+            // For SMTP, -X sets the custom command (e.g. "vrfy").
+            // custom_request_target preserves original case (unlike method which uppercases).
+            let smtp_custom_cmd = custom_request_target;
             return crate::protocol::smtp::send_mail(
                 url,
                 mail_data,
@@ -3540,6 +3547,7 @@ async fn do_single_request(
                 sasl_authzid,
                 sasl_ir,
                 creds_tuple,
+                smtp_custom_cmd,
             )
             .await;
         }
