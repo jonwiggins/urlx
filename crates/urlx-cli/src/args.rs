@@ -364,6 +364,14 @@ fn expand_combined_flags(args: &[String]) -> Vec<String> {
                     break;
                 }
             }
+        } else if arg.starts_with("--") && arg.contains('=') {
+            // Split --long=value into --long value (curl compat)
+            if let Some((flag, value)) = arg.split_once('=') {
+                result.push(flag.to_string());
+                result.push(value.to_string());
+            } else {
+                result.push(arg.clone());
+            }
         } else {
             result.push(arg.clone());
             // For single-char short flags or long flags that take args,
