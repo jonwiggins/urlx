@@ -115,6 +115,7 @@ impl CookieJar {
     /// Returns `None` if no cookies match.
     #[must_use]
     pub fn cookie_header(&self, host: &str, path: &str, is_secure: bool) -> Option<String> {
+        const MAX_COOKIE_SEND: usize = 150;
         let now = SystemTime::now();
         let host_lower = host.to_ascii_lowercase();
 
@@ -187,11 +188,26 @@ impl CookieJar {
                 .then_with(|| b.creation_index.cmp(&a.creation_index))
         });
 
-        let cookie_str = matching
-            .iter()
-            .map(|c| format!("{}={}", c.name, c.value))
-            .collect::<Vec<_>>()
-            .join("; ");
+        // curl caps at 150 cookies per request (MAX_COOKIE_SEND_AMOUNT).
+        // When over the limit, drop the newest cookies (highest creation_index).
+        if matching.len() > MAX_COOKIE_SEND {
+            // Sort by creation_index ASC to find oldest, then take first 150
+            matching.sort_by(|a, b| a.creation_index.cmp(&b.creation_index));
+            matching.truncate(MAX_COOKIE_SEND);
+            // Re-sort in curl's output order
+            matching.sort_by(|a, b| {
+                b.path
+                    .len()
+                    .cmp(&a.path.len())
+                    .then_with(|| b.domain.len().cmp(&a.domain.len()))
+                    .then_with(|| b.name.len().cmp(&a.name.len()))
+                    .then_with(|| b.creation_index.cmp(&a.creation_index))
+            });
+        }
+        let capped = &matching;
+
+        let cookie_str =
+            capped.iter().map(|c| format!("{}={}", c.name, c.value)).collect::<Vec<_>>().join("; ");
 
         Some(cookie_str)
     }
