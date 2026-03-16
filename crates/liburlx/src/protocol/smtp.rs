@@ -201,8 +201,8 @@ pub async fn send_mail(
         }
     }
 
-    // Authenticate if credentials provided
-    if let Some((user, pass)) = credentials {
+    // Authenticate if credentials provided AND server supports AUTH
+    if let Some((user, pass)) = credentials.filter(|_| !server_auth_mechanisms.is_empty()) {
         use base64::Engine;
 
         // Choose auth mechanism based on server capabilities

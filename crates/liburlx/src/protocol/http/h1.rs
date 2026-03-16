@@ -758,7 +758,8 @@ fn parse_headers(data: &[u8]) -> Result<ParsedHeaders, Error> {
         Err(e) => {
             // httparse rejects unknown HTTP versions (e.g. HTTP/1.2).
             // curl returns CURLE_UNSUPPORTED_PROTOCOL (1) for these.
-            if e.to_string().contains("version") {
+            // Only treat as version error if the response actually started with "HTTP/".
+            if e.to_string().contains("invalid HTTP version") && data.starts_with(b"HTTP/") {
                 return Err(Error::UnsupportedProtocol(
                     "unsupported HTTP version in response".to_string(),
                 ));
@@ -1326,7 +1327,8 @@ pub fn parse_response(data: &[u8], effective_url: &str, is_head: bool) -> Result
         Err(e) => {
             // httparse rejects unknown HTTP versions (e.g. HTTP/1.2).
             // curl returns CURLE_UNSUPPORTED_PROTOCOL (1) for these.
-            if e.to_string().contains("version") {
+            // Only treat as version error if the response actually started with "HTTP/".
+            if e.to_string().contains("invalid HTTP version") && data.starts_with(b"HTTP/") {
                 return Err(Error::UnsupportedProtocol(
                     "unsupported HTTP version in response".to_string(),
                 ));
