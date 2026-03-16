@@ -93,9 +93,12 @@ fn decode_remaining_length(data: &[u8]) -> Result<(usize, usize), Error> {
 
 /// Build a CONNECT packet.
 fn build_connect_packet(client_id: &str) -> Vec<u8> {
-    let client_id_bytes = client_id.as_bytes();
-    #[allow(clippy::cast_possible_truncation)]
-    let client_id_len = client_id_bytes.len() as u16;
+    // curl uses a fixed 12-byte client ID, zero-padded (e.g. "curl\0\0\0\0\0\0\0\0")
+    const MQTT_CLIENTID_LEN: usize = 12;
+    let mut client_id_padded = [0u8; MQTT_CLIENTID_LEN];
+    let src = client_id.as_bytes();
+    let copy_len = src.len().min(MQTT_CLIENTID_LEN);
+    client_id_padded[..copy_len].copy_from_slice(&src[..copy_len]);
 
     // Variable header: protocol name + level + flags + keepalive
     let mut variable_header = Vec::new();
@@ -109,10 +112,12 @@ fn build_connect_packet(client_id: &str) -> Vec<u8> {
     // Keep Alive: 60 seconds
     variable_header.extend_from_slice(&60_u16.to_be_bytes());
 
-    // Payload: client ID
+    // Payload: client ID (fixed 12 bytes, zero-padded)
     let mut payload = Vec::new();
+    #[allow(clippy::cast_possible_truncation)]
+    let client_id_len = MQTT_CLIENTID_LEN as u16;
     payload.extend_from_slice(&client_id_len.to_be_bytes());
-    payload.extend_from_slice(client_id_bytes);
+    payload.extend_from_slice(&client_id_padded);
 
     let remaining_len = variable_header.len() + payload.len();
 
@@ -286,7 +291,7 @@ pub async fn publish_qos(
     let mut tcp = tokio::net::TcpStream::connect(&addr).await.map_err(Error::Connect)?;
 
     // CONNECT
-    let connect = build_connect_packet("urlx-client");
+    let connect = build_connect_packet("curl");
     tcp.write_all(&connect)
         .await
         .map_err(|e| Error::Http(format!("MQTT connect write error: {e}")))?;
@@ -406,7 +411,7 @@ pub async fn subscribe_qos(url: &crate::url::Url, qos: QoS) -> Result<Response, 
     let mut tcp = tokio::net::TcpStream::connect(&addr).await.map_err(Error::Connect)?;
 
     // CONNECT
-    let connect = build_connect_packet("urlx-subscriber");
+    let connect = build_connect_packet("curl");
     tcp.write_all(&connect)
         .await
         .map_err(|e| Error::Http(format!("MQTT connect write error: {e}")))?;

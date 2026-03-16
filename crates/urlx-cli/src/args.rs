@@ -507,7 +507,13 @@ fn parse_args_options(args: &[String]) -> Result<CliOptions, u8> {
                 // Support @filename to read from file, @- for stdin
                 if let Some(path) = val.strip_prefix('@') {
                     match read_data_source(path) {
-                        Ok(data) => opts.easy.body(&data),
+                        Ok(mut data) => {
+                            // curl's -d @file strips trailing \r\n (unlike --data-binary)
+                            while data.last() == Some(&b'\n') || data.last() == Some(&b'\r') {
+                                let _ = data.pop();
+                            }
+                            opts.easy.body(&data);
+                        }
                         Err(e) => {
                             eprintln!("urlx: error reading data: {e}");
                             return Err(1);
@@ -996,10 +1002,16 @@ fn parse_args_options(args: &[String]) -> Result<CliOptions, u8> {
                 i += 1;
                 let val = require_arg(args, i, "--retry-delay")?;
                 if let Ok(s) = val.parse::<u64>() {
+                    // Reject values that would overflow Duration (curl returns exit 2)
+                    if s > 86_400 * 365 * 100 {
+                        // > 100 years is unreasonable
+                        eprintln!("urlx: too large --retry-delay value");
+                        return Err(2);
+                    }
                     opts.retry_delay_secs = s;
                 } else {
                     eprintln!("urlx: invalid retry-delay value: {val}");
-                    return Err(1);
+                    return Err(2);
                 }
             }
             "--retry-max-time" => {

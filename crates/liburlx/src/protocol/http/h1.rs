@@ -756,6 +756,13 @@ fn parse_headers(data: &[u8]) -> Result<ParsedHeaders, Error> {
             return Err(Error::Http("incomplete response headers".to_string()));
         }
         Err(e) => {
+            // httparse rejects unknown HTTP versions (e.g. HTTP/1.2).
+            // curl returns CURLE_UNSUPPORTED_PROTOCOL (1) for these.
+            if e.to_string().contains("version") {
+                return Err(Error::UnsupportedProtocol(
+                    "unsupported HTTP version in response".to_string(),
+                ));
+            }
             return Err(Error::Http(format!("Weird server reply: {e}")));
         }
     };
@@ -1317,6 +1324,13 @@ pub fn parse_response(data: &[u8], effective_url: &str, is_head: bool) -> Result
             return Err(Error::Http("incomplete response headers".to_string()));
         }
         Err(e) => {
+            // httparse rejects unknown HTTP versions (e.g. HTTP/1.2).
+            // curl returns CURLE_UNSUPPORTED_PROTOCOL (1) for these.
+            if e.to_string().contains("version") {
+                return Err(Error::UnsupportedProtocol(
+                    "unsupported HTTP version in response".to_string(),
+                ));
+            }
             return Err(Error::Http(format!("Weird server reply: {e}")));
         }
     };

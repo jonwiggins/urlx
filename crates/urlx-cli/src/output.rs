@@ -353,7 +353,25 @@ pub fn format_write_out(fmt: &str, response: &liburlx::Response) -> String {
     }
     result = result
         .replace("%{time_redirect}", &format!("{:.6}", info.time_namelookup.as_secs_f64() * 0.0));
-    result = result.replace("%{redirect_url}", response.header("location").unwrap_or(""));
+    // redirect_url: curl normalizes the Location URL (adds trailing slash for bare hostnames)
+    let redirect_url = response.header("location").unwrap_or("").to_string();
+    let redirect_url_normalized = if redirect_url.is_empty() {
+        redirect_url
+    } else {
+        // Normalize: bare hostname URLs need trailing slash (e.g. https://host -> https://host/)
+        if redirect_url.contains("://")
+            && !redirect_url.ends_with('/')
+            && redirect_url.matches('/').count() == 2
+        {
+            format!("{redirect_url}/")
+        } else {
+            redirect_url
+        }
+    };
+    #[allow(clippy::literal_string_with_formatting_args)]
+    {
+        result = result.replace("%{redirect_url}", &redirect_url_normalized);
+    }
     result = result.replace("%{method}", "GET");
     result = result.replace("%{errormsg}", "");
     result = result.replace("%{exitcode}", "0");

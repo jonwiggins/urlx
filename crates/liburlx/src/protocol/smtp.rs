@@ -142,11 +142,12 @@ pub async fn send_mail(
     mail_auth: Option<&str>,
     sasl_authzid: Option<&str>,
     sasl_ir: bool,
+    ext_credentials: Option<(&str, &str)>,
 ) -> Result<crate::protocol::http::response::Response, Error> {
     let (host, port) = url.host_and_port()?;
 
-    // Extract credentials and mail parameters from URL
-    let credentials = url.credentials();
+    // Extract credentials from URL or external parameter (-u flag)
+    let credentials = url.credentials().or(ext_credentials);
 
     // Connect to SMTP server
     let addr = format!("{host}:{port}");
@@ -176,7 +177,19 @@ pub async fn send_mail(
     };
     send_command(&mut writer, &format!("EHLO {ehlo_arg}")).await?;
     let ehlo_resp = read_response(&mut reader).await?;
-    if !ehlo_resp.is_ok() {
+
+    // Parse EHLO capabilities to find supported AUTH mechanisms
+    let mut server_auth_mechanisms: Vec<String> = Vec::new();
+    if ehlo_resp.is_ok() {
+        // EHLO response message may contain "AUTH PLAIN LOGIN" etc.
+        let ehlo_text = format!("{} {}", ehlo_resp.code, ehlo_resp.message);
+        for word in ehlo_text.split_whitespace() {
+            let upper = word.to_uppercase();
+            if matches!(upper.as_str(), "PLAIN" | "LOGIN" | "CRAM-MD5" | "NTLM" | "XOAUTH2") {
+                server_auth_mechanisms.push(upper);
+            }
+        }
+    } else {
         // Fall back to HELO
         send_command(&mut writer, &format!("HELO {ehlo_arg}")).await?;
         let helo_resp = read_response(&mut reader).await?;
@@ -190,28 +203,58 @@ pub async fn send_mail(
 
     // Authenticate if credentials provided
     if let Some((user, pass)) = credentials {
-        // Use AUTH PLAIN with optional SASL authorization identity
         use base64::Engine;
-        let auth_string = sasl_authzid.map_or_else(
-            || format!("\0{user}\0{pass}"),
-            |authzid| format!("{authzid}\0{user}\0{pass}"),
-        );
-        let encoded = base64::engine::general_purpose::STANDARD.encode(auth_string.as_bytes());
 
-        if sasl_ir {
-            // Send initial response inline with AUTH command (default curl behavior)
-            send_command(&mut writer, &format!("AUTH PLAIN {encoded}")).await?;
-        } else {
-            // Two-step: send AUTH PLAIN, wait for 334 continue, then send credentials
-            send_command(&mut writer, "AUTH PLAIN").await?;
-            let continue_resp = read_response(&mut reader).await?;
-            if continue_resp.code != 334 {
+        // Choose auth mechanism based on server capabilities
+        // Priority: PLAIN > LOGIN (matching curl's preference order)
+        let use_login = server_auth_mechanisms.contains(&"LOGIN".to_string())
+            && !server_auth_mechanisms.contains(&"PLAIN".to_string());
+
+        if use_login {
+            // AUTH LOGIN: send username and password separately, base64-encoded
+            let user_b64 = base64::engine::general_purpose::STANDARD.encode(user.as_bytes());
+            let pass_b64 = base64::engine::general_purpose::STANDARD.encode(pass.as_bytes());
+
+            send_command(&mut writer, "AUTH LOGIN").await?;
+            let resp = read_response(&mut reader).await?;
+            if resp.code != 334 {
                 return Err(Error::Http(format!(
-                    "SMTP AUTH PLAIN expected 334 continue, got: {} {}",
-                    continue_resp.code, continue_resp.message
+                    "SMTP AUTH LOGIN failed: {} {}",
+                    resp.code, resp.message
                 )));
             }
-            send_command(&mut writer, &encoded).await?;
+            send_command(&mut writer, &user_b64).await?;
+            let resp = read_response(&mut reader).await?;
+            if resp.code != 334 {
+                return Err(Error::Http(format!(
+                    "SMTP AUTH LOGIN failed: {} {}",
+                    resp.code, resp.message
+                )));
+            }
+            send_command(&mut writer, &pass_b64).await?;
+        } else {
+            // AUTH PLAIN
+            let auth_string = sasl_authzid.map_or_else(
+                || format!("\0{user}\0{pass}"),
+                |authzid| format!("{authzid}\0{user}\0{pass}"),
+            );
+            let encoded = base64::engine::general_purpose::STANDARD.encode(auth_string.as_bytes());
+
+            if sasl_ir {
+                // Send initial response inline with AUTH command
+                send_command(&mut writer, &format!("AUTH PLAIN {encoded}")).await?;
+            } else {
+                // Two-step: send AUTH PLAIN, wait for 334, then send credentials
+                send_command(&mut writer, "AUTH PLAIN").await?;
+                let continue_resp = read_response(&mut reader).await?;
+                if continue_resp.code != 334 {
+                    return Err(Error::Http(format!(
+                        "SMTP AUTH PLAIN expected 334 continue, got: {} {}",
+                        continue_resp.code, continue_resp.message
+                    )));
+                }
+                send_command(&mut writer, &encoded).await?;
+            }
         }
         let auth_resp = read_response(&mut reader).await?;
         if !auth_resp.is_ok() {

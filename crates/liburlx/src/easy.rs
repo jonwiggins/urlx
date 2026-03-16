@@ -3400,16 +3400,27 @@ async fn do_single_request(
                 let upload_data = body.unwrap_or(&[]);
                 return crate::protocol::file::write_file(url, upload_data);
             }
-            // Extract resume offset from Range header if present (e.g. "bytes=10-")
-            let resume_offset = headers.iter().find_map(|(k, v)| {
-                if k.eq_ignore_ascii_case("range") {
-                    v.strip_prefix("bytes=")
-                        .and_then(|r| r.strip_suffix('-').and_then(|n| n.parse::<u64>().ok()))
-                } else {
-                    None
-                }
-            });
-            return crate::protocol::file::read_file(url, resume_offset);
+            // Extract range from Range header if present
+            // Supports "bytes=10-" (resume) and "bytes=2-5" (byte range)
+            let (range_start, range_end) = headers
+                .iter()
+                .find_map(|(k, v)| {
+                    if k.eq_ignore_ascii_case("range") {
+                        v.strip_prefix("bytes=").map(|r| {
+                            if let Some((s, e)) = r.split_once('-') {
+                                let start = s.parse::<u64>().ok();
+                                let end = if e.is_empty() { None } else { e.parse::<u64>().ok() };
+                                (start, end)
+                            } else {
+                                (None, None)
+                            }
+                        })
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or((None, None));
+            return crate::protocol::file::read_file(url, range_start, range_end);
         }
         "tftp" => {
             return crate::protocol::tftp::download(url, tftp_blksize, tftp_no_options).await;
@@ -3518,6 +3529,8 @@ async fn do_single_request(
         }
         "smtp" | "smtps" => {
             let mail_data = body.unwrap_or(&[]);
+            let header_creds = extract_basic_auth_from_headers(headers);
+            let creds_tuple = header_creds.as_ref().map(|(u, p)| (u.as_str(), p.as_str()));
             return crate::protocol::smtp::send_mail(
                 url,
                 mail_data,
@@ -3526,6 +3539,7 @@ async fn do_single_request(
                 mail_auth,
                 sasl_authzid,
                 sasl_ir,
+                creds_tuple,
             )
             .await;
         }

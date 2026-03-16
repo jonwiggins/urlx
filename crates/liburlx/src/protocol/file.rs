@@ -16,7 +16,11 @@ use crate::protocol::http::response::Response;
 /// # Errors
 ///
 /// Returns [`Error::FileError`] if the file cannot be read.
-pub fn read_file(url: &crate::url::Url, resume_offset: Option<u64>) -> Result<Response, Error> {
+pub fn read_file(
+    url: &crate::url::Url,
+    range_start: Option<u64>,
+    range_end: Option<u64>,
+) -> Result<Response, Error> {
     let path = url.path();
 
     // Decode percent-encoded characters in the path
@@ -30,17 +34,27 @@ pub fn read_file(url: &crate::url::Url, resume_offset: Option<u64>) -> Result<Re
     let data = std::fs::read(&decoded_path)
         .map_err(|e| Error::FileError(format!("{decoded_path}: {e}")))?;
 
-    // Apply resume offset (skip first N bytes)
-    let data = if let Some(offset) = resume_offset {
-        #[allow(clippy::cast_possible_truncation)]
-        let offset = offset as usize;
-        if offset < data.len() {
-            data[offset..].to_vec()
-        } else {
-            Vec::new()
+    // Apply byte range (e.g. -r 2-5 or resume from offset)
+    #[allow(clippy::cast_possible_truncation)]
+    let data = match (range_start, range_end) {
+        (Some(start), Some(end)) => {
+            let s = start as usize;
+            let e = (end as usize).min(data.len().saturating_sub(1));
+            if s <= e && s < data.len() {
+                data[s..=e].to_vec()
+            } else {
+                Vec::new()
+            }
         }
-    } else {
-        data
+        (Some(start), None) => {
+            let s = start as usize;
+            if s < data.len() {
+                data[s..].to_vec()
+            } else {
+                Vec::new()
+            }
+        }
+        _ => data,
     };
 
     let mut headers = HashMap::new();
@@ -145,6 +159,6 @@ mod tests {
     #[test]
     fn read_file_nonexistent() {
         let url = crate::url::Url::parse("file:///nonexistent/path").unwrap();
-        assert!(read_file(&url, None).is_err());
+        assert!(read_file(&url, None, None).is_err());
     }
 }

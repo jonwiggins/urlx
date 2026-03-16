@@ -1713,9 +1713,9 @@ pub async fn perform(
         }
 
         // SIZE before upload for resume offset detection (curl compat: test 362)
-        // If SIZE fails (file doesn't exist), fall back to STOR instead of APPE
+        // Only send SIZE for resume, not for plain --append (curl compat: test 109)
         let mut use_appe_effective = use_appe;
-        if resume_from.is_some() || use_appe {
+        if resume_from.is_some() {
             send_command(&mut session.writer, &format!("SIZE {filename}")).await?;
             let size_resp = read_response(&mut session.reader).await?;
             if !size_resp.is_complete() {
