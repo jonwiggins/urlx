@@ -303,6 +303,7 @@ pub fn http_version_string(response: &liburlx::Response) -> String {
 }
 
 /// Format a `--write-out` string by replacing `%{variable}` placeholders.
+#[allow(clippy::too_many_lines)]
 pub fn format_write_out(fmt: &str, response: &liburlx::Response) -> String {
     let info = response.transfer_info();
     let mut result = fmt.to_string();
@@ -376,6 +377,40 @@ pub fn format_write_out(fmt: &str, response: &liburlx::Response) -> String {
     result = result.replace("%{errormsg}", "");
     result = result.replace("%{exitcode}", "0");
     result = result.replace("%{num_retries}", &info.num_retries.to_string());
+    // Connection info: extract from effective URL as approximation
+    // (actual peer address requires threading through transfer stack)
+    let effective = response.effective_url();
+    let url_host = effective
+        .find("://")
+        .map_or(effective, |p| &effective[p + 3..])
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .split(':')
+        .next()
+        .unwrap_or("");
+    let url_port = effective
+        .find("://")
+        .map_or(effective, |p| &effective[p + 3..])
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .rsplit(':')
+        .next()
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(0);
+    // Resolve hostname to IP for %{remote_ip}
+    let resolved_ip = std::net::ToSocketAddrs::to_socket_addrs(&(url_host, url_port))
+        .ok()
+        .and_then(|mut addrs| addrs.next())
+        .map_or_else(|| url_host.to_string(), |addr| addr.ip().to_string());
+    #[allow(clippy::literal_string_with_formatting_args)]
+    {
+        result = result.replace("%{remote_ip}", &resolved_ip);
+        result = result.replace("%{remote_port}", &url_port.to_string());
+        result = result.replace("%{local_ip}", "");
+        result = result.replace("%{local_port}", "0");
+    }
 
     // Handle escape sequences
     result = result.replace("\\n", "\n");
