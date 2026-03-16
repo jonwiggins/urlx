@@ -243,14 +243,36 @@ pub async fn retrieve(
         }
     }
 
-    // If custom request is set (e.g. -X NOOP), send that instead
+    // If custom request is set (e.g. -X NOOP, -X DELE), send that instead.
+    // If URL has a message number, append it to the command (e.g. DELE 858).
     if let Some(cmd) = custom_request {
-        send_command(&mut writer, cmd).await?;
+        let full_cmd = msg_num.map_or_else(|| cmd.to_string(), |num| format!("{cmd} {num}"));
+        send_command(&mut writer, &full_cmd).await?;
         let cmd_resp = read_response(&mut reader).await?;
         if !cmd_resp.ok {
+            send_command(&mut writer, "QUIT").await?;
+            let _ = read_response(&mut reader).await;
             return Err(Error::Http(format!("POP3 {cmd} failed: {}", cmd_resp.message)));
         }
-        // Don't try to read multiline for simple commands
+        // Some custom commands (TOP, RETR) return multiline data
+        let cmd_upper = cmd.to_uppercase();
+        if cmd_upper.starts_with("TOP")
+            || cmd_upper.starts_with("RETR")
+            || cmd_upper.starts_with("LIST")
+        {
+            let lines = read_multiline(&mut reader).await?;
+            let mut body_str = lines.join("\r\n");
+            if !body_str.is_empty() {
+                body_str.push_str("\r\n");
+            }
+            let body = body_str.into_bytes();
+            send_command(&mut writer, "QUIT").await?;
+            let _ = read_response(&mut reader).await;
+            let mut headers = std::collections::HashMap::new();
+            let _old = headers.insert("content-length".to_string(), body.len().to_string());
+            return Ok(Response::new(200, headers, body, url.as_str().to_string()));
+        }
+        // Simple commands (DELE, NOOP) — just QUIT
     } else if let Some(num) = msg_num {
         // RETR specific message
         send_command(&mut writer, &format!("RETR {num}")).await?;
