@@ -330,8 +330,34 @@ pub fn format_write_out(fmt: &str, response: &liburlx::Response) -> String {
     result = result.replace("%{size_upload}", &info.size_upload.to_string());
     // Additional curl-compatible variables
     result = result.replace("%{http_version}", &http_version_string(response));
-    result =
-        result.replace("%{scheme}", response.effective_url().split("://").next().unwrap_or(""));
+    let eff_scheme = response.effective_url().split("://").next().unwrap_or("");
+    result = result.replace("%{scheme}", eff_scheme);
+    // URL component variables (url.* and urle.* families)
+    // Parse effective URL to extract components
+    {
+        let eff_url = response.effective_url();
+        let (u_scheme, u_user, u_pass, u_host, u_port, u_path, u_query, u_fragment) =
+            parse_url_components(eff_url);
+        #[allow(clippy::literal_string_with_formatting_args)]
+        {
+            result = result.replace("%{url.scheme}", &u_scheme);
+            result = result.replace("%{url.host}", &u_host);
+            result = result.replace("%{url.port}", &u_port);
+            result = result.replace("%{url.path}", &u_path);
+            result = result.replace("%{url.query}", &u_query);
+            result = result.replace("%{url.user}", &u_user);
+            result = result.replace("%{url.password}", &u_pass);
+            result = result.replace("%{url.fragment}", &u_fragment);
+            result = result.replace("%{urle.scheme}", &u_scheme);
+            result = result.replace("%{urle.host}", &u_host);
+            result = result.replace("%{urle.port}", &u_port);
+            result = result.replace("%{urle.path}", &u_path);
+            result = result.replace("%{urle.query}", &u_query);
+            result = result.replace("%{urle.user}", &u_user);
+            result = result.replace("%{urle.password}", &u_pass);
+            result = result.replace("%{urle.fragment}", &u_fragment);
+        }
+    }
     // Header sizes: approximate from response headers
     let header_size: usize = response.headers().iter().map(|(k, v)| k.len() + v.len() + 4).sum();
     result = result.replace("%{size_header}", &header_size.to_string());
@@ -418,4 +444,71 @@ pub fn format_write_out(fmt: &str, response: &liburlx::Response) -> String {
     result = result.replace("\\r", "\r");
 
     result
+}
+
+/// Parse a URL string into its components.
+/// Returns (scheme, user, password, host, port, path, query, fragment).
+fn parse_url_components(
+    url: &str,
+) -> (String, String, String, String, String, String, String, String) {
+    let scheme = url.split("://").next().unwrap_or("").to_string();
+    let rest = url.find("://").map_or("", |p| &url[p + 3..]);
+
+    // Split fragment
+    let (rest, fragment) = rest.split_once('#').map_or((rest, ""), |(r, f)| (r, f));
+
+    // Split query
+    let (rest, query) = rest.split_once('?').map_or((rest, ""), |(r, q)| (r, q));
+
+    // Split path from authority
+    let (authority, path) = rest.find('/').map_or((rest, "/"), |p| (&rest[..p], &rest[p..]));
+
+    // Split userinfo from host
+    let (userinfo, hostport) = authority.split_once('@').map_or(("", authority), |(u, h)| (u, h));
+
+    // Split user:password
+    let (user, pass) = userinfo.split_once(':').map_or((userinfo, ""), |(u, p)| (u, p));
+
+    // Split host:port
+    let (host, port) = if hostport.starts_with('[') {
+        // IPv6
+        hostport.find(']').map_or((hostport, ""), |bracket| {
+            let h = &hostport[..=bracket];
+            let p = hostport.get(bracket + 2..).unwrap_or("");
+            (h, p)
+        })
+    } else {
+        hostport.rsplit_once(':').map_or((hostport, ""), |(h, p)| {
+            if p.parse::<u16>().is_ok() {
+                (h, p)
+            } else {
+                (hostport, "")
+            }
+        })
+    };
+
+    // Default port from scheme
+    let port_str = if port.is_empty() {
+        match scheme.as_str() {
+            "http" => "80",
+            "https" => "443",
+            "ftp" => "21",
+            "ftps" => "990",
+            _ => "0",
+        }
+        .to_string()
+    } else {
+        port.to_string()
+    };
+
+    (
+        scheme,
+        user.to_string(),
+        pass.to_string(),
+        host.to_string(),
+        port_str,
+        path.to_string(),
+        query.to_string(),
+        fragment.to_string(),
+    )
 }
