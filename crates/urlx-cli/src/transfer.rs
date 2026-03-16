@@ -1017,6 +1017,15 @@ pub fn run(args: &[String]) -> ExitCode {
         }
     }
 
+    // For non-HTTP protocols, -X sets a custom protocol command (not HTTP request target).
+    // Only set custom_request_target for non-HTTP schemes to avoid breaking HTTP -X behavior.
+    if let Some(ref custom_req) = opts.custom_request_original {
+        let scheme = opts.easy.url_ref().map(|u| u.scheme().to_lowercase()).unwrap_or_default();
+        if matches!(scheme.as_str(), "smtp" | "smtps" | "imap" | "imaps" | "pop3" | "pop3s") {
+            opts.easy.custom_request_target(custom_req);
+        }
+    }
+
     let result = perform_with_retry(&mut opts);
 
     // Save cookie jar after transfer (even on error)

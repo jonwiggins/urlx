@@ -117,6 +117,8 @@ pub struct CliOptions {
     pub(crate) inline_cookies: Vec<String>,
     /// Whether `--next` was seen without a following URL (parse error if true at end).
     pub(crate) next_needs_url: bool,
+    /// Original -X value preserving case (for non-HTTP protocol commands).
+    pub(crate) custom_request_original: Option<String>,
     /// Variables set via `--variable` for `--expand-*` expansion.
     pub(crate) variables: Vec<(String, String)>,
 }
@@ -457,6 +459,7 @@ fn parse_args_options(args: &[String]) -> Result<CliOptions, u8> {
         upload_file_path: None,
         inline_cookies: Vec::new(),
         next_needs_url: false,
+        custom_request_original: None,
         variables: Vec::new(),
     };
 
@@ -467,9 +470,9 @@ fn parse_args_options(args: &[String]) -> Result<CliOptions, u8> {
                 i += 1;
                 let val = require_arg(args, i, "-X")?;
                 opts.easy.method(val);
-                // Also store as custom_request_target for non-HTTP protocols
+                // Store original case value for non-HTTP protocols
                 // (IMAP/POP3/SMTP use -X as custom protocol command)
-                opts.easy.custom_request_target(val);
+                opts.custom_request_original = Some(val.to_string());
             }
             "-H" | "--header" => {
                 i += 1;
@@ -623,6 +626,11 @@ fn parse_args_options(args: &[String]) -> Result<CliOptions, u8> {
             }
             "--compressed" => {
                 opts.easy.accept_encoding(true);
+            }
+            "--tr-encoding" => {
+                // Add TE: gzip and Connection: TE headers for transfer-encoding request
+                opts.easy.header("TE", "gzip");
+                opts.easy.header("Connection", "TE");
             }
             "--connect-timeout" => {
                 i += 1;
@@ -1575,7 +1583,6 @@ fn parse_args_options(args: &[String]) -> Result<CliOptions, u8> {
             | "--cert-status"
             | "--false-start"
             | "--compressed-ssh"
-            | "--tr-encoding"
             | "--doh-cert-status"
             | "--ftp-pasv"
             | "--styled-output"
