@@ -15,7 +15,7 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 ## Current Status
 
 **Version:** v0.1.0 published (crates.io + GitHub Releases + Homebrew)
-**curl test suite:** 615 pass / 534 fail / 47 skip out of 1196 tests (53.5% pass rate, tests 1-1400)
+**curl test suite:** 629 pass / 520 fail / 47 skip out of 1196 tests (54.7% pass rate, tests 1-1400)
 **Rust test count:** ~2,596
 **Blockers:** None — infrastructure is live
 
@@ -109,27 +109,42 @@ Document every skip with a reason. Skips without rationale are not allowed.
 
 ## Remaining Work: Root Cause Analysis (as of 2026-03-15)
 
-Full test suite run: 581 pass / 568 fail / 47 skip (tests 1-1400, 30s timeout).
+Full test suite run: 629 pass / 520 fail / 47 skip (tests 1-1400, 30s timeout).
 
-### Failure Root Causes (ordered by ROI)
+### Completed Fixes (this session: +48 tests)
+
+- ~~FTP spurious `CWD /`~~ — Fixed: single-slash root URLs skip CWD
+- ~~SMTP EHLO hostname + missing QUIT~~ — Fixed: use URL path, read QUIT response
+- ~~HTTP upload resume (Content-Range)~~ — Fixed: move file read before Content-Range handling
+- ~~IMAP/POP3 greeting/connection~~ — Partial: banner handling, CAPABILITY/CAPA, credential passing
+- ~~MQTT client ID~~ — Fixed: 12-byte zero-padded "curl" ID
+- ~~FTP APPE~~ — Fixed: use APPE for --append uploads
+- ~~SMTP AUTH PLAIN/LOGIN~~ — Fixed: parse EHLO capabilities, choose mechanism
+- ~~file:// byte range~~ — Fixed: -r X-Y support
+- ~~-d @file trailing newline~~ — Fixed: strip trailing \r\n
+- ~~HTTP/1.2 exit code~~ — Fixed: return exit 1 instead of 8
+- ~~--retry-delay overflow~~ — Fixed: reject values > 100 years
+- ~~redirect_url trailing slash~~ — Fixed: normalize bare hostname URLs
+
+### Remaining Failure Root Causes (ordered by ROI)
 
 | # | Root Cause | ~Tests Fixable | Effort | Details |
 |---|-----------|---------------|--------|---------|
-| 1 | **IMAP/POP3 greeting/connection failure** | ~92 | 2-3 days | Every test returns error 56 — can't parse test server greeting |
-| 2 | **SMTP EHLO hostname + missing QUIT** | ~30 | 2 hours | Sends `EHLO 127.0.0.1` instead of `EHLO <url-hostname>` |
-| 3 | **FTP spurious `CWD /`** | ~22 | 1 hour | Extra `CWD /` when URL path is root and PWD already returned `/` |
-| 4 | **FTPS post-TLS pipeline broken** | ~20 | 3-4 days | Commands stop after `PBSZ 0` — TLS stream wrapping issue |
-| 5 | **SMTP SASL auth** (PLAIN/LOGIN/NTLM/XOAUTH2) | ~50 | 2 days | No AUTH commands sent at all |
-| 6 | **FTP connection reuse** | ~15 | 1-2 days | New connection per URL instead of reusing control connection |
-| 7 | **NTLM proxy auth Type 3 response** | ~15 | 1-2 days | Repeats Type 1 instead of computing Type 3 from challenge |
-| 8 | **HTTP upload resume (Content-Range)** | ~10 | 0.5 day | Missing `Content-Range` header for `-C` PUT/POST uploads |
-| 9 | **`--expand-data` variable expansion** | ~10 | 1 day | `{{var:func}}` sent literally instead of expanded |
-| 10 | **Cookie count cap + header size limit** | ~5 | 1 day | Off-by-one (151 vs 150 per domain), no 8KB header limit |
-| 11 | **Auth credential stripping on redirect** | ~5 | 0.5 day | Leaks `Authorization` header when redirecting cross-host |
-| 12 | **Expect: 100-continue body deferral** | ~5 | 0.5 day | Body sent immediately without waiting, Content-Length off-by-1 |
-| 13 | **`--next` header reset** | ~3 | 0.5 day | Headers from prior request leak into next request |
+| 1 | **IMAP URL parsing + command mapping** | ~50 | 2 days | Need RFC 5092 URL parsing (UIDVALIDITY, LIST, SEARCH, custom commands) |
+| 2 | **FTPS post-TLS pipeline broken** | ~20 | 3-4 days | Commands stop after `PBSZ 0` — TLS stream wrapping issue |
+| 3 | **FTP connection reuse** | ~15-20 | 1-2 days | New connection per URL instead of reusing control connection |
+| 4 | **NTLM proxy auth Type 3 response** | ~15 | 1-2 days | Repeats Type 1 instead of computing Type 3 from challenge |
+| 5 | **SMTP advanced auth** (CRAM-MD5/NTLM/XOAUTH2) | ~10 | 1 day | PLAIN/LOGIN done; need remaining mechanisms |
+| 6 | **POP3 AUTH + response parsing** | ~10-15 | 1 day | Need AUTH mechanisms and raw message output (not HTTP-wrapped) |
+| 7 | **Cookie limits + -b file detection** | ~6 | 0.5 day | Off-by-one count, 8KB header cap, -b file vs string |
+| 8 | **Expect: 100-continue body deferral** | ~5 | 0.5 day | Body sent immediately without waiting for 100 response |
+| 9 | **HTTP proxy CONNECT auth** | ~15 | 1-2 days | NTLM proxy auth, body suppression during negotiation, tunnel reuse |
+| 10 | **`--expand-data` variable expansion** | ~10 | 1 day | `{{var:func}}` sent literally instead of expanded |
+| 11 | **HTTP auth credential stripping on redirect** | ~5 | 0.5 day | Leaks Authorization header cross-host |
+| 12 | **`--next` header reset** | ~3 | 0.5 day | Headers from prior request leak into next |
+| 13 | **Misc CLI** (--raw, --ftp-method nocwd, etc.) | ~10 | 1 day | Various small fixes |
 
-**Total fixable: ~280 tests → would raise pass rate from 50.6% to ~75%**
+**Total remaining fixable: ~180 tests → would raise pass rate from 54.7% to ~70%+**
 
 ---
 
