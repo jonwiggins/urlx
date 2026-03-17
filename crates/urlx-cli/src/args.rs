@@ -1003,6 +1003,12 @@ fn parse_args_options(args: &[String]) -> Result<CliOptions, u8> {
             "--http2-prior-knowledge" => {
                 opts.easy.http_version(liburlx::HttpVersion::Http2PriorKnowledge);
             }
+            "--http0.9" => {
+                opts.easy.http09_allowed(true);
+            }
+            "--no-http0.9" => {
+                opts.easy.http09_allowed(false);
+            }
             "--expect100-timeout" => {
                 i += 1;
                 let val = require_arg(args, i, "--expect100-timeout")?;
@@ -1618,7 +1624,8 @@ fn parse_args_options(args: &[String]) -> Result<CliOptions, u8> {
             | "--tcp-fastopen"
             | "--suppress-connect-headers"
             | "--no-clobber"
-            | "--http0.9"
+            | "--ca-native"
+            | "--no-ca-native"
             | "--disallow-username-in-url"
             | "--ssl-allow-beast"
             | "--ssl-auto-client-cert"
@@ -1740,10 +1747,17 @@ fn parse_args_options(args: &[String]) -> Result<CliOptions, u8> {
             arg if arg.starts_with("--no-") => {
                 // --no- prefix used on a non-boolean option (curl returns exit code 2)
                 eprintln!("curl: option {arg}: is unknown");
+                eprintln!("curl: try 'curl --help' or 'curl --manual' for more information");
+                return Err(2);
+            }
+            arg if arg.starts_with("--") => {
+                eprintln!("curl: option {arg}: is unknown");
+                eprintln!("curl: try 'curl --help' or 'curl --manual' for more information");
                 return Err(2);
             }
             arg if arg.starts_with('-') => {
-                eprintln!("curl: unknown option: {arg}");
+                eprintln!("curl: option {arg}: is unknown");
+                eprintln!("curl: try 'curl --help' or 'curl --manual' for more information");
                 return Err(2);
             }
             url => {

@@ -90,6 +90,8 @@ pub struct Easy {
     h2_pool: crate::pool::H2Pool,
     share: Option<crate::share::Share>,
     http_version: HttpVersion,
+    /// Allow HTTP/0.9 responses (default: false, curl compat).
+    http09_allowed: bool,
     expect_100_timeout: Option<Duration>,
     chunked_upload: bool,
     max_recv_speed: Option<u64>,
@@ -260,6 +262,7 @@ impl std::fmt::Debug for Easy {
             .field("pool", &"<ConnectionPool>")
             .field("share", &self.share)
             .field("http_version", &self.http_version)
+            .field("http09_allowed", &self.http09_allowed)
             .field("expect_100_timeout", &self.expect_100_timeout)
             .field("max_recv_speed", &self.max_recv_speed)
             .field("max_send_speed", &self.max_send_speed)
@@ -370,6 +373,7 @@ impl Clone for Easy {
             h2_pool: crate::pool::H2Pool::new(),
             share: self.share.clone(),
             http_version: self.http_version,
+            http09_allowed: self.http09_allowed,
             expect_100_timeout: self.expect_100_timeout,
             chunked_upload: self.chunked_upload,
             max_recv_speed: self.max_recv_speed,
@@ -490,6 +494,7 @@ impl Easy {
             h2_pool: crate::pool::H2Pool::new(),
             share: None,
             http_version: HttpVersion::None,
+            http09_allowed: false,
             expect_100_timeout: None,
             chunked_upload: false,
             max_recv_speed: None,
@@ -1462,6 +1467,15 @@ impl Easy {
         self.http_version = version;
     }
 
+    /// Allow HTTP/0.9 responses (no status line, just raw body).
+    ///
+    /// By default, HTTP/0.9 responses are rejected with exit code 1
+    /// (`CURLE_UNSUPPORTED_PROTOCOL`). Enable this to accept them.
+    /// Equivalent to `CURLOPT_HTTP09_ALLOWED`.
+    pub const fn http09_allowed(&mut self, enable: bool) {
+        self.http09_allowed = enable;
+    }
+
     /// Set the Expect: 100-continue timeout.
     ///
     /// When set, POST/PUT requests with a body will send an
@@ -2225,6 +2239,7 @@ impl Easy {
             post_quote: self.ftp_post_quote.clone(),
             time_condition: self.ftp_time_condition,
             range_end: None,
+            ignore_content_length: self.ignore_content_length,
         };
 
         let dns_resolver = self.build_dns_resolver();
@@ -2307,6 +2322,7 @@ impl Easy {
             self.haproxy_protocol,
             self.abstract_unix_socket.as_deref(),
             self.chunked_upload,
+            self.http09_allowed,
             self.http_proxy_tunnel,
             self.proxy_http_10,
         );
@@ -2451,6 +2467,7 @@ async fn perform_transfer(
     haproxy_protocol: bool,
     abstract_unix_socket: Option<&str>,
     chunked_upload: bool,
+    http09_allowed: bool,
     http_proxy_tunnel: bool,
     proxy_http_10: bool,
 ) -> Result<Response, Error> {
@@ -2612,6 +2629,7 @@ async fn perform_transfer(
             haproxy_protocol,
             abstract_unix_socket,
             chunked_upload,
+            http09_allowed,
             deadline,
             http_proxy_tunnel,
             proxy_http_10,
@@ -2697,6 +2715,7 @@ async fn perform_transfer(
                         haproxy_protocol,
                         abstract_unix_socket,
                         chunked_upload,
+                        http09_allowed,
                         deadline,
                         http_proxy_tunnel,
                         proxy_http_10,
@@ -2823,6 +2842,7 @@ async fn perform_transfer(
                                 haproxy_protocol,
                                 abstract_unix_socket,
                                 chunked_upload,
+                                http09_allowed,
                                 deadline,
                                 http_proxy_tunnel,
                                 proxy_http_10,
@@ -2921,6 +2941,7 @@ async fn perform_transfer(
                                         haproxy_protocol,
                                         abstract_unix_socket,
                                         chunked_upload,
+                                        http09_allowed,
                                         deadline,
                                         http_proxy_tunnel,
                                         proxy_http_10,
@@ -3005,6 +3026,7 @@ async fn perform_transfer(
                                 haproxy_protocol,
                                 abstract_unix_socket,
                                 chunked_upload,
+                                http09_allowed,
                                 deadline,
                                 http_proxy_tunnel,
                                 proxy_http_10,
@@ -3096,6 +3118,7 @@ async fn perform_transfer(
                                         haproxy_protocol,
                                         abstract_unix_socket,
                                         chunked_upload,
+                                        http09_allowed,
                                         deadline,
                                         http_proxy_tunnel,
                                         proxy_http_10,
@@ -3198,6 +3221,7 @@ async fn perform_transfer(
                                 haproxy_protocol,
                                 abstract_unix_socket,
                                 chunked_upload,
+                                http09_allowed,
                                 deadline,
                                 http_proxy_tunnel,
                                 proxy_http_10,
@@ -3355,7 +3379,7 @@ async fn perform_transfer(
         info.speed_download = speed_download;
         info.speed_upload = speed_upload;
         info.size_upload = upload_size;
-        info.effective_method = method.unwrap_or("GET").to_string();
+        info.effective_method = current_method.clone();
         response.set_transfer_info(info);
         if !redirect_chain.is_empty() {
             response.set_redirect_responses(redirect_chain);
@@ -3426,6 +3450,7 @@ async fn do_single_request(
     haproxy_protocol: bool,
     #[cfg_attr(not(unix), allow(unused_variables))] abstract_unix_socket: Option<&str>,
     chunked_upload: bool,
+    http09_allowed: bool,
     deadline: Option<tokio::time::Instant>,
     http_proxy_tunnel: bool,
     proxy_http_10: bool,
@@ -3746,6 +3771,7 @@ async fn do_single_request(
                 ignore_content_length,
                 speed_limits,
                 chunked_upload,
+                http09_allowed,
                 deadline,
             )
             .await;
@@ -3862,6 +3888,7 @@ async fn do_single_request(
             ignore_content_length,
             speed_limits,
             chunked_upload,
+            http09_allowed,
             deadline,
         )
         .await?;
@@ -4138,6 +4165,7 @@ async fn do_single_request(
                         ignore_content_length,
                         speed_limits,
                         chunked_upload,
+                        http09_allowed,
                         deadline,
                     )
                     .await?;
@@ -4242,6 +4270,7 @@ async fn do_single_request(
                     ignore_content_length,
                     speed_limits,
                     chunked_upload,
+                    http09_allowed,
                     deadline,
                 )
                 .await?;
@@ -4315,6 +4344,7 @@ async fn do_single_request(
                     ignore_content_length,
                     speed_limits,
                     chunked_upload,
+                    http09_allowed,
                     deadline,
                 )
                 .await?;
@@ -4400,6 +4430,7 @@ async fn do_single_request(
                     ignore_content_length,
                     speed_limits,
                     chunked_upload,
+                    http09_allowed,
                     deadline,
                 )
                 .await?;

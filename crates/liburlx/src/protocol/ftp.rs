@@ -200,6 +200,8 @@ pub struct FtpConfig {
     /// End byte for range download (e.g., `-r 4-16` → `range_end = Some(16)`).
     /// When set, ABOR is sent after reading `range_end - start + 1` bytes.
     pub range_end: Option<u64>,
+    /// Skip SIZE command (`--ignore-content-length`).
+    pub ignore_content_length: bool,
 }
 
 impl Default for FtpConfig {
@@ -221,6 +223,7 @@ impl Default for FtpConfig {
             post_quote: Vec::new(),
             time_condition: None,
             range_end: None,
+            ignore_content_length: false,
         }
     }
 }
@@ -1942,8 +1945,9 @@ pub async fn perform(
     }
 
     // SIZE (curl always tries SIZE before RETR for non-ASCII transfers)
+    // Skip SIZE when --ignore-content-length is set (curl compat: test 1137)
     let mut remote_size: Option<u64> = None;
-    if !use_ascii {
+    if !use_ascii && !config.ignore_content_length {
         send_command(&mut session.writer, &format!("SIZE {filename}")).await?;
         let size_resp = read_response(&mut session.reader).await?;
         if size_resp.is_complete() {

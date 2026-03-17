@@ -55,6 +55,7 @@ pub async fn request<S>(
     ignore_content_length: bool,
     speed_limits: &SpeedLimits,
     chunked_upload: bool,
+    http09_allowed: bool,
     deadline: Option<tokio::time::Instant>,
 ) -> Result<(Response, bool), Error>
 where
@@ -332,6 +333,10 @@ where
 
     // HTTP/0.9: no headers at all — return body-only response
     if header_bytes.is_empty() {
+        // Reject HTTP/0.9 responses unless explicitly allowed (curl compat: tests 1172, 1174)
+        if !http09_allowed {
+            return Err(Error::Http("unsupported HTTP version in response".to_string()));
+        }
         // Read remaining body to EOF
         let mut body = body_prefix;
         let mut tmp = [0u8; 8192];
@@ -1591,6 +1596,7 @@ mod tests {
             false,
             &SpeedLimits::default(),
             false,
+            true,
             None,
         )
         .await
@@ -1634,6 +1640,7 @@ mod tests {
             false,
             &SpeedLimits::default(),
             false,
+            true,
             None,
         )
         .await
@@ -1681,6 +1688,7 @@ mod tests {
             false,
             &SpeedLimits::default(),
             false,
+            true,
             None,
         )
         .await
@@ -1723,6 +1731,7 @@ mod tests {
             false,
             &SpeedLimits::default(),
             false,
+            true,
             None,
         )
         .await
@@ -1766,6 +1775,7 @@ mod tests {
             false,
             &SpeedLimits::default(),
             false,
+            true,
             None,
         )
         .await
@@ -1814,6 +1824,7 @@ mod tests {
             false,
             &SpeedLimits::default(),
             false,
+            true,
             None,
         )
         .await
@@ -1869,6 +1880,7 @@ mod tests {
             false,
             &SpeedLimits::default(),
             false,
+            true,
             None,
         )
         .await
@@ -1910,6 +1922,7 @@ mod tests {
             false,
             &SpeedLimits::default(),
             false,
+            true,
             None,
         )
         .await
@@ -1956,6 +1969,7 @@ mod tests {
             false,
             &SpeedLimits::default(),
             false,
+            true,
             None,
         )
         .await
@@ -2005,6 +2019,7 @@ mod tests {
             false,
             &SpeedLimits::default(),
             false,
+            true,
             None,
         )
         .await
@@ -2052,6 +2067,7 @@ mod tests {
             false,
             &SpeedLimits::default(),
             false,
+            true,
             None,
         )
         .await
@@ -2091,6 +2107,7 @@ mod tests {
             true, // ignore_content_length
             &SpeedLimits::default(),
             false,
+            true,
             None,
         )
         .await
@@ -2136,6 +2153,7 @@ mod tests {
             false,
             &SpeedLimits::default(),
             false,
+            true,
             None,
         )
         .await
@@ -2181,6 +2199,7 @@ mod tests {
             false,
             &SpeedLimits::default(),
             false,
+            true,
             None,
         )
         .await
@@ -2250,6 +2269,7 @@ mod tests {
             false,
             &SpeedLimits::default(),
             true,
+            true,
             None,
         )
         .await
@@ -2312,6 +2332,7 @@ mod tests {
             false,
             &SpeedLimits::default(),
             false,
+            true,
             None,
         )
         .await
@@ -2358,6 +2379,7 @@ mod tests {
             false,
             &SpeedLimits::default(),
             false,
+            true,
             None,
         )
         .await
@@ -2404,6 +2426,7 @@ mod tests {
             false,
             &SpeedLimits::default(),
             false,
+            true,
             None,
         )
         .await
@@ -2446,6 +2469,7 @@ mod tests {
                 false,
                 &SpeedLimits::default(),
                 false,
+                true,
                 None,
             ),
         )
@@ -2491,6 +2515,7 @@ mod tests {
                 false,
                 &SpeedLimits::default(),
                 false,
+                true,
                 None,
             ),
         )
@@ -2565,6 +2590,7 @@ mod tests {
             false,
             &SpeedLimits::default(),
             false,
+            true,
             None,
         )
         .await

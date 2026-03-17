@@ -2215,7 +2215,7 @@ pub unsafe extern "C" fn curl_easy_setopt(
 
             // CURLOPT_HTTP09_ALLOWED = 285
             285 => {
-                // Accepted for compat; HTTP/0.9 not supported
+                h.easy.http09_allowed(!value.is_null());
                 CURLcode::CURLE_OK
             }
 
