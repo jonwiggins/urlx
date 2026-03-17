@@ -109,7 +109,7 @@ Document every skip with a reason. Skips without rationale are not allowed.
 
 ## Remaining Work: Failure Analysis (as of 2026-03-15)
 
-Full test suite run: 707 pass / 442 fail / 47 skip (tests 1-1400, 30s timeout). (+126 from session start of 581).
+Full test suite run: 708 pass / 441 fail / 47 skip (tests 1-1400, 30s timeout). (+127 from session start of 581).
 
 **78% of failures are bugs in existing features. 22% need new/incomplete features.**
 
@@ -147,7 +147,7 @@ Total addressable: ~330 of 520 failures (63%). Remaining ~190 are edge cases, co
 
 | Milestone | Pass Rate | Work |
 |-----------|-----------|------|
-| Current | 61.5% (707/1149) | — |
+| Current | 61.6% (708/1149) | — |
 | Quick bug fixes (cookies, auth, FTP) | ~62% (~710) | 1 week |
 | IMAP + POP3 protocols | ~69% (~795) | +1 week |
 | Proxy CONNECT + NTLM + FTPS | ~76% (~875) | +2 weeks |
