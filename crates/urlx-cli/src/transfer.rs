@@ -98,7 +98,7 @@ pub fn set_file_mtime(path: &str, last_modified: &str, silent: bool) {
         let mtime = filetime::FileTime::from_unix_time(timestamp, 0);
         if let Err(e) = filetime::set_file_mtime(path, mtime) {
             if !silent {
-                eprintln!("urlx: warning: could not set file time: {e}");
+                eprintln!("curl: warning: could not set file time: {e}");
             }
         }
     }
@@ -491,7 +491,7 @@ pub fn run(args: &[String]) -> ExitCode {
         let has_body = opts.easy.has_body();
         let has_multipart = opts.easy.has_multipart();
         if has_head && has_body && has_multipart {
-            eprintln!("urlx: (2) Mutually exclusive options detected");
+            eprintln!("curl: (2) Mutually exclusive options detected");
             return ExitCode::from(2);
         }
         // -T (upload/PUT) and -d (POST data) conflict (curl compat: test 378)
@@ -522,7 +522,7 @@ pub fn run(args: &[String]) -> ExitCode {
                 }
                 Err(e) => {
                     if !opts.silent || opts.show_error {
-                        eprintln!("urlx: (3) {e}");
+                        eprintln!("curl: (3) {e}");
                     }
                     return ExitCode::from(3); // CURLE_URL_MALFORMAT
                 }
@@ -608,7 +608,7 @@ pub fn run(args: &[String]) -> ExitCode {
         if let Some(ref proto_list) = opts.proto {
             if !is_protocol_allowed(&url, proto_list) {
                 if !opts.silent || opts.show_error {
-                    eprintln!("urlx: protocol not allowed by --proto");
+                    eprintln!("curl: protocol not allowed by --proto");
                 }
                 return ExitCode::FAILURE;
             }
@@ -637,7 +637,7 @@ pub fn run(args: &[String]) -> ExitCode {
 
         if let Err(e) = opts.easy.url(&url) {
             if !opts.silent || opts.show_error {
-                eprintln!("urlx: error parsing URL: {e}");
+                eprintln!("curl: error parsing URL: {e}");
             }
             return ExitCode::from(3); // CURLE_URL_MALFORMAT
         }
@@ -717,7 +717,7 @@ pub fn run(args: &[String]) -> ExitCode {
                                 Err(_) => {
                                     // Syntax error in netrc (e.g., unterminated quote)
                                     if !opts.silent || opts.show_error {
-                                        eprintln!("urlx: bad syntax in netrc file '{netrc_path}'");
+                                        eprintln!("curl: bad syntax in netrc file '{netrc_path}'");
                                     }
                                     return ExitCode::from(26);
                                 }
@@ -729,7 +729,7 @@ pub fn run(args: &[String]) -> ExitCode {
                             // Missing netrc file: curl returns CURLE_FAILED_INIT (2)
                             // when --netrc is used but the file doesn't exist
                             if !opts.silent || opts.show_error {
-                                eprintln!("urlx: (2) could not read netrc file '{netrc_path}'");
+                                eprintln!("curl: (2) could not read netrc file '{netrc_path}'");
                             }
                             return ExitCode::from(2);
                         }
@@ -763,7 +763,7 @@ pub fn run(args: &[String]) -> ExitCode {
                 );
                 if let Err(e) = opts.easy.url(&new_url) {
                     if !opts.silent || opts.show_error {
-                        eprintln!("urlx: error parsing URL with -u credentials: {e}");
+                        eprintln!("curl: error parsing URL with -u credentials: {e}");
                     }
                     return ExitCode::from(3);
                 }
@@ -776,6 +776,12 @@ pub fn run(args: &[String]) -> ExitCode {
         if opts.user_credentials.is_none()
             && !url.starts_with("ftp://")
             && !url.starts_with("ftps://")
+            && !url.starts_with("smtp://")
+            && !url.starts_with("smtps://")
+            && !url.starts_with("imap://")
+            && !url.starts_with("imaps://")
+            && !url.starts_with("pop3://")
+            && !url.starts_with("pop3s://")
         {
             let url_user = extract_url_username_raw(&url);
             let url_pass = extract_url_password(&url);
@@ -820,7 +826,7 @@ pub fn run(args: &[String]) -> ExitCode {
                 if !parent.as_os_str().is_empty() {
                     if let Err(e) = std::fs::create_dir_all(parent) {
                         if !opts.silent || opts.show_error {
-                            eprintln!("urlx: error creating directories: {e}");
+                            eprintln!("curl: error creating directories: {e}");
                         }
                         return ExitCode::FAILURE;
                     }
@@ -868,7 +874,7 @@ pub fn run(args: &[String]) -> ExitCode {
             }
             Err(e) => {
                 if !opts.silent || opts.show_error {
-                    eprintln!("urlx: can't read file '{path}': {e}");
+                    eprintln!("curl: can't read file '{path}': {e}");
                 }
                 return ExitCode::from(26); // CURLE_READ_ERROR
             }
@@ -1004,7 +1010,7 @@ pub fn run(args: &[String]) -> ExitCode {
         if let Some(parent) = std::path::Path::new(path).parent() {
             if !parent.as_os_str().is_empty() && !parent.exists() {
                 if !opts.silent || opts.show_error {
-                    eprintln!("urlx: (23) Failed creating file '{path}'");
+                    eprintln!("curl: (23) Failed creating file '{path}'");
                 }
                 return ExitCode::from(23); // CURLE_WRITE_ERROR
             }
@@ -1018,7 +1024,7 @@ pub fn run(args: &[String]) -> ExitCode {
                 if opts.create_dirs {
                     if let Err(e) = std::fs::create_dir_all(parent) {
                         if !opts.silent || opts.show_error {
-                            eprintln!("urlx: error creating directories for etag file: {e}");
+                            eprintln!("curl: error creating directories for etag file: {e}");
                         }
                         return ExitCode::FAILURE;
                     }
@@ -1049,7 +1055,7 @@ pub fn run(args: &[String]) -> ExitCode {
     if opts.cookie_jar_file.is_some() {
         if let Err(e) = opts.easy.save_cookie_jar() {
             if !opts.silent || opts.show_error {
-                eprintln!("urlx: error saving cookies: {e}");
+                eprintln!("curl: error saving cookies: {e}");
             }
         }
     }
@@ -1072,7 +1078,7 @@ pub fn run(args: &[String]) -> ExitCode {
                         let content = format!("{trimmed}\n");
                         if let Err(e) = std::fs::write(path, content) {
                             if !opts.silent || opts.show_error {
-                                eprintln!("urlx: error saving ETag to '{path}': {e}");
+                                eprintln!("curl: error saving ETag to '{path}': {e}");
                             }
                         }
                     }
@@ -1120,7 +1126,7 @@ pub fn run(args: &[String]) -> ExitCode {
                         true, // suppress body
                     );
                     if !opts.silent || opts.show_error {
-                        eprintln!("urlx: server returned {status} but resume was requested");
+                        eprintln!("curl: server returned {status} but resume was requested");
                     }
                     return ExitCode::from(33); // CURLE_RANGE_ERROR
                 }
@@ -1140,7 +1146,7 @@ pub fn run(args: &[String]) -> ExitCode {
                     );
                 }
                 if !opts.silent || opts.show_error {
-                    eprintln!("urlx: (22) The requested URL returned error: {}", response.status(),);
+                    eprintln!("curl: (22) The requested URL returned error: {}", response.status(),);
                 }
                 return ExitCode::from(22);
             }
@@ -1155,7 +1161,7 @@ pub fn run(args: &[String]) -> ExitCode {
                 let exceeded = cl_exceeded || response.body().len() as u64 > max_size;
                 if exceeded {
                     if !opts.silent || opts.show_error {
-                        eprintln!("urlx: maximum file size exceeded",);
+                        eprintln!("curl: maximum file size exceeded",);
                     }
                     return ExitCode::from(63);
                 }
@@ -1173,7 +1179,7 @@ pub fn run(args: &[String]) -> ExitCode {
                 let header_text = format_headers(&response);
                 if let Err(e) = std::fs::write(path, header_text) {
                     if !opts.silent || opts.show_error {
-                        eprintln!("urlx: error writing headers to {path}: {e}");
+                        eprintln!("curl: error writing headers to {path}: {e}");
                     }
                     return ExitCode::FAILURE;
                 }
@@ -1250,7 +1256,7 @@ pub fn run(args: &[String]) -> ExitCode {
             // --fail-with-body: output body first, then return error exit code
             if opts.fail_with_body && response.status() >= 400 {
                 if !opts.silent || opts.show_error {
-                    eprintln!("urlx: (22) The requested URL returned error: {}", response.status(),);
+                    eprintln!("curl: (22) The requested URL returned error: {}", response.status(),);
                 }
                 return ExitCode::from(22);
             }
@@ -1273,13 +1279,13 @@ pub fn run(args: &[String]) -> ExitCode {
                     || body_err.contains("outstanding read data")
                 {
                     if !opts.silent || opts.show_error {
-                        eprintln!("urlx: (18) {body_err}");
+                        eprintln!("curl: (18) {body_err}");
                     }
                     return ExitCode::from(18); // CURLE_PARTIAL_FILE
                 }
                 if body_err.contains("bad_content_encoding") {
                     if !opts.silent || opts.show_error {
-                        eprintln!("urlx: (61) Unrecognized or bad content encoding");
+                        eprintln!("curl: (61) Unrecognized or bad content encoding");
                     }
                     return ExitCode::from(61); // CURLE_BAD_CONTENT_ENCODING
                 }
@@ -1289,7 +1295,7 @@ pub fn run(args: &[String]) -> ExitCode {
                     || body_err.contains("duplicate_location")
                 {
                     if !opts.silent || opts.show_error {
-                        eprintln!("urlx: (8) Weird server reply");
+                        eprintln!("curl: (8) Weird server reply");
                     }
                     return ExitCode::from(8);
                 }
@@ -1299,12 +1305,12 @@ pub fn run(args: &[String]) -> ExitCode {
                             .easy
                             .timeout_duration()
                             .map_or_else(String::new, |d| format!(" after {d:?}"));
-                        eprintln!("urlx: (28) timeout{timeout_str}");
+                        eprintln!("curl: (28) timeout{timeout_str}");
                     }
                     return ExitCode::from(28); // CURLE_OPERATION_TIMEDOUT
                 }
                 if !opts.silent || opts.show_error {
-                    eprintln!("urlx: (56) {body_err}");
+                    eprintln!("curl: (56) {body_err}");
                 }
                 return ExitCode::from(56); // CURLE_RECV_ERROR
             }
@@ -1385,7 +1391,7 @@ pub fn run(args: &[String]) -> ExitCode {
                 let _ = std::io::stdout().flush();
             }
             if !opts.silent || opts.show_error {
-                eprintln!("urlx: {e}");
+                eprintln!("curl: {e}");
             }
             // --remove-on-error: delete output file on transfer failure
             if opts.remove_on_error {
@@ -1633,7 +1639,7 @@ pub fn run_multi(
     // between requests (curl behavior — avoids [DISCONNECT] between requests)
     let rt =
         tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap_or_else(|e| {
-            eprintln!("urlx: failed to create runtime: {e}");
+            eprintln!("curl: failed to create runtime: {e}");
             std::process::exit(1);
         });
 
@@ -1643,7 +1649,7 @@ pub fn run_multi(
     for (i, url) in urls.iter().enumerate() {
         if let Err(e) = easy.url(url) {
             if !silent || show_error {
-                eprintln!("urlx: error parsing URL '{url}': {e}");
+                eprintln!("curl: error parsing URL '{url}': {e}");
             }
             return ExitCode::FAILURE;
         }
@@ -1683,7 +1689,7 @@ pub fn run_multi(
             }
             Err(e) => {
                 if !silent || show_error {
-                    eprintln!("urlx: transfer {} ({}): {e}", i + 1, url);
+                    eprintln!("curl: transfer {} ({}): {e}", i + 1, url);
                 }
                 any_failed = true;
             }
@@ -1717,7 +1723,7 @@ fn run_multi_parallel(
         let mut easy = template.clone();
         if let Err(e) = easy.url(url) {
             if !silent || show_error {
-                eprintln!("urlx: error parsing URL '{url}': {e}");
+                eprintln!("curl: error parsing URL '{url}': {e}");
             }
             return ExitCode::FAILURE;
         }
@@ -1728,7 +1734,7 @@ fn run_multi_parallel(
         Ok(results) => results,
         Err(e) => {
             if !silent || show_error {
-                eprintln!("urlx: {e}");
+                eprintln!("curl: {e}");
             }
             return ExitCode::FAILURE;
         }
@@ -1757,7 +1763,7 @@ fn run_multi_parallel(
             }
             Err(e) => {
                 if !silent || show_error {
-                    eprintln!("urlx: transfer {} ({}): {e}", i + 1, urls[i]);
+                    eprintln!("curl: transfer {} ({}): {e}", i + 1, urls[i]);
                 }
                 any_failed = true;
             }

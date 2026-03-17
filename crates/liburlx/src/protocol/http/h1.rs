@@ -138,7 +138,7 @@ where
             let _ = write!(req, "{name}: {value}\r\n");
         }
         None => {
-            req.push_str("User-Agent: urlx/0.1.0\r\n");
+            req.push_str("User-Agent: curl/0.1.0\r\n");
         }
     }
 

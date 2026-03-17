@@ -3,6 +3,7 @@
 //! Supports Basic, Bearer, Digest (RFC 7616), NTLM, SCRAM-SHA-256, and AWS `SigV4` authentication.
 
 pub mod aws_sigv4;
+pub mod cram_md5;
 pub mod digest;
 pub mod ntlm;
 pub mod scram;

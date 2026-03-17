@@ -24,7 +24,7 @@ pub struct SmtpConfig<'a> {
     pub sasl_ir: bool,
     /// Custom SMTP command (curl `-X`).
     pub custom_request: Option<&'a str>,
-    /// OAuth 2.0 bearer token for XOAUTH2.
+    /// OAuth 2.0 bearer token for XOAUTH2/OAUTHBEARER.
     pub oauth2_bearer: Option<&'a str>,
     /// Convert LF to CRLF in upload data (curl `--crlf`).
     pub crlf: bool,
@@ -32,6 +32,8 @@ pub struct SmtpConfig<'a> {
     pub username: Option<&'a str>,
     /// Authentication password (from `-u user:pass`).
     pub password: Option<&'a str>,
+    /// Login options (`;AUTH=<mechanism>` from URL).
+    pub login_options: Option<&'a str>,
 }
 
 /// An SMTP response from the server.
@@ -228,8 +230,15 @@ pub async fn send_mail(
     }
 
     // Extract credentials: config (from -u flag) takes priority over URL-embedded
+    // Strip ";AUTH=..." from URL username (it's login-options, not part of the name)
     let credentials: Option<(String, String)> = config.username.map_or_else(
-        || url.credentials().map(|(u, p)| (u.to_string(), p.to_string())),
+        || {
+            url.credentials().map(|(u, p)| {
+                let decoded_user = url_decode(u);
+                let clean_user = strip_auth_from_username(&decoded_user);
+                (clean_user, p.to_string())
+            })
+        },
         |user| Some((user.to_string(), config.password.unwrap_or("").to_string())),
     );
 
@@ -276,20 +285,7 @@ pub async fn send_mail(
     // When EHLO failed (HELO fallback), skip auth (no capability).
     // When EHLO succeeded but no AUTH advertised, skip auth (curl compat: test 940).
     if ehlo_ok && !caps.auth_mechanisms.is_empty() {
-        if let Some(bearer) = config.oauth2_bearer {
-            // XOAUTH2 authentication
-            if let Some((ref user, _)) = credentials {
-                do_auth_xoauth2(
-                    &mut reader,
-                    &mut writer,
-                    user,
-                    bearer,
-                    config.sasl_ir,
-                    &caps.auth_mechanisms,
-                )
-                .await?;
-            }
-        } else if let Some((ref user, ref pass)) = credentials {
+        if let Some((ref user, ref pass)) = credentials {
             do_auth(
                 &mut reader,
                 &mut writer,
@@ -298,6 +294,10 @@ pub async fn send_mail(
                 config.sasl_authzid,
                 config.sasl_ir,
                 &caps.auth_mechanisms,
+                config.login_options,
+                &host,
+                port,
+                config.oauth2_bearer,
             )
             .await?;
         }
@@ -380,9 +380,9 @@ fn determine_smtp_mode(config: &SmtpConfig<'_>, has_data: bool) -> SmtpMode {
 
 /// Perform AUTH using the best available mechanism.
 ///
-/// curl negotiates: CRAM-MD5 > DIGEST-MD5 > NTLM > LOGIN > PLAIN.
-/// We support: LOGIN > PLAIN (matching what most SMTP servers need).
-#[allow(clippy::too_many_arguments)]
+/// curl's negotiation order: EXTERNAL > OAUTHBEARER > XOAUTH2 > CRAM-MD5 > NTLM > LOGIN > PLAIN.
+/// When `login_options` is set (e.g. `;AUTH=CRAM-MD5`), only that mechanism is tried.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn do_auth<S: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut BufReader<S>,
     writer: &mut W,
@@ -391,12 +391,164 @@ async fn do_auth<S: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     sasl_authzid: Option<&str>,
     sasl_ir: bool,
     server_mechs: &[String],
+    login_options: Option<&str>,
+    host: &str,
+    port: u16,
+    oauth2_bearer: Option<&str>,
 ) -> Result<(), Error> {
     use base64::Engine;
 
-    // Prefer LOGIN if available (matches most curl test expectations), then PLAIN
-    if server_mechs.iter().any(|m| m == "LOGIN") {
-        // AUTH LOGIN
+    let has = |mech: &str| server_mechs.iter().any(|m| m.eq_ignore_ascii_case(mech));
+    let forced =
+        login_options.and_then(|lo| lo.strip_prefix("AUTH=").or_else(|| lo.strip_prefix("auth=")));
+
+    // Helper: check if we should try this mechanism
+    let should_try =
+        |mech: &str| forced.map_or_else(|| has(mech), |f| f.eq_ignore_ascii_case(mech));
+
+    // EXTERNAL: send base64(username)
+    if should_try("EXTERNAL") {
+        send_command(writer, "AUTH EXTERNAL").await?;
+        let resp = read_response(reader).await?;
+        if resp.code == 334 {
+            let encoded = base64::engine::general_purpose::STANDARD.encode(user.as_bytes());
+            send_command(writer, &encoded).await?;
+            let auth_resp = read_response(reader).await?;
+            if auth_resp.is_ok() {
+                return Ok(());
+            }
+        }
+        return Err(Error::SmtpAuth("AUTH EXTERNAL failed".to_string()));
+    }
+
+    // OAUTHBEARER (RFC 7628): n,a=user,\x01host=H\x01port=P\x01auth=Bearer T\x01\x01
+    if let Some(bearer) = oauth2_bearer {
+        if should_try("OAUTHBEARER") {
+            let payload = format!(
+                "n,a={user},\x01host={host}\x01port={port}\x01auth=Bearer {bearer}\x01\x01"
+            );
+            let encoded = base64::engine::general_purpose::STANDARD.encode(payload.as_bytes());
+            if sasl_ir {
+                send_command(writer, &format!("AUTH OAUTHBEARER {encoded}")).await?;
+            } else {
+                send_command(writer, "AUTH OAUTHBEARER").await?;
+                let resp = read_response(reader).await?;
+                if resp.code != 334 {
+                    return Err(Error::SmtpAuth(format!(
+                        "AUTH OAUTHBEARER expected 334, got: {}",
+                        resp.code
+                    )));
+                }
+                send_command(writer, &encoded).await?;
+            }
+            let auth_resp = read_response(reader).await?;
+            if auth_resp.is_ok() {
+                return Ok(());
+            }
+            return Err(Error::SmtpAuth(format!(
+                "AUTH OAUTHBEARER failed: {} {}",
+                auth_resp.code, auth_resp.message
+            )));
+        }
+
+        // XOAUTH2 fallback
+        if should_try("XOAUTH2") {
+            let payload = format!("user={user}\x01auth=Bearer {bearer}\x01\x01");
+            let encoded = base64::engine::general_purpose::STANDARD.encode(payload.as_bytes());
+            if sasl_ir {
+                send_command(writer, &format!("AUTH XOAUTH2 {encoded}")).await?;
+            } else {
+                send_command(writer, "AUTH XOAUTH2").await?;
+                let resp = read_response(reader).await?;
+                if resp.code != 334 {
+                    return Err(Error::SmtpAuth(format!(
+                        "AUTH XOAUTH2 expected 334, got: {}",
+                        resp.code
+                    )));
+                }
+                send_command(writer, &encoded).await?;
+            }
+            let auth_resp = read_response(reader).await?;
+            if auth_resp.is_ok() {
+                return Ok(());
+            }
+            return Err(Error::SmtpAuth(format!(
+                "AUTH XOAUTH2 failed: {} {}",
+                auth_resp.code, auth_resp.message
+            )));
+        }
+    }
+
+    // CRAM-MD5: challenge-response with HMAC-MD5
+    if should_try("CRAM-MD5") {
+        send_command(writer, "AUTH CRAM-MD5").await?;
+        let resp = read_response(reader).await?;
+        if resp.code != 334 {
+            return Err(Error::SmtpAuth(format!("AUTH CRAM-MD5 expected 334, got: {}", resp.code)));
+        }
+        // Server sends base64-encoded challenge
+        let challenge_b64 = resp.message.trim();
+        let challenge_bytes = base64::engine::general_purpose::STANDARD
+            .decode(challenge_b64)
+            .map_err(|e| Error::SmtpAuth(format!("CRAM-MD5 challenge decode error: {e}")))?;
+        let challenge = String::from_utf8_lossy(&challenge_bytes);
+        let response_str = crate::auth::cram_md5::cram_md5_response(user, pass, &challenge);
+        let encoded = base64::engine::general_purpose::STANDARD.encode(response_str.as_bytes());
+        send_command(writer, &encoded).await?;
+        let auth_resp = read_response(reader).await?;
+        if auth_resp.is_ok() {
+            return Ok(());
+        }
+        return Err(Error::SmtpAuth(format!(
+            "AUTH CRAM-MD5 failed: {} {}",
+            auth_resp.code, auth_resp.message
+        )));
+    }
+
+    // NTLM: 3-step Type 1/2/3 exchange
+    if should_try("NTLM") {
+        let type1 = crate::auth::ntlm::create_type1_message();
+        send_command(writer, "AUTH NTLM").await?;
+        let resp = read_response(reader).await?;
+        if resp.code != 334 {
+            return Err(Error::SmtpAuth(format!("AUTH NTLM expected 334, got: {}", resp.code)));
+        }
+        // Send Type 1
+        send_command(writer, &type1).await?;
+        let resp2 = read_response(reader).await?;
+        if resp2.code != 334 {
+            // Invalid challenge — cancel auth
+            send_command(writer, "*").await?;
+            return Err(Error::Transfer { code: 67, message: "NTLM challenge failed".to_string() });
+        }
+        // Parse Type 2 and generate Type 3
+        let challenge_b64 = resp2.message.trim();
+        match crate::auth::ntlm::parse_type2_message(challenge_b64) {
+            Ok(challenge) => {
+                let type3 = crate::auth::ntlm::create_type3_message(&challenge, user, pass, "");
+                send_command(writer, &type3).await?;
+                let auth_resp = read_response(reader).await?;
+                if auth_resp.is_ok() {
+                    return Ok(());
+                }
+                return Err(Error::SmtpAuth(format!(
+                    "AUTH NTLM failed: {} {}",
+                    auth_resp.code, auth_resp.message
+                )));
+            }
+            Err(_) => {
+                // Bad Type 2 — cancel auth (send * per RFC 4954)
+                send_command(writer, "*").await?;
+                return Err(Error::Transfer {
+                    code: 67,
+                    message: "NTLM: invalid server challenge".to_string(),
+                });
+            }
+        }
+    }
+
+    // LOGIN: base64(user), base64(pass)
+    if should_try("LOGIN") {
         if sasl_ir {
             let encoded_user = base64::engine::general_purpose::STANDARD.encode(user.as_bytes());
             send_command(writer, &format!("AUTH LOGIN {encoded_user}")).await?;
@@ -409,11 +561,9 @@ async fn do_auth<S: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                     resp.code, resp.message
                 )));
             }
-            // Server sends base64("Username:") — send username
             let encoded_user = base64::engine::general_purpose::STANDARD.encode(user.as_bytes());
             send_command(writer, &encoded_user).await?;
         }
-
         let resp = read_response(reader).await?;
         if resp.code != 334 {
             return Err(Error::SmtpAuth(format!(
@@ -421,25 +571,25 @@ async fn do_auth<S: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                 resp.code, resp.message
             )));
         }
-        // Server sends base64("Password:") — send password
         let encoded_pass = base64::engine::general_purpose::STANDARD.encode(pass.as_bytes());
         send_command(writer, &encoded_pass).await?;
-
         let auth_resp = read_response(reader).await?;
-        if !auth_resp.is_ok() {
-            return Err(Error::SmtpAuth(format!(
-                "AUTH LOGIN failed: {} {}",
-                auth_resp.code, auth_resp.message
-            )));
+        if auth_resp.is_ok() {
+            return Ok(());
         }
-    } else if server_mechs.iter().any(|m| m == "PLAIN") {
-        // AUTH PLAIN
+        return Err(Error::SmtpAuth(format!(
+            "AUTH LOGIN failed: {} {}",
+            auth_resp.code, auth_resp.message
+        )));
+    }
+
+    // PLAIN: \0user\0pass
+    if should_try("PLAIN") {
         let auth_string = sasl_authzid.map_or_else(
             || format!("\0{user}\0{pass}"),
             |authzid| format!("{authzid}\0{user}\0{pass}"),
         );
         let encoded = base64::engine::general_purpose::STANDARD.encode(auth_string.as_bytes());
-
         if sasl_ir {
             send_command(writer, &format!("AUTH PLAIN {encoded}")).await?;
         } else {
@@ -453,60 +603,16 @@ async fn do_auth<S: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             }
             send_command(writer, &encoded).await?;
         }
-
         let auth_resp = read_response(reader).await?;
-        if !auth_resp.is_ok() {
-            return Err(Error::SmtpAuth(format!(
-                "AUTH failed: {} {}",
-                auth_resp.code, auth_resp.message
-            )));
+        if auth_resp.is_ok() {
+            return Ok(());
         }
-    }
-    // If server advertises AUTH but not PLAIN or LOGIN, skip authentication.
-    // curl would try other mechanisms, but we fall through silently.
-    Ok(())
-}
-
-/// Perform XOAUTH2 authentication.
-async fn do_auth_xoauth2<S: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
-    reader: &mut BufReader<S>,
-    writer: &mut W,
-    user: &str,
-    bearer: &str,
-    sasl_ir: bool,
-    server_mechs: &[String],
-) -> Result<(), Error> {
-    use base64::Engine;
-
-    if !server_mechs.iter().any(|m| m == "XOAUTH2") {
-        return Ok(());
-    }
-
-    // XOAUTH2 format: "user=<user>\x01auth=Bearer <token>\x01\x01"
-    let auth_string = format!("user={user}\x01auth=Bearer {bearer}\x01\x01");
-    let encoded = base64::engine::general_purpose::STANDARD.encode(auth_string.as_bytes());
-
-    if sasl_ir {
-        send_command(writer, &format!("AUTH XOAUTH2 {encoded}")).await?;
-    } else {
-        send_command(writer, "AUTH XOAUTH2").await?;
-        let resp = read_response(reader).await?;
-        if resp.code != 334 {
-            return Err(Error::SmtpAuth(format!(
-                "AUTH XOAUTH2 expected 334, got: {} {}",
-                resp.code, resp.message
-            )));
-        }
-        send_command(writer, &encoded).await?;
-    }
-
-    let auth_resp = read_response(reader).await?;
-    if !auth_resp.is_ok() {
         return Err(Error::SmtpAuth(format!(
-            "AUTH XOAUTH2 failed: {} {}",
+            "AUTH PLAIN failed: {} {}",
             auth_resp.code, auth_resp.message
         )));
     }
+
     Ok(())
 }
 
@@ -660,6 +766,23 @@ async fn write_smtp_data<W: AsyncWrite + Unpin>(
     writer.write_all(&buf).await.map_err(|e| Error::Http(format!("SMTP data write error: {e}")))?;
     writer.flush().await.map_err(|e| Error::Http(format!("SMTP flush error: {e}")))?;
     Ok(())
+}
+
+/// Strip `;AUTH=<mechanism>` from a URL username.
+///
+/// curl allows `smtp://user;AUTH=EXTERNAL@host/` syntax.
+fn strip_auth_from_username(username: &str) -> String {
+    if let Some(pos) = username.find(";AUTH=").or_else(|| username.find(";auth=")) {
+        username[..pos].to_string()
+    } else {
+        // Case-insensitive search
+        let upper = username.to_uppercase();
+        if let Some(pos) = upper.find(";AUTH=") {
+            username[..pos].to_string()
+        } else {
+            username.to_string()
+        }
+    }
 }
 
 /// URL-decode a percent-encoded string.

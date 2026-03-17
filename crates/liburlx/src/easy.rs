@@ -3575,6 +3575,8 @@ async fn do_single_request(
         "smtp" | "smtps" => {
             let mail_data = body.unwrap_or(&[]);
             let header_creds = extract_basic_auth_from_headers(headers);
+            // Extract ;AUTH= from URL username (e.g. "user;AUTH=EXTERNAL")
+            let url_login_opts = extract_login_options_from_url(url);
             let smtp_config = crate::protocol::smtp::SmtpConfig {
                 mail_from,
                 mail_rcpt,
@@ -3586,10 +3588,12 @@ async fn do_single_request(
                 crlf: false,
                 username: header_creds.as_ref().map(|(u, _)| u.as_str()),
                 password: header_creds.as_ref().map(|(_, p)| p.as_str()),
+                login_options: url_login_opts.as_deref(),
             };
             return crate::protocol::smtp::send_mail(url, mail_data, &smtp_config).await;
         }
         "imap" | "imaps" => {
+            let url_login_opts = extract_login_options_from_url(url);
             return crate::protocol::imap::fetch(
                 url,
                 method,
@@ -3597,6 +3601,7 @@ async fn do_single_request(
                 custom_request_target,
                 sasl_ir,
                 oauth2_bearer,
+                url_login_opts.as_deref(),
             )
             .await;
         }
@@ -3609,12 +3614,14 @@ async fn do_single_request(
                 }
                 _ => Some(method),
             };
+            let url_login_opts = extract_login_options_from_url(url);
             return crate::protocol::pop3::retrieve(
                 url,
                 creds_tuple,
                 custom_cmd,
                 sasl_ir,
                 oauth2_bearer,
+                url_login_opts.as_deref(),
             )
             .await;
         }
@@ -4667,7 +4674,7 @@ where
             let _ = write!(connect_req, "{name}: {value}\r\n");
         }
         None => {
-            connect_req.push_str("User-Agent: urlx/0.1.0\r\n");
+            connect_req.push_str("User-Agent: curl/0.1.0\r\n");
         }
     }
 
@@ -4751,6 +4758,22 @@ fn find_header(headers: &[(String, String)], name: &str) -> Option<String> {
 /// Extract username and password from an Authorization: Basic header.
 ///
 /// Returns `None` if no Authorization header or not Basic auth.
+/// Extract `;AUTH=<mechanism>` from a URL username.
+///
+/// curl allows `imap://user;AUTH=EXTERNAL@host/` to select a specific SASL mechanism.
+/// The `;AUTH=...` part is embedded in the username by the URL parser.
+/// Returns `Some("AUTH=EXTERNAL")` etc., or `None` if not present.
+fn extract_login_options_from_url(url: &Url) -> Option<String> {
+    let username = url.username();
+    if username.is_empty() {
+        return None;
+    }
+    // Check for ;AUTH= (case-insensitive) — URL may be percent-encoded
+    let decoded = percent_decode_str(username);
+    let upper = decoded.to_uppercase();
+    upper.find(";AUTH=").map(|pos| decoded[pos + 1..].to_string())
+}
+
 fn extract_basic_auth_from_headers(headers: &[(String, String)]) -> Option<(String, String)> {
     use base64::Engine;
     let auth_val = find_header(headers, "authorization")?;

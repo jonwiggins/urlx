@@ -134,7 +134,7 @@ pub fn write_trace_file(
     }
 
     if let Err(e) = std::fs::write(path, out) {
-        eprintln!("urlx: error writing trace file '{path}': {e}");
+        eprintln!("curl: error writing trace file '{path}': {e}");
     }
 }
 
@@ -267,7 +267,7 @@ pub fn output_response(
         data.extend_from_slice(body);
         if let Err(e) = std::fs::write(path, &data) {
             if !silent {
-                eprintln!("urlx: error writing to {path}: {e}");
+                eprintln!("curl: error writing to {path}: {e}");
             }
             return ExitCode::FAILURE;
         }
@@ -276,14 +276,14 @@ pub fn output_response(
         if let Some(ref headers) = all_headers {
             if let Err(e) = std::io::stdout().write_all(headers.as_bytes()) {
                 if !silent {
-                    eprintln!("urlx: write error: {e}");
+                    eprintln!("curl: write error: {e}");
                 }
                 return ExitCode::FAILURE;
             }
         }
         if let Err(e) = std::io::stdout().write_all(body) {
             if !silent {
-                eprintln!("urlx: write error: {e}");
+                eprintln!("curl: write error: {e}");
             }
             return ExitCode::FAILURE;
         }
