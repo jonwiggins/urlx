@@ -74,9 +74,30 @@ where
     // Deduplicate custom headers: among set-entries (non-empty values),
     // last one wins per header name. Removal markers (empty in removed_headers)
     // are separate and don't suppress custom set-entries.
+    // Exception: Host header uses first-wins (curl compat: test 1121).
     let mut seen_set: Vec<String> = Vec::new();
     let mut keep = vec![true; custom_headers.len()];
+    // Host: first-wins — scan forward, mark duplicates
+    {
+        let mut seen_host = false;
+        for i in 0..custom_headers.len() {
+            if custom_headers[i].0.eq_ignore_ascii_case("host") {
+                if seen_host {
+                    keep[i] = false;
+                } else {
+                    seen_host = true;
+                }
+            }
+        }
+        if seen_host {
+            seen_set.push("host".to_string());
+        }
+    }
+    // All other headers: last-wins — scan in reverse (skip Host, already handled)
     for i in (0..custom_headers.len()).rev() {
+        if custom_headers[i].0.eq_ignore_ascii_case("host") {
+            continue; // Host dedup handled above
+        }
         let name_lower = custom_headers[i].0.to_lowercase();
         if seen_set.contains(&name_lower) {
             keep[i] = false;
@@ -163,8 +184,16 @@ where
         .any(|(k, v)| k.eq_ignore_ascii_case("transfer-encoding") && v.is_empty());
     let use_chunked = !use_http10 && !te_suppressed && (chunked_upload || explicit_chunked);
     let has_expect = custom_headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("expect"));
+    // Whether to auto-emit the Expect: 100-continue header (don't if user provided it)
     let use_expect =
         expect_100_timeout.is_some() && body.is_some_and(|b| !b.is_empty()) && !has_expect;
+    // Whether to follow the 100-continue protocol (wait for server response before body).
+    // Do this both when we auto-emit and when the user explicitly provides Expect header.
+    let has_user_expect_100 = custom_headers
+        .iter()
+        .any(|(k, v)| k.eq_ignore_ascii_case("expect") && v.eq_ignore_ascii_case("100-continue"));
+    let do_expect_protocol =
+        use_expect || (has_user_expect_100 && body.is_some_and(|b| !b.is_empty()));
 
     // Emit auto Transfer-Encoding: chunked BEFORE custom headers (curl compat order).
     if body.is_some() && use_chunked && !explicit_chunked {
@@ -210,9 +239,6 @@ where
             let _ = write!(req, "Content-Length: {}\r\n", body_data.len());
         }
     }
-    if use_expect {
-        req.push_str("Expect: 100-continue\r\n");
-    }
 
     // Emit deferred Content-Type or auto-add it for POST (curl compat: test 669).
     // Note: for custom methods with -d (form data), Content-Type is added by the
@@ -221,6 +247,11 @@ where
         let _ = write!(req, "{name}: {value}\r\n");
     } else if !content_type_emitted && method.eq_ignore_ascii_case("POST") && body.is_some() {
         req.push_str("Content-Type: application/x-www-form-urlencoded\r\n");
+    }
+
+    // Emit auto Expect: 100-continue after Content-Length and Content-Type (curl order: test 1129)
+    if use_expect {
+        req.push_str("Expect: 100-continue\r\n");
     }
 
     // Connection management — only send Connection: close for HTTP/1.1 non-keepalive.
@@ -240,8 +271,8 @@ where
     // Create send rate limiter for body uploads
     let mut send_limiter = RateLimiter::for_send(speed_limits);
 
-    // Handle Expect: 100-continue
-    if use_expect {
+    // Handle Expect: 100-continue protocol (both auto-emitted and user-provided)
+    if do_expect_protocol {
         stream.flush().await.map_err(|e| Error::Http(format!("flush failed: {e}")))?;
 
         let timeout_dur = expect_100_timeout.unwrap_or(Duration::from_secs(1));
@@ -487,10 +518,16 @@ where
     // Read body with download rate limiting
     let mut recv_limiter = RateLimiter::for_recv(speed_limits);
     // If server says Connection: close, treat as non-keepalive for body reading
-    // (read until EOF when no Content-Length, instead of assuming empty body)
+    // (read until EOF when no Content-Length, instead of assuming empty body).
+    // HTTP/1.0 responses default to connection close unless Connection: keep-alive
+    // is present (curl compat: test 349).
     let server_close =
         ph.headers.get("connection").is_some_and(|v| v.eq_ignore_ascii_case("close"));
-    let effective_keepalive = keep_alive && !use_http10 && !server_close;
+    let response_is_http10 = ph.version == ResponseHttpVersion::Http10;
+    let server_keepalive =
+        ph.headers.get("connection").is_some_and(|v| v.eq_ignore_ascii_case("keep-alive"));
+    let effective_keepalive =
+        keep_alive && !use_http10 && !server_close && (!response_is_http10 || server_keepalive);
     let (response_body, body_read_to_eof, trailers, body_error) = if no_body {
         (Vec::new(), false, HashMap::new(), None)
     } else {

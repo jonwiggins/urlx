@@ -554,6 +554,25 @@ pub fn run(args: &[String]) -> ExitCode {
         opts.easy.set_form_data(false);
     }
 
+    // Deferred -T file read for multi-URL path: load upload file before run_multi
+    // returns early (run_multi clones the easy handle, so body must be set now).
+    // Single-URL path has its own deferred read further below (line ~892).
+    if opts.urls.len() > 1 {
+        if let Some(ref path) = opts.upload_file_path {
+            match std::fs::read(path) {
+                Ok(data) => {
+                    opts.easy.body(&data);
+                }
+                Err(e) => {
+                    if !opts.silent || opts.show_error {
+                        eprintln!("curl: can't read file '{path}': {e}");
+                    }
+                    return ExitCode::from(26); // CURLE_READ_ERROR
+                }
+            }
+        }
+    }
+
     // Multiple URLs: use Multi API for concurrent transfers
     if opts.urls.len() > 1 {
         // Build per-URL output filenames with #N glob template substitution
@@ -579,6 +598,7 @@ pub fn run(args: &[String]) -> ExitCode {
             opts.silent,
             opts.show_error,
             opts.fail_on_error,
+            opts.fail_early,
             opts.parallel,
             opts.parallel_max,
             opts.skip_existing,
@@ -1639,6 +1659,7 @@ pub fn run_multi(
     silent: bool,
     show_error: bool,
     fail_on_error: bool,
+    fail_early: bool,
     parallel: bool,
     parallel_max: usize,
     skip_existing: bool,
@@ -1725,6 +1746,9 @@ pub fn run_multi(
             Err(e) => {
                 if !silent || show_error {
                     eprintln!("curl: transfer {} ({}): {e}", i + 1, url);
+                }
+                if fail_early {
+                    return error_to_exit_code(&e);
                 }
                 any_failed = true;
             }

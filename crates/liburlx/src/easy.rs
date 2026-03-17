@@ -606,8 +606,14 @@ impl Easy {
         // For most headers, replace existing entry in-place to preserve ordering
         // (curl compat: test 385 — Content-Type override must keep its position).
         // Exception: Set-Cookie and other multi-value headers should not be replaced.
+        // Exception: Host header uses first-wins (curl compat: test 1121).
         let lower = name.to_ascii_lowercase();
-        if lower != "set-cookie" && lower != "cookie" {
+        if lower == "host" {
+            // Host: first-wins — if already set, ignore subsequent values
+            if self.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("host")) {
+                return;
+            }
+        } else if lower != "set-cookie" && lower != "cookie" {
             if let Some(pos) = self.headers.iter().position(|(k, _)| k.eq_ignore_ascii_case(name)) {
                 self.headers[pos] = (name.to_string(), value.to_string());
                 return;

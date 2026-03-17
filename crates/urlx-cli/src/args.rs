@@ -87,6 +87,7 @@ pub struct CliOptions {
     pub(crate) output_dir: Option<String>,
     pub(crate) remove_on_error: bool,
     pub(crate) fail_with_body: bool,
+    pub(crate) fail_early: bool,
     pub(crate) retry_all_errors: bool,
     pub(crate) no_progress_meter: bool,
     pub(crate) location_trusted: bool,
@@ -458,6 +459,7 @@ fn parse_args_options(args: &[String]) -> Result<CliOptions, u8> {
         output_dir: None,
         remove_on_error: false,
         fail_with_body: false,
+        fail_early: false,
         retry_all_errors: false,
         no_progress_meter: false,
         location_trusted: false,
@@ -640,6 +642,9 @@ fn parse_args_options(args: &[String]) -> Result<CliOptions, u8> {
             "--fail-with-body" => {
                 opts.fail_on_error = true;
                 opts.fail_with_body = true;
+            }
+            "--fail-early" => {
+                opts.fail_early = true;
             }
             "--compressed" => {
                 opts.easy.accept_encoding(true);
