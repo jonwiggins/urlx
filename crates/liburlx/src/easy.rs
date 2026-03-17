@@ -4340,8 +4340,9 @@ async fn do_single_request(
                 let request_target = if let Some(target) = custom_request_target {
                     target.to_string()
                 } else if is_http_proxy {
-                    // Strip fragment from proxy request URL (curl behavior)
-                    let full = url.to_full_string();
+                    // Strip fragment and credentials from proxy request URL
+                    // Credentials go in Authorization header, not the Request-URI
+                    let full = strip_url_credentials(&url.to_full_string());
                     let full = full
                         .split_once('#')
                         .map_or_else(|| full.clone(), |(base, _)| base.to_string());
@@ -4815,6 +4816,20 @@ fn proxy_from_env(scheme: &str) -> Option<Url> {
     }
 
     None
+}
+
+/// Strip credentials from a URL: `http://user:pass@host/` → `http://host/`.
+fn strip_url_credentials(url: &str) -> String {
+    let scheme_end = url.find("://").map_or(0, |p| p + 3);
+    let rest = &url[scheme_end..];
+    // Only strip if @ comes before / (i.e., it's in the authority, not the path)
+    let slash_pos = rest.find('/').unwrap_or(rest.len());
+    if let Some(at_pos) = rest.find('@') {
+        if at_pos < slash_pos {
+            return format!("{}{}", &url[..scheme_end], &rest[at_pos + 1..]);
+        }
+    }
+    url.to_string()
 }
 
 /// Get no-proxy list from environment variables.
