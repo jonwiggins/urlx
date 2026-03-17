@@ -290,8 +290,34 @@ pub fn output_response(
     }
 
     if let Some(fmt) = write_out {
-        let output = format_write_out(fmt, response);
-        print!("{output}");
+        // Check for %output{file} prefix: directs write-out to a file
+        // %output{>>file} = append, %output{file} = create/overwrite
+        let (out_file, append_mode, real_fmt) = if let Some(rest) = fmt.strip_prefix("%output{") {
+            if let Some(end) = rest.find('}') {
+                let path = &rest[..end];
+                let (path, append) =
+                    if let Some(p) = path.strip_prefix(">>") { (p, true) } else { (path, false) };
+                (Some(path), append, &rest[end + 1..])
+            } else {
+                (None, false, fmt)
+            }
+        } else {
+            (None, false, fmt)
+        };
+        let output = format_write_out(real_fmt, response);
+        if let Some(path) = out_file {
+            use std::io::Write;
+            let file = if append_mode {
+                std::fs::OpenOptions::new().create(true).append(true).open(path)
+            } else {
+                std::fs::OpenOptions::new().create(true).write(true).truncate(true).open(path)
+            };
+            if let Ok(mut f) = file {
+                let _ = f.write_all(output.as_bytes());
+            }
+        } else {
+            print!("{output}");
+        }
     }
 
     ExitCode::SUCCESS
