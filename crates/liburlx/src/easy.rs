@@ -883,10 +883,14 @@ impl Easy {
         };
 
         // Extract userinfo credentials from proxy URL (e.g., http://user:pass@host:port/)
+        // For SOCKS proxies, credentials are handled at the protocol level (SOCKS handshake),
+        // not via HTTP Proxy-Authorization header (curl compat: tests 717, 742).
         if let Ok(parsed) = url::Url::parse(&normalized) {
+            let scheme = parsed.scheme();
+            let is_socks = scheme.starts_with("socks");
             let user = percent_decode_str(parsed.username());
             let pass = parsed.password().map_or_else(String::new, percent_decode_str);
-            if !user.is_empty() {
+            if !user.is_empty() && !is_socks {
                 self.proxy_auth(&user, &pass);
             }
         }

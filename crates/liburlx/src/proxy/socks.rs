@@ -101,13 +101,26 @@ pub async fn connect_socks5(
     }
 
     // Step 3: Send connection request
-    // 0x05 = SOCKS5, 0x01 = CONNECT, 0x00 = reserved, 0x03 = domain address type
-    let mut connect_request = vec![0x05, 0x01, 0x00, 0x03];
-    #[allow(clippy::cast_possible_truncation)]
-    {
-        connect_request.push(target_host.len() as u8);
+    // 0x05 = SOCKS5, 0x01 = CONNECT, 0x00 = reserved
+    // Address type: 0x01 = IPv4, 0x03 = domain, 0x04 = IPv6
+    let mut connect_request = vec![0x05, 0x01, 0x00];
+    // Strip brackets from IPv6 addresses (e.g., "[::1]" → "::1")
+    let host =
+        target_host.strip_prefix('[').and_then(|s| s.strip_suffix(']')).unwrap_or(target_host);
+    if let Ok(ipv4) = host.parse::<std::net::Ipv4Addr>() {
+        connect_request.push(0x01); // IPv4
+        connect_request.extend_from_slice(&ipv4.octets());
+    } else if let Ok(ipv6) = host.parse::<std::net::Ipv6Addr>() {
+        connect_request.push(0x04); // IPv6
+        connect_request.extend_from_slice(&ipv6.octets());
+    } else {
+        connect_request.push(0x03); // Domain
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            connect_request.push(host.len() as u8);
+        }
+        connect_request.extend_from_slice(host.as_bytes());
     }
-    connect_request.extend_from_slice(target_host.as_bytes());
     connect_request.extend_from_slice(&target_port.to_be_bytes());
 
     proxy_stream
