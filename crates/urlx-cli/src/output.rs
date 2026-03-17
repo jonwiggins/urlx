@@ -399,7 +399,8 @@ pub fn format_write_out(fmt: &str, response: &liburlx::Response) -> String {
     {
         result = result.replace("%{redirect_url}", &redirect_url_normalized);
     }
-    result = result.replace("%{method}", "GET");
+    let method = if info.effective_method.is_empty() { "GET" } else { &info.effective_method };
+    result = result.replace("%{method}", method);
     result = result.replace("%{errormsg}", "");
     result = result.replace("%{exitcode}", "0");
     result = result.replace("%{num_retries}", &info.num_retries.to_string());

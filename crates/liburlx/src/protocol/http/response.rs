@@ -69,6 +69,8 @@ pub struct TransferInfo {
     pub size_upload: u64,
     /// Number of retries performed.
     pub num_retries: u32,
+    /// The effective HTTP method used for the transfer (e.g., "GET", "POST").
+    pub effective_method: String,
 }
 
 /// An HTTP response with status, headers, and body.
@@ -381,7 +383,7 @@ impl Response {
     }
 
     /// Set the transfer info on this response.
-    pub const fn set_transfer_info(&mut self, info: TransferInfo) {
+    pub fn set_transfer_info(&mut self, info: TransferInfo) {
         self.info = info;
     }
 

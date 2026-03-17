@@ -3349,6 +3349,7 @@ async fn perform_transfer(
         info.speed_download = speed_download;
         info.speed_upload = speed_upload;
         info.size_upload = upload_size;
+        info.effective_method = method.unwrap_or("GET").to_string();
         response.set_transfer_info(info);
         if !redirect_chain.is_empty() {
             response.set_redirect_responses(redirect_chain);
