@@ -418,10 +418,10 @@ impl CookieJar {
             return; // Invalid cookie
         };
 
-        // Reject cookies with control characters BEFORE trimming (curl compat)
-        // Tab (0x09) is allowed; other control chars (0x00-0x08, 0x0A-0x1F, 0x7F) are rejected
-        let has_control =
-            name.bytes().chain(value.bytes()).any(|b| b != b'\t' && (b < 0x20 || b == 0x7F));
+        // Reject cookies with control characters BEFORE trimming (curl compat).
+        // Tab (0x09) IS rejected in names and values — tab is the field separator
+        // in Netscape cookie format, so allowing it would corrupt the cookie jar.
+        let has_control = name.bytes().chain(value.bytes()).any(|b| b < 0x20 || b == 0x7F);
         if has_control {
             return;
         }
@@ -528,7 +528,6 @@ impl CookieJar {
 
         // Build display domain for jar output
         let (domain_display, include_subdomains) = if has_explicit_domain {
-            // Explicit domain: add dot prefix, set include_subdomains=TRUE
             // Preserve the original case from the Set-Cookie header
             let raw = if parts.len() > 1 {
                 parts[1]
@@ -552,7 +551,13 @@ impl CookieJar {
             } else {
                 domain.clone()
             };
-            (format!(".{raw}"), true)
+            // IP addresses don't have subdomains: no dot prefix, include_subdomains=FALSE
+            if is_ip_address(&domain) {
+                (raw, false)
+            } else {
+                // Explicit domain: add dot prefix, set include_subdomains=TRUE
+                (format!(".{raw}"), true)
+            }
         } else {
             // Host-only: no dot prefix, include_subdomains=FALSE
             (domain.clone(), false)

@@ -18,6 +18,28 @@ use crate::error::Error;
 use crate::protocol::http::response::{Response, ResponseHttpVersion};
 use crate::throttle::{RateLimiter, SpeedLimits, THROTTLE_CHUNK_SIZE};
 
+/// Check if the Transfer-Encoding header value includes "chunked" as one of
+/// the comma-separated encodings (e.g. "chunked", "gzip, chunked").
+fn te_contains_chunked(te: &str) -> bool {
+    te.split(',').any(|part| part.trim().eq_ignore_ascii_case("chunked"))
+}
+
+/// Extract the non-chunked Transfer-Encoding algorithms from the TE header.
+/// For example, "gzip, chunked" returns `Some("gzip")`, "chunked" returns `None`,
+/// and "gzip" returns `Some("gzip")`.
+pub(crate) fn te_compression_encoding(te: &str) -> Option<String> {
+    let parts: Vec<&str> = te
+        .split(',')
+        .map(str::trim)
+        .filter(|p| !p.eq_ignore_ascii_case("chunked") && !p.eq_ignore_ascii_case("identity"))
+        .collect();
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(", "))
+    }
+}
+
 /// Maximum response header size (64 KB, same as curl's default).
 const MAX_HEADER_SIZE: usize = 64 * 1024;
 
@@ -511,17 +533,14 @@ where
     // no Content-Length/chunked (would hang reading to EOF if server doesn't close).
     let sent_range = custom_headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("range"));
     let has_body_framing = ph.headers.contains_key("content-length")
-        || ph.headers.get("transfer-encoding").is_some_and(|te| te.eq_ignore_ascii_case("chunked"));
+        || ph.headers.get("transfer-encoding").is_some_and(|te| te_contains_chunked(te));
     let range_failed = sent_range && ph.status != 206 && ph.status != 416 && !has_body_framing;
     // For 3xx redirects without Content-Length/chunked, skip body read to avoid
     // hanging when the server says Connection: close but doesn't actually close.
     let is_redirect_no_cl = (300..400).contains(&ph.status)
         && ph.headers.get("location").is_some_and(|v| !v.trim().is_empty())
         && !ph.headers.contains_key("content-length")
-        && !ph
-            .headers
-            .get("transfer-encoding")
-            .is_some_and(|te| te.eq_ignore_ascii_case("chunked"));
+        && !ph.headers.get("transfer-encoding").is_some_and(|te| te_contains_chunked(te));
     let no_body =
         is_head || ph.status == 204 || ph.status == 304 || range_failed || is_redirect_no_cl;
 
@@ -1065,8 +1084,7 @@ async fn read_body_from_headers<S>(
 where
     S: AsyncRead + Unpin,
 {
-    let is_chunked =
-        headers.get("transfer-encoding").is_some_and(|te| te.eq_ignore_ascii_case("chunked"));
+    let is_chunked = headers.get("transfer-encoding").is_some_and(|te| te_contains_chunked(te));
 
     // In raw mode, skip chunked decoding — pass bytes through as-is (curl --raw)
     // Still parse chunk framing to know when to stop, but include all framing in output.
@@ -1574,8 +1592,7 @@ pub fn parse_response(data: &[u8], effective_url: &str, is_head: bool) -> Result
 
     let body_data = &data[header_len..];
 
-    let is_chunked =
-        headers.get("transfer-encoding").is_some_and(|te| te.eq_ignore_ascii_case("chunked"));
+    let is_chunked = headers.get("transfer-encoding").is_some_and(|te| te_contains_chunked(te));
 
     let body = if is_chunked {
         decode_chunked(body_data)?

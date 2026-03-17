@@ -300,9 +300,11 @@ pub fn extract_hostname(url: &str) -> String {
 #[allow(clippy::option_if_let_else)]
 fn extract_url_username(url: &str) -> Option<String> {
     let without_scheme = url.find("://").map_or(url, |pos| &url[pos + 3..]);
-    let without_path = without_scheme.split('/').next().unwrap_or(without_scheme);
-    if let Some(at_pos) = without_path.rfind('@') {
-        let userinfo = &without_path[..at_pos];
+    // Only look for @ in the authority part (before first / or ?)
+    let authority_end = without_scheme.find(['/', '?']).unwrap_or(without_scheme.len());
+    let authority = &without_scheme[..authority_end];
+    if let Some(at_pos) = authority.rfind('@') {
+        let userinfo = &authority[..at_pos];
         let user = userinfo.split(':').next().unwrap_or(userinfo);
         if user.is_empty() {
             None
@@ -322,9 +324,11 @@ fn extract_url_username(url: &str) -> Option<String> {
 #[allow(clippy::option_if_let_else)]
 fn extract_url_username_raw(url: &str) -> Option<String> {
     let without_scheme = url.find("://").map_or(url, |pos| &url[pos + 3..]);
-    let without_path = without_scheme.split('/').next().unwrap_or(without_scheme);
-    if let Some(at_pos) = without_path.rfind('@') {
-        let userinfo = &without_path[..at_pos];
+    // Only look for @ in the authority part (before first / or ?)
+    let authority_end = without_scheme.find(['/', '?']).unwrap_or(without_scheme.len());
+    let authority = &without_scheme[..authority_end];
+    if let Some(at_pos) = authority.rfind('@') {
+        let userinfo = &authority[..at_pos];
         let user = userinfo.split(':').next().unwrap_or(userinfo);
         Some(url_decode(user))
     } else {
@@ -338,9 +342,11 @@ fn extract_url_username_raw(url: &str) -> Option<String> {
 #[allow(clippy::option_if_let_else)]
 fn extract_url_password(url: &str) -> Option<String> {
     let without_scheme = url.find("://").map_or(url, |pos| &url[pos + 3..]);
-    let without_path = without_scheme.split('/').next().unwrap_or(without_scheme);
-    if let Some(at_pos) = without_path.rfind('@') {
-        let userinfo = &without_path[..at_pos];
+    // Only look for @ in the authority part (before first / or ?)
+    let authority_end = without_scheme.find(['/', '?']).unwrap_or(without_scheme.len());
+    let authority = &without_scheme[..authority_end];
+    if let Some(at_pos) = authority.rfind('@') {
+        let userinfo = &authority[..at_pos];
         if let Some((_user, pass)) = userinfo.split_once(':') {
             Some(url_decode(pass))
         } else {
@@ -356,7 +362,10 @@ fn extract_url_password(url: &str) -> Option<String> {
 fn strip_url_credentials(url: &str) -> String {
     let scheme_end = url.find("://").map_or(0, |p| p + 3);
     let rest = &url[scheme_end..];
-    if let Some(at_pos) = rest.find('@') {
+    // Only look for @ in the authority part (before first / or ?)
+    let authority_end = rest.find(['/', '?']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    if let Some(at_pos) = authority.find('@') {
         format!("{}{}", &url[..scheme_end], &rest[at_pos + 1..])
     } else {
         url.to_string()
@@ -554,6 +563,51 @@ pub fn run(args: &[String]) -> ExitCode {
         opts.easy.set_form_data(false);
     }
 
+    // -z/--time-cond: set If-Modified-Since or If-Unmodified-Since header.
+    // Must be before multi-URL branch so the header and time_cond_ts are set for run_multi.
+    if let Some(ref cond) = opts.time_cond {
+        let (negate, date_str) =
+            cond.strip_prefix('-').map_or((false, cond.as_str()), |stripped| (true, stripped));
+        opts.time_cond_negate = negate;
+        // Try to parse as a file path first (use file mtime), then as a date string
+        let date_val = if std::path::Path::new(date_str).exists() {
+            let mtime = std::fs::metadata(date_str).ok().and_then(|m| m.modified().ok());
+            if let Some(ref t) = mtime {
+                #[allow(clippy::cast_possible_wrap)]
+                let ts = t.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).ok();
+                opts.time_cond_ts = ts;
+            }
+            mtime.map(format_http_date)
+        } else {
+            // Try parsing as RFC 7231 first, then loose date format
+            if let Some(ts) = parse_http_date(date_str) {
+                opts.time_cond_ts = Some(ts);
+                Some(date_str.to_string())
+            } else if let Some(ts) = parse_loose_date(date_str) {
+                opts.time_cond_ts = Some(ts);
+                u64::try_from(ts).ok().map(|secs| {
+                    format_http_date(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+                })
+            } else {
+                None
+            }
+        };
+        // For FTP, use MDTM-based time condition instead of HTTP headers
+        let is_ftp_url =
+            opts.urls.first().is_some_and(|u| u.starts_with("ftp://") || u.starts_with("ftps://"));
+        if is_ftp_url {
+            if let Some(ts) = opts.time_cond_ts {
+                opts.easy.ftp_time_condition(ts, negate);
+            }
+        } else if let Some(date) = date_val {
+            if negate {
+                opts.easy.header("If-Unmodified-Since", &date);
+            } else {
+                opts.easy.header("If-Modified-Since", &date);
+            }
+        }
+    }
+
     // Deferred -T file read for multi-URL path: load upload file before run_multi
     // returns early (run_multi clones the easy handle, so body must be set now).
     // Single-URL path has its own deferred read further below (line ~892).
@@ -602,6 +656,8 @@ pub fn run(args: &[String]) -> ExitCode {
             opts.parallel,
             opts.parallel_max,
             opts.skip_existing,
+            opts.time_cond_ts,
+            opts.time_cond_negate,
         );
     }
 
@@ -965,50 +1021,6 @@ pub fn run(args: &[String]) -> ExitCode {
         // Enable chunked upload (unless user explicitly suppressed Transfer-Encoding)
         if !opts.easy.has_header("Transfer-Encoding") {
             opts.easy.set_chunked_upload(true);
-        }
-    }
-
-    // -z/--time-cond: set If-Modified-Since or If-Unmodified-Since header
-    if let Some(ref cond) = opts.time_cond {
-        let (negate, date_str) =
-            cond.strip_prefix('-').map_or((false, cond.as_str()), |stripped| (true, stripped));
-        opts.time_cond_negate = negate;
-        // Try to parse as a file path first (use file mtime), then as a date string
-        let date_val = if std::path::Path::new(date_str).exists() {
-            let mtime = std::fs::metadata(date_str).ok().and_then(|m| m.modified().ok());
-            if let Some(ref t) = mtime {
-                #[allow(clippy::cast_possible_wrap)]
-                let ts = t.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).ok();
-                opts.time_cond_ts = ts;
-            }
-            mtime.map(format_http_date)
-        } else {
-            // Try parsing as RFC 7231 first, then loose date format
-            if let Some(ts) = parse_http_date(date_str) {
-                opts.time_cond_ts = Some(ts);
-                Some(date_str.to_string())
-            } else if let Some(ts) = parse_loose_date(date_str) {
-                opts.time_cond_ts = Some(ts);
-                u64::try_from(ts).ok().map(|secs| {
-                    format_http_date(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
-                })
-            } else {
-                None
-            }
-        };
-        // For FTP, use MDTM-based time condition instead of HTTP headers
-        let is_ftp_url =
-            opts.urls.first().is_some_and(|u| u.starts_with("ftp://") || u.starts_with("ftps://"));
-        if is_ftp_url {
-            if let Some(ts) = opts.time_cond_ts {
-                opts.easy.ftp_time_condition(ts, negate);
-            }
-        } else if let Some(date) = date_val {
-            if negate {
-                opts.easy.header("If-Unmodified-Since", &date);
-            } else {
-                opts.easy.header("If-Modified-Since", &date);
-            }
         }
     }
 
@@ -1677,6 +1689,8 @@ pub fn run_multi(
     parallel: bool,
     parallel_max: usize,
     skip_existing: bool,
+    time_cond_ts: Option<i64>,
+    time_cond_negate: bool,
 ) -> ExitCode {
     if parallel {
         return run_multi_parallel(
@@ -1745,13 +1759,27 @@ pub fn run_multi(
                 }
                 // Each URL uses its corresponding output file (from #N substitution)
                 let file_for_this = output_files.get(i).map(String::as_str);
+
+                // -z/--time-cond body suppression (curl compat: test 1128)
+                let suppress_body = time_cond_ts.is_some_and(|cond_ts| {
+                    response.header("last-modified").and_then(parse_http_date).is_some_and(
+                        |lm_ts| {
+                            if time_cond_negate {
+                                lm_ts > cond_ts
+                            } else {
+                                lm_ts <= cond_ts
+                            }
+                        },
+                    )
+                });
+
                 let exit = output_response(
                     &response,
                     file_for_this,
                     write_out,
                     include_headers,
                     silent,
-                    false,
+                    suppress_body,
                 );
                 if exit != ExitCode::SUCCESS {
                     any_failed = true;

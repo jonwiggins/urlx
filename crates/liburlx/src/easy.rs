@@ -4530,6 +4530,36 @@ const fn hex_val(b: u8) -> Option<u8> {
 }
 
 fn maybe_decompress(mut response: Response, accept_encoding: bool) -> Response {
+    // Transfer-Encoding decompression (hop-by-hop): always decompress regardless of
+    // --compressed flag. Chunked is already handled at the framing layer; here we
+    // handle gzip/deflate/br/zstd that may appear alongside chunked.
+    if let Some(te) = response.header("transfer-encoding") {
+        if let Some(compression) = crate::protocol::http::h1::te_compression_encoding(te) {
+            // Walk encodings in reverse order (outermost first, but chunked already stripped)
+            let mut body = response.body().to_vec();
+            // The compression part may be a single encoding like "gzip" or multiple
+            // like "deflate, gzip" (applied left-to-right, so decompress right-to-left).
+            let parts: Vec<&str> = compression.split(',').map(str::trim).collect();
+            let mut ok = true;
+            for enc in parts.iter().rev() {
+                match crate::protocol::http::decompress::decompress(&body, enc) {
+                    Ok(decompressed) => body = decompressed,
+                    Err(_) => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok {
+                response.set_body(body);
+            } else {
+                response.set_body(Vec::new());
+                response.set_body_error(Some("bad_transfer_encoding".to_string()));
+            }
+        }
+    }
+
+    // Content-Encoding decompression: only when --compressed was used.
     if accept_encoding {
         if let Some(encoding) = response.header("content-encoding") {
             if encoding != "identity" && !encoding.eq_ignore_ascii_case("none") {
@@ -4900,10 +4930,10 @@ fn proxy_from_env(scheme: &str) -> Option<Url> {
 fn strip_url_credentials(url: &str) -> String {
     let scheme_end = url.find("://").map_or(0, |p| p + 3);
     let rest = &url[scheme_end..];
-    // Only strip if @ comes before / (i.e., it's in the authority, not the path)
-    let slash_pos = rest.find('/').unwrap_or(rest.len());
+    // Only strip if @ comes before / or ? (i.e., it's in the authority, not the path/query)
+    let authority_end = rest.find(['/', '?']).unwrap_or(rest.len());
     if let Some(at_pos) = rest.find('@') {
-        if at_pos < slash_pos {
+        if at_pos < authority_end {
             return format!("{}{}", &url[..scheme_end], &rest[at_pos + 1..]);
         }
     }
