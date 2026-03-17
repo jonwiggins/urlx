@@ -339,6 +339,8 @@ pub async fn retrieve(
         if cmd_upper.starts_with("TOP")
             || cmd_upper.starts_with("RETR")
             || cmd_upper.starts_with("LIST")
+            || cmd_upper.starts_with("UIDL")
+            || cmd_upper.starts_with("CAPA")
         {
             let lines = read_multiline(&mut reader).await?;
             let mut body_str = lines.join("\r\n");
