@@ -164,6 +164,16 @@ pub async fn retrieve(
     sasl_ir: bool,
     oauth2_bearer: Option<&str>,
 ) -> Result<Response, Error> {
+    use base64::Engine;
+    // Reject URLs with CR/LF (curl returns exit code 3, test 875)
+    let raw_url = url.as_str();
+    if raw_url.contains("%0a")
+        || raw_url.contains("%0A")
+        || raw_url.contains("%0d")
+        || raw_url.contains("%0D")
+    {
+        return Err(Error::UrlParse("POP3 URL contains CR/LF".to_string()));
+    }
     let (host, port) = url.host_and_port()?;
     let url_creds = url.credentials();
     let (user, pass) = url_creds
@@ -187,14 +197,26 @@ pub async fn retrieve(
     // CAPA (curl always sends this before auth)
     send_command(&mut writer, "CAPA").await?;
     let capa_resp = read_response(&mut reader).await?;
+    let mut server_auth_plain = false;
+    let mut server_auth_login = false;
     if capa_resp.ok {
-        // Read the multi-line CAPA response
-        let _ = read_multiline(&mut reader).await?;
+        let capa_lines = read_multiline(&mut reader).await?;
+        // Parse SASL capabilities
+        for line in &capa_lines {
+            if line.starts_with("SASL") || line.starts_with("sasl") {
+                let upper = line.to_uppercase();
+                if upper.contains("PLAIN") {
+                    server_auth_plain = true;
+                }
+                if upper.contains("LOGIN") {
+                    server_auth_login = true;
+                }
+            }
+        }
     }
 
-    // Authenticate: XOAUTH2 if bearer token, otherwise USER/PASS
+    // Authenticate: XOAUTH2 > AUTH PLAIN > AUTH LOGIN > USER/PASS
     if let Some(bearer) = oauth2_bearer {
-        use base64::Engine;
         let payload = format!("user={user}\x01auth=Bearer {bearer}\x01\x01");
         let encoded = base64::engine::general_purpose::STANDARD.encode(payload.as_bytes());
 
@@ -221,8 +243,66 @@ pub async fn retrieve(
                 message: format!("POP3 AUTH XOAUTH2 failed: {}", auth_resp.message),
             });
         }
+    } else if server_auth_plain {
+        // AUTH PLAIN (two-step or inline SASL-IR)
+        let auth_string = format!("\0{user}\0{pass}");
+        let encoded = base64::engine::general_purpose::STANDARD.encode(auth_string.as_bytes());
+        if sasl_ir {
+            send_command(&mut writer, &format!("AUTH PLAIN {encoded}")).await?;
+        } else {
+            send_command(&mut writer, "AUTH PLAIN").await?;
+            let mut line = String::new();
+            let _ = reader.read_line(&mut line).await;
+            writer
+                .write_all(format!("{encoded}\r\n").as_bytes())
+                .await
+                .map_err(|e| Error::Http(format!("POP3 write error: {e}")))?;
+            let _ = writer.flush().await;
+        }
+        let auth_resp = read_response(&mut reader).await?;
+        if !auth_resp.ok {
+            send_command(&mut writer, "QUIT").await?;
+            let _ = read_response(&mut reader).await;
+            return Err(Error::Transfer {
+                code: 67,
+                message: format!("POP3 AUTH PLAIN failed: {}", auth_resp.message),
+            });
+        }
+    } else if server_auth_login {
+        // AUTH LOGIN (two-step or inline SASL-IR)
+        let user_b64 = base64::engine::general_purpose::STANDARD.encode(user.as_bytes());
+        let pass_b64 = base64::engine::general_purpose::STANDARD.encode(pass.as_bytes());
+        if sasl_ir {
+            send_command(&mut writer, &format!("AUTH LOGIN {user_b64}")).await?;
+        } else {
+            send_command(&mut writer, "AUTH LOGIN").await?;
+            let mut line = String::new();
+            let _ = reader.read_line(&mut line).await;
+            writer
+                .write_all(format!("{user_b64}\r\n").as_bytes())
+                .await
+                .map_err(|e| Error::Http(format!("POP3 write error: {e}")))?;
+            let _ = writer.flush().await;
+        }
+        // Server sends password challenge
+        let mut line2 = String::new();
+        let _ = reader.read_line(&mut line2).await;
+        writer
+            .write_all(format!("{pass_b64}\r\n").as_bytes())
+            .await
+            .map_err(|e| Error::Http(format!("POP3 write error: {e}")))?;
+        let _ = writer.flush().await;
+        let auth_resp = read_response(&mut reader).await?;
+        if !auth_resp.ok {
+            send_command(&mut writer, "QUIT").await?;
+            let _ = read_response(&mut reader).await;
+            return Err(Error::Transfer {
+                code: 67,
+                message: format!("POP3 AUTH LOGIN failed: {}", auth_resp.message),
+            });
+        }
     } else {
-        // USER/PASS authentication
+        // USER/PASS authentication (fallback)
         send_command(&mut writer, &format!("USER {user}")).await?;
         let user_resp = read_response(&mut reader).await?;
         if !user_resp.ok {
