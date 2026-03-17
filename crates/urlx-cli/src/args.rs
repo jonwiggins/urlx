@@ -121,6 +121,8 @@ pub struct CliOptions {
     pub(crate) custom_request_original: Option<String>,
     /// Variables set via `--variable` for `--expand-*` expansion.
     pub(crate) variables: Vec<(String, String)>,
+    /// `--skip-existing`: skip download if output file already exists.
+    pub(crate) skip_existing: bool,
 }
 
 /// Print version information to stdout.
@@ -475,6 +477,7 @@ fn parse_args_options(args: &[String]) -> Result<CliOptions, u8> {
         next_needs_url: false,
         custom_request_original: None,
         variables: Vec::new(),
+        skip_existing: false,
     };
 
     let mut i = 1;
@@ -930,16 +933,16 @@ fn parse_args_options(args: &[String]) -> Result<CliOptions, u8> {
                 // "-b none" or "-b ''" enables the cookie engine without sending cookies
                 if val == "none" || val.is_empty() {
                     opts.easy.cookie_jar(true);
-                } else if !val.contains('=') && std::path::Path::new(val).exists() {
-                    // File path: load cookies from cookie file
+                } else if val.contains('=') || val.contains(';') {
+                    // Contains '=' or ';': treat as inline cookie string
+                    opts.easy.cookie_jar(true);
+                    opts.inline_cookies.push(val.to_string());
+                } else {
+                    // No '=' or ';': treat as a cookie file path (curl compat)
                     if let Err(e) = opts.easy.cookie_file(val) {
                         eprintln!("curl: error reading cookie file '{val}': {e}");
                         return Err(1);
                     }
-                } else {
-                    // Inline cookie string: accumulate verbatim for later joining
-                    opts.easy.cookie_jar(true);
-                    opts.inline_cookies.push(val.to_string());
                 }
             }
             "--data-binary" => {
@@ -1547,6 +1550,9 @@ fn parse_args_options(args: &[String]) -> Result<CliOptions, u8> {
             }
             "--remove-on-error" => {
                 opts.remove_on_error = true;
+            }
+            "--skip-existing" => {
+                opts.skip_existing = true;
             }
             "--proxy-insecure" => {
                 opts.easy.proxy_ssl_verify_peer(false);

@@ -581,6 +581,7 @@ pub fn run(args: &[String]) -> ExitCode {
             opts.fail_on_error,
             opts.parallel,
             opts.parallel_max,
+            opts.skip_existing,
         );
     }
 
@@ -845,6 +846,18 @@ pub fn run(args: &[String]) -> ExitCode {
         if let Some(proxy_url) = env_var {
             if !proxy_url.is_empty() {
                 let _ = opts.easy.proxy(&proxy_url);
+            }
+        }
+    }
+
+    // --skip-existing: skip transfer if output file already exists
+    if opts.skip_existing {
+        if let Some(ref path) = opts.output_file {
+            if std::path::Path::new(path).exists() {
+                if !opts.silent {
+                    eprintln!("Note: skips transfer, \"{}\" exists locally", path);
+                }
+                return ExitCode::SUCCESS;
             }
         }
     }
@@ -1619,6 +1632,7 @@ pub fn run_multi(
     fail_on_error: bool,
     parallel: bool,
     parallel_max: usize,
+    skip_existing: bool,
 ) -> ExitCode {
     if parallel {
         return run_multi_parallel(
@@ -1647,6 +1661,18 @@ pub fn run_multi(
     let mut any_failed = false;
 
     for (i, url) in urls.iter().enumerate() {
+        // --skip-existing: skip transfer if output file already exists
+        if skip_existing {
+            if let Some(path) = output_files.get(i) {
+                if std::path::Path::new(path).exists() {
+                    if !silent {
+                        eprintln!("Note: skips transfer, \"{path}\" exists locally");
+                    }
+                    continue;
+                }
+            }
+        }
+
         if let Err(e) = easy.url(url) {
             if !silent || show_error {
                 eprintln!("curl: error parsing URL '{url}': {e}");
