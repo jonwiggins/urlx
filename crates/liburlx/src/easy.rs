@@ -2099,6 +2099,26 @@ impl Easy {
 
         // Build effective headers, body, and method considering multipart and range
         let mut headers = self.headers.clone();
+
+        // Apply removed_headers: for built-in default headers (User-Agent, Accept),
+        // add a sentinel empty-value entry so the h1 emitter suppresses the default.
+        // Only apply to known built-in defaults — other removal markers just prevent
+        // previously-set custom headers from being emitted.
+        // (curl compat: -H "User-Agent:" suppresses User-Agent, test 1147)
+        for removed in &self.removed_headers {
+            let already_set = headers.iter().any(|(k, _)| k.eq_ignore_ascii_case(removed));
+            if !already_set {
+                let name = match removed.as_str() {
+                    "user-agent" => Some("User-Agent"),
+                    "accept" => Some("Accept"),
+                    _ => None,
+                };
+                if let Some(name) = name {
+                    headers.push((name.to_string(), String::new()));
+                }
+            }
+        }
+
         let (effective_method, effective_body);
 
         if let Some(ref multipart) = self.multipart {
@@ -2331,6 +2351,7 @@ impl Easy {
             self.http09_allowed,
             self.http_proxy_tunnel,
             self.proxy_http_10,
+            self.raw,
         );
 
         // Apply total transfer timeout if set.
@@ -2476,6 +2497,7 @@ async fn perform_transfer(
     http09_allowed: bool,
     http_proxy_tunnel: bool,
     proxy_http_10: bool,
+    raw: bool,
 ) -> Result<Response, Error> {
     let transfer_start = Instant::now();
     let original_url = url.clone();
@@ -2639,6 +2661,7 @@ async fn perform_transfer(
             deadline,
             http_proxy_tunnel,
             proxy_http_10,
+            raw,
         ))
         .await?;
 
@@ -2725,6 +2748,7 @@ async fn perform_transfer(
                         deadline,
                         http_proxy_tunnel,
                         proxy_http_10,
+                        raw,
                     ))
                     .await?;
                 }
@@ -2852,6 +2876,7 @@ async fn perform_transfer(
                                 deadline,
                                 http_proxy_tunnel,
                                 proxy_http_10,
+                                raw,
                             ))
                             .await?;
 
@@ -2951,6 +2976,7 @@ async fn perform_transfer(
                                         deadline,
                                         http_proxy_tunnel,
                                         proxy_http_10,
+                                        raw,
                                     ))
                                     .await?;
                                 }
@@ -3036,6 +3062,7 @@ async fn perform_transfer(
                                 deadline,
                                 http_proxy_tunnel,
                                 proxy_http_10,
+                                raw,
                             ))
                             .await?;
                         }
@@ -3128,6 +3155,7 @@ async fn perform_transfer(
                                         deadline,
                                         http_proxy_tunnel,
                                         proxy_http_10,
+                                        raw,
                                     ))
                                     .await?;
                                 }
@@ -3231,6 +3259,7 @@ async fn perform_transfer(
                                 deadline,
                                 http_proxy_tunnel,
                                 proxy_http_10,
+                                raw,
                             ))
                             .await?;
                         }
@@ -3330,9 +3359,8 @@ async fn perform_transfer(
                 if let Some(allowed) = redir_protocols {
                     let scheme = next_url.scheme().to_lowercase();
                     if !allowed.iter().any(|p| p.as_str() == scheme) {
-                        return Err(Error::Http(format!(
-                            "redirect to protocol '{scheme}' not allowed (allowed: {})",
-                            allowed.iter().map(String::as_str).collect::<Vec<_>>().join(",")
+                        return Err(Error::UnsupportedProtocol(format!(
+                            "Protocol \"{scheme}\" not supported or disabled in libcurl"
                         )));
                     }
                 }
@@ -3460,6 +3488,7 @@ async fn do_single_request(
     deadline: Option<tokio::time::Instant>,
     http_proxy_tunnel: bool,
     proxy_http_10: bool,
+    raw: bool,
 ) -> Result<Response, Error> {
     // Handle non-HTTP schemes directly
     match url.scheme() {
@@ -3779,6 +3808,7 @@ async fn do_single_request(
                 chunked_upload,
                 http09_allowed,
                 deadline,
+                raw,
             )
             .await;
 
@@ -3896,6 +3926,7 @@ async fn do_single_request(
             chunked_upload,
             http09_allowed,
             deadline,
+            raw,
         )
         .await?;
         let time_starttransfer = request_start.elapsed();
@@ -4173,6 +4204,7 @@ async fn do_single_request(
                         chunked_upload,
                         http09_allowed,
                         deadline,
+                        raw,
                     )
                     .await?;
                     let time_starttransfer = request_start.elapsed();
@@ -4278,6 +4310,7 @@ async fn do_single_request(
                     chunked_upload,
                     http09_allowed,
                     deadline,
+                    raw,
                 )
                 .await?;
                 let time_starttransfer = request_start.elapsed();
@@ -4352,6 +4385,7 @@ async fn do_single_request(
                     chunked_upload,
                     http09_allowed,
                     deadline,
+                    raw,
                 )
                 .await?;
                 let time_starttransfer = request_start.elapsed();
@@ -4438,6 +4472,7 @@ async fn do_single_request(
                     chunked_upload,
                     http09_allowed,
                     deadline,
+                    raw,
                 )
                 .await?;
                 let time_starttransfer = request_start.elapsed();

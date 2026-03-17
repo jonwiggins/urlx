@@ -390,6 +390,100 @@ fn expand_combined_flags(args: &[String]) -> Vec<String> {
                 if ARG_FLAGS.contains(&ch) {
                     skip_next = true;
                 }
+            } else if arg.starts_with("--") {
+                // Long flags that take an argument — skip expansion of next arg.
+                // This prevents values like "-http" from being expanded as short flags.
+                if matches!(
+                    arg.as_str(),
+                    "--proto-redir"
+                        | "--proto"
+                        | "--request"
+                        | "--header"
+                        | "--data"
+                        | "--data-raw"
+                        | "--data-binary"
+                        | "--data-urlencode"
+                        | "--output"
+                        | "--dump-header"
+                        | "--write-out"
+                        | "--proxy"
+                        | "--user"
+                        | "--user-agent"
+                        | "--cookie"
+                        | "--cookie-jar"
+                        | "--referer"
+                        | "--form"
+                        | "--upload-file"
+                        | "--range"
+                        | "--continue-at"
+                        | "--max-time"
+                        | "--connect-timeout"
+                        | "--max-redirs"
+                        | "--resolve"
+                        | "--connect-to"
+                        | "--interface"
+                        | "--abstract-unix-socket"
+                        | "--unix-socket"
+                        | "--doh-url"
+                        | "--cert"
+                        | "--key"
+                        | "--cacert"
+                        | "--capath"
+                        | "--trace"
+                        | "--trace-ascii"
+                        | "--config"
+                        | "--proxy-user"
+                        | "--proxy-header"
+                        | "--max-filesize"
+                        | "--netrc-file"
+                        | "--etag-compare"
+                        | "--etag-save"
+                        | "--limit-rate"
+                        | "--speed-limit"
+                        | "--speed-time"
+                        | "--local-port"
+                        | "--ciphers"
+                        | "--tls13-ciphers"
+                        | "--proxy-cert"
+                        | "--proxy-key"
+                        | "--proxy-cacert"
+                        | "--proxy-capath"
+                        | "--proxy-ciphers"
+                        | "--variable"
+                        | "--expand-data"
+                        | "--json"
+                        | "--mail-from"
+                        | "--mail-rcpt"
+                        | "--mail-auth"
+                        | "--sasl-authzid"
+                        | "--service-name"
+                        | "--oauth2-bearer"
+                        | "--hostpubsha256"
+                        | "--pubkey"
+                        | "--noproxy"
+                        | "--preproxy"
+                        | "--proxy1.0"
+                        | "--socks4"
+                        | "--socks4a"
+                        | "--socks5"
+                        | "--socks5-hostname"
+                        | "--delegation"
+                        | "--aws-sigv4"
+                        | "--time-cond"
+                        | "--url"
+                        | "--alt-svc"
+                        | "--hsts"
+                        | "--ftp-method"
+                        | "--ftp-account"
+                        | "--ftp-port"
+                        | "--quote"
+                        | "--ftp-alternative-to-user"
+                        | "--ftp-ssl-ccc-mode"
+                        | "--tftp-blksize"
+                        | "--http2-ping-interval"
+                ) {
+                    skip_next = true;
+                }
             }
         }
     }
@@ -496,7 +590,31 @@ fn parse_args_options(args: &[String]) -> Result<CliOptions, u8> {
             "-H" | "--header" => {
                 i += 1;
                 let val = require_arg(args, i, "-H")?;
-                if let Some((name, value)) = val.split_once(':') {
+                // -H @filename: read headers from file, one per line (curl compat: test 1147)
+                if let Some(path) = val.strip_prefix('@') {
+                    if let Ok(contents) = std::fs::read_to_string(path) {
+                        for line in contents.lines() {
+                            // Skip empty lines
+                            if line.trim().is_empty() {
+                                continue;
+                            }
+                            if let Some((name, value)) = line.split_once(':') {
+                                let value_trimmed = value.trim();
+                                if value_trimmed.is_empty() {
+                                    // "Name:" → removal marker
+                                    opts.easy.header_remove(name.trim());
+                                } else {
+                                    // "Name: value" → set header
+                                    opts.easy.header(name, value.trim_start());
+                                }
+                            }
+                            // Lines without colon are silently ignored (curl compat)
+                        }
+                    } else {
+                        eprintln!("curl: Failed to open {path}");
+                        return Err(2);
+                    }
+                } else if let Some((name, value)) = val.split_once(':') {
                     let name = name.trim();
                     let value_trimmed = value.trim();
                     if value_trimmed.is_empty() {
@@ -2250,6 +2368,60 @@ pub fn is_protocol_allowed(url: &str, proto_list: &str) -> bool {
     list.split(',').any(|p| p.trim().eq_ignore_ascii_case(&scheme))
 }
 
+/// Parse a `--proto` / `--proto-redir` protocol specification.
+///
+/// Supports the curl protocol specification syntax:
+///   - `=proto1,proto2` — only these protocols
+///   - `+proto` — add to default set
+///   - `-proto` — remove from default set
+///   - `all,-proto` — all minus specific protocols
+///
+/// Returns the list of allowed protocol names (lowercase).
+pub fn parse_proto_spec(spec: &str) -> Vec<String> {
+    let all_protocols: &[&str] = &[
+        "http", "https", "ftp", "ftps", "scp", "sftp", "imap", "imaps", "pop3", "pop3s", "smtp",
+        "smtps", "dict", "file", "tftp", "mqtt", "ws", "wss",
+    ];
+
+    // "=proto1,proto2" means exactly these protocols
+    if let Some(rest) = spec.strip_prefix('=') {
+        return rest
+            .split(',')
+            .map(|p| p.trim().to_lowercase())
+            .filter(|p| !p.is_empty())
+            .collect();
+    }
+
+    // Start with all protocols, then apply +/- modifiers
+    let mut allowed: Vec<String> = all_protocols.iter().map(|s| s.to_string()).collect();
+
+    for part in spec.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if let Some(proto) = part.strip_prefix('+') {
+            let proto = proto.to_lowercase();
+            if !allowed.contains(&proto) {
+                allowed.push(proto);
+            }
+        } else if let Some(proto) = part.strip_prefix('-') {
+            let proto = proto.to_lowercase();
+            allowed.retain(|p| p != &proto);
+        } else if part.eq_ignore_ascii_case("all") {
+            allowed = all_protocols.iter().map(|s| s.to_string()).collect();
+        } else {
+            // Bare protocol name: treat as "add"
+            let proto = part.to_lowercase();
+            if !allowed.contains(&proto) {
+                allowed.push(proto);
+            }
+        }
+    }
+
+    allowed
+}
+
 /// Parse a `--variable` argument.
 ///
 /// Formats:
@@ -2359,7 +2531,7 @@ fn parse_variable(spec: &str) -> Result<(String, String), u8> {
 /// Simple base64 encoder (no external dependency needed).
 fn simple_base64_encode(data: &[u8]) -> String {
     const CHARS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut result = String::with_capacity((data.len() + 2) / 3 * 4);
+    let mut result = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
         let b0 = chunk[0] as u32;
         let b1 = chunk.get(1).copied().unwrap_or(0) as u32;

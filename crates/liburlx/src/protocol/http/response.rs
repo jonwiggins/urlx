@@ -93,6 +93,9 @@ pub struct Response {
     uses_crlf: bool,
     /// Trailer headers from chunked transfer encoding.
     trailers: HashMap<String, String>,
+    /// Raw trailer bytes as received from the wire (for output).
+    /// Includes each trailer line with its original line endings.
+    raw_trailers: Vec<u8>,
     /// Response body bytes.
     body: Vec<u8>,
     /// The effective URL after any redirects.
@@ -147,6 +150,7 @@ impl Response {
             headers_ordered: Vec::new(),
             uses_crlf: true,
             trailers: HashMap::new(),
+            raw_trailers: Vec::new(),
             body,
             effective_url,
             info: TransferInfo::default(),
@@ -175,6 +179,7 @@ impl Response {
             headers_ordered: Vec::new(),
             uses_crlf: true,
             trailers: HashMap::new(),
+            raw_trailers: Vec::new(),
             body,
             effective_url,
             info,
@@ -205,6 +210,7 @@ impl Response {
             headers_ordered: Vec::new(),
             uses_crlf: true,
             trailers: HashMap::new(),
+            raw_trailers: Vec::new(),
             body,
             effective_url,
             info: TransferInfo::default(),
@@ -253,6 +259,17 @@ impl Response {
     /// Set trailer headers on this response.
     pub fn set_trailers(&mut self, trailers: HashMap<String, String>) {
         self.trailers = trailers;
+    }
+
+    /// Set raw trailer bytes as received from the wire.
+    pub fn set_raw_trailers(&mut self, raw: Vec<u8>) {
+        self.raw_trailers = raw;
+    }
+
+    /// Returns raw trailer bytes if available.
+    #[must_use]
+    pub fn raw_trailers(&self) -> &[u8] {
+        &self.raw_trailers
     }
 
     /// Set raw header bytes as received from the wire.

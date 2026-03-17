@@ -6,8 +6,8 @@
 use std::process::ExitCode;
 
 use crate::args::{
-    is_protocol_allowed, parse_args, percent_encode, print_usage, print_version, CliOptions,
-    ParseResult,
+    is_protocol_allowed, parse_args, parse_proto_spec, percent_encode, print_usage, print_version,
+    CliOptions, ParseResult,
 };
 use crate::output::{
     content_disposition_filename, format_headers, format_write_out, http_status_text,
@@ -1091,6 +1091,14 @@ pub fn run(args: &[String]) -> ExitCode {
         }
     }
 
+    // --proto-redir: restrict allowed protocols for redirects (curl compat: test 325)
+    if let Some(ref proto_redir) = opts.proto_redir {
+        let allowed = parse_proto_spec(proto_redir);
+        if !allowed.is_empty() {
+            opts.easy.set_redir_protocols_str(&allowed.join(","));
+        }
+    }
+
     let result = perform_with_retry(&mut opts);
 
     // Save cookie jar after transfer (even on error)
@@ -1219,7 +1227,13 @@ pub fn run(args: &[String]) -> ExitCode {
             // --dump-header: write headers to file
             if let Some(ref path) = opts.dump_header {
                 let header_text = format_headers(&response);
-                if let Err(e) = std::fs::write(path, header_text) {
+                let raw_trailers = response.raw_trailers();
+                let mut dump_data = header_text.into_bytes();
+                // Append chunked trailer headers after response headers (curl compat: test 1116)
+                if !raw_trailers.is_empty() {
+                    dump_data.extend_from_slice(raw_trailers);
+                }
+                if let Err(e) = std::fs::write(path, dump_data) {
                     if !opts.silent || opts.show_error {
                         eprintln!("curl: error writing headers to {path}: {e}");
                     }

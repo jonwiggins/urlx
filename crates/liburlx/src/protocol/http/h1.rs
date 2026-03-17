@@ -57,6 +57,7 @@ pub async fn request<S>(
     chunked_upload: bool,
     http09_allowed: bool,
     deadline: Option<tokio::time::Instant>,
+    raw: bool,
 ) -> Result<(Response, bool), Error>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -298,8 +299,8 @@ where
                         || ph.status == 304
                         || (100..200).contains(&ph.status);
                     let mut recv_limiter = RateLimiter::for_recv(speed_limits);
-                    let (response_body, body_read_to_eof, trailers) = if no_body {
-                        (Vec::new(), false, HashMap::new())
+                    let (response_body, body_read_to_eof, trailers, raw_trailers) = if no_body {
+                        (Vec::new(), false, HashMap::new(), Vec::new())
                     } else {
                         read_body_from_headers(
                             stream,
@@ -309,6 +310,7 @@ where
                             ignore_content_length,
                             &mut recv_limiter,
                             deadline,
+                            raw,
                         )
                         .await?
                     };
@@ -328,6 +330,9 @@ where
                     resp.set_raw_headers(header_bytes);
                     if !trailers.is_empty() {
                         resp.set_trailers(trailers);
+                    }
+                    if !raw_trailers.is_empty() {
+                        resp.set_raw_trailers(raw_trailers);
                     }
                     return Ok((resp, can_reuse));
                 }
@@ -386,7 +391,12 @@ where
     let mut ph = parse_headers(&header_bytes)?;
 
     // Skip 1xx informational responses (100 Continue, 103 Early Hints, etc.)
+    // Collect the raw bytes of 1xx responses so they can be included in output
+    // when --include is used (curl includes 1xx headers before the final response).
+    let mut informational_prefix: Vec<u8> = Vec::new();
     while (100..200).contains(&ph.status) {
+        // Preserve this 1xx response's raw headers (already includes trailing blank line)
+        informational_prefix.extend_from_slice(&header_bytes);
         // The body_prefix may contain the start of the next response
         let next = read_response_headers_with_prefix(stream, body_prefix).await?;
         header_bytes = next.0;
@@ -528,8 +538,8 @@ where
         ph.headers.get("connection").is_some_and(|v| v.eq_ignore_ascii_case("keep-alive"));
     let effective_keepalive =
         keep_alive && !use_http10 && !server_close && (!response_is_http10 || server_keepalive);
-    let (response_body, body_read_to_eof, trailers, body_error) = if no_body {
-        (Vec::new(), false, HashMap::new(), None)
+    let (response_body, body_read_to_eof, trailers, raw_trailers, body_error) = if no_body {
+        (Vec::new(), false, HashMap::new(), Vec::new(), None)
     } else {
         match read_body_from_headers(
             stream,
@@ -539,17 +549,18 @@ where
             ignore_content_length,
             &mut recv_limiter,
             deadline,
+            raw,
         )
         .await
         {
-            Ok((body, eof, trailers)) => (body, eof, trailers, None),
+            Ok((body, eof, trailers, raw_trailers)) => (body, eof, trailers, raw_trailers, None),
             Err(Error::PartialBody { partial_body, message }) => {
                 // Chunked decode error with partial data — return headers + partial body
-                (partial_body, true, HashMap::new(), Some(message))
+                (partial_body, true, HashMap::new(), Vec::new(), Some(message))
             }
             Err(e) => {
                 // Other body read errors — return headers only
-                (Vec::new(), true, HashMap::new(), Some(e.to_string()))
+                (Vec::new(), true, HashMap::new(), Vec::new(), Some(e.to_string()))
             }
         }
     };
@@ -565,9 +576,19 @@ where
     resp.set_status_reason(ph.reason);
     resp.set_uses_crlf(ph.uses_crlf);
     resp.set_http_version(ph.version);
-    resp.set_raw_headers(header_bytes);
+    // Prepend 1xx informational response headers so --include shows them
+    if informational_prefix.is_empty() {
+        resp.set_raw_headers(header_bytes);
+    } else {
+        let mut combined = informational_prefix;
+        combined.extend_from_slice(&header_bytes);
+        resp.set_raw_headers(combined);
+    }
     if !trailers.is_empty() {
         resp.set_trailers(trailers);
+    }
+    if !raw_trailers.is_empty() {
+        resp.set_raw_trailers(raw_trailers);
     }
 
     // If body reading failed, mark the response as partial for the caller
@@ -1028,8 +1049,9 @@ where
 
 /// Read the response body based on headers (Content-Length, chunked, or EOF).
 ///
-/// Returns the body bytes, whether the body was read to EOF, and any trailer headers.
-#[allow(clippy::large_futures)]
+/// Returns the body bytes, whether the body was read to EOF, any trailer headers,
+/// and raw trailer bytes.
+#[allow(clippy::large_futures, clippy::too_many_arguments)]
 async fn read_body_from_headers<S>(
     stream: &mut S,
     headers: &HashMap<String, String>,
@@ -1038,16 +1060,24 @@ async fn read_body_from_headers<S>(
     ignore_content_length: bool,
     limiter: &mut RateLimiter,
     deadline: Option<tokio::time::Instant>,
-) -> Result<(Vec<u8>, bool, HashMap<String, String>), Error>
+    raw: bool,
+) -> Result<(Vec<u8>, bool, HashMap<String, String>, Vec<u8>), Error>
 where
     S: AsyncRead + Unpin,
 {
     let is_chunked =
         headers.get("transfer-encoding").is_some_and(|te| te.eq_ignore_ascii_case("chunked"));
 
+    // In raw mode, skip chunked decoding — pass bytes through as-is (curl --raw)
+    // Still parse chunk framing to know when to stop, but include all framing in output.
+    if is_chunked && raw {
+        let body = read_chunked_raw(stream, body_prefix, limiter).await?;
+        return Ok((body, false, HashMap::new(), Vec::new()));
+    }
+
     if is_chunked {
         match read_chunked_body_streaming(stream, body_prefix, limiter).await {
-            Ok((body, trailers)) => Ok((body, false, trailers)),
+            Ok((body, trailers, raw_trailers)) => Ok((body, false, trailers, raw_trailers)),
             Err(Error::PartialBody { partial_body, message }) => {
                 Err(Error::PartialBody { message, partial_body })
             }
@@ -1057,7 +1087,7 @@ where
         let cl = &headers["content-length"];
         if let Ok(content_length) = cl.parse::<usize>() {
             let body = read_exact_body(stream, content_length, body_prefix, limiter).await?;
-            Ok((body, false, HashMap::new()))
+            Ok((body, false, HashMap::new(), Vec::new()))
         } else {
             // Content-Length overflows usize — read to EOF (curl compat: test 395)
             let mut body = body_prefix;
@@ -1070,15 +1100,15 @@ where
                     Err(e) => return Err(Error::Http(format!("body read failed: {e}"))),
                 }
             }
-            Ok((body, true, HashMap::new()))
+            Ok((body, true, HashMap::new(), Vec::new()))
         }
     } else if keep_alive && !ignore_content_length {
         // No Content-Length, no chunked, but keep-alive → assume empty body
-        Ok((body_prefix, false, HashMap::new()))
+        Ok((body_prefix, false, HashMap::new(), Vec::new()))
     } else {
         // No Content-Length (or ignoring it), connection close → read until EOF
         let body = read_to_eof_throttled(stream, body_prefix, limiter, deadline).await?;
-        Ok((body, true, HashMap::new()))
+        Ok((body, true, HashMap::new(), Vec::new()))
     }
 }
 
@@ -1164,15 +1194,110 @@ where
     Ok(body)
 }
 
+/// Read a chunked transfer-encoded body in raw mode (--raw).
+///
+/// Passes through chunk framing bytes (sizes, CRLF terminators) as-is but still
+/// parses chunk sizes to know when to stop reading. The output includes the raw
+/// chunked encoding including the terminating `0\r\n\r\n`.
+async fn read_chunked_raw<S>(
+    stream: &mut S,
+    prefix: Vec<u8>,
+    limiter: &mut RateLimiter,
+) -> Result<Vec<u8>, Error>
+where
+    S: AsyncRead + Unpin,
+{
+    let mut buf = prefix;
+    let mut pos = 0;
+
+    loop {
+        // Ensure we have a complete chunk size line
+        while find_crlf(&buf, pos).is_none() {
+            let mut tmp = [0u8; 4096];
+            let n = match stream.read(&mut tmp).await {
+                Ok(n) => n,
+                Err(e) if is_close_notify_error(&e) => 0,
+                Err(e) => return Err(Error::Http(format!("chunked read failed: {e}"))),
+            };
+            if n == 0 {
+                // Connection closed — return what we have
+                return Ok(buf);
+            }
+            buf.extend_from_slice(&tmp[..n]);
+        }
+
+        let (line_end, eol_len) = find_line_ending(&buf, pos)
+            .ok_or_else(|| Error::Http("incomplete chunked encoding".into()))?;
+
+        let size_str = std::str::from_utf8(&buf[pos..line_end])
+            .map_err(|_| Error::Http("invalid chunk size encoding".into()))?;
+        let size_str = size_str.split(';').next().unwrap_or(size_str).trim();
+        let chunk_size = usize::from_str_radix(size_str, 16)
+            .map_err(|e| Error::Http(format!("invalid chunk size '{size_str}': {e}")))?;
+
+        pos = line_end + eol_len;
+
+        if chunk_size == 0 {
+            // Read until we have the final empty line after trailers
+            loop {
+                while find_crlf(&buf, pos).is_none() {
+                    let mut tmp = [0u8; 256];
+                    let n = match stream.read(&mut tmp).await {
+                        Ok(n) => n,
+                        Err(e) if is_close_notify_error(&e) => 0,
+                        Err(e) => {
+                            return Err(Error::Http(format!("chunked trailer read failed: {e}")));
+                        }
+                    };
+                    if n == 0 {
+                        return Ok(buf);
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                }
+                let Some((le, el)) = find_line_ending(&buf, pos) else {
+                    break;
+                };
+                if le == pos {
+                    // Empty line — end of chunked encoding
+                    pos = le + el;
+                    break;
+                }
+                pos = le + el;
+            }
+            // Truncate to include only the chunked data (not any pipelined data)
+            buf.truncate(pos);
+            return Ok(buf);
+        }
+
+        // Skip past chunk data + trailing CRLF
+        let needed = pos + chunk_size + 2; // data + CRLF
+        while buf.len() < needed {
+            let mut tmp = [0u8; 4096];
+            let n = match stream.read(&mut tmp).await {
+                Ok(n) => n,
+                Err(e) if is_close_notify_error(&e) => 0,
+                Err(e) => return Err(Error::Http(format!("chunked read failed: {e}"))),
+            };
+            if n == 0 {
+                return Ok(buf);
+            }
+            buf.extend_from_slice(&tmp[..n]);
+        }
+        pos = needed;
+
+        let _ = limiter.record(chunk_size).await;
+    }
+}
+
 /// Read a chunked transfer-encoded body incrementally from a stream.
 ///
-/// Returns the decoded body and any trailer headers. Applies rate
-/// limiting after each decoded chunk.
+/// Returns the decoded body, any trailer headers (parsed), and raw trailer bytes.
+/// Applies rate limiting after each decoded chunk.
 async fn read_chunked_body_streaming<S>(
     stream: &mut S,
     prefix: Vec<u8>,
     limiter: &mut RateLimiter,
-) -> Result<(Vec<u8>, HashMap<String, String>), Error>
+) -> Result<(Vec<u8>, HashMap<String, String>, Vec<u8>), Error>
 where
     S: AsyncRead + Unpin,
 {
@@ -1220,6 +1345,7 @@ where
             // Read trailers + final CRLF after last chunk
             // Trailers end with an empty line (\r\n\r\n) or just \r\n if none
             let mut trailers = HashMap::new();
+            let mut raw_trailers = Vec::new();
             loop {
                 // Ensure we have at least one line
                 while find_crlf(&buf, pos).is_none() {
@@ -1232,7 +1358,7 @@ where
                         }
                     };
                     if n == 0 {
-                        return Ok((decoded, trailers));
+                        return Ok((decoded, trailers, raw_trailers));
                     }
                     buf.extend_from_slice(&tmp[..n]);
                 }
@@ -1243,6 +1369,8 @@ where
                     // Empty line — end of trailers
                     break;
                 }
+                // Capture raw trailer bytes (including line ending)
+                raw_trailers.extend_from_slice(&buf[pos..line_end + trailer_eol_len]);
                 // Parse trailer header
                 if let Ok(line) = std::str::from_utf8(&buf[pos..line_end]) {
                     if let Some((name, value)) = line.split_once(':') {
@@ -1252,7 +1380,7 @@ where
                 }
                 pos = line_end + trailer_eol_len;
             }
-            return Ok((decoded, trailers));
+            return Ok((decoded, trailers, raw_trailers));
         }
 
         // Ensure we have the full chunk data + trailing line ending (\r\n or \n)
@@ -1635,6 +1763,7 @@ mod tests {
             false,
             true,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -1679,6 +1808,7 @@ mod tests {
             false,
             true,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -1727,6 +1857,7 @@ mod tests {
             false,
             true,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -1770,6 +1901,7 @@ mod tests {
             false,
             true,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -1814,6 +1946,7 @@ mod tests {
             false,
             true,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -1863,6 +1996,7 @@ mod tests {
             false,
             true,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -1919,6 +2053,7 @@ mod tests {
             false,
             true,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -1961,6 +2096,7 @@ mod tests {
             false,
             true,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -2008,6 +2144,7 @@ mod tests {
             false,
             true,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -2058,6 +2195,7 @@ mod tests {
             false,
             true,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -2106,6 +2244,7 @@ mod tests {
             false,
             true,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -2146,6 +2285,7 @@ mod tests {
             false,
             true,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -2192,6 +2332,7 @@ mod tests {
             false,
             true,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -2238,6 +2379,7 @@ mod tests {
             false,
             true,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -2308,6 +2450,7 @@ mod tests {
             true,
             true,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -2371,6 +2514,7 @@ mod tests {
             false,
             true,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -2418,6 +2562,7 @@ mod tests {
             false,
             true,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -2465,6 +2610,7 @@ mod tests {
             false,
             true,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -2508,6 +2654,7 @@ mod tests {
                 false,
                 true,
                 None,
+                false,
             ),
         )
         .await;
@@ -2554,6 +2701,7 @@ mod tests {
                 false,
                 true,
                 None,
+                false,
             ),
         )
         .await;
@@ -2629,6 +2777,7 @@ mod tests {
             false,
             true,
             None,
+            false,
         )
         .await
         .unwrap();

@@ -254,6 +254,8 @@ pub fn output_response(
     };
 
     let body = if suppress_body { &[] as &[u8] } else { response.body() };
+    // Raw trailer bytes from chunked transfer encoding (appended after body, curl compat)
+    let raw_trailers = response.raw_trailers();
 
     // "-" means stdout (curl compat)
     let effective_output = output_file.filter(|p| *p != "-");
@@ -265,6 +267,10 @@ pub fn output_response(
             data.extend_from_slice(headers.as_bytes());
         }
         data.extend_from_slice(body);
+        // Append chunked trailer headers after body (curl compat: test 1116)
+        if !raw_trailers.is_empty() {
+            data.extend_from_slice(raw_trailers);
+        }
         if let Err(e) = std::fs::write(path, &data) {
             if !silent {
                 eprintln!("curl: error writing to {path}: {e}");
@@ -286,6 +292,15 @@ pub fn output_response(
                 eprintln!("curl: write error: {e}");
             }
             return ExitCode::FAILURE;
+        }
+        // Append chunked trailer headers after body (curl compat: test 1116)
+        if !raw_trailers.is_empty() {
+            if let Err(e) = std::io::stdout().write_all(raw_trailers) {
+                if !silent {
+                    eprintln!("curl: write error: {e}");
+                }
+                return ExitCode::FAILURE;
+            }
         }
     }
 
