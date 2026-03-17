@@ -406,6 +406,10 @@ pub fn format_write_out(fmt: &str, response: &liburlx::Response) -> String {
     }
     result = result
         .replace("%{time_redirect}", &format!("{:.6}", info.time_namelookup.as_secs_f64() * 0.0));
+    #[allow(clippy::literal_string_with_formatting_args)]
+    {
+        result = result.replace("%{filename_effective}", "");
+    }
     // redirect_url: curl normalizes the Location URL (adds trailing slash for bare hostnames)
     let redirect_url = response.header("location").unwrap_or("").to_string();
     let redirect_url_normalized = if redirect_url.is_empty() {

@@ -2337,11 +2337,81 @@ fn parse_variable(spec: &str) -> Result<(String, String), u8> {
 }
 
 /// Expand `{{variable}}` placeholders in a string using the provided variables.
+/// Simple base64 encoder (no external dependency needed).
+fn simple_base64_encode(data: &[u8]) -> String {
+    const CHARS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut result = String::with_capacity((data.len() + 2) / 3 * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        result.push(CHARS[((n >> 18) & 63) as usize] as char);
+        result.push(CHARS[((n >> 12) & 63) as usize] as char);
+        if chunk.len() > 1 {
+            result.push(CHARS[((n >> 6) & 63) as usize] as char);
+        } else {
+            result.push('=');
+        }
+        if chunk.len() > 2 {
+            result.push(CHARS[(n & 63) as usize] as char);
+        } else {
+            result.push('=');
+        }
+    }
+    result
+}
+
 fn expand_variables(template: &str, variables: &[(String, String)]) -> String {
-    let mut result = template.to_string();
-    for (name, value) in variables {
-        let placeholder = format!("{{{{{name}}}}}");
-        result = result.replace(&placeholder, value);
+    let mut result = String::with_capacity(template.len());
+    let mut i = 0;
+    let bytes = template.as_bytes();
+    while i < bytes.len() {
+        if i + 1 < bytes.len() && bytes[i] == b'{' && bytes[i + 1] == b'{' {
+            // Find closing }}
+            if let Some(end) = template[i + 2..].find("}}") {
+                let inner = &template[i + 2..i + 2 + end];
+                // Check for name:function syntax
+                let (var_name, func) = inner.split_once(':').unwrap_or((inner, ""));
+                if let Some((_, value)) = variables.iter().find(|(n, _)| n == var_name) {
+                    let transformed = match func {
+                        "" => value.clone(),
+                        "trim" => value.trim().to_string(),
+                        "url" | "urlencode" => percent_encode(value),
+                        "b64" | "base64" => simple_base64_encode(value.as_bytes()),
+                        "json" => {
+                            // JSON string escaping
+                            let mut s = String::with_capacity(value.len() + 2);
+                            s.push('"');
+                            for c in value.chars() {
+                                match c {
+                                    '"' => s.push_str("\\\""),
+                                    '\\' => s.push_str("\\\\"),
+                                    '\n' => s.push_str("\\n"),
+                                    '\r' => s.push_str("\\r"),
+                                    '\t' => s.push_str("\\t"),
+                                    c => s.push(c),
+                                }
+                            }
+                            s.push('"');
+                            s
+                        }
+                        _ => {
+                            // Unknown function: leave as-is (curl returns error 2)
+                            result.push_str(&template[i..i + 2 + end + 2]);
+                            i += 2 + end + 2;
+                            continue;
+                        }
+                    };
+                    result.push_str(&transformed);
+                }
+                // Else: undefined variable — expand to empty string
+                i += 2 + end + 2;
+                continue;
+            }
+        }
+        result.push(bytes[i] as char);
+        i += 1;
     }
     result
 }
