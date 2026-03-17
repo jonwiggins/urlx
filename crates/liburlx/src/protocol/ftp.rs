@@ -1579,6 +1579,13 @@ pub async fn perform(
                         ),
                     });
                 }
+            } else if cwd_resp.code == 421 {
+                // 421 = Service not available / timeout. Don't send QUIT —
+                // the server is closing the connection (curl compat: test 1120).
+                return Err(Error::Transfer {
+                    code: 28,
+                    message: format!("FTP server timeout: {} {}", cwd_resp.code, cwd_resp.message),
+                });
             } else {
                 // CWD failed - send QUIT and return error code 9
                 let _ = session.quit().await;

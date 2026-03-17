@@ -331,7 +331,19 @@ pub fn output_response(
                 let _ = f.write_all(output.as_bytes());
             }
         } else {
-            print!("{output}");
+            // Handle %{stderr} directive: text after it goes to stderr (curl compat: test 1278)
+            if let Some(pos) = output.find("%{stderr}") {
+                let stdout_part = &output[..pos];
+                let stderr_part = &output[pos + "%{stderr}".len()..];
+                if !stdout_part.is_empty() {
+                    print!("{stdout_part}");
+                }
+                if !stderr_part.is_empty() {
+                    eprint!("{stderr_part}");
+                }
+            } else {
+                print!("{output}");
+            }
         }
     }
 
@@ -425,19 +437,47 @@ pub fn format_write_out(fmt: &str, response: &liburlx::Response) -> String {
     {
         result = result.replace("%{filename_effective}", "");
     }
-    // redirect_url: curl normalizes the Location URL (adds trailing slash for bare hostnames)
-    let redirect_url = response.header("location").unwrap_or("").to_string();
-    let redirect_url_normalized = if redirect_url.is_empty() {
-        redirect_url
+    // redirect_url: curl resolves the Location URL to absolute (relative to request URL)
+    // and normalizes bare hostnames with trailing slash (test 1261).
+    let redirect_url_raw = response.header("location").unwrap_or("").to_string();
+    let redirect_url_normalized = if redirect_url_raw.is_empty() {
+        redirect_url_raw
     } else {
-        // Normalize: bare hostname URLs need trailing slash (e.g. https://host -> https://host/)
-        if redirect_url.contains("://")
-            && !redirect_url.ends_with('/')
-            && redirect_url.matches('/').count() == 2
+        // Resolve relative URLs against the effective (request) URL
+        let resolved = if redirect_url_raw.starts_with("http://")
+            || redirect_url_raw.starts_with("https://")
         {
-            format!("{redirect_url}/")
+            redirect_url_raw.clone()
+        } else if redirect_url_raw.starts_with('/') {
+            // Absolute path — keep scheme + authority from base
+            let base = response.effective_url();
+            if let Some(idx) = base.find("://") {
+                let after_scheme = &base[idx + 3..];
+                if let Some(path_start) = after_scheme.find('/') {
+                    let authority = &base[..idx + 3 + path_start];
+                    format!("{authority}{}", &redirect_url_raw)
+                } else {
+                    format!("{base}{}", &redirect_url_raw)
+                }
+            } else {
+                format!("{base}{}", &redirect_url_raw)
+            }
         } else {
-            redirect_url
+            // Relative path — replace last path segment
+            let base = response.effective_url();
+            base.rfind('/').map_or_else(
+                || format!("{base}/{redirect_url_raw}"),
+                |idx| format!("{}{redirect_url_raw}", &base[..=idx]),
+            )
+        };
+        // Normalize: bare hostname URLs need trailing slash (e.g. https://host -> https://host/)
+        if resolved.contains("://")
+            && !resolved.ends_with('/')
+            && resolved.matches('/').count() == 2
+        {
+            format!("{resolved}/")
+        } else {
+            resolved
         }
     };
     #[allow(clippy::literal_string_with_formatting_args)]

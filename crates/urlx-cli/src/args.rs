@@ -118,6 +118,11 @@ pub struct CliOptions {
     pub(crate) inline_cookies: Vec<String>,
     /// Whether `--next` was seen without a following URL (parse error if true at end).
     pub(crate) next_needs_url: bool,
+    /// Whether `--next` was used at least once (for per-URL output file mapping).
+    pub(crate) had_next: bool,
+    /// Per-URL credentials from `-u` (indexed by URL position).
+    /// Each entry records the `-u` credential active when the URL was added.
+    pub(crate) per_url_credentials: Vec<Option<(String, String)>>,
     /// Original -X value preserving case (for non-HTTP protocol commands).
     pub(crate) custom_request_original: Option<String>,
     /// Variables set via `--variable` for `--expand-*` expansion.
@@ -571,12 +576,15 @@ fn parse_args_options(args: &[String]) -> Result<CliOptions, u8> {
         upload_file_path: None,
         inline_cookies: Vec::new(),
         next_needs_url: false,
+        had_next: false,
+        per_url_credentials: Vec::new(),
         custom_request_original: None,
         variables: Vec::new(),
         skip_existing: false,
     };
 
     let mut i = 1;
+    let mut group_start_idx: usize = 0;
     while i < args.len() {
         match args[i].as_str() {
             "-X" | "--request" => {
@@ -1671,6 +1679,7 @@ fn parse_args_options(args: &[String]) -> Result<CliOptions, u8> {
                 i += 1;
                 let val = require_arg(args, i, "--url")?;
                 opts.urls.push(val.to_string());
+                opts.per_url_credentials.push(opts.user_credentials.clone());
             }
             "--output-dir" => {
                 i += 1;
@@ -1864,8 +1873,18 @@ fn parse_args_options(args: &[String]) -> Result<CliOptions, u8> {
                 // Accepted for compatibility; not implemented
             }
             "--next" => {
-                // --next separates URL groups; mark that we need a URL for the next group
+                // --next separates URL groups; assign current group's -u credentials
+                // to URLs in the current group (from group_start_idx onwards), then reset.
+                let group_creds = opts.user_credentials.clone();
+                for cred_slot in opts.per_url_credentials[group_start_idx..].iter_mut() {
+                    if cred_slot.is_none() {
+                        *cred_slot = group_creds.clone();
+                    }
+                }
+                group_start_idx = opts.per_url_credentials.len();
+                opts.user_credentials = None;
                 opts.next_needs_url = true;
+                opts.had_next = true;
             }
             arg if arg.starts_with("--no-") => {
                 // --no- prefix used on a non-boolean option (curl returns exit code 2)
@@ -1885,10 +1904,21 @@ fn parse_args_options(args: &[String]) -> Result<CliOptions, u8> {
             }
             url => {
                 opts.urls.push(url.to_string());
+                opts.per_url_credentials.push(opts.user_credentials.clone());
                 opts.next_needs_url = false;
             }
         }
         i += 1;
+    }
+
+    // Assign last group's -u credentials to URLs in the last group that weren't assigned yet
+    {
+        let group_creds = opts.user_credentials.clone();
+        for cred_slot in opts.per_url_credentials[group_start_idx..].iter_mut() {
+            if cred_slot.is_none() {
+                *cred_slot = group_creds.clone();
+            }
+        }
     }
 
     // --next at the end with no URL is a parse error (curl returns exit code 2)

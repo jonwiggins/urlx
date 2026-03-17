@@ -30,6 +30,20 @@ impl Url {
 
         let input = Self::maybe_add_scheme(input);
 
+        // Reject URLs with multiple @ in the authority (e.g. http://user@host:80@other).
+        // curl treats this as an invalid port number (test 1260).
+        if let Some(scheme_end) = input.find("://") {
+            let rest = &input[scheme_end + 3..];
+            let authority_end = rest.find('/').unwrap_or(rest.len());
+            let authority = &rest[..authority_end];
+            // Count @ signs in the authority — more than one means ambiguous userinfo/host
+            if authority.chars().filter(|&c| c == '@').count() > 1 {
+                return Err(Error::UrlParse(
+                    "Port number was not a decimal number between 0 and 65535".to_string(),
+                ));
+            }
+        }
+
         match url::Url::parse(&input) {
             Ok(inner) => {
                 // Reject hostnames > 255 chars (curl returns CURLE_URL_MALFORMAT: test 399)

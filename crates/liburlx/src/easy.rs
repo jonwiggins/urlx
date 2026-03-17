@@ -3343,6 +3343,23 @@ async fn perform_transfer(
             }
 
             if let Some(location) = response.header("location") {
+                // Reject redirect URLs with empty authority (e.g. http:////path).
+                // curl returns CURLE_URL_MALFORMAT for these (test 1142).
+                if let Some(rest) = location.strip_prefix("http://") {
+                    if rest.starts_with('/') {
+                        return Err(Error::UrlParse(
+                            "Redirect to URL with bad scheme or empty host".to_string(),
+                        ));
+                    }
+                }
+                if let Some(rest) = location.strip_prefix("https://") {
+                    if rest.starts_with('/') {
+                        return Err(Error::UrlParse(
+                            "Redirect to URL with bad scheme or empty host".to_string(),
+                        ));
+                    }
+                }
+
                 // Resolve relative URLs against current URL
                 let mut next_url =
                     if location.starts_with("http://") || location.starts_with("https://") {

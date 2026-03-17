@@ -629,8 +629,14 @@ pub fn run(args: &[String]) -> ExitCode {
 
     // Multiple URLs: use Multi API for concurrent transfers
     if opts.urls.len() > 1 {
-        // Build per-URL output filenames with #N glob template substitution
-        let per_url_output: Vec<String> = if let Some(ref tmpl) = opts.output_file {
+        // Build per-URL output filenames:
+        // - With --next: use output_files positionally (each -o pairs with its URL group, test 1134)
+        // - Without --next (glob): expand single -o template with #N substitution (tests 74,86,87)
+        // - Otherwise, no per-URL output files (all go to stdout)
+        let per_url_output: Vec<String> = if opts.had_next && !opts.output_files.is_empty() {
+            // Per-URL output files from individual -o flags (may be fewer than URLs)
+            opts.output_files.clone()
+        } else if let Some(ref tmpl) = opts.output_file {
             opts.urls
                 .iter()
                 .enumerate()
@@ -658,6 +664,7 @@ pub fn run(args: &[String]) -> ExitCode {
             opts.skip_existing,
             opts.time_cond_ts,
             opts.time_cond_negate,
+            &opts.per_url_credentials,
         );
     }
 
@@ -1691,6 +1698,7 @@ pub fn run_multi(
     skip_existing: bool,
     time_cond_ts: Option<i64>,
     time_cond_negate: bool,
+    per_url_credentials: &[Option<(String, String)>],
 ) -> ExitCode {
     if parallel {
         return run_multi_parallel(
@@ -1716,7 +1724,7 @@ pub fn run_multi(
         });
 
     let mut easy = template.clone();
-    let mut any_failed = false;
+    let mut last_exit = ExitCode::SUCCESS;
 
     for (i, url) in urls.iter().enumerate() {
         // --skip-existing: skip transfer if output file already exists
@@ -1733,19 +1741,23 @@ pub fn run_multi(
 
         if let Err(e) = easy.url(url) {
             if !silent || show_error {
-                eprintln!("curl: error parsing URL '{url}': {e}");
+                eprintln!("curl: ({}) URL rejected: {e}", 3);
             }
-            return ExitCode::FAILURE;
+            last_exit = ExitCode::from(3); // CURLE_URL_MALFORMAT
+            continue;
         }
 
-        // Extract credentials from URL userinfo (user:pass@host) for each URL
-        {
+        // Apply per-URL credentials: -u flag takes priority, then URL userinfo.
+        // Remove old Authorization header before setting new credentials (curl compat: test 1134).
+        if let Some(Some((ref user, ref pass))) = per_url_credentials.get(i) {
+            easy.remove_header("Authorization");
+            easy.basic_auth(user, pass);
+        } else {
             let url_user = extract_url_username_raw(url);
             let url_pass = extract_url_password(url);
             if url_user.is_some() || url_pass.is_some() {
                 let user = url_user.unwrap_or_default();
                 let pass = url_pass.unwrap_or_default();
-                // Remove old auth header and set new one per URL
                 easy.remove_header("Authorization");
                 easy.basic_auth(&user, &pass);
             }
@@ -1754,7 +1766,7 @@ pub fn run_multi(
         match rt.block_on(easy.perform_async()) {
             Ok(response) => {
                 if fail_on_error && response.status() >= 400 {
-                    any_failed = true;
+                    last_exit = ExitCode::from(22); // CURLE_HTTP_RETURNED_ERROR
                     continue;
                 }
                 // Each URL uses its corresponding output file (from #N substitution)
@@ -1782,26 +1794,23 @@ pub fn run_multi(
                     suppress_body,
                 );
                 if exit != ExitCode::SUCCESS {
-                    any_failed = true;
+                    last_exit = exit;
                 }
             }
             Err(e) => {
                 if !silent || show_error {
                     eprintln!("curl: transfer {} ({}): {e}", i + 1, url);
                 }
+                let exit = error_to_exit_code(&e);
                 if fail_early {
-                    return error_to_exit_code(&e);
+                    return exit;
                 }
-                any_failed = true;
+                last_exit = exit;
             }
         }
     }
 
-    if any_failed {
-        ExitCode::FAILURE
-    } else {
-        ExitCode::SUCCESS
-    }
+    last_exit
 }
 
 /// Run multiple URLs concurrently using the Multi API.
