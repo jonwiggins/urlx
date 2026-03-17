@@ -506,12 +506,112 @@ pub fn format_write_out(fmt: &str, response: &liburlx::Response) -> String {
         result = result.replace("%{local_port}", "0");
     }
 
+    // Handle %header{name} and %header{name:all:separator} patterns
+    // (curl compat: tests 764, 765)
+    result = replace_header_variables(&result, response);
+
     // Handle escape sequences
     result = result.replace("\\n", "\n");
     result = result.replace("\\t", "\t");
     result = result.replace("\\r", "\r");
 
     result
+}
+
+/// Replace `%header{name}` and `%header{name:all:separator}` patterns in a write-out string.
+///
+/// `%header{name}` returns the last value of the header.
+/// `%header{name:all:separator}` returns all values joined by the separator.
+/// The separator may contain `\}` to include a literal `}`.
+fn replace_header_variables(fmt: &str, response: &liburlx::Response) -> String {
+    let mut result = String::with_capacity(fmt.len());
+    let mut chars = fmt.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '%' {
+            // Check if this is %header{
+            let rest: String = chars.clone().collect();
+            if rest.starts_with("header{") {
+                // Consume "header{"
+                for _ in 0..7 {
+                    let _ = chars.next();
+                }
+                // Read until unescaped }
+                let mut content = String::new();
+                let mut found_close = false;
+                while let Some(c) = chars.next() {
+                    if c == '\\' {
+                        if let Some(&next_c) = chars.peek() {
+                            if next_c == '}' {
+                                content.push('}');
+                                let _ = chars.next();
+                                continue;
+                            }
+                        }
+                        content.push(c);
+                    } else if c == '}' {
+                        found_close = true;
+                        break;
+                    } else {
+                        content.push(c);
+                    }
+                }
+                if found_close {
+                    result.push_str(&expand_header_var(&content, response));
+                } else {
+                    // Malformed — output as-is
+                    result.push('%');
+                    result.push_str("header{");
+                    result.push_str(&content);
+                }
+            } else {
+                result.push(ch);
+            }
+        } else {
+            result.push(ch);
+        }
+    }
+
+    result
+}
+
+/// Expand a header variable content (the part inside `%header{...}`).
+///
+/// Formats:
+/// - `name` → last value of header `name`
+/// - `name:all:sep` → all values of header `name` joined by `sep`
+fn expand_header_var(content: &str, response: &liburlx::Response) -> String {
+    // Check for :all: pattern
+    if let Some(colon_pos) = content.find(':') {
+        let name = &content[..colon_pos];
+        let rest = &content[colon_pos + 1..];
+        if let Some(sep_start) = rest.strip_prefix("all:") {
+            // Collect all values of this header from all responses (redirects + final)
+            let mut values = Vec::new();
+            for redir_resp in response.redirect_responses() {
+                collect_header_values(redir_resp, name, &mut values);
+            }
+            collect_header_values(response, name, &mut values);
+            return values.join(sep_start);
+        }
+    }
+
+    // Simple %header{name} — return the value from the final response
+    response.header(&content.to_ascii_lowercase()).unwrap_or("").to_string()
+}
+
+/// Collect all values of a header from a response's ordered headers.
+fn collect_header_values(resp: &liburlx::Response, name: &str, values: &mut Vec<String>) {
+    let name_lower = name.to_ascii_lowercase();
+    for (hdr_name, hdr_value) in resp.headers_ordered() {
+        if hdr_name.eq_ignore_ascii_case(&name_lower) {
+            // Raw values from headers_ordered include the ": " prefix (e.g., ": value")
+            // because they are stored in wire format. Strip the colon prefix.
+            let clean_value =
+                hdr_value.strip_prefix(':').map(|v| v.trim_start()).unwrap_or(hdr_value);
+            values.push(clean_value.to_string());
+        }
+    }
 }
 
 /// Parse a URL string into its components.

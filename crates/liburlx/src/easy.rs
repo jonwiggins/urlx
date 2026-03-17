@@ -4753,7 +4753,7 @@ where
         }
     }
 
-    Err(Error::Http(format!("proxy CONNECT failed with status {status}")))
+    Err(Error::Http(format!("CONNECT tunnel failed, response {status}")))
 }
 
 /// Send a CONNECT request and read the response status + headers.
@@ -4838,6 +4838,38 @@ where
             .map_err(|e| Error::Http(format!("proxy CONNECT read failed: {e}")))?;
 
         if n == 0 {
+            // If we got some data but never found valid HTTP headers via \r\n\r\n,
+            // try bare LF (\n\n) as well. Some servers/test harnesses send bare LF.
+            if total > 0 {
+                // Try \n\n header end (bare LF)
+                if let Some(pos) = buf[..total].windows(2).position(|w| w == b"\n\n") {
+                    let end = pos + 2;
+                    let header_str = std::str::from_utf8(&buf[..end]).map_err(|_| {
+                        Error::Http("invalid proxy CONNECT response encoding".into())
+                    })?;
+                    let mut lines = header_str.lines();
+                    let status_line = lines
+                        .next()
+                        .ok_or_else(|| Error::Http("empty proxy CONNECT response".into()))?;
+                    let parts: Vec<&str> = status_line.splitn(3, ' ').collect();
+                    if parts.len() >= 2 {
+                        if let Ok(status) = parts[1].parse::<u16>() {
+                            let mut response_headers = Vec::new();
+                            for line in lines {
+                                if let Some((name, value)) = line.split_once(':') {
+                                    response_headers
+                                        .push((name.trim().to_string(), value.trim().to_string()));
+                                }
+                            }
+                            let raw_bytes = buf[..end].to_vec();
+                            return Ok((status, response_headers, raw_bytes));
+                        }
+                    }
+                }
+                // No valid HTTP response found at all — invalid response header
+                // (curl compat: test 750 → CURLE_BAD_RESP = 43)
+                return Err(Error::Http("Invalid response header".to_string()));
+            }
             return Err(Error::Http("proxy closed connection during CONNECT".to_string()));
         }
 

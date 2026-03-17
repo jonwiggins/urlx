@@ -116,9 +116,16 @@ pub enum Error {
 }
 
 /// Format a URL glob error with position caret.
+///
+/// For "bad range" errors, includes a `^` caret indicator pointing at the error position.
+/// For "too many" errors (curl compat: test 761), only shows the message and truncated URL.
 fn format_url_glob_error(message: &str, url: &str, position: usize) -> String {
     if url.is_empty() {
         return message.to_string();
+    }
+    // "too many" errors don't show a caret indicator (curl compat: test 761)
+    if message.starts_with("too many") {
+        return format!("{message}\n{url}");
     }
     format!("{message}\n{url}\n{:>width$}", "^", width = position + 1)
 }

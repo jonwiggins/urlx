@@ -784,20 +784,42 @@ fn parse_args_options(args: &[String]) -> Result<CliOptions, u8> {
                 i += 1;
                 let val = require_arg(args, i, "--connect-timeout")?;
                 if let Ok(secs) = val.parse::<f64>() {
+                    // curl rejects values that overflow a 32-bit long
+                    if secs < 0.0 || secs > f64::from(u32::MAX) {
+                        eprintln!(
+                            "curl: option --connect-timeout: expected a proper numerical parameter"
+                        );
+                        eprintln!(
+                            "curl: try 'curl --help' or 'curl --manual' for more information"
+                        );
+                        return Err(2);
+                    }
                     opts.easy.connect_timeout(std::time::Duration::from_secs_f64(secs));
                 } else {
-                    eprintln!("curl: invalid timeout value: {val}");
-                    return Err(1);
+                    eprintln!(
+                        "curl: option --connect-timeout: expected a proper numerical parameter"
+                    );
+                    eprintln!("curl: try 'curl --help' or 'curl --manual' for more information");
+                    return Err(2);
                 }
             }
             "-m" | "--max-time" => {
                 i += 1;
                 let val = require_arg(args, i, "-m")?;
                 if let Ok(secs) = val.parse::<f64>() {
+                    // curl rejects values that overflow a 32-bit long
+                    if secs < 0.0 || secs > f64::from(u32::MAX) {
+                        eprintln!("curl: option -m: expected a proper numerical parameter");
+                        eprintln!(
+                            "curl: try 'curl --help' or 'curl --manual' for more information"
+                        );
+                        return Err(2);
+                    }
                     opts.easy.timeout(std::time::Duration::from_secs_f64(secs));
                 } else {
-                    eprintln!("curl: invalid timeout value: {val}");
-                    return Err(1);
+                    eprintln!("curl: option -m: expected a proper numerical parameter");
+                    eprintln!("curl: try 'curl --help' or 'curl --manual' for more information");
+                    return Err(2);
                 }
             }
             "-w" | "--write-out" => {
@@ -1680,6 +1702,7 @@ fn parse_args_options(args: &[String]) -> Result<CliOptions, u8> {
                 let val = require_arg(args, i, "--url")?;
                 opts.urls.push(val.to_string());
                 opts.per_url_credentials.push(opts.user_credentials.clone());
+                opts.next_needs_url = false;
             }
             "--output-dir" => {
                 i += 1;
@@ -1872,7 +1895,7 @@ fn parse_args_options(args: &[String]) -> Result<CliOptions, u8> {
                 let _val = require_arg(args, i, &args[i - 1].clone())?;
                 // Accepted for compatibility; not implemented
             }
-            "--next" => {
+            "-:" | "--next" => {
                 // --next separates URL groups; assign current group's -u credentials
                 // to URLs in the current group (from group_start_idx onwards), then reset.
                 let group_creds = opts.user_credentials.clone();

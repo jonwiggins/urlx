@@ -40,8 +40,8 @@ pub(crate) fn te_compression_encoding(te: &str) -> Option<String> {
     }
 }
 
-/// Maximum response header size (64 KB, same as curl's default).
-const MAX_HEADER_SIZE: usize = 64 * 1024;
+/// Maximum response header size (300 KB, same as curl's default `MAX_HTTP_RESP_HEADER_SIZE`).
+const MAX_HEADER_SIZE: usize = 300 * 1024;
 
 /// Send an HTTP/1.x request and read the response.
 ///
@@ -855,13 +855,20 @@ fn parse_headers(data: &[u8]) -> Result<ParsedHeaders, Error> {
             return Err(Error::Http("incomplete response headers".to_string()));
         }
         Err(e) => {
+            let emsg = e.to_string();
             // httparse rejects unknown HTTP versions (e.g. HTTP/1.2).
             // curl returns CURLE_UNSUPPORTED_PROTOCOL (1) for these.
             // Only treat as version error if the response actually started with "HTTP/".
-            if e.to_string().contains("invalid HTTP version") && data.starts_with(b"HTTP/") {
+            if emsg.contains("invalid HTTP version") && data.starts_with(b"HTTP/") {
                 return Err(Error::UnsupportedProtocol(
                     "unsupported HTTP version in response".to_string(),
                 ));
+            }
+            // httparse has a limited header buffer (64). If the response has more
+            // headers than that, fall through to the dynamic-buffer retry below.
+            if emsg.contains("too many headers") {
+                // Retry with a larger, heap-allocated header buffer to count them
+                return parse_headers_large(data);
             }
             return Err(Error::Http(format!("Weird server reply: {e}")));
         }
@@ -923,14 +930,101 @@ fn parse_headers(data: &[u8]) -> Result<ParsedHeaders, Error> {
                 })
                 .or_insert(value);
         } else if name == "location" && headers.contains_key("location") {
-            // Duplicate Location headers: mark as error (curl compat: test 772)
+            // Duplicate Location headers with *different* values: mark as error (curl compat: test 772)
+            // Identical duplicates are allowed (curl compat: test 773)
             let _entry = headers.entry(name).and_modify(|existing: &mut String| {
-                existing.push('\x00'); // sentinel for duplicate detection
-                existing.push_str(&value);
+                if *existing != value {
+                    existing.push('\x00'); // sentinel for duplicate detection
+                    existing.push_str(&value);
+                }
             });
         } else {
             let _old = headers.insert(name, value);
         }
+    }
+
+    Ok(ParsedHeaders {
+        status,
+        reason,
+        version,
+        uses_crlf,
+        headers,
+        original_names,
+        headers_ordered,
+    })
+}
+
+/// Maximum number of HTTP response headers allowed (curl compat: test 747).
+const MAX_HEADER_COUNT: usize = 5000;
+
+/// Re-parse headers with a large heap-allocated buffer.
+///
+/// Called when the initial 64-entry stack buffer is too small.
+/// Enforces curl's 5000-header limit (`CURLE_TOO_LARGE` = 100).
+fn parse_headers_large(data: &[u8]) -> Result<ParsedHeaders, Error> {
+    let mut headers_buf: Vec<httparse::Header<'_>> =
+        vec![httparse::EMPTY_HEADER; MAX_HEADER_COUNT + 1];
+    let mut parsed = httparse::Response::new(&mut headers_buf);
+
+    let header_len = match parsed.parse(data) {
+        Ok(httparse::Status::Complete(len)) => len,
+        Ok(httparse::Status::Partial) => {
+            return Err(Error::Http("incomplete response headers".to_string()));
+        }
+        Err(e) => {
+            let emsg = e.to_string();
+            if emsg.contains("too many headers") {
+                // Even 5001 slots were not enough — reject
+                return Err(Error::Transfer {
+                    code: 100,
+                    message: format!("Too many response headers, {MAX_HEADER_COUNT} is max"),
+                });
+            }
+            return Err(Error::Http(format!("Weird server reply: {e}")));
+        }
+    };
+
+    // Count actual headers (non-empty name)
+    let count = parsed.headers.iter().filter(|h| !h.name.is_empty()).count();
+    if count > MAX_HEADER_COUNT {
+        return Err(Error::Transfer {
+            code: 100,
+            message: format!("Too many response headers, {MAX_HEADER_COUNT} is max"),
+        });
+    }
+
+    if header_len > MAX_HEADER_SIZE {
+        return Err(Error::Http(format!(
+            "response headers too large: {header_len} bytes (max {MAX_HEADER_SIZE})"
+        )));
+    }
+
+    let status =
+        parsed.code.ok_or_else(|| Error::Http("response has no status code".to_string()))?;
+    let reason = parsed.reason.map(str::to_string);
+    let version = match parsed.version {
+        Some(0) => ResponseHttpVersion::Http10,
+        Some(1) | None => ResponseHttpVersion::Http11,
+        Some(v) => {
+            return Err(Error::UnsupportedProtocol(format!("unsupported HTTP version: 1.{v}")));
+        }
+    };
+    let uses_crlf = data.windows(2).any(|w| w == b"\r\n");
+    let raw_values = extract_raw_header_values(&data[..header_len]);
+
+    let mut headers = HashMap::with_capacity(parsed.headers.len());
+    let mut original_names = HashMap::with_capacity(parsed.headers.len());
+    let mut headers_ordered = Vec::with_capacity(parsed.headers.len());
+    for (idx, header) in parsed.headers.iter().enumerate() {
+        if header.name.is_empty() {
+            break;
+        }
+        let name = header.name.to_ascii_lowercase();
+        let value = String::from_utf8_lossy(header.value).to_string();
+        let raw_value = raw_values.get(idx).cloned().unwrap_or_else(|| value.clone());
+        headers_ordered.push((header.name.to_string(), raw_value));
+        let _old = original_names.entry(name.clone()).or_insert_with(|| header.name.to_string());
+        let _old2 = headers.insert(name, value);
     }
 
     Ok(ParsedHeaders {

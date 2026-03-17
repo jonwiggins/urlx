@@ -1466,7 +1466,9 @@ pub fn run(args: &[String]) -> ExitCode {
                 let _ = std::io::stdout().flush();
             }
             if !opts.silent || opts.show_error {
-                eprintln!("curl: {e}");
+                let code_num = error_to_curl_code(&e);
+                let msg = curl_error_message(&e);
+                eprintln!("curl: ({code_num}) {msg}");
             }
             // --remove-on-error: delete output file on transfer failure
             if opts.remove_on_error {
@@ -1481,91 +1483,125 @@ pub fn run(args: &[String]) -> ExitCode {
     }
 }
 
-/// Map a liburlx error to a curl-compatible exit code.
+/// Map a liburlx error to a curl-compatible numeric exit code.
 ///
 /// Matches curl's exit code conventions for the most common errors.
-pub fn error_to_exit_code(err: &liburlx::Error) -> ExitCode {
+pub fn error_to_curl_code(err: &liburlx::Error) -> u8 {
     match err {
-        liburlx::Error::UrlParse(_) => ExitCode::from(3), // CURLE_URL_MALFORMAT
-        liburlx::Error::UnsupportedProtocol(_) => ExitCode::from(1), // CURLE_UNSUPPORTED_PROTOCOL
-        liburlx::Error::DnsResolve(_) => ExitCode::from(6), // CURLE_COULDNT_RESOLVE_HOST
+        liburlx::Error::UrlParse(_) => 3,            // CURLE_URL_MALFORMAT
+        liburlx::Error::UnsupportedProtocol(_) => 1, // CURLE_UNSUPPORTED_PROTOCOL
+        liburlx::Error::DnsResolve(_) => 6,          // CURLE_COULDNT_RESOLVE_HOST
         liburlx::Error::Connect(io_err) => {
             match io_err.kind() {
-                // DNS resolution failure
                 std::io::ErrorKind::Other => {
                     let msg = io_err.to_string();
                     if msg.contains("dns") || msg.contains("DNS") || msg.contains("resolve") {
-                        ExitCode::from(6) // CURLE_COULDNT_RESOLVE_HOST
+                        6 // CURLE_COULDNT_RESOLVE_HOST
                     } else {
-                        ExitCode::from(7) // CURLE_COULDNT_CONNECT
+                        7 // CURLE_COULDNT_CONNECT
                     }
                 }
-                _ => ExitCode::from(7), // CURLE_COULDNT_CONNECT
+                _ => 7, // CURLE_COULDNT_CONNECT
             }
         }
         liburlx::Error::Tls(e) => {
             let msg = e.to_string();
             if msg.contains("certificate") || msg.contains("verify") {
-                ExitCode::from(60) // CURLE_PEER_FAILED_VERIFICATION
+                60 // CURLE_PEER_FAILED_VERIFICATION
             } else {
-                ExitCode::from(35) // CURLE_SSL_CONNECT_ERROR
+                35 // CURLE_SSL_CONNECT_ERROR
             }
         }
         liburlx::Error::Http(msg) => {
             if msg.contains("Weird server reply") || msg.contains("binary zero") {
-                ExitCode::from(8) // CURLE_WEIRD_SERVER_REPLY
+                8 // CURLE_WEIRD_SERVER_REPLY
             } else if msg.contains("range not satisfiable") || msg.contains("Range not satisfiable")
             {
-                ExitCode::from(33) // CURLE_RANGE_ERROR
+                33 // CURLE_RANGE_ERROR
             } else if msg.contains("empty response") || msg.contains("Empty response") {
-                ExitCode::from(52) // CURLE_GOT_NOTHING
+                52 // CURLE_GOT_NOTHING
             } else if msg.contains("too many redirects") || msg.contains("Too many redirects") {
-                ExitCode::from(47) // CURLE_TOO_MANY_REDIRECTS
+                47 // CURLE_TOO_MANY_REDIRECTS
             } else if msg.contains("fail_on_error") {
-                ExitCode::from(22) // CURLE_HTTP_RETURNED_ERROR
+                22 // CURLE_HTTP_RETURNED_ERROR
             } else if msg.contains("unsupported protocol")
                 || msg.contains("Unsupported protocol")
                 || msg.contains("invalid HTTP version")
                 || msg.contains("unsupported HTTP version")
             {
-                ExitCode::from(1) // CURLE_UNSUPPORTED_PROTOCOL
+                1 // CURLE_UNSUPPORTED_PROTOCOL
+            } else if msg.contains("Invalid response header") {
+                43 // CURLE_BAD_RESP (curl compat: test 750)
             } else if msg.contains("partial") || msg.contains("Partial") {
-                ExitCode::from(18) // CURLE_PARTIAL_FILE
+                18 // CURLE_PARTIAL_FILE
             } else if msg.contains("upload") || msg.contains("Upload") {
-                ExitCode::from(25) // CURLE_UPLOAD_FAILED
+                25 // CURLE_UPLOAD_FAILED
             } else if msg.contains("send") || msg.contains("Send") {
-                ExitCode::from(55) // CURLE_SEND_ERROR
+                55 // CURLE_SEND_ERROR
             } else {
-                ExitCode::from(56) // CURLE_RECV_ERROR
+                56 // CURLE_RECV_ERROR
             }
         }
         liburlx::Error::Timeout(_) | liburlx::Error::SpeedLimit { .. } => {
-            ExitCode::from(28) // CURLE_OPERATION_TIMEDOUT
+            28 // CURLE_OPERATION_TIMEDOUT
         }
-        liburlx::Error::FileError(_) => ExitCode::from(37), // CURLE_FILE_COULDNT_READ_FILE
-        liburlx::Error::Io(_) => ExitCode::from(23),        // CURLE_WRITE_ERROR
+        liburlx::Error::FileError(_) => 37, // CURLE_FILE_COULDNT_READ_FILE
+        liburlx::Error::Io(_) => 23,        // CURLE_WRITE_ERROR
         liburlx::Error::Ssh(msg) => {
             if msg.contains("No such file")
                 || msg.contains("not found")
                 || msg.contains("does not exist")
             {
-                ExitCode::from(78) // CURLE_REMOTE_FILE_NOT_FOUND
+                78 // CURLE_REMOTE_FILE_NOT_FOUND
             } else if msg.contains("permission denied") || msg.contains("Permission denied") {
-                ExitCode::from(9) // CURLE_REMOTE_ACCESS_DENIED
+                9 // CURLE_REMOTE_ACCESS_DENIED
             } else if msg.contains("quote") || msg.contains("Quote") {
-                ExitCode::from(21) // CURLE_QUOTE_ERROR
+                21 // CURLE_QUOTE_ERROR
             } else {
-                ExitCode::from(67) // CURLE_LOGIN_DENIED
+                67 // CURLE_LOGIN_DENIED
             }
         }
-        liburlx::Error::Transfer { code, .. } => {
-            ExitCode::from(u8::try_from(*code).map_or(1, |c| c))
+        liburlx::Error::Transfer { code, .. } => u8::try_from(*code).unwrap_or(1),
+        liburlx::Error::PartialBody { .. } => 56, // CURLE_RECV_ERROR
+        liburlx::Error::SmtpAuth(_) => 67,        // CURLE_LOGIN_DENIED
+        liburlx::Error::SmtpSend(_) => 55,        // CURLE_SEND_ERROR
+        liburlx::Error::Protocol(code) => u8::try_from(*code).unwrap_or(1),
+        _ => 1,
+    }
+}
+
+/// Map a liburlx error to a curl-compatible exit code.
+///
+/// Matches curl's exit code conventions for the most common errors.
+pub fn error_to_exit_code(err: &liburlx::Error) -> ExitCode {
+    ExitCode::from(error_to_curl_code(err))
+}
+
+/// Get a short error message suitable for curl-style `(CODE) message` output.
+///
+/// Strips the error type prefix and returns just the descriptive message.
+pub fn curl_error_message(err: &liburlx::Error) -> String {
+    match err {
+        liburlx::Error::Http(msg) => msg.clone(),
+        liburlx::Error::Transfer { message, .. } => message.clone(),
+        liburlx::Error::DnsResolve(host) => format!("Could not resolve host: {host}"),
+        liburlx::Error::Timeout(d) => format!("Operation timed out after {d:?}"),
+        liburlx::Error::UrlParse(msg) => msg.clone(),
+        liburlx::Error::Ssh(msg) => msg.clone(),
+        liburlx::Error::Connect(e) => format!("Failed to connect: {e}"),
+        liburlx::Error::Tls(e) => e.to_string(),
+        liburlx::Error::FileError(msg) => msg.clone(),
+        liburlx::Error::PartialBody { message, .. } => message.clone(),
+        liburlx::Error::SmtpAuth(msg) => msg.clone(),
+        liburlx::Error::SmtpSend(msg) => msg.clone(),
+        liburlx::Error::UrlGlob { message, url, position } => {
+            if url.is_empty() {
+                message.clone()
+            } else {
+                format!("{message}\n{url}\n{:>width$}", "^", width = position + 1)
+            }
         }
-        liburlx::Error::PartialBody { .. } => ExitCode::from(56), // CURLE_RECV_ERROR
-        liburlx::Error::SmtpAuth(_) => ExitCode::from(67),        // CURLE_LOGIN_DENIED
-        liburlx::Error::SmtpSend(_) => ExitCode::from(55),        // CURLE_SEND_ERROR
-        liburlx::Error::Protocol(code) => ExitCode::from(u8::try_from(*code).map_or(1, |c| c)),
-        _ => ExitCode::FAILURE,
+        _ => err.to_string(),
     }
 }
 

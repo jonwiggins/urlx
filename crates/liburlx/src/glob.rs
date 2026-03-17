@@ -81,20 +81,37 @@ impl Segment {
     }
 }
 
+/// Maximum number of glob patterns (sets + ranges) allowed in a single URL.
+/// Matches curl's `CURL_GLOB_PATTERNS_MAX`.
+const MAX_GLOB_PATTERNS: usize = 100;
+
 /// Parse a URL glob pattern into segments, tracking character position for errors.
 ///
 /// # Errors
 ///
-/// Returns an error if the glob pattern is malformed.
+/// Returns an error if the glob pattern is malformed or exceeds the pattern limit.
 fn parse_glob(pattern: &str) -> Result<Vec<Segment>, Error> {
     let mut segments = Vec::new();
     let mut chars = pattern.chars().peekable();
     let mut literal = String::new();
     let mut pos: usize = 0;
+    let mut glob_count: usize = 0;
 
     while let Some(&ch) = chars.peek() {
         match ch {
             '{' => {
+                glob_count += 1;
+                if glob_count > MAX_GLOB_PATTERNS {
+                    // Truncate the URL display for the error message
+                    // 1-indexed position for display
+                    let display_pos = pos + 1;
+                    let truncated: String = pattern.chars().take(pos + 2).collect();
+                    return Err(Error::UrlGlob {
+                        message: format!("too many {{}} sets in URL position {display_pos}:"),
+                        url: truncated,
+                        position: pos,
+                    });
+                }
                 if !literal.is_empty() {
                     segments.push(Segment::Literal(std::mem::take(&mut literal)));
                 }
@@ -105,6 +122,16 @@ fn parse_glob(pattern: &str) -> Result<Vec<Segment>, Error> {
                 segments.push(set);
             }
             '[' => {
+                glob_count += 1;
+                if glob_count > MAX_GLOB_PATTERNS {
+                    let display_pos = pos + 1;
+                    let truncated: String = pattern.chars().take(pos + 2).collect();
+                    return Err(Error::UrlGlob {
+                        message: format!("too many [] sets in URL position {display_pos}:"),
+                        url: truncated,
+                        position: pos,
+                    });
+                }
                 if !literal.is_empty() {
                     segments.push(Segment::Literal(std::mem::take(&mut literal)));
                 }
