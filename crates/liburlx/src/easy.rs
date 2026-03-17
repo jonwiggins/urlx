@@ -3430,7 +3430,7 @@ async fn perform_transfer(
         info.speed_download = speed_download;
         info.speed_upload = speed_upload;
         info.size_upload = upload_size;
-        info.effective_method = current_method.clone();
+        info.effective_method.clone_from(&current_method);
         response.set_transfer_info(info);
         if !redirect_chain.is_empty() {
             response.set_redirect_responses(redirect_chain);
@@ -3964,6 +3964,7 @@ async fn do_single_request(
     }
 
     // DNS resolution: check cache first, then use resolver
+    let is_proxy_connect = proxy.is_some();
     let addrs = if let Some(cached) = dns_cache.get(&resolved_host, connect_port) {
         if verbose {
             #[allow(clippy::print_stderr)]
@@ -3977,9 +3978,40 @@ async fn do_single_request(
         let resolved = if let Some(timeout_dur) = connect_timeout {
             tokio::time::timeout(timeout_dur, resolve_fut)
                 .await
-                .map_err(|_| Error::Timeout(timeout_dur))??
+                .map_err(|_| Error::Timeout(timeout_dur))?
+                .map_err(|e| {
+                    // When resolving a proxy hostname fails, return code 5
+                    // (CURLE_COULDNT_RESOLVE_PROXY) instead of 6 (curl compat: test 1329)
+                    if is_proxy_connect {
+                        if let Error::DnsResolve(host) = e {
+                            Error::Transfer {
+                                code: 5,
+                                message: format!("Could not resolve proxy: {host}"),
+                            }
+                        } else {
+                            e
+                        }
+                    } else {
+                        e
+                    }
+                })?
         } else {
-            resolve_fut.await?
+            resolve_fut.await.map_err(|e| {
+                // When resolving a proxy hostname fails, return code 5
+                // (CURLE_COULDNT_RESOLVE_PROXY) instead of 6 (curl compat: test 1329)
+                if is_proxy_connect {
+                    if let Error::DnsResolve(host) = e {
+                        Error::Transfer {
+                            code: 5,
+                            message: format!("Could not resolve proxy: {host}"),
+                        }
+                    } else {
+                        e
+                    }
+                } else {
+                    e
+                }
+            })?
         };
         dns_cache.put(&resolved_host, connect_port, resolved.clone());
         resolved
@@ -4546,6 +4578,9 @@ const fn hex_val(b: u8) -> Option<u8> {
     }
 }
 
+/// Maximum number of content/transfer encodings allowed (curl compat: test 387).
+const MAX_ENCODING_LAYERS: usize = 5;
+
 fn maybe_decompress(mut response: Response, accept_encoding: bool) -> Response {
     // Transfer-Encoding decompression (hop-by-hop): always decompress regardless of
     // --compressed flag. Chunked is already handled at the framing layer; here we
@@ -4556,15 +4591,22 @@ fn maybe_decompress(mut response: Response, accept_encoding: bool) -> Response {
             let mut body = response.body().to_vec();
             // The compression part may be a single encoding like "gzip" or multiple
             // like "deflate, gzip" (applied left-to-right, so decompress right-to-left).
-            let parts: Vec<&str> = compression.split(',').map(str::trim).collect();
+            let parts: Vec<&str> =
+                compression.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+            // Reject overly long encoding chains (curl compat: test 387)
+            if parts.len() > MAX_ENCODING_LAYERS {
+                response.set_body(Vec::new());
+                response.set_body_error(Some("too_many_content_encodings".to_string()));
+                return response;
+            }
             let mut ok = true;
             for enc in parts.iter().rev() {
-                match crate::protocol::http::decompress::decompress(&body, enc) {
-                    Ok(decompressed) => body = decompressed,
-                    Err(_) => {
-                        ok = false;
-                        break;
-                    }
+                if let Ok(decompressed) = crate::protocol::http::decompress::decompress(&body, enc)
+                {
+                    body = decompressed;
+                } else {
+                    ok = false;
+                    break;
                 }
             }
             if ok {
@@ -4580,6 +4622,14 @@ fn maybe_decompress(mut response: Response, accept_encoding: bool) -> Response {
     if accept_encoding {
         if let Some(encoding) = response.header("content-encoding") {
             if encoding != "identity" && !encoding.eq_ignore_ascii_case("none") {
+                // Check encoding chain length limit (curl compat: test 387)
+                if encoding.split(',').map(str::trim).filter(|s| !s.is_empty()).count()
+                    > MAX_ENCODING_LAYERS
+                {
+                    response.set_body(Vec::new());
+                    response.set_body_error(Some("too_many_content_encodings".to_string()));
+                    return response;
+                }
                 if let Ok(decompressed) =
                     crate::protocol::http::decompress::decompress(response.body(), encoding)
                 {
@@ -4759,6 +4809,7 @@ where
 /// Send a CONNECT request and read the response status + headers.
 ///
 /// Returns `(status_code, response_headers, raw_response_bytes)`.
+#[allow(clippy::too_many_lines)]
 async fn send_connect_request<S>(
     stream: &mut S,
     target_host: &str,

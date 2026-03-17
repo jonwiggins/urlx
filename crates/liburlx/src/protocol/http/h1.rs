@@ -1129,8 +1129,20 @@ where
         match stream.read_exact(&mut remaining_buf).await {
             Ok(_) => {}
             Err(e) if is_close_notify_error(&e) => {
-                // Treat as truncated — return what we have
-                return Ok(body);
+                // Treat as truncated — return partial body error
+                // (curl compat: test 376 — CURLE_PARTIAL_FILE when Content-Length > actual)
+                return Err(Error::PartialBody {
+                    message: "transfer closed with outstanding read data remaining".to_string(),
+                    partial_body: body,
+                });
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                // Connection closed before all Content-Length bytes received
+                // (curl compat: test 376 — CURLE_PARTIAL_FILE)
+                return Err(Error::PartialBody {
+                    message: "transfer closed with outstanding read data remaining".to_string(),
+                    partial_body: body,
+                });
             }
             Err(e) => return Err(Error::Http(format!("body read failed: {e}"))),
         }
@@ -1150,7 +1162,15 @@ where
         let mut chunk_buf = vec![0u8; chunk_size];
         match stream.read_exact(&mut chunk_buf).await {
             Ok(_) => {}
-            Err(e) if is_close_notify_error(&e) => break,
+            Err(e)
+                if is_close_notify_error(&e) || e.kind() == std::io::ErrorKind::UnexpectedEof =>
+            {
+                // Connection closed before all Content-Length bytes received
+                return Err(Error::PartialBody {
+                    message: "transfer closed with outstanding read data remaining".to_string(),
+                    partial_body: body,
+                });
+            }
             Err(e) => return Err(Error::Http(format!("body read failed: {e}"))),
         }
         body.extend_from_slice(&chunk_buf);

@@ -665,6 +665,7 @@ pub fn run(args: &[String]) -> ExitCode {
             opts.time_cond_ts,
             opts.time_cond_negate,
             &opts.per_url_credentials,
+            opts.fail_with_body,
         );
     }
 
@@ -1239,11 +1240,18 @@ pub fn run(args: &[String]) -> ExitCode {
             // -J/--remote-header-name: override output filename from Content-Disposition
             if opts.remote_header_name {
                 if let Some(name) = content_disposition_filename(&response) {
-                    opts.output_file = Some(name);
+                    // Apply --output-dir if set (curl compat: test 1311)
+                    if let Some(ref dir) = opts.output_dir {
+                        opts.output_file = Some(
+                            std::path::Path::new(dir).join(&name).to_string_lossy().to_string(),
+                        );
+                    } else {
+                        opts.output_file = Some(name);
+                    }
                 }
             }
 
-            // --dump-header: write headers to file
+            // --dump-header: write headers to file (or stdout if "-")
             if let Some(ref path) = opts.dump_header {
                 let header_text = format_headers(&response);
                 let raw_trailers = response.raw_trailers();
@@ -1252,7 +1260,16 @@ pub fn run(args: &[String]) -> ExitCode {
                 if !raw_trailers.is_empty() {
                     dump_data.extend_from_slice(raw_trailers);
                 }
-                if let Err(e) = std::fs::write(path, dump_data) {
+                if path == "-" {
+                    // Write to stdout (curl compat: test 1335)
+                    use std::io::Write;
+                    if let Err(e) = std::io::stdout().write_all(&dump_data) {
+                        if !opts.silent || opts.show_error {
+                            eprintln!("curl: error writing headers: {e}");
+                        }
+                        return ExitCode::FAILURE;
+                    }
+                } else if let Err(e) = std::fs::write(path, dump_data) {
                     if !opts.silent || opts.show_error {
                         eprintln!("curl: error writing headers to {path}: {e}");
                     }
@@ -1357,6 +1374,14 @@ pub fn run(args: &[String]) -> ExitCode {
                         eprintln!("curl: (18) {body_err}");
                     }
                     return ExitCode::from(18); // CURLE_PARTIAL_FILE
+                }
+                if body_err.contains("too_many_content_encodings") {
+                    if !opts.silent || opts.show_error {
+                        eprintln!(
+                            "curl: (61) Reject response due to more than 5 content encodings"
+                        );
+                    }
+                    return ExitCode::from(61); // CURLE_BAD_CONTENT_ENCODING
                 }
                 if body_err.contains("bad_content_encoding") {
                     if !opts.silent || opts.show_error {
@@ -1562,9 +1587,15 @@ pub fn error_to_curl_code(err: &liburlx::Error) -> u8 {
             }
         }
         liburlx::Error::Transfer { code, .. } => u8::try_from(*code).unwrap_or(1),
-        liburlx::Error::PartialBody { .. } => 56, // CURLE_RECV_ERROR
-        liburlx::Error::SmtpAuth(_) => 67,        // CURLE_LOGIN_DENIED
-        liburlx::Error::SmtpSend(_) => 55,        // CURLE_SEND_ERROR
+        liburlx::Error::PartialBody { message, .. } => {
+            if message.contains("transfer closed") || message.contains("outstanding read data") {
+                18 // CURLE_PARTIAL_FILE
+            } else {
+                56 // CURLE_RECV_ERROR (bad chunk encoding, etc.)
+            }
+        }
+        liburlx::Error::SmtpAuth(_) => 67, // CURLE_LOGIN_DENIED
+        liburlx::Error::SmtpSend(_) => 55, // CURLE_SEND_ERROR
         liburlx::Error::Protocol(code) => u8::try_from(*code).unwrap_or(1),
         _ => 1,
     }
@@ -1735,6 +1766,7 @@ pub fn run_multi(
     time_cond_ts: Option<i64>,
     time_cond_negate: bool,
     per_url_credentials: &[Option<(String, String)>],
+    fail_with_body: bool,
 ) -> ExitCode {
     if parallel {
         return run_multi_parallel(
@@ -1802,6 +1834,18 @@ pub fn run_multi(
         match rt.block_on(easy.perform_async()) {
             Ok(response) => {
                 if fail_on_error && response.status() >= 400 {
+                    // --fail-with-body: output body before returning error (curl compat: test 361)
+                    if fail_with_body {
+                        let file_for_this = output_files.get(i).map(String::as_str);
+                        let _ = output_response(
+                            &response,
+                            file_for_this,
+                            write_out,
+                            include_headers,
+                            silent,
+                            false,
+                        );
+                    }
                     last_exit = ExitCode::from(22); // CURLE_HTTP_RETURNED_ERROR
                     continue;
                 }
@@ -1829,9 +1873,9 @@ pub fn run_multi(
                     silent,
                     suppress_body,
                 );
-                if exit != ExitCode::SUCCESS {
-                    last_exit = exit;
-                }
+                // Always update last_exit: curl uses last transfer's exit code
+                // (curl compat: test 1328 — --fail with glob, last URL succeeds)
+                last_exit = exit;
             }
             Err(e) => {
                 if !silent || show_error {

@@ -43,7 +43,12 @@ pub fn read_file(
             if s <= e && s < data.len() {
                 data[s..=e].to_vec()
             } else {
-                Vec::new()
+                // Range start beyond file size — curl returns error 36
+                // (CURLE_BAD_DOWNLOAD_RESUME) for invalid ranges on file://
+                return Err(Error::Transfer {
+                    code: 36,
+                    message: "Couldn't resume download".to_string(),
+                });
             }
         }
         (Some(start), None) => {
@@ -51,7 +56,11 @@ pub fn read_file(
             if s < data.len() {
                 data[s..].to_vec()
             } else {
-                Vec::new()
+                // Range start beyond file size (curl compat: test 1063)
+                return Err(Error::Transfer {
+                    code: 36,
+                    message: "Couldn't resume download".to_string(),
+                });
             }
         }
         _ => data,

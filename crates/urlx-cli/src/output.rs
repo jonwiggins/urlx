@@ -221,6 +221,8 @@ pub fn content_disposition_filename(response: &liburlx::Response) -> Option<Stri
         // Unquoted: take until semicolon or end
         let end = after.find(';').unwrap_or(after.len());
         let name = after[..end].trim();
+        // Strip leading single quote if present (curl compat: test 1313)
+        let name = name.strip_prefix('\'').unwrap_or(name);
         if name.is_empty() {
             None
         } else {
@@ -485,9 +487,12 @@ pub fn format_write_out(fmt: &str, response: &liburlx::Response) -> String {
         result = result.replace("%{redirect_url}", &redirect_url_normalized);
     }
     let method = if info.effective_method.is_empty() { "GET" } else { &info.effective_method };
-    result = result.replace("%{method}", method);
-    result = result.replace("%{errormsg}", "");
-    result = result.replace("%{exitcode}", "0");
+    #[allow(clippy::literal_string_with_formatting_args)]
+    {
+        result = result.replace("%{method}", method);
+        result = result.replace("%{errormsg}", "");
+        result = result.replace("%{exitcode}", "0");
+    }
     result = result.replace("%{num_retries}", &info.num_retries.to_string());
     // Connection info: use parsed URL components
     let (_, _, _, rip_host, rip_port, _, _, _) = parse_url_components(response.effective_url());

@@ -523,28 +523,24 @@ async fn do_auth<S: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         }
         // Parse Type 2 and generate Type 3
         let challenge_b64 = resp2.message.trim();
-        match crate::auth::ntlm::parse_type2_message(challenge_b64) {
-            Ok(challenge) => {
-                let type3 = crate::auth::ntlm::create_type3_message(&challenge, user, pass, "");
-                send_command(writer, &type3).await?;
-                let auth_resp = read_response(reader).await?;
-                if auth_resp.is_ok() {
-                    return Ok(());
-                }
-                return Err(Error::SmtpAuth(format!(
-                    "AUTH NTLM failed: {} {}",
-                    auth_resp.code, auth_resp.message
-                )));
+        if let Ok(challenge) = crate::auth::ntlm::parse_type2_message(challenge_b64) {
+            let type3 = crate::auth::ntlm::create_type3_message(&challenge, user, pass, "");
+            send_command(writer, &type3).await?;
+            let auth_resp = read_response(reader).await?;
+            if auth_resp.is_ok() {
+                return Ok(());
             }
-            Err(_) => {
-                // Bad Type 2 — cancel auth (send * per RFC 4954)
-                send_command(writer, "*").await?;
-                return Err(Error::Transfer {
-                    code: 67,
-                    message: "NTLM: invalid server challenge".to_string(),
-                });
-            }
+            return Err(Error::SmtpAuth(format!(
+                "AUTH NTLM failed: {} {}",
+                auth_resp.code, auth_resp.message
+            )));
         }
+        // Bad Type 2 — cancel auth (send * per RFC 4954)
+        send_command(writer, "*").await?;
+        return Err(Error::Transfer {
+            code: 67,
+            message: "NTLM: invalid server challenge".to_string(),
+        });
     }
 
     // LOGIN: base64(user), base64(pass)
@@ -772,17 +768,11 @@ async fn write_smtp_data<W: AsyncWrite + Unpin>(
 ///
 /// curl allows `smtp://user;AUTH=EXTERNAL@host/` syntax.
 fn strip_auth_from_username(username: &str) -> String {
-    if let Some(pos) = username.find(";AUTH=").or_else(|| username.find(";auth=")) {
-        username[..pos].to_string()
-    } else {
-        // Case-insensitive search
-        let upper = username.to_uppercase();
-        if let Some(pos) = upper.find(";AUTH=") {
-            username[..pos].to_string()
-        } else {
-            username.to_string()
-        }
-    }
+    username
+        .find(";AUTH=")
+        .or_else(|| username.find(";auth="))
+        .or_else(|| username.to_uppercase().find(";AUTH="))
+        .map_or_else(|| username.to_string(), |pos| username[..pos].to_string())
 }
 
 /// URL-decode a percent-encoded string.

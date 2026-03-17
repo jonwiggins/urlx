@@ -275,7 +275,6 @@ pub async fn retrieve(
                     message: format!("POP3 AUTH OAUTHBEARER failed: {}", auth_resp.message),
                 });
             }
-            true
         } else {
             // XOAUTH2 fallback
             let payload = format!("user={user}\x01auth=Bearer {bearer}\x01\x01");
@@ -301,8 +300,8 @@ pub async fn retrieve(
                     message: format!("POP3 AUTH XOAUTH2 failed: {}", auth_resp.message),
                 });
             }
-            true
         }
+        true
     } else if should_try("CRAM-MD5") {
         send_command(&mut writer, "AUTH CRAM-MD5").await?;
         let mut line = String::new();
@@ -344,38 +343,35 @@ pub async fn retrieve(
         let mut line2 = String::new();
         let _ = reader.read_line(&mut line2).await;
         let challenge_b64 = line2.trim().trim_start_matches('+').trim();
-        match crate::auth::ntlm::parse_type2_message(challenge_b64) {
-            Ok(challenge) => {
-                let type3 = crate::auth::ntlm::create_type3_message(&challenge, user, pass, "");
-                writer
-                    .write_all(format!("{type3}\r\n").as_bytes())
-                    .await
-                    .map_err(|e| Error::Http(format!("POP3 write error: {e}")))?;
-                let _ = writer.flush().await;
-                let auth_resp = read_response(&mut reader).await?;
-                if !auth_resp.ok {
-                    send_command(&mut writer, "QUIT").await?;
-                    let _ = read_response(&mut reader).await;
-                    return Err(Error::Transfer {
-                        code: 67,
-                        message: format!("POP3 AUTH NTLM failed: {}", auth_resp.message),
-                    });
-                }
-            }
-            Err(_) => {
-                // Bad challenge — cancel
-                writer
-                    .write_all(b"*\r\n")
-                    .await
-                    .map_err(|e| Error::Http(format!("POP3 write error: {e}")))?;
-                let _ = writer.flush().await;
+        if let Ok(challenge) = crate::auth::ntlm::parse_type2_message(challenge_b64) {
+            let type3 = crate::auth::ntlm::create_type3_message(&challenge, user, pass, "");
+            writer
+                .write_all(format!("{type3}\r\n").as_bytes())
+                .await
+                .map_err(|e| Error::Http(format!("POP3 write error: {e}")))?;
+            let _ = writer.flush().await;
+            let auth_resp = read_response(&mut reader).await?;
+            if !auth_resp.ok {
                 send_command(&mut writer, "QUIT").await?;
                 let _ = read_response(&mut reader).await;
                 return Err(Error::Transfer {
                     code: 67,
-                    message: "POP3 AUTH NTLM: invalid challenge".to_string(),
+                    message: format!("POP3 AUTH NTLM failed: {}", auth_resp.message),
                 });
             }
+        } else {
+            // Bad challenge — cancel
+            writer
+                .write_all(b"*\r\n")
+                .await
+                .map_err(|e| Error::Http(format!("POP3 write error: {e}")))?;
+            let _ = writer.flush().await;
+            send_command(&mut writer, "QUIT").await?;
+            let _ = read_response(&mut reader).await;
+            return Err(Error::Transfer {
+                code: 67,
+                message: "POP3 AUTH NTLM: invalid challenge".to_string(),
+            });
         }
         true
     } else if should_try("LOGIN") {
@@ -566,11 +562,7 @@ pub async fn retrieve(
 /// Strip `;AUTH=<mechanism>` from a URL username.
 fn strip_auth_from_username(username: &str) -> String {
     let upper = username.to_uppercase();
-    if let Some(pos) = upper.find(";AUTH=") {
-        username[..pos].to_string()
-    } else {
-        username.to_string()
-    }
+    upper.find(";AUTH=").map_or_else(|| username.to_string(), |pos| username[..pos].to_string())
 }
 
 /// Percent-decode a string.

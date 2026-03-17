@@ -469,34 +469,31 @@ pub async fn fetch(
         // Read Type 2 challenge
         let cont2 = read_continuation(&mut reader).await?;
         let challenge_b64 = cont2.trim_start_matches('+').trim();
-        match crate::auth::ntlm::parse_type2_message(challenge_b64) {
-            Ok(challenge) => {
-                let type3 = crate::auth::ntlm::create_type3_message(&challenge, &user, &pass, "");
-                send_raw(&mut writer, type3.as_bytes()).await?;
-                let auth_resp = read_response(&mut reader, &tag).await?;
-                if !auth_resp.is_ok() {
-                    let ltag = tags.next_tag();
-                    let _ = send_command(&mut writer, &ltag, "LOGOUT").await;
-                    return Err(Error::Transfer {
-                        code: 67,
-                        message: format!(
-                            "IMAP NTLM failed: {} {}",
-                            auth_resp.status, auth_resp.message
-                        ),
-                    });
-                }
-            }
-            Err(_) => {
-                // Bad challenge — cancel
-                send_raw(&mut writer, b"*").await?;
-                let _ = read_response(&mut reader, &tag).await;
+        if let Ok(challenge) = crate::auth::ntlm::parse_type2_message(challenge_b64) {
+            let type3 = crate::auth::ntlm::create_type3_message(&challenge, &user, &pass, "");
+            send_raw(&mut writer, type3.as_bytes()).await?;
+            let auth_resp = read_response(&mut reader, &tag).await?;
+            if !auth_resp.is_ok() {
                 let ltag = tags.next_tag();
                 let _ = send_command(&mut writer, &ltag, "LOGOUT").await;
                 return Err(Error::Transfer {
                     code: 67,
-                    message: "IMAP NTLM: invalid challenge".to_string(),
+                    message: format!(
+                        "IMAP NTLM failed: {} {}",
+                        auth_resp.status, auth_resp.message
+                    ),
                 });
             }
+        } else {
+            // Bad challenge — cancel
+            send_raw(&mut writer, b"*").await?;
+            let _ = read_response(&mut reader, &tag).await;
+            let ltag = tags.next_tag();
+            let _ = send_command(&mut writer, &ltag, "LOGOUT").await;
+            return Err(Error::Transfer {
+                code: 67,
+                message: "IMAP NTLM: invalid challenge".to_string(),
+            });
         }
     } else if should_try("PLAIN") {
         let auth_string = format!("\0{user}\0{pass}");
@@ -818,11 +815,7 @@ fn extract_fetch_body(data: &[String]) -> Vec<u8> {
 /// Strip `;AUTH=<mechanism>` from a URL username.
 fn strip_auth_from_username(username: &str) -> String {
     let upper = username.to_uppercase();
-    if let Some(pos) = upper.find(";AUTH=") {
-        username[..pos].to_string()
-    } else {
-        username.to_string()
-    }
+    upper.find(";AUTH=").map_or_else(|| username.to_string(), |pos| username[..pos].to_string())
 }
 
 /// Percent-decode a URL path segment.

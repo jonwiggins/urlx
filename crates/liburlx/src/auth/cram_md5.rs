@@ -5,7 +5,8 @@
 //! the client replies with `username HMAC-MD5(password, challenge)` base64-encoded.
 
 use hmac::{Hmac, Mac};
-use md5::Md5;
+use md5::{Digest, Md5};
+use std::fmt::Write;
 
 /// Compute the CRAM-MD5 response for a given challenge.
 ///
@@ -32,7 +33,6 @@ pub fn cram_md5_response(username: &str, password: &str, challenge: &str) -> Str
     let digest = result.into_bytes();
 
     // Format as "username hex_digest"
-    use std::fmt::Write;
     let mut hex = String::with_capacity(digest.len() * 2);
     for b in &digest {
         let _ = write!(hex, "{b:02x}");
@@ -47,12 +47,10 @@ pub fn cram_md5_response(username: &str, password: &str, challenge: &str) -> Str
 /// Returns the hex digest string.
 #[must_use]
 pub fn apop_digest(timestamp: &str, password: &str) -> String {
-    use md5::Digest;
     let mut hasher = Md5::new();
     hasher.update(timestamp.as_bytes());
     hasher.update(password.as_bytes());
     let result = hasher.finalize();
-    use std::fmt::Write;
     let mut hex = String::with_capacity(result.len() * 2);
     for b in &result {
         let _ = write!(hex, "{b:02x}");
