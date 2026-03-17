@@ -850,6 +850,15 @@ pub fn run(args: &[String]) -> ExitCode {
         }
     }
 
+    // POP3 with -l/--list-only: set custom request to LIST
+    // (curl uses -l to send LIST instead of RETR for POP3)
+    if opts.easy.is_ftp_list_only() {
+        let scheme = opts.easy.url_ref().map(|u| u.scheme().to_lowercase()).unwrap_or_default();
+        if scheme == "pop3" || scheme == "pop3s" {
+            opts.easy.custom_request_target("LIST");
+        }
+    }
+
     // --skip-existing: skip transfer if output file already exists
     if opts.skip_existing {
         if let Some(ref path) = opts.output_file {

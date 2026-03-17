@@ -1830,6 +1830,12 @@ impl Easy {
         self.ftp_list_only = enable;
     }
 
+    /// Returns whether `-l` / `--list-only` mode is enabled.
+    #[must_use]
+    pub const fn is_ftp_list_only(&self) -> bool {
+        self.ftp_list_only
+    }
+
     /// Add an FTP quote command.
     ///
     /// Commands prefixed with `-` are sent after the transfer (post-quote).
