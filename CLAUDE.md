@@ -15,7 +15,7 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 ## Current Status
 
 **Version:** v0.1.0 published (crates.io + GitHub Releases + Homebrew)
-**curl test suite:** 865 pass / 398 fail / 130 skip out of 1393 tests (68.5% pass rate, tests 1-1400)
+**curl test suite:** 870 pass / 393 fail / 130 skip out of 1393 tests (68.9% pass rate, tests 1-1400)
 **Rust test count:** ~2,600
 **Blockers:** None — infrastructure is live
 
@@ -109,7 +109,7 @@ Document every skip with a reason. Skips without rationale are not allowed.
 
 ## Remaining Work: Failure Analysis (as of 2026-03-17)
 
-Full test suite run: 865 pass / 398 fail / 130 skip (tests 1-1400, 30s timeout). (+151 from session start of 714).
+Full test suite run: 870 pass / 393 fail / 130 skip (tests 1-1400, 30s timeout). (+156 from session start of 714).
 
 **78% of failures are bugs in existing features. 22% need new/incomplete features.**
 
