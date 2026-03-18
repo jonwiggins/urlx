@@ -58,7 +58,9 @@ pub struct CliOptions {
     pub(crate) create_dirs: bool,
     pub(crate) proxy_digest: bool,
     pub(crate) proxy_ntlm: bool,
+    pub(crate) proxy_anyauth: bool,
     pub(crate) proxy_user: Option<(String, String)>,
+    pub(crate) suppress_connect_headers: bool,
     pub(crate) trace_file: Option<String>,
     pub(crate) trace_ascii_file: Option<String>,
     pub(crate) trace_time: bool,
@@ -540,7 +542,9 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
         create_dirs: false,
         proxy_digest: false,
         proxy_ntlm: false,
+        proxy_anyauth: false,
         proxy_user: None,
+        suppress_connect_headers: false,
         trace_file: None,
         trace_ascii_file: None,
         trace_time: false,
@@ -868,7 +872,10 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
             "-x" | "--proxy" => {
                 i += 1;
                 let val = require_arg(args, i, "-x")?;
-                if let Err(e) = opts.easy.proxy(val) {
+                if val.is_empty() {
+                    // --proxy "" means no proxy (curl compat: test 1004)
+                    opts.easy.clear_proxy();
+                } else if let Err(e) = opts.easy.proxy(val) {
                     eprintln!("curl: invalid proxy URL: {e}");
                     return Err(1);
                 }
@@ -990,6 +997,12 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
             }
             "--proxy-ntlm" => {
                 opts.proxy_ntlm = true;
+            }
+            "--proxy-anyauth" => {
+                opts.proxy_anyauth = true;
+            }
+            "--suppress-connect-headers" => {
+                opts.suppress_connect_headers = true;
             }
             "--tlsv1.2" => {
                 opts.easy.ssl_min_version(liburlx::TlsVersion::Tls12);
@@ -1837,9 +1850,7 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
             | "--metalink"
             | "--basic"
             | "--proxy-basic"
-            | "--proxy-anyauth"
             | "--tcp-fastopen"
-            | "--suppress-connect-headers"
             | "--no-clobber"
             | "--ca-native"
             | "--no-ca-native"
@@ -2016,8 +2027,24 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
             opts.easy.proxy_ntlm_auth(user, pass);
         } else if opts.proxy_digest {
             opts.easy.proxy_digest_auth(user, pass);
+        } else if opts.proxy_anyauth {
+            opts.easy.proxy_anyauth(user, pass);
         } else {
             opts.easy.proxy_auth(user, pass);
+        }
+    } else if opts.proxy_digest || opts.proxy_ntlm || opts.proxy_anyauth {
+        // Proxy credentials were extracted from the URL (in proxy()). Override the auth
+        // method if --proxy-digest/--proxy-ntlm/--proxy-anyauth was specified.
+        if let Some(creds) = opts.easy.proxy_credentials_ref() {
+            let user = creds.username.clone();
+            let pass = creds.password.clone();
+            if opts.proxy_ntlm {
+                opts.easy.proxy_ntlm_auth(&user, &pass);
+            } else if opts.proxy_digest {
+                opts.easy.proxy_digest_auth(&user, &pass);
+            } else if opts.proxy_anyauth {
+                opts.easy.proxy_anyauth(&user, &pass);
+            }
         }
     }
 

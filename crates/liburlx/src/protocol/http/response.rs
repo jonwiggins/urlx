@@ -116,6 +116,9 @@ pub struct Response {
     /// Includes the status line and all headers with original line endings.
     /// Does NOT include the trailing blank line separator.
     raw_headers: Option<Vec<u8>>,
+    /// The HTTP status code from a CONNECT tunnel response (for `%{http_connect}`).
+    /// 0 when no CONNECT tunnel was used.
+    connect_code: u16,
 }
 
 /// An HTTP/2 server-pushed response.
@@ -160,6 +163,7 @@ impl Response {
             redirect_responses: Vec::new(),
             body_error: None,
             raw_headers: None,
+            connect_code: 0,
         }
     }
 
@@ -189,6 +193,7 @@ impl Response {
             redirect_responses: Vec::new(),
             body_error: None,
             raw_headers: None,
+            connect_code: 0,
         }
     }
 
@@ -220,6 +225,7 @@ impl Response {
             redirect_responses: Vec::new(),
             body_error: None,
             raw_headers: Some(raw_headers),
+            connect_code: 0,
         }
     }
 
@@ -433,6 +439,18 @@ impl Response {
         self.redirect_responses = resps;
     }
 
+    /// Remove CONNECT tunnel responses from the redirect chain.
+    ///
+    /// Used with `--suppress-connect-headers` to hide CONNECT response
+    /// headers from `--include` and `--dump-header` output while keeping
+    /// the `connect_code` for `%{http_connect}`.
+    pub fn suppress_connect_headers(&mut self) {
+        // CONNECT responses are added as redirect_responses with empty
+        // parsed headers (only raw_headers are set). Keep actual redirect
+        // responses (from -L) which have parsed headers.
+        self.redirect_responses.retain(|r| !r.headers.is_empty());
+    }
+
     /// Returns the body error message, if any.
     ///
     /// When set, the response is partial — headers are valid but the body
@@ -462,6 +480,20 @@ impl Response {
         new_body.extend_from_slice(prefix);
         new_body.extend_from_slice(&self.body);
         self.body = new_body;
+    }
+
+    /// Returns the HTTP status code from the CONNECT tunnel response.
+    ///
+    /// Returns 0 when no CONNECT tunnel was used. This maps to curl's
+    /// `%{http_connect}` write-out variable.
+    #[must_use]
+    pub const fn connect_code(&self) -> u16 {
+        self.connect_code
+    }
+
+    /// Set the HTTP CONNECT tunnel response status code.
+    pub const fn set_connect_code(&mut self, code: u16) {
+        self.connect_code = code;
     }
 }
 

@@ -1151,9 +1151,14 @@ pub fn run(args: &[String]) -> ExitCode {
     }
 
     match result {
-        Ok(response) => {
+        Ok(mut response) => {
             if opts.show_progress && !opts.silent {
                 eprintln!();
+            }
+
+            // --suppress-connect-headers: remove CONNECT response from redirect chain
+            if opts.suppress_connect_headers {
+                response.suppress_connect_headers();
             }
 
             // --etag-save: save ETag from response header

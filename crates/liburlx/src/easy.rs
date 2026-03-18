@@ -1101,6 +1101,8 @@ impl Easy {
     ///
     /// Equivalent to curl's `--proxy-digest --proxy-user user:pass`.
     pub fn proxy_digest_auth(&mut self, user: &str, password: &str) {
+        // Remove any Basic auth header set by proxy_auth() (curl compat: test 335)
+        self.headers.retain(|(k, _)| !k.eq_ignore_ascii_case("proxy-authorization"));
         self.proxy_credentials = Some(ProxyAuthCredentials {
             username: user.to_string(),
             password: password.to_string(),
@@ -1115,6 +1117,8 @@ impl Easy {
     ///
     /// Equivalent to curl's `--proxy-ntlm --proxy-user user:pass`.
     pub fn proxy_ntlm_auth(&mut self, user: &str, password: &str) {
+        // Remove any Basic auth header set by proxy_auth()
+        self.headers.retain(|(k, _)| !k.eq_ignore_ascii_case("proxy-authorization"));
         // Extract domain from "DOMAIN\user" format if present
         let (domain, username) = if let Some((d, u)) = user.split_once('\\') {
             (Some(d.to_string()), u.to_string())
@@ -1126,6 +1130,44 @@ impl Easy {
             username,
             password: password.to_string(),
             method: ProxyAuthMethod::Ntlm,
+            domain,
+        });
+    }
+
+    /// Clear the proxy setting.
+    ///
+    /// After calling this, requests will connect directly without a proxy.
+    /// Equivalent to curl's `--proxy ""`.
+    pub fn clear_proxy(&mut self) {
+        self.proxy = None;
+    }
+
+    /// Returns a reference to the current proxy credentials, if set.
+    #[must_use]
+    pub const fn proxy_credentials_ref(&self) -> Option<&ProxyAuthCredentials> {
+        self.proxy_credentials.as_ref()
+    }
+
+    /// Set proxy authentication to auto-select the strongest method.
+    ///
+    /// On 407, examines the `Proxy-Authenticate` header and picks the
+    /// strongest supported method: NTLM > Digest > Basic.
+    ///
+    /// Equivalent to curl's `--proxy-anyauth --proxy-user user:pass`.
+    pub fn proxy_anyauth(&mut self, user: &str, password: &str) {
+        // Remove any Basic auth header set by proxy_auth()
+        self.headers.retain(|(k, _)| !k.eq_ignore_ascii_case("proxy-authorization"));
+        // Extract domain from "DOMAIN\user" format if present (for NTLM)
+        let (domain, username) = if let Some((d, u)) = user.split_once('\\') {
+            (Some(d.to_string()), u.to_string())
+        } else {
+            (None, user.to_string())
+        };
+
+        self.proxy_credentials = Some(ProxyAuthCredentials {
+            username,
+            password: password.to_string(),
+            method: ProxyAuthMethod::Any,
             domain,
         });
     }
@@ -2743,16 +2785,23 @@ async fn perform_transfer(
         // establish_connect_tunnel. For non-CONNECT proxy NTLM, send Type 1 here.
         let is_proxy_ntlm =
             proxy_credentials.is_some_and(|pcreds| pcreds.method == ProxyAuthMethod::Ntlm);
+        let _is_proxy_anyauth =
+            proxy_credentials.is_some_and(|pcreds| pcreds.method == ProxyAuthMethod::Any);
+        let is_proxy_digest =
+            proxy_credentials.is_some_and(|pcreds| pcreds.method == ProxyAuthMethod::Digest);
         let is_connect_tunnel = effective_proxy.is_some() && http_proxy_tunnel;
         if is_proxy_ntlm && !is_connect_tunnel {
             let type1 = crate::auth::ntlm::create_type1_message();
             request_headers.push(("Proxy-Authorization".to_string(), format!("NTLM {type1}")));
         }
-        // Suppress body during NTLM Type 1 negotiation (Content-Length: 0, test 239)
-        // Send Content-Length: 0 for POST/PUT (empty body signals "will resend after auth").
+        // Suppress body during proxy auth negotiation (Content-Length: 0)
+        // For NTLM Type 1, Digest probe, and AnyAuth probe: send empty body.
         // For POST form data: keep Content-Type: application/x-www-form-urlencoded
         // For multipart: suppress Content-Type entirely (curl compat)
-        let ntlm_initial_body = if is_proxy_ntlm && !is_connect_tunnel {
+        // For NTLM and Digest: suppress body on probe (Content-Length: 0).
+        // For AnyAuth: send full body on initial request (proxy might not require auth).
+        let proxy_auth_needs_probe = (is_proxy_ntlm || is_proxy_digest) && !is_connect_tunnel;
+        let ntlm_initial_body = if proxy_auth_needs_probe {
             // Remove multipart Content-Type during NTLM Type 1 (no body = no boundary).
             // Also suppress the auto-generated Content-Type that h1.rs adds for POST.
             let has_multipart_ct = request_headers
@@ -3420,6 +3469,7 @@ async fn perform_transfer(
                             ignore_content_length,
                             speed_limits,
                             ftp_ssl_mode,
+                            use_ssl,
                             ssh_key_path,
                             proxy_tls_config,
                             alt_svc_cache,
@@ -3467,6 +3517,9 @@ async fn perform_transfer(
             }
         }
 
+        // Track proxy auth header from 407 retry for dual-auth (proxy + server) scenarios
+        let mut saved_proxy_auth: Option<(String, String)> = None;
+
         // Handle 407 Proxy Authentication Required for proxy NTLM/Digest (non-CONNECT path)
         if response.status() == 407 {
             if let Some(pcreds) = proxy_credentials {
@@ -3492,10 +3545,13 @@ async fn perform_transfer(
                                 type3_headers.retain(|(k, _)| {
                                     !k.eq_ignore_ascii_case("proxy-authorization")
                                 });
-                                type3_headers.push((
+                                let ntlm_proxy_auth = format!("NTLM {type3}");
+                                saved_proxy_auth = Some((
                                     "Proxy-Authorization".to_string(),
-                                    format!("NTLM {type3}"),
+                                    ntlm_proxy_auth.clone(),
                                 ));
+                                type3_headers
+                                    .push(("Proxy-Authorization".to_string(), ntlm_proxy_auth));
 
                                 response = Box::pin(do_single_request(
                                     &current_url,
@@ -3604,6 +3660,8 @@ async fn perform_transfer(
                                 digest_headers.retain(|(k, _)| {
                                     !k.eq_ignore_ascii_case("proxy-authorization")
                                 });
+                                saved_proxy_auth =
+                                    Some(("Proxy-Authorization".to_string(), auth_value.clone()));
                                 digest_headers
                                     .push(("Proxy-Authorization".to_string(), auth_value));
 
@@ -3680,7 +3738,409 @@ async fn perform_transfer(
                             }
                         }
                     }
+                    ProxyAuthMethod::Any => {
+                        // AnyAuth: parse Proxy-Authenticate and select strongest method
+                        if let Some(proxy_auth) = response.header("proxy-authenticate") {
+                            let selected = select_proxy_auth_method(proxy_auth);
+                            match selected {
+                                Some(ProxyAuthMethod::Ntlm) => {
+                                    // Send Type 1, expect 407 with Type 2, then send Type 3
+                                    redirect_chain.push(response.clone());
+                                    let type1 = crate::auth::ntlm::create_type1_message();
+                                    let mut type1_headers = request_headers.clone();
+                                    type1_headers.retain(|(k, _)| {
+                                        !k.eq_ignore_ascii_case("proxy-authorization")
+                                    });
+                                    type1_headers.push((
+                                        "Proxy-Authorization".to_string(),
+                                        format!("NTLM {type1}"),
+                                    ));
+                                    // Restore multipart Content-Type for Type 1 probe? No — Type 1 is also a probe (no body)
+                                    let type1_resp = Box::pin(do_single_request(
+                                        &current_url,
+                                        &current_method,
+                                        &type1_headers,
+                                        if current_body.is_some() {
+                                            Some(&[] as &[u8])
+                                        } else {
+                                            None
+                                        },
+                                        verbose,
+                                        accept_encoding,
+                                        connect_timeout,
+                                        effective_proxy,
+                                        proxy_credentials,
+                                        resolve_overrides,
+                                        tls_config,
+                                        tcp_nodelay,
+                                        tcp_keepalive,
+                                        unix_socket,
+                                        interface,
+                                        local_port,
+                                        dns_shuffle,
+                                        dns_cache,
+                                        pool,
+                                        #[cfg(feature = "http2")]
+                                        h2_pool,
+                                        http_version,
+                                        expect_100_timeout,
+                                        happy_eyeballs_timeout,
+                                        ignore_content_length,
+                                        speed_limits,
+                                        ftp_ssl_mode,
+                                        use_ssl,
+                                        ssh_key_path,
+                                        proxy_tls_config,
+                                        alt_svc_cache,
+                                        #[cfg(feature = "http2")]
+                                        h2_config,
+                                        dns_resolver,
+                                        custom_request_target,
+                                        tftp_blksize,
+                                        tftp_no_options,
+                                        #[cfg(feature = "ssh")]
+                                        ssh_host_key_policy,
+                                        mail_from,
+                                        mail_rcpt,
+                                        fresh_connect,
+                                        forbid_reuse,
+                                        ftp_config,
+                                        proxy_headers,
+                                        connect_to,
+                                        path_as_is,
+                                        #[cfg(feature = "ssh")]
+                                        ssh_public_keyfile,
+                                        #[cfg(not(feature = "ssh"))]
+                                        None,
+                                        #[cfg(feature = "ssh")]
+                                        ssh_auth_types,
+                                        #[cfg(not(feature = "ssh"))]
+                                        None,
+                                        mail_auth,
+                                        sasl_authzid,
+                                        sasl_ir,
+                                        oauth2_bearer,
+                                        haproxy_protocol,
+                                        abstract_unix_socket,
+                                        chunked_upload,
+                                        http09_allowed,
+                                        deadline,
+                                        http_proxy_tunnel,
+                                        proxy_http_10,
+                                        raw,
+                                    ))
+                                    .await?;
+
+                                    if type1_resp.status() == 407 {
+                                        if let Some(t2_auth) =
+                                            type1_resp.header("proxy-authenticate")
+                                        {
+                                            if let Some(type2_data) = t2_auth.strip_prefix("NTLM ")
+                                            {
+                                                let challenge =
+                                                    crate::auth::ntlm::parse_type2_message(
+                                                        type2_data,
+                                                    )?;
+                                                let domain = pcreds.domain.as_deref().unwrap_or("");
+                                                let type3 = crate::auth::ntlm::create_type3_message(
+                                                    &challenge,
+                                                    &pcreds.username,
+                                                    &pcreds.password,
+                                                    domain,
+                                                );
+                                                redirect_chain.push(type1_resp);
+                                                let mut type3_headers = request_headers.clone();
+                                                type3_headers.retain(|(k, _)| {
+                                                    !k.eq_ignore_ascii_case("proxy-authorization")
+                                                });
+                                                type3_headers.push((
+                                                    "Proxy-Authorization".to_string(),
+                                                    format!("NTLM {type3}"),
+                                                ));
+                                                response = Box::pin(do_single_request(
+                                                    &current_url,
+                                                    &current_method,
+                                                    &type3_headers,
+                                                    current_body.as_deref(),
+                                                    verbose,
+                                                    accept_encoding,
+                                                    connect_timeout,
+                                                    effective_proxy,
+                                                    proxy_credentials,
+                                                    resolve_overrides,
+                                                    tls_config,
+                                                    tcp_nodelay,
+                                                    tcp_keepalive,
+                                                    unix_socket,
+                                                    interface,
+                                                    local_port,
+                                                    dns_shuffle,
+                                                    dns_cache,
+                                                    pool,
+                                                    #[cfg(feature = "http2")]
+                                                    h2_pool,
+                                                    http_version,
+                                                    expect_100_timeout,
+                                                    happy_eyeballs_timeout,
+                                                    ignore_content_length,
+                                                    speed_limits,
+                                                    ftp_ssl_mode,
+                                                    use_ssl,
+                                                    ssh_key_path,
+                                                    proxy_tls_config,
+                                                    alt_svc_cache,
+                                                    #[cfg(feature = "http2")]
+                                                    h2_config,
+                                                    dns_resolver,
+                                                    custom_request_target,
+                                                    tftp_blksize,
+                                                    tftp_no_options,
+                                                    #[cfg(feature = "ssh")]
+                                                    ssh_host_key_policy,
+                                                    mail_from,
+                                                    mail_rcpt,
+                                                    fresh_connect,
+                                                    forbid_reuse,
+                                                    ftp_config,
+                                                    proxy_headers,
+                                                    connect_to,
+                                                    path_as_is,
+                                                    #[cfg(feature = "ssh")]
+                                                    ssh_public_keyfile,
+                                                    #[cfg(not(feature = "ssh"))]
+                                                    None,
+                                                    #[cfg(feature = "ssh")]
+                                                    ssh_auth_types,
+                                                    #[cfg(not(feature = "ssh"))]
+                                                    None,
+                                                    mail_auth,
+                                                    sasl_authzid,
+                                                    sasl_ir,
+                                                    oauth2_bearer,
+                                                    haproxy_protocol,
+                                                    abstract_unix_socket,
+                                                    chunked_upload,
+                                                    http09_allowed,
+                                                    deadline,
+                                                    http_proxy_tunnel,
+                                                    proxy_http_10,
+                                                    raw,
+                                                ))
+                                                .await?;
+                                            }
+                                        }
+                                    } else {
+                                        response = type1_resp;
+                                    }
+                                }
+                                Some(ProxyAuthMethod::Digest) => {
+                                    // Same as explicit Digest path
+                                    if let Ok(challenge) =
+                                        crate::auth::digest::DigestChallenge::parse(proxy_auth)
+                                    {
+                                        let uri = current_url.path().to_string();
+                                        let cnonce = crate::auth::digest::generate_cnonce();
+                                        let auth_value = challenge.respond(
+                                            &pcreds.username,
+                                            &pcreds.password,
+                                            &current_method,
+                                            &uri,
+                                            1,
+                                            &cnonce,
+                                        );
+                                        redirect_chain.push(response.clone());
+                                        let mut digest_headers = request_headers.clone();
+                                        digest_headers.retain(|(k, _)| {
+                                            !k.eq_ignore_ascii_case("proxy-authorization")
+                                        });
+                                        digest_headers
+                                            .push(("Proxy-Authorization".to_string(), auth_value));
+                                        response = Box::pin(do_single_request(
+                                            &current_url,
+                                            &current_method,
+                                            &digest_headers,
+                                            current_body.as_deref(),
+                                            verbose,
+                                            accept_encoding,
+                                            connect_timeout,
+                                            effective_proxy,
+                                            proxy_credentials,
+                                            resolve_overrides,
+                                            tls_config,
+                                            tcp_nodelay,
+                                            tcp_keepalive,
+                                            unix_socket,
+                                            interface,
+                                            local_port,
+                                            dns_shuffle,
+                                            dns_cache,
+                                            pool,
+                                            #[cfg(feature = "http2")]
+                                            h2_pool,
+                                            http_version,
+                                            expect_100_timeout,
+                                            happy_eyeballs_timeout,
+                                            ignore_content_length,
+                                            speed_limits,
+                                            ftp_ssl_mode,
+                                            use_ssl,
+                                            ssh_key_path,
+                                            proxy_tls_config,
+                                            alt_svc_cache,
+                                            #[cfg(feature = "http2")]
+                                            h2_config,
+                                            dns_resolver,
+                                            custom_request_target,
+                                            tftp_blksize,
+                                            tftp_no_options,
+                                            #[cfg(feature = "ssh")]
+                                            ssh_host_key_policy,
+                                            mail_from,
+                                            mail_rcpt,
+                                            fresh_connect,
+                                            forbid_reuse,
+                                            ftp_config,
+                                            proxy_headers,
+                                            connect_to,
+                                            path_as_is,
+                                            #[cfg(feature = "ssh")]
+                                            ssh_public_keyfile,
+                                            #[cfg(not(feature = "ssh"))]
+                                            None,
+                                            #[cfg(feature = "ssh")]
+                                            ssh_auth_types,
+                                            #[cfg(not(feature = "ssh"))]
+                                            None,
+                                            mail_auth,
+                                            sasl_authzid,
+                                            sasl_ir,
+                                            oauth2_bearer,
+                                            haproxy_protocol,
+                                            abstract_unix_socket,
+                                            chunked_upload,
+                                            http09_allowed,
+                                            deadline,
+                                            http_proxy_tunnel,
+                                            proxy_http_10,
+                                            raw,
+                                        ))
+                                        .await?;
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
                     _ => {}
+                }
+            }
+        }
+
+        // After proxy auth (407), the server may also require auth (401).
+        // Handle the "dual auth" case: proxy auth succeeded but server wants credentials.
+        if response.status() == 401 && saved_proxy_auth.is_some() {
+            if let Some(auth) = auth_credentials {
+                if matches!(auth.method, AuthMethod::Digest | AuthMethod::AnyAuth) {
+                    if let Some(www_auth) = response.header("www-authenticate") {
+                        if www_auth.to_lowercase().contains("digest") {
+                            if let Ok(challenge) =
+                                crate::auth::digest::DigestChallenge::parse(www_auth)
+                            {
+                                let uri = current_url.path().to_string();
+                                let cnonce = crate::auth::digest::generate_cnonce();
+                                let auth_value = challenge.respond(
+                                    &auth.username,
+                                    &auth.password,
+                                    &current_method,
+                                    &uri,
+                                    1,
+                                    &cnonce,
+                                );
+
+                                redirect_chain.push(response.clone());
+                                let mut auth_headers = request_headers.clone();
+                                // Add saved proxy auth header from the 407 retry
+                                auth_headers.retain(|(k, _)| {
+                                    !k.eq_ignore_ascii_case("proxy-authorization")
+                                        && !k.eq_ignore_ascii_case("authorization")
+                                });
+                                if let Some(ref pa) = saved_proxy_auth {
+                                    auth_headers.push(pa.clone());
+                                }
+                                auth_headers.push(("Authorization".to_string(), auth_value));
+                                response = Box::pin(do_single_request(
+                                    &current_url,
+                                    &current_method,
+                                    &auth_headers,
+                                    current_body.as_deref(),
+                                    verbose,
+                                    accept_encoding,
+                                    connect_timeout,
+                                    effective_proxy,
+                                    proxy_credentials,
+                                    resolve_overrides,
+                                    tls_config,
+                                    tcp_nodelay,
+                                    tcp_keepalive,
+                                    unix_socket,
+                                    interface,
+                                    local_port,
+                                    dns_shuffle,
+                                    dns_cache,
+                                    pool,
+                                    #[cfg(feature = "http2")]
+                                    h2_pool,
+                                    http_version,
+                                    expect_100_timeout,
+                                    happy_eyeballs_timeout,
+                                    ignore_content_length,
+                                    speed_limits,
+                                    ftp_ssl_mode,
+                                    use_ssl,
+                                    ssh_key_path,
+                                    proxy_tls_config,
+                                    alt_svc_cache,
+                                    #[cfg(feature = "http2")]
+                                    h2_config,
+                                    dns_resolver,
+                                    custom_request_target,
+                                    tftp_blksize,
+                                    tftp_no_options,
+                                    #[cfg(feature = "ssh")]
+                                    ssh_host_key_policy,
+                                    mail_from,
+                                    mail_rcpt,
+                                    fresh_connect,
+                                    forbid_reuse,
+                                    ftp_config,
+                                    proxy_headers,
+                                    connect_to,
+                                    path_as_is,
+                                    #[cfg(feature = "ssh")]
+                                    ssh_public_keyfile,
+                                    #[cfg(not(feature = "ssh"))]
+                                    None,
+                                    #[cfg(feature = "ssh")]
+                                    ssh_auth_types,
+                                    #[cfg(not(feature = "ssh"))]
+                                    None,
+                                    mail_auth,
+                                    sasl_authzid,
+                                    sasl_ir,
+                                    oauth2_bearer,
+                                    haproxy_protocol,
+                                    abstract_unix_socket,
+                                    chunked_upload,
+                                    http09_allowed,
+                                    deadline,
+                                    http_proxy_tunnel,
+                                    proxy_http_10,
+                                    raw,
+                                ))
+                                .await?;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -4676,7 +5136,7 @@ async fn do_single_request(
                         }
                     }
 
-                    let (tunnel_stream, _raw_connect) = establish_connect_tunnel(
+                    let tunnel_result = establish_connect_tunnel(
                         proxy_tls_stream,
                         &host,
                         port,
@@ -4687,6 +5147,18 @@ async fn do_single_request(
                         proxy_http_10,
                     )
                     .await?;
+                    let tunnel_stream = match tunnel_result {
+                        ConnectTunnelResult::Connected { stream, .. } => stream,
+                        ConnectTunnelResult::Failed { status, raw_response } => {
+                            return Ok(make_connect_failed_response(
+                                status,
+                                raw_response,
+                                url.as_str(),
+                                time_namelookup,
+                                time_connect,
+                            ));
+                        }
+                    };
 
                     let tls = crate::tls::TlsConnector::new(tls_config)?;
                     let (mut tls_stream, _alpn) = tls.connect_generic(tunnel_stream, &host).await?;
@@ -4737,7 +5209,7 @@ async fn do_single_request(
                             eprintln!("* Establishing tunnel to {host}:{port} via proxy");
                         }
                     }
-                    let (tun, _raw_connect) = establish_connect_tunnel(
+                    let tunnel_result = establish_connect_tunnel(
                         tcp_stream,
                         &host,
                         port,
@@ -4748,7 +5220,18 @@ async fn do_single_request(
                         proxy_http_10,
                     )
                     .await?;
-                    tun
+                    match tunnel_result {
+                        ConnectTunnelResult::Connected { stream, .. } => stream,
+                        ConnectTunnelResult::Failed { status, raw_response } => {
+                            return Ok(make_connect_failed_response(
+                                status,
+                                raw_response,
+                                url.as_str(),
+                                time_namelookup,
+                                time_connect,
+                            ));
+                        }
+                    }
                 } else {
                     tcp_stream
                 };
@@ -4856,7 +5339,7 @@ async fn do_single_request(
                         eprintln!("* Establishing tunnel to {host}:{port} via proxy");
                     }
                 }
-                let (tunnel_stream, raw_connect) = establish_connect_tunnel(
+                let tunnel_result = establish_connect_tunnel(
                     tcp_stream,
                     &host,
                     port,
@@ -4867,6 +5350,21 @@ async fn do_single_request(
                     proxy_http_10,
                 )
                 .await?;
+
+                let (tunnel_stream, raw_connect, connect_status) = match tunnel_result {
+                    ConnectTunnelResult::Connected { stream, raw_connect, connect_status } => {
+                        (stream, raw_connect, connect_status)
+                    }
+                    ConnectTunnelResult::Failed { status, raw_response } => {
+                        return Ok(make_connect_failed_response(
+                            status,
+                            raw_response,
+                            url.as_str(),
+                            time_namelookup,
+                            time_connect,
+                        ));
+                    }
+                };
 
                 let request_target = resolve_request_target(custom_request_target, url, path_as_is);
                 let use_http10 = http_version == HttpVersion::Http10;
@@ -4900,6 +5398,7 @@ async fn do_single_request(
                 let time_starttransfer = request_start.elapsed();
 
                 let mut resp = resp;
+                resp.set_connect_code(connect_status);
                 // Prepend CONNECT response as a redirect response for --include output
                 if !raw_connect.is_empty() {
                     let connect_resp = Response::with_raw_headers(
@@ -5114,6 +5613,55 @@ fn maybe_decompress(mut response: Response, accept_encoding: bool) -> Response {
     response
 }
 
+/// Create a Response for a failed CONNECT tunnel.
+///
+/// When the proxy returns a non-200 status on CONNECT, curl outputs the
+/// CONNECT response headers and returns error 56 (`CURLE_RECV_ERROR`).
+/// We build a Response with `body_error` set so the CLI can output headers
+/// and then return the error exit code.
+fn make_connect_failed_response(
+    status: u16,
+    raw_response: Vec<u8>,
+    effective_url: &str,
+    time_namelookup: std::time::Duration,
+    time_connect: std::time::Duration,
+) -> Response {
+    let mut resp = Response::with_raw_headers(
+        0,
+        std::collections::HashMap::new(),
+        Vec::new(),
+        effective_url.to_string(),
+        raw_response,
+    );
+    resp.set_connect_code(status);
+    resp.set_body_error(Some(format!("CONNECT tunnel failed, response {status}")));
+    let mut info = resp.transfer_info().clone();
+    info.time_namelookup = time_namelookup;
+    info.time_connect = time_connect;
+    resp.set_transfer_info(info);
+    resp
+}
+
+/// Result of a CONNECT tunnel attempt.
+enum ConnectTunnelResult<S> {
+    /// Tunnel established successfully.
+    Connected {
+        /// The underlying stream (ready for inner HTTP request or TLS).
+        stream: S,
+        /// Raw CONNECT response bytes (for --include output).
+        raw_connect: Vec<u8>,
+        /// CONNECT response status code (200).
+        connect_status: u16,
+    },
+    /// CONNECT failed with a non-200 status (not recoverable).
+    Failed {
+        /// The CONNECT response status code.
+        status: u16,
+        /// Raw CONNECT response bytes (for output).
+        raw_response: Vec<u8>,
+    },
+}
+
 /// Establish an HTTP CONNECT tunnel through a proxy.
 ///
 /// Sends a CONNECT request to the proxy and validates the 200 response
@@ -5132,7 +5680,7 @@ async fn establish_connect_tunnel<S>(
     proxy_headers: &[(String, String)],
     verbose: bool,
     proxy_http_10: bool,
-) -> Result<(S, Vec<u8>), Error>
+) -> Result<ConnectTunnelResult<S>, Error>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -5164,7 +5712,22 @@ where
     .await?;
 
     if status == 200 {
-        return Ok((stream, raw_connect));
+        // Log warnings for ignored CONNECT response headers (curl compat: test 1287)
+        if verbose {
+            if find_header(&response_headers, "content-length").is_some() {
+                #[allow(clippy::print_stderr)]
+                {
+                    eprintln!("* Ignoring Content-Length in CONNECT {status} response");
+                }
+            }
+            if find_header(&response_headers, "transfer-encoding").is_some() {
+                #[allow(clippy::print_stderr)]
+                {
+                    eprintln!("* Ignoring Transfer-Encoding in CONNECT {status} response");
+                }
+            }
+        }
+        return Ok(ConnectTunnelResult::Connected { stream, raw_connect, connect_status: status });
     }
 
     // Handle 407 Proxy Authentication Required
@@ -5214,12 +5777,17 @@ where
                                 // Concatenate 407 + 200 raw bytes for --include output
                                 let mut combined = raw_connect.clone();
                                 combined.extend_from_slice(&raw_retry);
-                                return Ok((stream, combined));
+                                return Ok(ConnectTunnelResult::Connected {
+                                    stream,
+                                    raw_connect: combined,
+                                    connect_status: retry_status,
+                                });
                             }
 
-                            return Err(Error::Http(format!(
-                                "proxy CONNECT Digest auth failed with status {retry_status}"
-                            )));
+                            return Ok(ConnectTunnelResult::Failed {
+                                status: retry_status,
+                                raw_response: raw_retry,
+                            });
                         }
                     }
                 }
@@ -5253,12 +5821,17 @@ where
                                 // Concatenate 407 + 200 raw bytes for --include output
                                 let mut combined = raw_connect.clone();
                                 combined.extend_from_slice(&raw3);
-                                return Ok((stream, combined));
+                                return Ok(ConnectTunnelResult::Connected {
+                                    stream,
+                                    raw_connect: combined,
+                                    connect_status: status3,
+                                });
                             }
 
-                            return Err(Error::Http(format!(
-                                "proxy CONNECT NTLM auth failed with status {status3}"
-                            )));
+                            return Ok(ConnectTunnelResult::Failed {
+                                status: status3,
+                                raw_response: raw3,
+                            });
                         }
                     }
 
@@ -5269,15 +5842,173 @@ where
                 ProxyAuthMethod::Basic => {
                     // Basic auth should have been in the initial headers already.
                     // If we still got 407, the credentials are wrong.
-                    return Err(Error::Http(format!(
-                        "proxy CONNECT failed with status {status} (Basic auth rejected)"
-                    )));
+                    return Ok(ConnectTunnelResult::Failed { status, raw_response: raw_connect });
+                }
+                ProxyAuthMethod::Any => {
+                    // AnyAuth in CONNECT: parse Proxy-Authenticate and select method
+                    if let Some(ref auth_header) = proxy_auth_header {
+                        let selected = select_proxy_auth_method(auth_header);
+                        match selected {
+                            Some(ProxyAuthMethod::Ntlm) => {
+                                // Need to send Type 1 — the initial CONNECT had no auth
+                                let type1 = crate::auth::ntlm::create_type1_message();
+                                let (status2, resp_headers2, raw2) = send_connect_request(
+                                    &mut stream,
+                                    target_host,
+                                    target_port,
+                                    headers,
+                                    Some(&format!("Proxy-Authorization: NTLM {type1}")),
+                                    proxy_headers,
+                                    proxy_http_10,
+                                )
+                                .await?;
+
+                                if status2 == 407 {
+                                    // Parse Type 2 challenge
+                                    let type2_header =
+                                        find_header(&resp_headers2, "proxy-authenticate");
+                                    if let Some(ref t2h) = type2_header {
+                                        if let Some(type2_data) = t2h.strip_prefix("NTLM ") {
+                                            let challenge =
+                                                crate::auth::ntlm::parse_type2_message(type2_data)?;
+                                            let domain = creds.domain.as_deref().unwrap_or("");
+                                            let type3 = crate::auth::ntlm::create_type3_message(
+                                                &challenge,
+                                                &creds.username,
+                                                &creds.password,
+                                                domain,
+                                            );
+                                            let (status3, _, raw3) = send_connect_request(
+                                                &mut stream,
+                                                target_host,
+                                                target_port,
+                                                headers,
+                                                Some(&format!("Proxy-Authorization: NTLM {type3}")),
+                                                proxy_headers,
+                                                proxy_http_10,
+                                            )
+                                            .await?;
+
+                                            if status3 == 200 {
+                                                let mut combined = raw_connect.clone();
+                                                combined.extend_from_slice(&raw2);
+                                                combined.extend_from_slice(&raw3);
+                                                return Ok(ConnectTunnelResult::Connected {
+                                                    stream,
+                                                    raw_connect: combined,
+                                                    connect_status: status3,
+                                                });
+                                            }
+                                            return Ok(ConnectTunnelResult::Failed {
+                                                status: status3,
+                                                raw_response: raw3,
+                                            });
+                                        }
+                                    }
+                                }
+                                return Ok(ConnectTunnelResult::Failed {
+                                    status: status2,
+                                    raw_response: raw2,
+                                });
+                            }
+                            Some(ProxyAuthMethod::Digest) => {
+                                if let Ok(challenge) =
+                                    crate::auth::digest::DigestChallenge::parse(auth_header)
+                                {
+                                    let uri = format!("{target_host}:{target_port}");
+                                    let cnonce = crate::auth::digest::generate_cnonce();
+                                    let auth_value = challenge.respond(
+                                        &creds.username,
+                                        &creds.password,
+                                        "CONNECT",
+                                        &uri,
+                                        1,
+                                        &cnonce,
+                                    );
+                                    let (retry_status, _, raw_retry) = send_connect_request(
+                                        &mut stream,
+                                        target_host,
+                                        target_port,
+                                        headers,
+                                        Some(&format!("Proxy-Authorization: {auth_value}")),
+                                        proxy_headers,
+                                        proxy_http_10,
+                                    )
+                                    .await?;
+
+                                    if retry_status == 200 {
+                                        let mut combined = raw_connect.clone();
+                                        combined.extend_from_slice(&raw_retry);
+                                        return Ok(ConnectTunnelResult::Connected {
+                                            stream,
+                                            raw_connect: combined,
+                                            connect_status: retry_status,
+                                        });
+                                    }
+                                    return Ok(ConnectTunnelResult::Failed {
+                                        status: retry_status,
+                                        raw_response: raw_retry,
+                                    });
+                                }
+                            }
+                            Some(ProxyAuthMethod::Basic) => {
+                                use base64::Engine;
+                                let encoded = base64::engine::general_purpose::STANDARD.encode(
+                                    format!("{}:{}", creds.username, creds.password).as_bytes(),
+                                );
+                                let (retry_status, _, raw_retry) = send_connect_request(
+                                    &mut stream,
+                                    target_host,
+                                    target_port,
+                                    headers,
+                                    Some(&format!("Proxy-Authorization: Basic {encoded}")),
+                                    proxy_headers,
+                                    proxy_http_10,
+                                )
+                                .await?;
+
+                                if retry_status == 200 {
+                                    let mut combined = raw_connect.clone();
+                                    combined.extend_from_slice(&raw_retry);
+                                    return Ok(ConnectTunnelResult::Connected {
+                                        stream,
+                                        raw_connect: combined,
+                                        connect_status: retry_status,
+                                    });
+                                }
+                                return Ok(ConnectTunnelResult::Failed {
+                                    status: retry_status,
+                                    raw_response: raw_retry,
+                                });
+                            }
+                            _ => {}
+                        }
+                    }
+                    // No auth method offered or no Proxy-Authenticate header
+                    return Ok(ConnectTunnelResult::Failed { status, raw_response: raw_connect });
                 }
             }
         }
     }
 
-    Err(Error::Http(format!("CONNECT tunnel failed, response {status}")))
+    // Non-200, non-407 status or no credentials — CONNECT tunnel failed
+    Ok(ConnectTunnelResult::Failed { status, raw_response: raw_connect })
+}
+
+/// Select the strongest proxy auth method from a Proxy-Authenticate header.
+///
+/// Preference order: NTLM > Digest > Basic (curl compat).
+fn select_proxy_auth_method(header: &str) -> Option<ProxyAuthMethod> {
+    let upper = header.to_uppercase();
+    if upper.contains("NTLM") {
+        Some(ProxyAuthMethod::Ntlm)
+    } else if upper.contains("DIGEST") {
+        Some(ProxyAuthMethod::Digest)
+    } else if upper.contains("BASIC") {
+        Some(ProxyAuthMethod::Basic)
+    } else {
+        None
+    }
 }
 
 /// Send a CONNECT request and read the response status + headers.
@@ -5299,9 +6030,15 @@ where
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let http_version = if proxy_http_10 { "HTTP/1.0" } else { "HTTP/1.1" };
+    // IPv6 addresses need brackets in the CONNECT target (curl compat: test 1230)
+    let connect_host = if target_host.contains(':') && !target_host.starts_with('[') {
+        format!("[{target_host}]")
+    } else {
+        target_host.to_string()
+    };
     let mut connect_req = format!(
-        "CONNECT {target_host}:{target_port} {http_version}\r\n\
-         Host: {target_host}:{target_port}\r\n"
+        "CONNECT {connect_host}:{target_port} {http_version}\r\n\
+         Host: {connect_host}:{target_port}\r\n"
     );
 
     // Add auth header: use extra_header if provided (Digest/NTLM retry),
@@ -5318,30 +6055,36 @@ where
         }
     }
 
-    // Forward User-Agent from request headers (curl sends UA in CONNECT requests)
-    // An empty value (from -A "") suppresses the header entirely.
-    let custom_ua = headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("user-agent"));
-    match custom_ua {
-        Some((_, value)) if value.is_empty() => {
-            // -A "" suppresses User-Agent entirely
-        }
-        Some((name, value)) => {
-            use std::fmt::Write as _;
-            let _ = write!(connect_req, "{name}: {value}\r\n");
-        }
-        None => {
-            connect_req.push_str("User-Agent: curl/0.1.0\r\n");
+    // Check if proxy_headers override User-Agent
+    let proxy_has_ua = proxy_headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("user-agent"));
+
+    // Forward User-Agent: use --proxy-header UA if provided, otherwise -H UA,
+    // otherwise default. An empty value (from -A "") suppresses the header entirely.
+    // curl order: Host, [Auth], User-Agent, Proxy-Connection, [proxy-headers]
+    if !proxy_has_ua {
+        let custom_ua = headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("user-agent"));
+        match custom_ua {
+            Some((_, value)) if value.is_empty() => {
+                // -A "" suppresses User-Agent entirely
+            }
+            Some((name, value)) => {
+                use std::fmt::Write as _;
+                let _ = write!(connect_req, "{name}: {value}\r\n");
+            }
+            None => {
+                connect_req.push_str("User-Agent: curl/0.1.0\r\n");
+            }
         }
     }
+
+    // curl always sends Proxy-Connection: Keep-Alive in CONNECT requests
+    connect_req.push_str("Proxy-Connection: Keep-Alive\r\n");
 
     // Add proxy-specific headers (--proxy-header / CURLOPT_PROXYHEADER)
     for (name, value) in proxy_headers {
         use std::fmt::Write as _;
         let _ = write!(connect_req, "{name}: {value}\r\n");
     }
-
-    // curl always sends Proxy-Connection: Keep-Alive in CONNECT requests
-    connect_req.push_str("Proxy-Connection: Keep-Alive\r\n");
 
     connect_req.push_str("\r\n");
 

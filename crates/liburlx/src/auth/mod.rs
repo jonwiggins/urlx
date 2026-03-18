@@ -59,6 +59,12 @@ pub enum ProxyAuthMethod {
     Digest,
     /// NTLM authentication.
     Ntlm,
+    /// Automatic authentication method selection.
+    ///
+    /// Sends the first request without auth, then examines the
+    /// `Proxy-Authenticate` header to pick the strongest supported method
+    /// (NTLM > Digest > Basic).
+    Any,
 }
 
 /// Proxy authentication credentials.
