@@ -438,20 +438,21 @@ pub fn format_write_out(
     {
         result = result.replace("%{http_connect}", &response.connect_code().to_string());
     }
-    // Header sizes: compute from raw_headers if available, otherwise from parsed headers.
-    // Include all redirect/CONNECT response headers too (curl counts total received header bytes).
-    let header_size: usize = {
+    // Header sizes: use pre-computed size if available (from --suppress-connect-headers),
+    // otherwise compute from raw_headers including redirect/CONNECT responses.
+    let header_size: usize = if response.total_header_size() > 0 {
+        response.total_header_size()
+    } else {
         let mut total: usize = 0;
         // Count redirect/CONNECT response headers
         for redir in response.redirect_responses() {
             if let Some(raw) = redir.raw_headers() {
-                // raw_headers + trailing \r\n
-                total += raw.len() + 2;
+                total += raw.len();
             }
         }
         // Count final response headers
         if let Some(raw) = response.raw_headers() {
-            total += raw.len() + 2;
+            total += raw.len();
         } else {
             total += response.headers().iter().map(|(k, v)| k.len() + v.len() + 4).sum::<usize>();
         }

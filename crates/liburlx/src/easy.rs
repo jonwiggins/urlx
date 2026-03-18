@@ -2681,9 +2681,13 @@ async fn perform_transfer(
         if redirects_followed > 0 {
             let orig_host = original_url.host_str().unwrap_or("");
             let cur_host = current_url.host_str().unwrap_or("");
-            if !orig_host.eq_ignore_ascii_case(cur_host) {
+            let orig_port = original_url.port_or_default().unwrap_or(0);
+            let cur_port = current_url.port_or_default().unwrap_or(0);
+            let is_cross_origin =
+                !orig_host.eq_ignore_ascii_case(cur_host) || orig_port != cur_port;
+            if is_cross_origin {
                 if !unrestricted_auth {
-                    // Strip auth and sensitive headers on cross-host redirect
+                    // Strip auth and sensitive headers on cross-origin redirect
                     request_headers.retain(|(k, _)| {
                         !k.eq_ignore_ascii_case("authorization")
                             && !k.eq_ignore_ascii_case("cookie")
@@ -4060,12 +4064,17 @@ async fn perform_transfer(
                                 redirect_chain.push(response.clone());
                                 let mut auth_headers = request_headers.clone();
                                 // Add saved proxy auth header from the 407 retry
+                                // For Digest: re-send Proxy-Authorization on each request
+                                // For NTLM: connection-based auth, don't re-send
                                 auth_headers.retain(|(k, _)| {
                                     !k.eq_ignore_ascii_case("proxy-authorization")
                                         && !k.eq_ignore_ascii_case("authorization")
                                 });
                                 if let Some(ref pa) = saved_proxy_auth {
-                                    auth_headers.push(pa.clone());
+                                    // Only re-send Proxy-Authorization for Digest (not NTLM)
+                                    if !pa.1.starts_with("NTLM ") {
+                                        auth_headers.push(pa.clone());
+                                    }
                                 }
                                 auth_headers.push(("Authorization".to_string(), auth_value));
                                 response = Box::pin(do_single_request(

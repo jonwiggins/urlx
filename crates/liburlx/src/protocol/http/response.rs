@@ -119,6 +119,10 @@ pub struct Response {
     /// The HTTP status code from a CONNECT tunnel response (for `%{http_connect}`).
     /// 0 when no CONNECT tunnel was used.
     connect_code: u16,
+    /// Pre-computed total header size in bytes (for `%{size_header}` when
+    /// `--suppress-connect-headers` is used). When set, this overrides the
+    /// dynamically computed size. 0 means "not set, compute dynamically".
+    total_header_size: usize,
 }
 
 /// An HTTP/2 server-pushed response.
@@ -164,6 +168,7 @@ impl Response {
             body_error: None,
             raw_headers: None,
             connect_code: 0,
+            total_header_size: 0,
         }
     }
 
@@ -194,6 +199,7 @@ impl Response {
             body_error: None,
             raw_headers: None,
             connect_code: 0,
+            total_header_size: 0,
         }
     }
 
@@ -226,6 +232,7 @@ impl Response {
             body_error: None,
             raw_headers: Some(raw_headers),
             connect_code: 0,
+            total_header_size: 0,
         }
     }
 
@@ -494,6 +501,21 @@ impl Response {
     /// Set the HTTP CONNECT tunnel response status code.
     pub const fn set_connect_code(&mut self, code: u16) {
         self.connect_code = code;
+    }
+
+    /// Returns the pre-computed total header size, if set.
+    ///
+    /// When non-zero, this overrides the dynamically computed `%{size_header}`.
+    /// Used with `--suppress-connect-headers` to preserve the total byte count
+    /// even after CONNECT responses are removed from the redirect chain.
+    #[must_use]
+    pub const fn total_header_size(&self) -> usize {
+        self.total_header_size
+    }
+
+    /// Set the pre-computed total header size.
+    pub const fn set_total_header_size(&mut self, size: usize) {
+        self.total_header_size = size;
     }
 }
 
