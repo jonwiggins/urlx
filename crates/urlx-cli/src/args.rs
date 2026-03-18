@@ -1593,6 +1593,11 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
                 let val = require_arg(args, i, "--sasl-authzid")?;
                 opts.easy.sasl_authzid(val);
             }
+            "--login-options" => {
+                i += 1;
+                let val = require_arg(args, i, "--login-options")?;
+                opts.easy.login_options(val);
+            }
             "--sasl-ir" => {
                 opts.easy.sasl_ir(true);
             }
@@ -1935,7 +1940,6 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
             | "--proxy-tls13-ciphers"
             | "--proxy-ciphers"
             | "--tls13-ciphers"
-            | "--login-options"
             | "--cert-type"
             | "--key-type"
             | "--pass"

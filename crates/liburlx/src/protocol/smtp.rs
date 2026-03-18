@@ -438,6 +438,9 @@ fn determine_smtp_mode(config: &SmtpConfig<'_>, has_data: bool) -> SmtpMode {
 ///
 /// curl's negotiation order: EXTERNAL > OAUTHBEARER > XOAUTH2 > CRAM-MD5 > NTLM > LOGIN > PLAIN.
 /// When `login_options` is set (e.g. `;AUTH=CRAM-MD5`), only that mechanism is tried.
+///
+/// Supports SASL downgrade: when CRAM-MD5 or NTLM fails with a bad challenge,
+/// sends `*` to cancel and tries the next mechanism (PLAIN).
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn do_auth<S: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut BufReader<S>,
@@ -462,17 +465,26 @@ async fn do_auth<S: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     let should_try =
         |mech: &str| forced.map_or_else(|| has(mech), |f| f.eq_ignore_ascii_case(mech));
 
-    // EXTERNAL: send base64(username)
+    // EXTERNAL: send base64(username) or = for empty
     if should_try("EXTERNAL") {
-        send_command(writer, "AUTH EXTERNAL").await?;
-        let resp = read_response(reader).await?;
-        if resp.code == 334 {
-            let encoded = base64::engine::general_purpose::STANDARD.encode(user.as_bytes());
-            send_command(writer, &encoded).await?;
-            let auth_resp = read_response(reader).await?;
-            if auth_resp.is_ok() {
-                return Ok(());
+        let encoded = if user.is_empty() {
+            "=".to_string()
+        } else {
+            base64::engine::general_purpose::STANDARD.encode(user.as_bytes())
+        };
+        if sasl_ir {
+            send_command(writer, &format!("AUTH EXTERNAL {encoded}")).await?;
+        } else {
+            send_command(writer, "AUTH EXTERNAL").await?;
+            let resp = read_response(reader).await?;
+            if resp.code != 334 {
+                return Err(Error::SmtpAuth("AUTH EXTERNAL failed".to_string()));
             }
+            send_command(writer, &encoded).await?;
+        }
+        let auth_resp = read_response(reader).await?;
+        if auth_resp.is_ok() {
+            return Ok(());
         }
         return Err(Error::SmtpAuth("AUTH EXTERNAL failed".to_string()));
     }
@@ -501,10 +513,18 @@ async fn do_auth<S: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             if auth_resp.is_ok() {
                 return Ok(());
             }
-            return Err(Error::SmtpAuth(format!(
-                "AUTH OAUTHBEARER failed: {} {}",
-                auth_resp.code, auth_resp.message
-            )));
+            // Server may send 334 with error JSON — need to send AQ== cancel
+            if auth_resp.code == 334 {
+                send_command(writer, "AQ==").await?;
+                let _ = read_response(reader).await;
+            }
+            return Err(Error::Transfer {
+                code: 67,
+                message: format!(
+                    "AUTH OAUTHBEARER failed: {} {}",
+                    auth_resp.code, auth_resp.message
+                ),
+            });
         }
 
         // XOAUTH2 fallback
@@ -535,6 +555,10 @@ async fn do_auth<S: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         }
     }
 
+    // Track downgrade state
+    let mut cram_failed = false;
+    let mut ntlm_failed = false;
+
     // CRAM-MD5: challenge-response with HMAC-MD5
     if should_try("CRAM-MD5") {
         send_command(writer, "AUTH CRAM-MD5").await?;
@@ -544,63 +568,66 @@ async fn do_auth<S: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         }
         // Server sends base64-encoded challenge
         let challenge_b64 = resp.message.trim();
-        let challenge_bytes = base64::engine::general_purpose::STANDARD
-            .decode(challenge_b64)
-            .map_err(|e| Error::SmtpAuth(format!("CRAM-MD5 challenge decode error: {e}")))?;
-        let challenge = String::from_utf8_lossy(&challenge_bytes);
-        let response_str = crate::auth::cram_md5::cram_md5_response(user, pass, &challenge);
-        let encoded = base64::engine::general_purpose::STANDARD.encode(response_str.as_bytes());
-        send_command(writer, &encoded).await?;
-        let auth_resp = read_response(reader).await?;
-        if auth_resp.is_ok() {
-            return Ok(());
-        }
-        return Err(Error::SmtpAuth(format!(
-            "AUTH CRAM-MD5 failed: {} {}",
-            auth_resp.code, auth_resp.message
-        )));
-    }
-
-    // NTLM: 3-step Type 1/2/3 exchange
-    if should_try("NTLM") {
-        let type1 = crate::auth::ntlm::create_type1_message();
-        send_command(writer, "AUTH NTLM").await?;
-        let resp = read_response(reader).await?;
-        if resp.code != 334 {
-            return Err(Error::SmtpAuth(format!("AUTH NTLM expected 334, got: {}", resp.code)));
-        }
-        // Send Type 1
-        send_command(writer, &type1).await?;
-        let resp2 = read_response(reader).await?;
-        if resp2.code != 334 {
-            // Invalid challenge — cancel auth
-            send_command(writer, "*").await?;
-            return Err(Error::Transfer { code: 67, message: "NTLM challenge failed".to_string() });
-        }
-        // Parse Type 2 and generate Type 3
-        let challenge_b64 = resp2.message.trim();
-        if let Ok(challenge) = crate::auth::ntlm::parse_type2_message(challenge_b64) {
-            let type3 = crate::auth::ntlm::create_type3_message(&challenge, user, pass, "");
-            send_command(writer, &type3).await?;
+        if let Ok(challenge_bytes) = base64::engine::general_purpose::STANDARD.decode(challenge_b64)
+        {
+            let challenge = String::from_utf8_lossy(&challenge_bytes);
+            let response_str = crate::auth::cram_md5::cram_md5_response(user, pass, &challenge);
+            let encoded = base64::engine::general_purpose::STANDARD.encode(response_str.as_bytes());
+            send_command(writer, &encoded).await?;
             let auth_resp = read_response(reader).await?;
             if auth_resp.is_ok() {
                 return Ok(());
             }
             return Err(Error::SmtpAuth(format!(
-                "AUTH NTLM failed: {} {}",
+                "AUTH CRAM-MD5 failed: {} {}",
                 auth_resp.code, auth_resp.message
             )));
         }
-        // Bad Type 2 — cancel auth (send * per RFC 4954)
+        // Invalid challenge — send SASL cancel
         send_command(writer, "*").await?;
-        return Err(Error::Transfer {
-            code: 67,
-            message: "NTLM: invalid server challenge".to_string(),
-        });
+        let _ = read_response(reader).await;
+        cram_failed = true;
+    }
+
+    // NTLM: 3-step Type 1/2/3 exchange
+    if !cram_failed && should_try("NTLM") || cram_failed && has("NTLM") {
+        let type1 = crate::auth::ntlm::create_type1_message();
+        if sasl_ir {
+            send_command(writer, &format!("AUTH NTLM {type1}")).await?;
+        } else {
+            send_command(writer, "AUTH NTLM").await?;
+            let resp = read_response(reader).await?;
+            if resp.code != 334 {
+                return Err(Error::SmtpAuth(format!("AUTH NTLM expected 334, got: {}", resp.code)));
+            }
+            // Send Type 1
+            send_command(writer, &type1).await?;
+        }
+        let resp2 = read_response(reader).await?;
+        if resp2.code == 334 {
+            // Parse Type 2 and generate Type 3
+            let challenge_b64 = resp2.message.trim();
+            if let Ok(challenge) = crate::auth::ntlm::parse_type2_message(challenge_b64) {
+                let type3 = crate::auth::ntlm::create_type3_message(&challenge, user, pass, "");
+                send_command(writer, &type3).await?;
+                let auth_resp = read_response(reader).await?;
+                if auth_resp.is_ok() {
+                    return Ok(());
+                }
+                return Err(Error::SmtpAuth(format!(
+                    "AUTH NTLM failed: {} {}",
+                    auth_resp.code, auth_resp.message
+                )));
+            }
+        }
+        // Invalid or bad Type 2 challenge — cancel auth (send * per RFC 4954)
+        send_command(writer, "*").await?;
+        let _ = read_response(reader).await;
+        ntlm_failed = true;
     }
 
     // LOGIN: base64(user), base64(pass)
-    if should_try("LOGIN") {
+    if should_try("LOGIN") && !cram_failed && !ntlm_failed {
         if sasl_ir {
             let encoded_user = base64::engine::general_purpose::STANDARD.encode(user.as_bytes());
             send_command(writer, &format!("AUTH LOGIN {encoded_user}")).await?;
@@ -635,8 +662,9 @@ async fn do_auth<S: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         )));
     }
 
-    // PLAIN: \0user\0pass
-    if should_try("PLAIN") {
+    // PLAIN: \0user\0pass (also used as downgrade target)
+    let try_plain = should_try("PLAIN") || (cram_failed || ntlm_failed) && has("PLAIN");
+    if try_plain {
         let auth_string = sasl_authzid.map_or_else(
             || format!("\0{user}\0{pass}"),
             |authzid| format!("{authzid}\0{user}\0{pass}"),
@@ -663,6 +691,14 @@ async fn do_auth<S: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             "AUTH PLAIN failed: {} {}",
             auth_resp.code, auth_resp.message
         )));
+    }
+
+    // If CRAM-MD5 or NTLM failed and no PLAIN available, error out
+    if cram_failed || ntlm_failed {
+        return Err(Error::Transfer {
+            code: 67,
+            message: "SMTP authentication cancelled, no fallback available".to_string(),
+        });
     }
 
     Ok(())

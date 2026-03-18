@@ -33,16 +33,17 @@ impl ImapResponse {
 
 /// A simple tag counter for IMAP commands.
 struct TagCounter {
+    prefix: char,
     next: u32,
 }
 
 impl TagCounter {
-    const fn new() -> Self {
-        Self { next: 1 }
+    const fn new(prefix: char) -> Self {
+        Self { prefix, next: 1 }
     }
 
     fn next_tag(&mut self) -> String {
-        let tag = format!("A{:03}", self.next);
+        let tag = format!("{}{:03}", self.prefix, self.next);
         self.next += 1;
         tag
     }
@@ -301,10 +302,12 @@ pub async fn fetch(
     sasl_ir: bool,
     oauth2_bearer: Option<&str>,
     login_options: Option<&str>,
+    sasl_authzid: Option<&str>,
+    resolve_overrides: &[(String, String)],
+    tag_prefix: char,
     use_ssl: UseSsl,
     tls_config: &crate::tls::TlsConfig,
 ) -> Result<Response, Error> {
-    use base64::Engine;
     // Reject URLs with CR or LF in the path (curl compat: test 829).
     // Check BEFORE credentials or connection setup.
     let path = url.path();
@@ -318,15 +321,16 @@ pub async fn fetch(
     }
 
     let (host, port) = url.host_and_port()?;
-    let (raw_user, raw_pass) = url
-        .credentials()
-        .ok_or_else(|| Error::Http("IMAP requires credentials in the URL".to_string()))?;
+    // Credentials are optional for EXTERNAL auth (test 838/840)
+    let creds = url.credentials();
 
     // URL credentials are percent-encoded; decode them for IMAP LOGIN.
     // Strip ";AUTH=..." from username (it's login options, not part of the name).
-    let decoded_user = percent_decode(raw_user);
-    let user = strip_auth_from_username(&decoded_user);
-    let pass = percent_decode(raw_pass);
+    let user = creds.map_or_else(String::new, |(raw_user, _)| {
+        let decoded_user = percent_decode(raw_user);
+        strip_auth_from_username(&decoded_user)
+    });
+    let pass = creds.map_or_else(String::new, |(_, raw_pass)| percent_decode(raw_pass));
 
     let imap_params = parse_imap_url(path, url.query());
 
@@ -334,7 +338,19 @@ pub async fn fetch(
     let use_implicit_tls = url.scheme() == "imaps";
     let use_starttls = !use_implicit_tls && use_ssl != UseSsl::None;
 
-    let addr = format!("{host}:{port}");
+    // Apply resolve overrides: --resolve host:port:addr stores (host, addr) with port stripped
+    let resolved_host =
+        resolve_overrides
+            .iter()
+            .find_map(|(pattern, target)| {
+                if pattern.eq_ignore_ascii_case(&host) {
+                    Some(target.as_str())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(&host);
+    let addr = format!("{resolved_host}:{port}");
     let tcp = tokio::net::TcpStream::connect(&addr).await.map_err(Error::Connect)?;
 
     let (reader, mut writer): (
@@ -350,7 +366,7 @@ pub async fn fetch(
         (Box::new(r), Box::new(w))
     };
     let mut reader = BufReader::new(reader);
-    let mut tags = TagCounter::new();
+    let mut tags = TagCounter::new(tag_prefix);
 
     // Read greeting
     let greeting = read_greeting(&mut reader).await?;
@@ -416,204 +432,36 @@ pub async fn fetch(
 
     let forced =
         login_options.and_then(|lo| lo.strip_prefix("AUTH=").or_else(|| lo.strip_prefix("auth=")));
-    let has_mech = |mech: &str| server_auth_mechs.iter().any(|m| m.eq_ignore_ascii_case(mech));
-    let should_try =
-        |mech: &str| forced.map_or_else(|| has_mech(mech), |f| f.eq_ignore_ascii_case(mech));
+
+    // Check if forced mechanism is +LOGIN (plain LOGIN command, not SASL AUTHENTICATE LOGIN)
+    let force_login_cmd =
+        forced.is_some_and(|f| f.eq_ignore_ascii_case("+LOGIN") || f.eq_ignore_ascii_case("LOGIN"));
 
     // Authenticate using the best available mechanism
     // Order: EXTERNAL > OAUTHBEARER > XOAUTH2 > CRAM-MD5 > NTLM > LOGIN > PLAIN > LOGIN command
-    if should_try("EXTERNAL") {
-        let tag = tags.next_tag();
-        send_command(&mut writer, &tag, "AUTHENTICATE EXTERNAL").await?;
-        let _ = read_continuation(&mut reader).await?;
-        let encoded = base64::engine::general_purpose::STANDARD.encode(user.as_bytes());
-        send_raw(&mut writer, encoded.as_bytes()).await?;
-        let auth_resp = read_response(&mut reader, &tag).await?;
-        if !auth_resp.is_ok() {
-            let ltag = tags.next_tag();
-            let _ = send_command(&mut writer, &ltag, "LOGOUT").await;
-            return Err(Error::Transfer {
-                code: 67,
-                message: "IMAP AUTHENTICATE EXTERNAL failed".to_string(),
-            });
-        }
-    } else if let Some(bearer) = oauth2_bearer {
-        if should_try("OAUTHBEARER") {
-            // RFC 7628 OAUTHBEARER
-            let payload = format!(
-                "n,a={user},\x01host={host}\x01port={port}\x01auth=Bearer {bearer}\x01\x01"
-            );
-            let encoded = base64::engine::general_purpose::STANDARD.encode(payload.as_bytes());
-            let tag = tags.next_tag();
-            if server_sasl_ir || sasl_ir {
-                send_command(&mut writer, &tag, &format!("AUTHENTICATE OAUTHBEARER {encoded}"))
-                    .await?;
-            } else {
-                send_command(&mut writer, &tag, "AUTHENTICATE OAUTHBEARER").await?;
-                let _ = read_continuation(&mut reader).await?;
-                send_raw(&mut writer, encoded.as_bytes()).await?;
-            }
-            let auth_resp = read_response(&mut reader, &tag).await?;
-            if !auth_resp.is_ok() {
-                let ltag = tags.next_tag();
-                let _ = send_command(&mut writer, &ltag, "LOGOUT").await;
-                return Err(Error::Transfer {
-                    code: 67,
-                    message: format!(
-                        "IMAP OAUTHBEARER failed: {} {}",
-                        auth_resp.status, auth_resp.message
-                    ),
-                });
-            }
-        } else {
-            // XOAUTH2 fallback
-            let payload = format!("user={user}\x01auth=Bearer {bearer}\x01\x01");
-            let encoded = base64::engine::general_purpose::STANDARD.encode(payload.as_bytes());
-            let tag = tags.next_tag();
-            if server_sasl_ir || sasl_ir {
-                send_command(&mut writer, &tag, &format!("AUTHENTICATE XOAUTH2 {encoded}")).await?;
-            } else {
-                send_command(&mut writer, &tag, "AUTHENTICATE XOAUTH2").await?;
-                let _ = read_continuation(&mut reader).await?;
-                send_raw(&mut writer, encoded.as_bytes()).await?;
-            }
-            let auth_resp = read_response(&mut reader, &tag).await?;
-            if !auth_resp.is_ok() {
-                let ltag = tags.next_tag();
-                let _ = send_command(&mut writer, &ltag, "LOGOUT").await;
-                return Err(Error::Transfer {
-                    code: 67,
-                    message: format!(
-                        "IMAP XOAUTH2 failed: {} {}",
-                        auth_resp.status, auth_resp.message
-                    ),
-                });
-            }
-        }
-    } else if should_try("CRAM-MD5") {
-        let tag = tags.next_tag();
-        send_command(&mut writer, &tag, "AUTHENTICATE CRAM-MD5").await?;
-        let cont = read_continuation(&mut reader).await?;
-        let challenge_b64 = cont.trim_start_matches('+').trim();
-        let challenge_bytes = base64::engine::general_purpose::STANDARD
-            .decode(challenge_b64)
-            .map_err(|e| Error::Http(format!("CRAM-MD5 decode error: {e}")))?;
-        let challenge = String::from_utf8_lossy(&challenge_bytes);
-        let response_str = crate::auth::cram_md5::cram_md5_response(&user, &pass, &challenge);
-        let encoded = base64::engine::general_purpose::STANDARD.encode(response_str.as_bytes());
-        send_raw(&mut writer, encoded.as_bytes()).await?;
-        let auth_resp = read_response(&mut reader, &tag).await?;
-        if !auth_resp.is_ok() {
-            let ltag = tags.next_tag();
-            let _ = send_command(&mut writer, &ltag, "LOGOUT").await;
-            return Err(Error::Transfer {
-                code: 67,
-                message: format!(
-                    "IMAP CRAM-MD5 failed: {} {}",
-                    auth_resp.status, auth_resp.message
-                ),
-            });
-        }
-    } else if should_try("NTLM") {
-        let type1 = crate::auth::ntlm::create_type1_message();
-        let tag = tags.next_tag();
-        send_command(&mut writer, &tag, "AUTHENTICATE NTLM").await?;
-        let _ = read_continuation(&mut reader).await?;
-        // Send Type 1
-        send_raw(&mut writer, type1.as_bytes()).await?;
-        // Read Type 2 challenge
-        let cont2 = read_continuation(&mut reader).await?;
-        let challenge_b64 = cont2.trim_start_matches('+').trim();
-        if let Ok(challenge) = crate::auth::ntlm::parse_type2_message(challenge_b64) {
-            let type3 = crate::auth::ntlm::create_type3_message(&challenge, &user, &pass, "");
-            send_raw(&mut writer, type3.as_bytes()).await?;
-            let auth_resp = read_response(&mut reader, &tag).await?;
-            if !auth_resp.is_ok() {
-                let ltag = tags.next_tag();
-                let _ = send_command(&mut writer, &ltag, "LOGOUT").await;
-                return Err(Error::Transfer {
-                    code: 67,
-                    message: format!(
-                        "IMAP NTLM failed: {} {}",
-                        auth_resp.status, auth_resp.message
-                    ),
-                });
-            }
-        } else {
-            // Bad challenge — cancel
-            send_raw(&mut writer, b"*").await?;
-            let _ = read_response(&mut reader, &tag).await;
-            let ltag = tags.next_tag();
-            let _ = send_command(&mut writer, &ltag, "LOGOUT").await;
-            return Err(Error::Transfer {
-                code: 67,
-                message: "IMAP NTLM: invalid challenge".to_string(),
-            });
-        }
-    } else if should_try("PLAIN") {
-        let auth_string = format!("\0{user}\0{pass}");
-        let encoded = base64::engine::general_purpose::STANDARD.encode(auth_string.as_bytes());
-        let tag = tags.next_tag();
-        if sasl_ir || server_sasl_ir {
-            send_command(&mut writer, &tag, &format!("AUTHENTICATE PLAIN {encoded}")).await?;
-        } else {
-            send_command(&mut writer, &tag, "AUTHENTICATE PLAIN").await?;
-            let _ = read_continuation(&mut reader).await?;
-            send_raw(&mut writer, encoded.as_bytes()).await?;
-        }
-        let auth_resp = read_response(&mut reader, &tag).await?;
-        if !auth_resp.is_ok() {
-            let ltag = tags.next_tag();
-            let _ = send_command(&mut writer, &ltag, "LOGOUT").await;
-            return Err(Error::Transfer {
-                code: 67,
-                message: format!(
-                    "IMAP AUTHENTICATE PLAIN failed: {} {}",
-                    auth_resp.status, auth_resp.message
-                ),
-            });
-        }
-    } else if should_try("LOGIN") {
-        let tag = tags.next_tag();
-        let user_b64 = base64::engine::general_purpose::STANDARD.encode(user.as_bytes());
-        let pass_b64 = base64::engine::general_purpose::STANDARD.encode(pass.as_bytes());
-        if sasl_ir || server_sasl_ir {
-            send_command(&mut writer, &tag, &format!("AUTHENTICATE LOGIN {user_b64}")).await?;
-        } else {
-            send_command(&mut writer, &tag, "AUTHENTICATE LOGIN").await?;
-            let _ = read_continuation(&mut reader).await?;
-            send_raw(&mut writer, user_b64.as_bytes()).await?;
-        }
-        let _ = read_continuation(&mut reader).await?;
-        send_raw(&mut writer, pass_b64.as_bytes()).await?;
-        let auth_resp = read_response(&mut reader, &tag).await?;
-        if !auth_resp.is_ok() {
-            let ltag = tags.next_tag();
-            let _ = send_command(&mut writer, &ltag, "LOGOUT").await;
-            return Err(Error::Transfer {
-                code: 67,
-                message: format!(
-                    "IMAP AUTHENTICATE LOGIN failed: {} {}",
-                    auth_resp.status, auth_resp.message
-                ),
-            });
-        }
-    } else {
-        // Plain LOGIN command
-        let tag = tags.next_tag();
-        let login_user = if needs_quoting(&user) { imap_quote(&user) } else { user.clone() };
-        let login_pass = if needs_quoting(&pass) { imap_quote(&pass) } else { pass.clone() };
-        send_command(&mut writer, &tag, &format!("LOGIN {login_user} {login_pass}")).await?;
-        let login_resp = read_response(&mut reader, &tag).await?;
-        if !login_resp.is_ok() {
-            let ltag = tags.next_tag();
-            let _ = send_command(&mut writer, &ltag, "LOGOUT").await;
-            return Err(Error::Auth(format!(
-                "IMAP LOGIN failed: {} {}",
-                login_resp.status, login_resp.message
-            )));
-        }
-    }
+    // With downgrade: if CRAM-MD5 or NTLM fails with bad challenge, cancel and try next
+    let auth_result = do_imap_auth(
+        &mut reader,
+        &mut writer,
+        &mut tags,
+        &user,
+        &pass,
+        sasl_ir,
+        server_sasl_ir,
+        oauth2_bearer,
+        sasl_authzid,
+        &host,
+        port,
+        force_login_cmd,
+        forced,
+        &server_auth_mechs,
+    )
+    .await;
+
+    // Auth failed — do NOT send LOGOUT (curl compat: tests 830, 831, 844, 845, 849)
+    // The multi interface considers a broken "CONNECT" as a prematurely broken
+    // transfer and such a connection will not get a "LOGOUT"
+    auth_result?;
 
     // Determine what operation to perform
     let result = dispatch_imap_operation(
@@ -642,6 +490,322 @@ pub async fn fetch(
     // a non-HTTP protocol response.
     resp.set_raw_headers(Vec::new());
     Ok(resp)
+}
+
+/// Perform IMAP authentication with mechanism negotiation and downgrade support.
+///
+/// Tries mechanisms in order: EXTERNAL > OAUTHBEARER > XOAUTH2 > CRAM-MD5 > NTLM > PLAIN > LOGIN cmd.
+/// When CRAM-MD5 or NTLM fails with a bad challenge, sends `*` to cancel and tries the next mechanism.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn do_imap_auth<S: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    reader: &mut BufReader<S>,
+    writer: &mut W,
+    tags: &mut TagCounter,
+    user: &str,
+    pass: &str,
+    sasl_ir: bool,
+    server_sasl_ir: bool,
+    oauth2_bearer: Option<&str>,
+    sasl_authzid: Option<&str>,
+    host: &str,
+    port: u16,
+    force_login_cmd: bool,
+    forced: Option<&str>,
+    server_auth_mechs: &[String],
+) -> Result<(), Error> {
+    use base64::Engine;
+
+    let has_mech = |mech: &str| server_auth_mechs.iter().any(|m| m.eq_ignore_ascii_case(mech));
+    let should_try =
+        |mech: &str| forced.map_or_else(|| has_mech(mech), |f| f.eq_ignore_ascii_case(mech));
+
+    // If forced to plain LOGIN command (AUTH=+LOGIN or AUTH=LOGIN)
+    if force_login_cmd {
+        let tag = tags.next_tag();
+        let login_user = if needs_quoting(user) { imap_quote(user) } else { user.to_string() };
+        let login_pass = if needs_quoting(pass) { imap_quote(pass) } else { pass.to_string() };
+        send_command(writer, &tag, &format!("LOGIN {login_user} {login_pass}")).await?;
+        let login_resp = read_response(reader, &tag).await?;
+        if !login_resp.is_ok() {
+            return Err(Error::Transfer {
+                code: 67,
+                message: format!("IMAP LOGIN failed: {} {}", login_resp.status, login_resp.message),
+            });
+        }
+        return Ok(());
+    }
+
+    // EXTERNAL: send base64(username)
+    if should_try("EXTERNAL") {
+        let tag = tags.next_tag();
+        let use_ir = sasl_ir || server_sasl_ir;
+        let encoded = if user.is_empty() {
+            "=".to_string() // empty initial response
+        } else {
+            base64::engine::general_purpose::STANDARD.encode(user.as_bytes())
+        };
+        if use_ir {
+            send_command(writer, &tag, &format!("AUTHENTICATE EXTERNAL {encoded}")).await?;
+        } else {
+            send_command(writer, &tag, "AUTHENTICATE EXTERNAL").await?;
+            let _ = read_continuation(reader).await?;
+            send_raw(writer, encoded.as_bytes()).await?;
+        }
+        let auth_resp = read_response(reader, &tag).await?;
+        if !auth_resp.is_ok() {
+            return Err(Error::Transfer {
+                code: 67,
+                message: "IMAP AUTHENTICATE EXTERNAL failed".to_string(),
+            });
+        }
+        return Ok(());
+    }
+
+    // OAUTHBEARER / XOAUTH2
+    if let Some(bearer) = oauth2_bearer {
+        if should_try("OAUTHBEARER") {
+            // RFC 7628 OAUTHBEARER
+            let payload = format!(
+                "n,a={user},\x01host={host}\x01port={port}\x01auth=Bearer {bearer}\x01\x01"
+            );
+            let encoded = base64::engine::general_purpose::STANDARD.encode(payload.as_bytes());
+            let tag = tags.next_tag();
+            if server_sasl_ir || sasl_ir {
+                send_command(writer, &tag, &format!("AUTHENTICATE OAUTHBEARER {encoded}")).await?;
+                // After SASL-IR, server may send continuation with error JSON
+                // We need to read next line: if it's '+', send AQ== cancel
+                let line = read_continuation(reader).await?;
+                if line.starts_with('+') {
+                    // Server sent error JSON challenge — send SASL abort (base64 of 0x01)
+                    send_raw(writer, b"AQ==").await?;
+                    let _ = read_response(reader, &tag).await;
+                    return Err(Error::Transfer {
+                        code: 67,
+                        message: "IMAP OAUTHBEARER failed".to_string(),
+                    });
+                }
+                // If it's not '+', it should be the tagged OK/NO response
+                // (handled by read_response which was already consumed)
+                // Actually the read_continuation just reads one line — check if it was
+                // the tagged response
+                if line.starts_with(&tag) {
+                    // Tagged response inline
+                    if line.contains(" OK ") {
+                        return Ok(());
+                    }
+                    return Err(Error::Transfer {
+                        code: 67,
+                        message: "IMAP OAUTHBEARER failed".to_string(),
+                    });
+                }
+                // Otherwise read the tagged response normally
+                let auth_resp = read_response(reader, &tag).await?;
+                if auth_resp.is_ok() {
+                    return Ok(());
+                }
+                return Err(Error::Transfer {
+                    code: 67,
+                    message: format!(
+                        "IMAP OAUTHBEARER failed: {} {}",
+                        auth_resp.status, auth_resp.message
+                    ),
+                });
+            }
+            // Without SASL-IR: send AUTHENTICATE, wait for continuation, send payload
+            send_command(writer, &tag, "AUTHENTICATE OAUTHBEARER").await?;
+            let _ = read_continuation(reader).await?;
+            send_raw(writer, encoded.as_bytes()).await?;
+            let auth_resp = read_response(reader, &tag).await?;
+            if auth_resp.is_ok() {
+                return Ok(());
+            }
+            return Err(Error::Transfer {
+                code: 67,
+                message: format!(
+                    "IMAP OAUTHBEARER failed: {} {}",
+                    auth_resp.status, auth_resp.message
+                ),
+            });
+        }
+
+        if should_try("XOAUTH2") || !should_try("OAUTHBEARER") {
+            // XOAUTH2 fallback (or if XOAUTH2 forced)
+            let payload = format!("user={user}\x01auth=Bearer {bearer}\x01\x01");
+            let encoded = base64::engine::general_purpose::STANDARD.encode(payload.as_bytes());
+            let tag = tags.next_tag();
+            if server_sasl_ir || sasl_ir {
+                send_command(writer, &tag, &format!("AUTHENTICATE XOAUTH2 {encoded}")).await?;
+            } else {
+                send_command(writer, &tag, "AUTHENTICATE XOAUTH2").await?;
+                let _ = read_continuation(reader).await?;
+                send_raw(writer, encoded.as_bytes()).await?;
+            }
+            let auth_resp = read_response(reader, &tag).await?;
+            if !auth_resp.is_ok() {
+                return Err(Error::Transfer {
+                    code: 67,
+                    message: format!(
+                        "IMAP XOAUTH2 failed: {} {}",
+                        auth_resp.status, auth_resp.message
+                    ),
+                });
+            }
+            return Ok(());
+        }
+    }
+
+    // Track whether CRAM-MD5 or NTLM failed (for downgrade)
+    let mut cram_failed = false;
+    let mut ntlm_failed = false;
+
+    // CRAM-MD5
+    if should_try("CRAM-MD5") {
+        let tag = tags.next_tag();
+        send_command(writer, &tag, "AUTHENTICATE CRAM-MD5").await?;
+        let cont = read_continuation(reader).await?;
+        let challenge_b64 = cont.trim_start_matches('+').trim();
+        if let Ok(challenge_bytes) = base64::engine::general_purpose::STANDARD.decode(challenge_b64)
+        {
+            let challenge = String::from_utf8_lossy(&challenge_bytes);
+            let response_str = crate::auth::cram_md5::cram_md5_response(user, pass, &challenge);
+            let encoded = base64::engine::general_purpose::STANDARD.encode(response_str.as_bytes());
+            send_raw(writer, encoded.as_bytes()).await?;
+            let auth_resp = read_response(reader, &tag).await?;
+            if auth_resp.is_ok() {
+                return Ok(());
+            }
+            return Err(Error::Transfer {
+                code: 67,
+                message: format!(
+                    "IMAP CRAM-MD5 failed: {} {}",
+                    auth_resp.status, auth_resp.message
+                ),
+            });
+        }
+        // Invalid challenge — send SASL cancel
+        send_raw(writer, b"*").await?;
+        let _ = read_response(reader, &tag).await;
+        cram_failed = true;
+    }
+
+    // NTLM
+    if !cram_failed && should_try("NTLM") || cram_failed && has_mech("NTLM") {
+        let type1 = crate::auth::ntlm::create_type1_message();
+        let tag = tags.next_tag();
+        let use_ir = sasl_ir || server_sasl_ir;
+        if use_ir {
+            send_command(writer, &tag, &format!("AUTHENTICATE NTLM {type1}")).await?;
+        } else {
+            send_command(writer, &tag, "AUTHENTICATE NTLM").await?;
+            let _ = read_continuation(reader).await?;
+            send_raw(writer, type1.as_bytes()).await?;
+        }
+        // Read Type 2 challenge
+        let cont2 = read_continuation(reader).await?;
+        let challenge_b64 = cont2.trim_start_matches('+').trim();
+        if let Ok(challenge) = crate::auth::ntlm::parse_type2_message(challenge_b64) {
+            let type3 = crate::auth::ntlm::create_type3_message(&challenge, user, pass, "");
+            send_raw(writer, type3.as_bytes()).await?;
+            let auth_resp = read_response(reader, &tag).await?;
+            if auth_resp.is_ok() {
+                return Ok(());
+            }
+            return Err(Error::Transfer {
+                code: 67,
+                message: format!("IMAP NTLM failed: {} {}", auth_resp.status, auth_resp.message),
+            });
+        }
+        // Bad challenge — cancel
+        send_raw(writer, b"*").await?;
+        let _ = read_response(reader, &tag).await;
+        ntlm_failed = true;
+    }
+
+    // PLAIN (also used as downgrade target from CRAM-MD5/NTLM)
+    let try_plain = should_try("PLAIN") || (cram_failed || ntlm_failed) && has_mech("PLAIN");
+    if try_plain {
+        let auth_string = sasl_authzid.map_or_else(
+            || format!("\0{user}\0{pass}"),
+            |authzid| format!("{authzid}\0{user}\0{pass}"),
+        );
+        let encoded = base64::engine::general_purpose::STANDARD.encode(auth_string.as_bytes());
+        let tag = tags.next_tag();
+        if sasl_ir || server_sasl_ir {
+            send_command(writer, &tag, &format!("AUTHENTICATE PLAIN {encoded}")).await?;
+        } else {
+            send_command(writer, &tag, "AUTHENTICATE PLAIN").await?;
+            let _ = read_continuation(reader).await?;
+            send_raw(writer, encoded.as_bytes()).await?;
+        }
+        let auth_resp = read_response(reader, &tag).await?;
+        if auth_resp.is_ok() {
+            return Ok(());
+        }
+        return Err(Error::Transfer {
+            code: 67,
+            message: format!(
+                "IMAP AUTHENTICATE PLAIN failed: {} {}",
+                auth_resp.status, auth_resp.message
+            ),
+        });
+    }
+
+    // LOGIN SASL mechanism (AUTHENTICATE LOGIN)
+    if should_try("LOGIN") {
+        let tag = tags.next_tag();
+        let user_b64 = base64::engine::general_purpose::STANDARD.encode(user.as_bytes());
+        let pass_b64 = base64::engine::general_purpose::STANDARD.encode(pass.as_bytes());
+        if sasl_ir || server_sasl_ir {
+            send_command(writer, &tag, &format!("AUTHENTICATE LOGIN {user_b64}")).await?;
+        } else {
+            send_command(writer, &tag, "AUTHENTICATE LOGIN").await?;
+            let _ = read_continuation(reader).await?;
+            send_raw(writer, user_b64.as_bytes()).await?;
+        }
+        let _ = read_continuation(reader).await?;
+        send_raw(writer, pass_b64.as_bytes()).await?;
+        let auth_resp = read_response(reader, &tag).await?;
+        if auth_resp.is_ok() {
+            return Ok(());
+        }
+        return Err(Error::Transfer {
+            code: 67,
+            message: format!(
+                "IMAP AUTHENTICATE LOGIN failed: {} {}",
+                auth_resp.status, auth_resp.message
+            ),
+        });
+    }
+
+    // If CRAM-MD5 or NTLM failed and no PLAIN available, error out
+    if cram_failed || ntlm_failed {
+        return Err(Error::Transfer {
+            code: 67,
+            message: "IMAP authentication cancelled, no fallback available".to_string(),
+        });
+    }
+
+    // If no password is available, no auth method can work — fail early
+    if pass.is_empty() {
+        return Err(Error::Transfer {
+            code: 67,
+            message: "IMAP login denied: no password available".to_string(),
+        });
+    }
+
+    // Plain LOGIN command (fallback when no SASL mechanism matches)
+    let tag = tags.next_tag();
+    let login_user = if needs_quoting(user) { imap_quote(user) } else { user.to_string() };
+    let login_pass = if needs_quoting(pass) { imap_quote(pass) } else { pass.to_string() };
+    send_command(writer, &tag, &format!("LOGIN {login_user} {login_pass}")).await?;
+    let login_resp = read_response(reader, &tag).await?;
+    if !login_resp.is_ok() {
+        return Err(Error::Auth(format!(
+            "IMAP LOGIN failed: {} {}",
+            login_resp.status, login_resp.message
+        )));
+    }
+    Ok(())
 }
 
 /// Dispatch the appropriate IMAP operation based on URL parameters and options.
@@ -954,7 +1118,7 @@ mod tests {
 
     #[test]
     fn tag_counter_increments() {
-        let mut counter = TagCounter::new();
+        let mut counter = TagCounter::new('A');
         assert_eq!(counter.next_tag(), "A001");
         assert_eq!(counter.next_tag(), "A002");
         assert_eq!(counter.next_tag(), "A003");

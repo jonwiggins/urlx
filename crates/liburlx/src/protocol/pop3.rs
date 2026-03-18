@@ -147,6 +147,25 @@ pub async fn send_command<S: AsyncWrite + Unpin>(
     Ok(())
 }
 
+/// Read a continuation line from POP3 server (starts with `+`).
+///
+/// # Errors
+///
+/// Returns an error if the read fails.
+async fn read_continuation<S: AsyncRead + Unpin>(
+    stream: &mut BufReader<S>,
+) -> Result<String, Error> {
+    let mut line = String::new();
+    let bytes_read = stream
+        .read_line(&mut line)
+        .await
+        .map_err(|e| Error::Http(format!("POP3 read error: {e}")))?;
+    if bytes_read == 0 {
+        return Err(Error::Http("POP3 connection closed waiting for continuation".to_string()));
+    }
+    Ok(line.trim().to_string())
+}
+
 /// Retrieve email from a POP3 server.
 ///
 /// URL format: `pop3://user:pass@host:port/N`
@@ -165,10 +184,10 @@ pub async fn retrieve(
     sasl_ir: bool,
     oauth2_bearer: Option<&str>,
     login_options: Option<&str>,
+    sasl_authzid: Option<&str>,
     use_ssl: UseSsl,
     tls_config: &crate::tls::TlsConfig,
 ) -> Result<Response, Error> {
-    use base64::Engine;
     // Reject URLs with CR/LF (curl returns exit code 3, test 875)
     let raw_url = url.as_str();
     if raw_url.contains("%0a")
@@ -180,9 +199,15 @@ pub async fn retrieve(
     }
     let (host, port) = url.host_and_port()?;
     let url_creds = url.credentials();
-    let (raw_user, pass) = url_creds
-        .or(credentials)
-        .ok_or_else(|| Error::Http("POP3 requires credentials".to_string()))?;
+    // Credentials are optional for EXTERNAL auth
+    let has_creds = url_creds.is_some() || credentials.is_some();
+    let (raw_user, pass) = if has_creds {
+        url_creds
+            .or(credentials)
+            .ok_or_else(|| Error::Http("POP3 requires credentials".to_string()))?
+    } else {
+        ("", "")
+    };
     // Strip ";AUTH=..." from username (login options, not part of the name)
     let user_owned = strip_auth_from_username(&percent_decode_str(raw_user));
     let user: &str = &user_owned;
@@ -277,235 +302,23 @@ pub async fn retrieve(
 
     let forced =
         login_options.and_then(|lo| lo.strip_prefix("AUTH=").or_else(|| lo.strip_prefix("auth=")));
-    let should_try = |mech: &str| {
-        forced.map_or_else(
-            || server_sasl_mechs.iter().any(|m| m.eq_ignore_ascii_case(mech)),
-            |f| f.eq_ignore_ascii_case(mech),
-        )
-    };
 
-    // EXTERNAL: send base64(username)
-    let auth_done = if should_try("EXTERNAL") {
-        send_command(&mut writer, "AUTH EXTERNAL").await?;
-        let mut line = String::new();
-        let _ = reader.read_line(&mut line).await;
-        let encoded = base64::engine::general_purpose::STANDARD.encode(user.as_bytes());
-        writer
-            .write_all(format!("{encoded}\r\n").as_bytes())
-            .await
-            .map_err(|e| Error::Http(format!("POP3 write error: {e}")))?;
-        let _ = writer.flush().await;
-        let auth_resp = read_response(&mut reader).await?;
-        if !auth_resp.ok {
-            send_command(&mut writer, "QUIT").await?;
-            let _ = read_response(&mut reader).await;
-            return Err(Error::Transfer {
-                code: 67,
-                message: "POP3 AUTH EXTERNAL failed".to_string(),
-            });
-        }
-        true
-    } else if let Some(bearer) = oauth2_bearer {
-        if should_try("OAUTHBEARER") {
-            // RFC 7628 OAUTHBEARER format
-            let payload = format!(
-                "n,a={user},\x01host={host}\x01port={port}\x01auth=Bearer {bearer}\x01\x01"
-            );
-            let encoded = base64::engine::general_purpose::STANDARD.encode(payload.as_bytes());
-            send_command(&mut writer, "AUTH OAUTHBEARER").await?;
-            let mut line = String::new();
-            let _ = reader.read_line(&mut line).await;
-            writer
-                .write_all(format!("{encoded}\r\n").as_bytes())
-                .await
-                .map_err(|e| Error::Http(format!("POP3 write error: {e}")))?;
-            let _ = writer.flush().await;
-            let auth_resp = read_response(&mut reader).await?;
-            if !auth_resp.ok {
-                send_command(&mut writer, "QUIT").await?;
-                let _ = read_response(&mut reader).await;
-                return Err(Error::Transfer {
-                    code: 67,
-                    message: format!("POP3 AUTH OAUTHBEARER failed: {}", auth_resp.message),
-                });
-            }
-        } else {
-            // XOAUTH2 fallback
-            let payload = format!("user={user}\x01auth=Bearer {bearer}\x01\x01");
-            let encoded = base64::engine::general_purpose::STANDARD.encode(payload.as_bytes());
-            if sasl_ir {
-                send_command(&mut writer, &format!("AUTH XOAUTH2 {encoded}")).await?;
-            } else {
-                send_command(&mut writer, "AUTH XOAUTH2").await?;
-                let mut line = String::new();
-                let _ = reader.read_line(&mut line).await;
-                writer
-                    .write_all(format!("{encoded}\r\n").as_bytes())
-                    .await
-                    .map_err(|e| Error::Http(format!("POP3 write error: {e}")))?;
-                let _ = writer.flush().await;
-            }
-            let auth_resp = read_response(&mut reader).await?;
-            if !auth_resp.ok {
-                send_command(&mut writer, "QUIT").await?;
-                let _ = read_response(&mut reader).await;
-                return Err(Error::Transfer {
-                    code: 67,
-                    message: format!("POP3 AUTH XOAUTH2 failed: {}", auth_resp.message),
-                });
-            }
-        }
-        true
-    } else if should_try("CRAM-MD5") {
-        send_command(&mut writer, "AUTH CRAM-MD5").await?;
-        let mut line = String::new();
-        let _ = reader.read_line(&mut line).await;
-        let challenge_b64 = line.trim().trim_start_matches('+').trim();
-        let challenge_bytes = base64::engine::general_purpose::STANDARD
-            .decode(challenge_b64)
-            .map_err(|e| Error::Http(format!("CRAM-MD5 decode error: {e}")))?;
-        let challenge = String::from_utf8_lossy(&challenge_bytes);
-        let response_str = crate::auth::cram_md5::cram_md5_response(user, pass, &challenge);
-        let encoded = base64::engine::general_purpose::STANDARD.encode(response_str.as_bytes());
-        writer
-            .write_all(format!("{encoded}\r\n").as_bytes())
-            .await
-            .map_err(|e| Error::Http(format!("POP3 write error: {e}")))?;
-        let _ = writer.flush().await;
-        let auth_resp = read_response(&mut reader).await?;
-        if !auth_resp.ok {
-            send_command(&mut writer, "QUIT").await?;
-            let _ = read_response(&mut reader).await;
-            return Err(Error::Transfer {
-                code: 67,
-                message: format!("POP3 AUTH CRAM-MD5 failed: {}", auth_resp.message),
-            });
-        }
-        true
-    } else if should_try("NTLM") {
-        let type1 = crate::auth::ntlm::create_type1_message();
-        send_command(&mut writer, "AUTH NTLM").await?;
-        let mut line = String::new();
-        let _ = reader.read_line(&mut line).await;
-        // Send Type 1
-        writer
-            .write_all(format!("{type1}\r\n").as_bytes())
-            .await
-            .map_err(|e| Error::Http(format!("POP3 write error: {e}")))?;
-        let _ = writer.flush().await;
-        // Read Type 2 challenge
-        let mut line2 = String::new();
-        let _ = reader.read_line(&mut line2).await;
-        let challenge_b64 = line2.trim().trim_start_matches('+').trim();
-        if let Ok(challenge) = crate::auth::ntlm::parse_type2_message(challenge_b64) {
-            let type3 = crate::auth::ntlm::create_type3_message(&challenge, user, pass, "");
-            writer
-                .write_all(format!("{type3}\r\n").as_bytes())
-                .await
-                .map_err(|e| Error::Http(format!("POP3 write error: {e}")))?;
-            let _ = writer.flush().await;
-            let auth_resp = read_response(&mut reader).await?;
-            if !auth_resp.ok {
-                send_command(&mut writer, "QUIT").await?;
-                let _ = read_response(&mut reader).await;
-                return Err(Error::Transfer {
-                    code: 67,
-                    message: format!("POP3 AUTH NTLM failed: {}", auth_resp.message),
-                });
-            }
-        } else {
-            // Bad challenge — cancel
-            writer
-                .write_all(b"*\r\n")
-                .await
-                .map_err(|e| Error::Http(format!("POP3 write error: {e}")))?;
-            let _ = writer.flush().await;
-            send_command(&mut writer, "QUIT").await?;
-            let _ = read_response(&mut reader).await;
-            return Err(Error::Transfer {
-                code: 67,
-                message: "POP3 AUTH NTLM: invalid challenge".to_string(),
-            });
-        }
-        true
-    } else if should_try("LOGIN") {
-        let user_b64 = base64::engine::general_purpose::STANDARD.encode(user.as_bytes());
-        let pass_b64 = base64::engine::general_purpose::STANDARD.encode(pass.as_bytes());
-        if sasl_ir {
-            send_command(&mut writer, &format!("AUTH LOGIN {user_b64}")).await?;
-        } else {
-            send_command(&mut writer, "AUTH LOGIN").await?;
-            let mut line = String::new();
-            let _ = reader.read_line(&mut line).await;
-            writer
-                .write_all(format!("{user_b64}\r\n").as_bytes())
-                .await
-                .map_err(|e| Error::Http(format!("POP3 write error: {e}")))?;
-            let _ = writer.flush().await;
-        }
-        let mut line2 = String::new();
-        let _ = reader.read_line(&mut line2).await;
-        writer
-            .write_all(format!("{pass_b64}\r\n").as_bytes())
-            .await
-            .map_err(|e| Error::Http(format!("POP3 write error: {e}")))?;
-        let _ = writer.flush().await;
-        let auth_resp = read_response(&mut reader).await?;
-        if !auth_resp.ok {
-            send_command(&mut writer, "QUIT").await?;
-            let _ = read_response(&mut reader).await;
-            return Err(Error::Transfer {
-                code: 67,
-                message: format!("POP3 AUTH LOGIN failed: {}", auth_resp.message),
-            });
-        }
-        true
-    } else if should_try("PLAIN") {
-        let auth_string = format!("\0{user}\0{pass}");
-        let encoded = base64::engine::general_purpose::STANDARD.encode(auth_string.as_bytes());
-        if sasl_ir {
-            send_command(&mut writer, &format!("AUTH PLAIN {encoded}")).await?;
-        } else {
-            send_command(&mut writer, "AUTH PLAIN").await?;
-            let mut line = String::new();
-            let _ = reader.read_line(&mut line).await;
-            writer
-                .write_all(format!("{encoded}\r\n").as_bytes())
-                .await
-                .map_err(|e| Error::Http(format!("POP3 write error: {e}")))?;
-            let _ = writer.flush().await;
-        }
-        let auth_resp = read_response(&mut reader).await?;
-        if !auth_resp.ok {
-            send_command(&mut writer, "QUIT").await?;
-            let _ = read_response(&mut reader).await;
-            return Err(Error::Transfer {
-                code: 67,
-                message: format!("POP3 AUTH PLAIN failed: {}", auth_resp.message),
-            });
-        }
-        true
-    } else if server_has_apop || apop_timestamp.is_some() {
-        // APOP: MD5(timestamp + password)
-        if let Some(ref ts) = apop_timestamp {
-            let digest = crate::auth::cram_md5::apop_digest(ts, pass);
-            send_command(&mut writer, &format!("APOP {user} {digest}")).await?;
-            let auth_resp = read_response(&mut reader).await?;
-            if !auth_resp.ok {
-                send_command(&mut writer, "QUIT").await?;
-                let _ = read_response(&mut reader).await;
-                return Err(Error::Transfer {
-                    code: 67,
-                    message: format!("POP3 APOP failed: {}", auth_resp.message),
-                });
-            }
-            true
-        } else {
-            false // No timestamp in greeting, fall through to USER/PASS
-        }
-    } else {
-        false
-    };
+    let auth_done = do_pop3_auth(
+        &mut reader,
+        &mut writer,
+        user,
+        pass,
+        sasl_ir,
+        oauth2_bearer,
+        sasl_authzid,
+        &host,
+        port,
+        server_has_apop,
+        apop_timestamp.as_ref(),
+        forced,
+        &server_sasl_mechs,
+    )
+    .await?;
 
     if !auth_done {
         // USER/PASS authentication (fallback)
@@ -611,6 +424,314 @@ pub async fn retrieve(
 
     let headers = std::collections::HashMap::new();
     Ok(Response::new(200, headers, Vec::new(), url.as_str().to_string()))
+}
+
+/// Perform POP3 authentication with mechanism negotiation and downgrade support.
+///
+/// Returns `Ok(true)` if SASL auth succeeded, `Ok(false)` if no SASL mechanism matched
+/// (caller should fall through to USER/PASS).
+///
+/// Returns `Err` if authentication was attempted and failed (no QUIT/retry possible).
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn do_pop3_auth<S: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    reader: &mut BufReader<S>,
+    writer: &mut W,
+    user: &str,
+    pass: &str,
+    sasl_ir: bool,
+    oauth2_bearer: Option<&str>,
+    sasl_authzid: Option<&str>,
+    host: &str,
+    port: u16,
+    server_has_apop: bool,
+    apop_timestamp: Option<&String>,
+    forced: Option<&str>,
+    server_sasl_mechs: &[String],
+) -> Result<bool, Error> {
+    use base64::Engine;
+
+    let has_mech = |mech: &str| server_sasl_mechs.iter().any(|m| m.eq_ignore_ascii_case(mech));
+    let should_try =
+        |mech: &str| forced.map_or_else(|| has_mech(mech), |f| f.eq_ignore_ascii_case(mech));
+
+    // EXTERNAL: send base64(username) or = for empty
+    if should_try("EXTERNAL") {
+        let encoded = if user.is_empty() {
+            "=".to_string()
+        } else {
+            base64::engine::general_purpose::STANDARD.encode(user.as_bytes())
+        };
+        if sasl_ir {
+            send_command(writer, &format!("AUTH EXTERNAL {encoded}")).await?;
+        } else {
+            send_command(writer, "AUTH EXTERNAL").await?;
+            let _ = read_continuation(reader).await?;
+            writer
+                .write_all(format!("{encoded}\r\n").as_bytes())
+                .await
+                .map_err(|e| Error::Http(format!("POP3 write error: {e}")))?;
+            let _ = writer.flush().await;
+        }
+        let auth_resp = read_response(reader).await?;
+        if !auth_resp.ok {
+            return Err(Error::Transfer {
+                code: 67,
+                message: "POP3 AUTH EXTERNAL failed".to_string(),
+            });
+        }
+        return Ok(true);
+    }
+
+    // OAUTHBEARER / XOAUTH2
+    if let Some(bearer) = oauth2_bearer {
+        if should_try("OAUTHBEARER") {
+            // RFC 7628 OAUTHBEARER format
+            let payload = format!(
+                "n,a={user},\x01host={host}\x01port={port}\x01auth=Bearer {bearer}\x01\x01"
+            );
+            let encoded = base64::engine::general_purpose::STANDARD.encode(payload.as_bytes());
+            if sasl_ir {
+                send_command(writer, &format!("AUTH OAUTHBEARER {encoded}")).await?;
+            } else {
+                send_command(writer, "AUTH OAUTHBEARER").await?;
+                let _ = read_continuation(reader).await?;
+                writer
+                    .write_all(format!("{encoded}\r\n").as_bytes())
+                    .await
+                    .map_err(|e| Error::Http(format!("POP3 write error: {e}")))?;
+                let _ = writer.flush().await;
+            }
+            // Read response — could be +OK or a continuation with error JSON
+            let mut line = String::new();
+            let _ = reader.read_line(&mut line).await;
+            let trimmed = line.trim();
+            if trimmed.starts_with("+OK") {
+                return Ok(true);
+            }
+            if trimmed.starts_with('+') && !trimmed.starts_with("+OK") {
+                // Server sent error JSON as continuation — send SASL abort (AQ==)
+                writer
+                    .write_all(b"AQ==\r\n")
+                    .await
+                    .map_err(|e| Error::Http(format!("POP3 write error: {e}")))?;
+                let _ = writer.flush().await;
+                // Read the -ERR response
+                let _ = read_response(reader).await;
+                return Err(Error::Transfer {
+                    code: 67,
+                    message: "POP3 AUTH OAUTHBEARER failed".to_string(),
+                });
+            }
+            // -ERR response
+            return Err(Error::Transfer {
+                code: 67,
+                message: format!("POP3 AUTH OAUTHBEARER failed: {trimmed}"),
+            });
+        }
+
+        if should_try("XOAUTH2") || !should_try("OAUTHBEARER") {
+            // XOAUTH2 fallback
+            let payload = format!("user={user}\x01auth=Bearer {bearer}\x01\x01");
+            let encoded = base64::engine::general_purpose::STANDARD.encode(payload.as_bytes());
+            if sasl_ir {
+                send_command(writer, &format!("AUTH XOAUTH2 {encoded}")).await?;
+            } else {
+                send_command(writer, "AUTH XOAUTH2").await?;
+                let _ = read_continuation(reader).await?;
+                writer
+                    .write_all(format!("{encoded}\r\n").as_bytes())
+                    .await
+                    .map_err(|e| Error::Http(format!("POP3 write error: {e}")))?;
+                let _ = writer.flush().await;
+            }
+            let auth_resp = read_response(reader).await?;
+            if !auth_resp.ok {
+                return Err(Error::Transfer {
+                    code: 67,
+                    message: format!("POP3 AUTH XOAUTH2 failed: {}", auth_resp.message),
+                });
+            }
+            return Ok(true);
+        }
+    }
+
+    // Track downgrade state
+    let mut cram_failed = false;
+    let mut ntlm_failed = false;
+
+    // CRAM-MD5
+    if should_try("CRAM-MD5") {
+        send_command(writer, "AUTH CRAM-MD5").await?;
+        let mut line = String::new();
+        let _ = reader.read_line(&mut line).await;
+        let challenge_b64 = line.trim().trim_start_matches('+').trim();
+        if let Ok(challenge_bytes) = base64::engine::general_purpose::STANDARD.decode(challenge_b64)
+        {
+            let challenge = String::from_utf8_lossy(&challenge_bytes);
+            let response_str = crate::auth::cram_md5::cram_md5_response(user, pass, &challenge);
+            let encoded = base64::engine::general_purpose::STANDARD.encode(response_str.as_bytes());
+            writer
+                .write_all(format!("{encoded}\r\n").as_bytes())
+                .await
+                .map_err(|e| Error::Http(format!("POP3 write error: {e}")))?;
+            let _ = writer.flush().await;
+            let auth_resp = read_response(reader).await?;
+            if auth_resp.ok {
+                return Ok(true);
+            }
+            return Err(Error::Transfer {
+                code: 67,
+                message: format!("POP3 AUTH CRAM-MD5 failed: {}", auth_resp.message),
+            });
+        }
+        // Invalid challenge — send SASL cancel
+        writer
+            .write_all(b"*\r\n")
+            .await
+            .map_err(|e| Error::Http(format!("POP3 write error: {e}")))?;
+        let _ = writer.flush().await;
+        // Read server's error response
+        let _ = read_response(reader).await;
+        cram_failed = true;
+    }
+
+    // NTLM
+    if !cram_failed && should_try("NTLM") || cram_failed && has_mech("NTLM") {
+        let type1 = crate::auth::ntlm::create_type1_message();
+        if sasl_ir {
+            send_command(writer, &format!("AUTH NTLM {type1}")).await?;
+        } else {
+            send_command(writer, "AUTH NTLM").await?;
+            let mut line = String::new();
+            let _ = reader.read_line(&mut line).await;
+            // Send Type 1
+            writer
+                .write_all(format!("{type1}\r\n").as_bytes())
+                .await
+                .map_err(|e| Error::Http(format!("POP3 write error: {e}")))?;
+            let _ = writer.flush().await;
+        }
+        // Read Type 2 challenge
+        let mut line2 = String::new();
+        let _ = reader.read_line(&mut line2).await;
+        let challenge_b64 = line2.trim().trim_start_matches('+').trim();
+        if let Ok(challenge) = crate::auth::ntlm::parse_type2_message(challenge_b64) {
+            let type3 = crate::auth::ntlm::create_type3_message(&challenge, user, pass, "");
+            writer
+                .write_all(format!("{type3}\r\n").as_bytes())
+                .await
+                .map_err(|e| Error::Http(format!("POP3 write error: {e}")))?;
+            let _ = writer.flush().await;
+            let auth_resp = read_response(reader).await?;
+            if auth_resp.ok {
+                return Ok(true);
+            }
+            return Err(Error::Transfer {
+                code: 67,
+                message: format!("POP3 AUTH NTLM failed: {}", auth_resp.message),
+            });
+        }
+        // Bad challenge — cancel
+        writer
+            .write_all(b"*\r\n")
+            .await
+            .map_err(|e| Error::Http(format!("POP3 write error: {e}")))?;
+        let _ = writer.flush().await;
+        // Read server's error response
+        let _ = read_response(reader).await;
+        ntlm_failed = true;
+    }
+
+    // LOGIN
+    if should_try("LOGIN") {
+        let user_b64 = base64::engine::general_purpose::STANDARD.encode(user.as_bytes());
+        let pass_b64 = base64::engine::general_purpose::STANDARD.encode(pass.as_bytes());
+        if sasl_ir {
+            send_command(writer, &format!("AUTH LOGIN {user_b64}")).await?;
+        } else {
+            send_command(writer, "AUTH LOGIN").await?;
+            let mut line = String::new();
+            let _ = reader.read_line(&mut line).await;
+            writer
+                .write_all(format!("{user_b64}\r\n").as_bytes())
+                .await
+                .map_err(|e| Error::Http(format!("POP3 write error: {e}")))?;
+            let _ = writer.flush().await;
+        }
+        let mut line2 = String::new();
+        let _ = reader.read_line(&mut line2).await;
+        writer
+            .write_all(format!("{pass_b64}\r\n").as_bytes())
+            .await
+            .map_err(|e| Error::Http(format!("POP3 write error: {e}")))?;
+        let _ = writer.flush().await;
+        let auth_resp = read_response(reader).await?;
+        if !auth_resp.ok {
+            return Err(Error::Transfer {
+                code: 67,
+                message: format!("POP3 AUTH LOGIN failed: {}", auth_resp.message),
+            });
+        }
+        return Ok(true);
+    }
+
+    // PLAIN (also used as downgrade target from CRAM-MD5/NTLM)
+    let try_plain = should_try("PLAIN") || (cram_failed || ntlm_failed) && has_mech("PLAIN");
+    if try_plain {
+        let auth_string = sasl_authzid.map_or_else(
+            || format!("\0{user}\0{pass}"),
+            |authzid| format!("{authzid}\0{user}\0{pass}"),
+        );
+        let encoded = base64::engine::general_purpose::STANDARD.encode(auth_string.as_bytes());
+        if sasl_ir {
+            send_command(writer, &format!("AUTH PLAIN {encoded}")).await?;
+        } else {
+            send_command(writer, "AUTH PLAIN").await?;
+            let mut line = String::new();
+            let _ = reader.read_line(&mut line).await;
+            writer
+                .write_all(format!("{encoded}\r\n").as_bytes())
+                .await
+                .map_err(|e| Error::Http(format!("POP3 write error: {e}")))?;
+            let _ = writer.flush().await;
+        }
+        let auth_resp = read_response(reader).await?;
+        if !auth_resp.ok {
+            return Err(Error::Transfer {
+                code: 67,
+                message: format!("POP3 AUTH PLAIN failed: {}", auth_resp.message),
+            });
+        }
+        return Ok(true);
+    }
+
+    // APOP
+    if (server_has_apop || apop_timestamp.is_some()) && !cram_failed && !ntlm_failed {
+        if let Some(ts) = apop_timestamp {
+            let digest = crate::auth::cram_md5::apop_digest(ts, pass);
+            send_command(writer, &format!("APOP {user} {digest}")).await?;
+            let auth_resp = read_response(reader).await?;
+            if !auth_resp.ok {
+                send_command(writer, "QUIT").await?;
+                let _ = read_response(reader).await;
+                return Err(Error::Transfer {
+                    code: 67,
+                    message: format!("POP3 APOP failed: {}", auth_resp.message),
+                });
+            }
+            return Ok(true);
+        }
+    }
+
+    // If CRAM-MD5 or NTLM failed and no PLAIN available, error out
+    if cram_failed || ntlm_failed {
+        return Err(Error::Transfer {
+            code: 67,
+            message: "POP3 authentication cancelled, no fallback available".to_string(),
+        });
+    }
+
+    Ok(false)
 }
 
 /// Strip `;AUTH=<mechanism>` from a URL username.
