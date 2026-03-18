@@ -3830,10 +3830,19 @@ async fn do_single_request(
                 password: header_creds.as_ref().map(|(_, p)| p.as_str()),
                 login_options: url_login_opts.as_deref(),
             };
-            return crate::protocol::smtp::send_mail(url, mail_data, &smtp_config).await;
+            let use_smtp_tls = url.scheme() == "smtps";
+            return crate::protocol::smtp::send_mail(
+                url,
+                mail_data,
+                &smtp_config,
+                use_smtp_tls,
+                tls_config,
+            )
+            .await;
         }
         "imap" | "imaps" => {
             let url_login_opts = extract_login_options_from_url(url);
+            let use_imap_tls = url.scheme() == "imaps";
             return crate::protocol::imap::fetch(
                 url,
                 method,
@@ -3842,6 +3851,8 @@ async fn do_single_request(
                 sasl_ir,
                 oauth2_bearer,
                 url_login_opts.as_deref(),
+                use_imap_tls,
+                tls_config,
             )
             .await;
         }
@@ -3855,6 +3866,7 @@ async fn do_single_request(
                 _ => Some(method),
             };
             let url_login_opts = extract_login_options_from_url(url);
+            let use_pop3_tls = url.scheme() == "pop3s";
             return crate::protocol::pop3::retrieve(
                 url,
                 creds_tuple,
@@ -3862,6 +3874,8 @@ async fn do_single_request(
                 sasl_ir,
                 oauth2_bearer,
                 url_login_opts.as_deref(),
+                use_pop3_tls,
+                tls_config,
             )
             .await;
         }

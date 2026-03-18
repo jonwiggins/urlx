@@ -164,6 +164,8 @@ pub async fn retrieve(
     sasl_ir: bool,
     oauth2_bearer: Option<&str>,
     login_options: Option<&str>,
+    use_tls: bool,
+    tls_config: &crate::tls::TlsConfig,
 ) -> Result<Response, Error> {
     use base64::Engine;
     // Reject URLs with CR/LF (curl returns exit code 3, test 875)
@@ -189,7 +191,19 @@ pub async fn retrieve(
 
     let addr = format!("{host}:{port}");
     let tcp = tokio::net::TcpStream::connect(&addr).await.map_err(Error::Connect)?;
-    let (reader, mut writer) = tokio::io::split(tcp);
+
+    let (reader, mut writer): (
+        Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+        Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
+    ) = if use_tls {
+        let connector = crate::tls::TlsConnector::new(tls_config)?;
+        let (tls_stream, _alpn) = connector.connect(tcp, &host).await?;
+        let (r, w) = tokio::io::split(tls_stream);
+        (Box::new(r), Box::new(w))
+    } else {
+        let (r, w) = tokio::io::split(tcp);
+        (Box::new(r), Box::new(w))
+    };
     let mut reader = BufReader::new(reader);
 
     // Read greeting — skip banner lines until we find +OK or -ERR

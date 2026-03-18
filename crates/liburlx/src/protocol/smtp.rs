@@ -213,6 +213,8 @@ pub async fn send_mail(
     url: &crate::url::Url,
     mail_data: &[u8],
     config: &SmtpConfig<'_>,
+    use_tls: bool,
+    tls_config: &crate::tls::TlsConfig,
 ) -> Result<crate::protocol::http::response::Response, Error> {
     let (host, port) = url.host_and_port()?;
 
@@ -245,10 +247,23 @@ pub async fn send_mail(
     // Determine SMTP mode
     let mode = determine_smtp_mode(config, !mail_data.is_empty());
 
-    // Connect to SMTP server
+    // Connect to SMTP server (with optional TLS for smtps://)
     let addr = format!("{host}:{port}");
     let tcp = tokio::net::TcpStream::connect(&addr).await.map_err(Error::Connect)?;
-    let (reader, mut writer) = tokio::io::split(tcp);
+
+    // Type-erased reader/writer so we can use either plain or TLS streams
+    let (reader, mut writer): (
+        Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+        Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
+    ) = if use_tls {
+        let connector = crate::tls::TlsConnector::new(tls_config)?;
+        let (tls_stream, _alpn) = connector.connect(tcp, &host).await?;
+        let (r, w) = tokio::io::split(tls_stream);
+        (Box::new(r), Box::new(w))
+    } else {
+        let (r, w) = tokio::io::split(tcp);
+        (Box::new(r), Box::new(w))
+    };
     let mut reader = BufReader::new(reader);
 
     // Read server greeting
