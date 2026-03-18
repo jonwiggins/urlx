@@ -2652,9 +2652,8 @@ fn expand_variables(template: &str, variables: &[(String, String)]) -> String {
                         "url" | "urlencode" => percent_encode(value),
                         "b64" | "base64" => simple_base64_encode(value.as_bytes()),
                         "json" => {
-                            // JSON string escaping
-                            let mut s = String::with_capacity(value.len() + 2);
-                            s.push('"');
+                            // JSON string escaping (no wrapping quotes — curl compat: test 268)
+                            let mut s = String::with_capacity(value.len());
                             for c in value.chars() {
                                 match c {
                                     '"' => s.push_str("\\\""),
@@ -2662,10 +2661,16 @@ fn expand_variables(template: &str, variables: &[(String, String)]) -> String {
                                     '\n' => s.push_str("\\n"),
                                     '\r' => s.push_str("\\r"),
                                     '\t' => s.push_str("\\t"),
+                                    c if c < '\u{20}' => {
+                                        // Control characters: \u00XX
+                                        let _ = std::fmt::Write::write_fmt(
+                                            &mut s,
+                                            format_args!("\\u{:04x}", c as u32),
+                                        );
+                                    }
                                     c => s.push(c),
                                 }
                             }
-                            s.push('"');
                             s
                         }
                         _ => {

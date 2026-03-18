@@ -649,50 +649,54 @@ async fn write_chunked_body<S>(
 where
     S: AsyncWrite + Unpin,
 {
-    if send_limiter.is_active() {
-        let mut offset = 0;
-        while offset < body.len() {
-            let end = (offset + THROTTLE_CHUNK_SIZE).min(body.len());
-            let chunk = &body[offset..end];
-            let chunk_len = chunk.len();
+    // Only write body chunks if there's actual data; empty body skips straight
+    // to the terminating zero-length chunk (curl compat: test 1333).
+    if !body.is_empty() {
+        if send_limiter.is_active() {
+            let mut offset = 0;
+            while offset < body.len() {
+                let end = (offset + THROTTLE_CHUNK_SIZE).min(body.len());
+                let chunk = &body[offset..end];
+                let chunk_len = chunk.len();
 
-            // Write chunk header: hex size + CRLF
-            let header = format!("{chunk_len:x}\r\n");
+                // Write chunk header: hex size + CRLF
+                let header = format!("{chunk_len:x}\r\n");
+                stream
+                    .write_all(header.as_bytes())
+                    .await
+                    .map_err(|e| Error::Http(format!("chunked header write failed: {e}")))?;
+
+                // Write chunk data
+                stream
+                    .write_all(chunk)
+                    .await
+                    .map_err(|e| Error::Http(format!("chunked data write failed: {e}")))?;
+
+                // Write chunk trailer CRLF
+                stream
+                    .write_all(b"\r\n")
+                    .await
+                    .map_err(|e| Error::Http(format!("chunked trailer write failed: {e}")))?;
+
+                send_limiter.record(chunk_len).await?;
+                offset = end;
+            }
+        } else {
+            // Write entire body as single chunk
+            let header = format!("{:x}\r\n", body.len());
             stream
                 .write_all(header.as_bytes())
                 .await
                 .map_err(|e| Error::Http(format!("chunked header write failed: {e}")))?;
-
-            // Write chunk data
             stream
-                .write_all(chunk)
+                .write_all(body)
                 .await
                 .map_err(|e| Error::Http(format!("chunked data write failed: {e}")))?;
-
-            // Write chunk trailer CRLF
             stream
                 .write_all(b"\r\n")
                 .await
                 .map_err(|e| Error::Http(format!("chunked trailer write failed: {e}")))?;
-
-            send_limiter.record(chunk_len).await?;
-            offset = end;
         }
-    } else {
-        // Write entire body as single chunk
-        let header = format!("{:x}\r\n", body.len());
-        stream
-            .write_all(header.as_bytes())
-            .await
-            .map_err(|e| Error::Http(format!("chunked header write failed: {e}")))?;
-        stream
-            .write_all(body)
-            .await
-            .map_err(|e| Error::Http(format!("chunked data write failed: {e}")))?;
-        stream
-            .write_all(b"\r\n")
-            .await
-            .map_err(|e| Error::Http(format!("chunked trailer write failed: {e}")))?;
     }
 
     // Write terminating chunk: 0\r\n\r\n

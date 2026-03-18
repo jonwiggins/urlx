@@ -666,6 +666,8 @@ pub fn run(args: &[String]) -> ExitCode {
             opts.time_cond_negate,
             &opts.per_url_credentials,
             opts.fail_with_body,
+            opts.is_upload,
+            opts.dump_header.as_deref(),
         );
     }
 
@@ -1252,28 +1254,47 @@ pub fn run(args: &[String]) -> ExitCode {
             }
 
             // --dump-header: write headers to file (or stdout if "-")
+            // --dump-header: write headers to file (or stdout if "-")
+            let dump_to_stdout_single =
+                opts.dump_header.as_deref() == Some("-") && opts.output_file.is_none();
             if let Some(ref path) = opts.dump_header {
                 let header_text = format_headers(&response);
                 let raw_trailers = response.raw_trailers();
-                let mut dump_data = header_text.into_bytes();
-                // Append chunked trailer headers after response headers (curl compat: test 1116)
-                if !raw_trailers.is_empty() {
-                    dump_data.extend_from_slice(raw_trailers);
-                }
-                if path == "-" {
-                    // Write to stdout (curl compat: test 1335)
+                if dump_to_stdout_single && opts.include_headers {
+                    // Both --dump-header - and --include: each header line appears twice
                     use std::io::Write;
+                    let mut stdout = std::io::stdout();
+                    for line in header_text.split_inclusive('\n') {
+                        let _ = stdout.write_all(line.as_bytes());
+                        let _ = stdout.write_all(line.as_bytes());
+                    }
+                } else if dump_to_stdout_single {
+                    // --dump-header - without --include: headers once to stdout
+                    use std::io::Write;
+                    let _ = std::io::stdout().write_all(header_text.as_bytes());
+                } else if path == "-" {
+                    use std::io::Write;
+                    let mut dump_data = header_text.into_bytes();
+                    if !raw_trailers.is_empty() {
+                        dump_data.extend_from_slice(raw_trailers);
+                    }
                     if let Err(e) = std::io::stdout().write_all(&dump_data) {
                         if !opts.silent || opts.show_error {
                             eprintln!("curl: error writing headers: {e}");
                         }
                         return ExitCode::FAILURE;
                     }
-                } else if let Err(e) = std::fs::write(path, dump_data) {
-                    if !opts.silent || opts.show_error {
-                        eprintln!("curl: error writing headers to {path}: {e}");
+                } else {
+                    let mut dump_data = header_text.into_bytes();
+                    if !raw_trailers.is_empty() {
+                        dump_data.extend_from_slice(raw_trailers);
                     }
-                    return ExitCode::FAILURE;
+                    if let Err(e) = std::fs::write(path, &dump_data) {
+                        if !opts.silent || opts.show_error {
+                            eprintln!("curl: error writing headers to {path}: {e}");
+                        }
+                        return ExitCode::FAILURE;
+                    }
                 }
             }
 
@@ -1327,11 +1348,19 @@ pub fn run(args: &[String]) -> ExitCode {
                 })
             });
 
+            // When dump-header goes to stdout and include_headers is active,
+            // headers were already output as doubled lines above. Skip include
+            // in output_response to avoid triple output.
+            let effective_include = if dump_to_stdout_single && opts.include_headers {
+                false
+            } else {
+                opts.include_headers
+            };
             let exit = output_response(
                 &response,
                 opts.output_file.as_deref(),
                 opts.write_out.as_deref(),
-                opts.include_headers,
+                effective_include,
                 opts.silent,
                 suppress_body,
             );
@@ -1767,6 +1796,8 @@ pub fn run_multi(
     time_cond_negate: bool,
     per_url_credentials: &[Option<(String, String)>],
     fail_with_body: bool,
+    is_upload: bool,
+    dump_header: Option<&str>,
 ) -> ExitCode {
     if parallel {
         return run_multi_parallel(
@@ -1795,6 +1826,13 @@ pub fn run_multi(
     let mut last_exit = ExitCode::SUCCESS;
 
     for (i, url) in urls.iter().enumerate() {
+        // -T upload: only the first URL gets PUT with the upload body.
+        // Subsequent URLs revert to GET without body (curl compat: test 1065).
+        if is_upload && i > 0 && easy.has_body() {
+            let _ = easy.take_body();
+            easy.method("GET");
+        }
+
         // --skip-existing: skip transfer if output file already exists
         if skip_existing {
             if let Some(path) = output_files.get(i) {
@@ -1865,11 +1903,53 @@ pub fn run_multi(
                     )
                 });
 
+                // --dump-header: write headers before body output
+                // --dump-header handling for multi-URL mode
+                let dump_to_stdout = dump_header == Some("-") && file_for_this.is_none();
+                if let Some(dh_path) = dump_header {
+                    let header_text = format_headers(&response);
+                    let raw_trailers = response.raw_trailers();
+                    if dump_to_stdout && include_headers {
+                        // Both --dump-header - and --include: each header line appears twice
+                        // (once from dump callback, once from include). Then body follows.
+                        // (curl compat: test 1066)
+                        use std::io::Write;
+                        let mut stdout = std::io::stdout();
+                        for line in header_text.split_inclusive('\n') {
+                            let _ = stdout.write_all(line.as_bytes());
+                            let _ = stdout.write_all(line.as_bytes());
+                        }
+                    } else if dump_to_stdout {
+                        // --dump-header - without --include: headers once to stdout
+                        use std::io::Write;
+                        let _ = std::io::stdout().write_all(header_text.as_bytes());
+                    } else if dh_path == "-" {
+                        // --dump-header - with -o file: dump to stdout
+                        use std::io::Write;
+                        let mut dump_data = header_text.into_bytes();
+                        if !raw_trailers.is_empty() {
+                            dump_data.extend_from_slice(raw_trailers);
+                        }
+                        let _ = std::io::stdout().write_all(&dump_data);
+                    } else {
+                        let mut dump_data = header_text.into_bytes();
+                        if !raw_trailers.is_empty() {
+                            dump_data.extend_from_slice(raw_trailers);
+                        }
+                        let _ = std::fs::write(dh_path, &dump_data);
+                    }
+                }
+
+                // When dump-header goes to stdout and include_headers is active,
+                // headers were already output as doubled lines above. Skip include
+                // in output_response to avoid triple output.
+                let effective_include =
+                    if dump_to_stdout && include_headers { false } else { include_headers };
                 let exit = output_response(
                     &response,
                     file_for_this,
                     write_out,
-                    include_headers,
+                    effective_include,
                     silent,
                     suppress_body,
                 );

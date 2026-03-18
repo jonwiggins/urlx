@@ -3546,12 +3546,11 @@ async fn perform_transfer(
                 // 301/302: change POST to GET (curl compat) unless --post301/--post302
                 let status = response.status();
                 // On 303: always change to GET (unless --post303 preserves POST)
-                // On 301/302: change to GET when body was sent (POST or custom -X with -d)
-                //   unless --post301/--post302 preserves POST
-                let has_body = current_body.is_some();
-                let should_change_to_get = (status == 303
-                    && !(post303 && current_method == "POST"))
-                    || ((status == 301 && !post301 || status == 302 && !post302) && has_body);
+                // On 301/302: change POST to GET (curl compat) unless --post301/--post302
+                //   Only POST is changed; PUT and other methods are preserved (test 1051)
+                let is_post = current_method.eq_ignore_ascii_case("POST");
+                let should_change_to_get = (status == 303 && !(post303 && is_post))
+                    || ((status == 301 && !post301 || status == 302 && !post302) && is_post);
                 if should_change_to_get {
                     current_method = "GET".to_string();
                     current_body = None;
@@ -5697,8 +5696,35 @@ async fn connect_with_bind(
     } else {
         std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
     };
-    let bind_ip: std::net::IpAddr =
-        interface.map_or(unspecified, |iface| iface.parse().unwrap_or(unspecified));
+    let bind_ip: std::net::IpAddr = match interface {
+        None => unspecified,
+        Some(iface) => {
+            if let Ok(ip) = iface.parse::<std::net::IpAddr>() {
+                ip
+            } else {
+                // Try to resolve interface name as a hostname (curl compat: test 1085)
+                use std::net::ToSocketAddrs;
+                match (iface, 0u16).to_socket_addrs() {
+                    Ok(mut addrs) => {
+                        // Find an address matching the required IP version
+                        let is_ipv4 = remote.is_ipv4();
+                        addrs.find(|a| a.is_ipv4() == is_ipv4).map(|a| a.ip()).ok_or_else(|| {
+                            Error::Transfer {
+                                code: 45,
+                                message: format!("Failed to bind to interface '{iface}'"),
+                            }
+                        })?
+                    }
+                    Err(_) => {
+                        return Err(Error::Transfer {
+                            code: 45,
+                            message: format!("Failed to bind to interface '{iface}'"),
+                        });
+                    }
+                }
+            }
+        }
+    };
 
     let bind_addr = std::net::SocketAddr::new(bind_ip, local_port.unwrap_or(0));
     socket.bind(&bind_addr.into()).map_err(Error::Connect)?;
