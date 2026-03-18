@@ -640,14 +640,23 @@ pub fn run(args: &[String]) -> ExitCode {
             // Per-URL output files from --next groups
             opts.output_files.clone()
         } else if let Some(ref tmpl) = opts.output_file {
-            opts.urls
-                .iter()
-                .enumerate()
-                .map(|(i, _)| {
-                    let values = opts.glob_values.get(i).map(Vec::as_slice).unwrap_or_default();
-                    substitute_glob_template(tmpl, values)
-                })
-                .collect()
+            // Check if the template contains glob substitution patterns (#N).
+            // If it does, expand for all URLs. If not, only apply to the first URL
+            // (curl compat: positional -o applies to next URL only).
+            let has_glob = tmpl.contains('#');
+            if has_glob {
+                opts.urls
+                    .iter()
+                    .enumerate()
+                    .map(|(i, _)| {
+                        let values = opts.glob_values.get(i).map(Vec::as_slice).unwrap_or_default();
+                        substitute_glob_template(tmpl, values)
+                    })
+                    .collect()
+            } else {
+                // Single -o without glob: only first URL uses it
+                vec![tmpl.clone()]
+            }
         } else {
             Vec::new()
         };
@@ -1149,6 +1158,13 @@ pub fn run(args: &[String]) -> ExitCode {
             if !opts.silent || opts.show_error {
                 eprintln!("curl: error saving cookies: {e}");
             }
+        }
+    }
+
+    // Save HSTS cache after transfer (even on error)
+    if let Err(e) = opts.easy.save_hsts_cache() {
+        if !opts.silent || opts.show_error {
+            eprintln!("curl: error saving HSTS cache: {e}");
         }
     }
 
@@ -2044,6 +2060,7 @@ pub fn run_multi(
         if !easy.uses_challenge_auth() {
             if let Some(Some((ref user, ref pass))) = per_url_credentials.get(i) {
                 easy.remove_header("Authorization");
+                easy.remove_header("_auto_Authorization");
                 easy.basic_auth(user, pass);
             } else {
                 let url_user = extract_url_username_raw(url);
@@ -2052,11 +2069,13 @@ pub fn run_multi(
                     let user = url_user.unwrap_or_default();
                     let pass = url_pass.unwrap_or_default();
                     easy.remove_header("Authorization");
+                    easy.remove_header("_auto_Authorization");
                     easy.basic_auth(&user, &pass);
                 } else {
                     // No credentials for this URL — remove stale auth from previous URL
                     // (curl compat: test 999)
                     easy.remove_header("Authorization");
+                    easy.remove_header("_auto_Authorization");
                 }
             }
         }
@@ -2172,6 +2191,19 @@ pub fn run_multi(
 
     // Send FTP QUIT to cleanly close any reusable FTP session
     rt.block_on(easy.ftp_quit());
+
+    // Save cookie jar after all transfers (curl compat: tests 327, 329, 444)
+    if let Err(e) = easy.save_cookie_jar() {
+        if !silent || show_error {
+            eprintln!("curl: error saving cookies: {e}");
+        }
+    }
+    // Save HSTS cache after all transfers
+    if let Err(e) = easy.save_hsts_cache() {
+        if !silent || show_error {
+            eprintln!("curl: error saving HSTS cache: {e}");
+        }
+    }
 
     last_exit
 }

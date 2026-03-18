@@ -1313,7 +1313,12 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
                 }
             }
             "--hsts" => {
-                opts.easy.hsts(true);
+                i += 1;
+                let val = require_arg(args, i, "--hsts")?;
+                if let Err(e) = opts.easy.hsts_file(val) {
+                    eprintln!("curl: error reading HSTS file '{val}': {e}");
+                    return Err(1);
+                }
             }
             "--bearer" => {
                 i += 1;
