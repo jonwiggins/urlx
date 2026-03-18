@@ -94,7 +94,7 @@ async fn default_user_agent_sent() {
 
     let resp = easy.perform_async().await.unwrap();
     let ua = resp.body_str().unwrap();
-    assert!(ua.contains("urlx"), "default UA should contain urlx: {ua}");
+    assert!(ua.contains("curl/"), "default UA should contain curl/: {ua}");
 }
 
 // --- User-Agent override ---
