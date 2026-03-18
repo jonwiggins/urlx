@@ -92,6 +92,8 @@ pub struct FtpResponse {
     pub code: u16,
     /// The response text (may be multi-line).
     pub message: String,
+    /// The raw wire-format bytes of the complete response (including code prefixes and CRLF).
+    pub raw_bytes: Vec<u8>,
 }
 
 impl FtpResponse {
@@ -268,9 +270,18 @@ pub struct FtpSession {
     tls_connector: Option<crate::tls::TlsConnector>,
     /// FTP transfer configuration.
     config: FtpConfig,
+    /// Accumulated raw FTP response bytes for dump-header support.
+    header_bytes: Vec<u8>,
 }
 
 impl FtpSession {
+    /// Read an FTP response and record its raw bytes in `header_bytes` for dump-header.
+    async fn read_and_record(&mut self) -> Result<FtpResponse, Error> {
+        let resp = read_response(&mut self.reader).await?;
+        self.header_bytes.extend_from_slice(&resp.raw_bytes);
+        Ok(resp)
+    }
+
     /// Connect to an FTP server and log in (plain FTP, no TLS).
     ///
     /// # Errors
@@ -300,6 +311,8 @@ impl FtpSession {
         }
 
         let active_port = config.active_port.clone();
+        let mut header_bytes = Vec::new();
+        header_bytes.extend_from_slice(&greeting.raw_bytes);
         let mut session = Self {
             reader,
             writer,
@@ -311,6 +324,7 @@ impl FtpSession {
             #[cfg(feature = "rustls")]
             tls_connector: None,
             config,
+            header_bytes,
         };
 
         // Login
@@ -320,7 +334,7 @@ impl FtpSession {
         if let Some(ref account) = session.config.account {
             let acct_cmd = format!("ACCT {account}");
             send_command(&mut session.writer, &acct_cmd).await?;
-            let acct_resp = read_response(&mut session.reader).await?;
+            let acct_resp = session.read_and_record().await?;
             if !acct_resp.is_complete() {
                 return Err(Error::Transfer {
                     code: 11,
@@ -386,6 +400,8 @@ impl FtpSession {
         }
 
         let active_port = config.active_port.clone();
+        let mut header_bytes = Vec::new();
+        header_bytes.extend_from_slice(&greeting.raw_bytes);
         let mut session = Self {
             reader,
             writer,
@@ -396,6 +412,7 @@ impl FtpSession {
             active_port,
             tls_connector: Some(tls_connector),
             config,
+            header_bytes,
         };
 
         // For explicit FTPS, upgrade the control connection to TLS
@@ -413,7 +430,7 @@ impl FtpSession {
         if let Some(ref account) = session.config.account {
             let acct_cmd = format!("ACCT {account}");
             send_command(&mut session.writer, &acct_cmd).await?;
-            let acct_resp = read_response(&mut session.reader).await?;
+            let acct_resp = session.read_and_record().await?;
             if !acct_resp.is_complete() {
                 return Err(Error::Transfer {
                     code: 11,
@@ -433,7 +450,7 @@ impl FtpSession {
     async fn auth_tls(mut self) -> Result<Self, Error> {
         // Send AUTH TLS command on the plain connection
         send_command(&mut self.writer, "AUTH TLS").await?;
-        let resp = read_response(&mut self.reader).await?;
+        let resp = self.read_and_record().await?;
         if !resp.is_complete() {
             return Err(Error::Http(format!(
                 "FTP AUTH TLS failed: {} {}",
@@ -474,6 +491,7 @@ impl FtpSession {
             active_port: self.active_port,
             tls_connector: self.tls_connector,
             config: self.config,
+            header_bytes: self.header_bytes,
         })
     }
 
@@ -485,7 +503,7 @@ impl FtpSession {
     async fn setup_data_protection(&mut self) -> Result<(), Error> {
         // PBSZ 0 (Protection Buffer Size — always 0 for TLS)
         send_command(&mut self.writer, "PBSZ 0").await?;
-        let pbsz_resp = read_response(&mut self.reader).await?;
+        let pbsz_resp = self.read_and_record().await?;
         if !pbsz_resp.is_complete() {
             return Err(Error::Http(format!(
                 "FTP PBSZ failed: {} {}",
@@ -495,7 +513,7 @@ impl FtpSession {
 
         // PROT P (Protection level Private — encrypt data connections)
         send_command(&mut self.writer, "PROT P").await?;
-        let prot_resp = read_response(&mut self.reader).await?;
+        let prot_resp = self.read_and_record().await?;
         if !prot_resp.is_complete() {
             return Err(Error::Http(format!(
                 "FTP PROT P failed: {} {}",
@@ -521,12 +539,12 @@ impl FtpSession {
     /// Returns `Error::Transfer { code: 67, .. }` on login failure (`CURLE_LOGIN_DENIED`).
     async fn login(&mut self, user: &str, pass: &str) -> Result<(), Error> {
         send_command(&mut self.writer, &format!("USER {user}")).await?;
-        let user_resp = read_response(&mut self.reader).await?;
+        let user_resp = self.read_and_record().await?;
 
         if user_resp.code == 331 {
             // 331 = User name OK, need password
             send_command(&mut self.writer, &format!("PASS {pass}")).await?;
-            let pass_resp = read_response(&mut self.reader).await?;
+            let pass_resp = self.read_and_record().await?;
             // 332 = Need account for login (ACCT will be sent separately)
             if !pass_resp.is_complete() && pass_resp.code != 332 {
                 return Err(Error::Transfer {
@@ -551,7 +569,7 @@ impl FtpSession {
         if send_command(&mut self.writer, "PWD").await.is_err() {
             return None;
         }
-        match read_response(&mut self.reader).await {
+        match self.read_and_record().await {
             Ok(resp) if resp.is_complete() => {
                 // Parse path from 257 "/path"
                 if let Some(start) = resp.message.find('"') {
@@ -573,7 +591,7 @@ impl FtpSession {
     /// support FEAT, returns default (empty) features without error.
     pub async fn feat(&mut self) -> Result<&FtpFeatures, Error> {
         send_command(&mut self.writer, "FEAT").await?;
-        let resp = read_response(&mut self.reader).await?;
+        let resp = self.read_and_record().await?;
 
         let features = if resp.is_complete() {
             parse_feat_response(&resp.message)
@@ -598,7 +616,7 @@ impl FtpSession {
             TransferType::Binary => "TYPE I",
         };
         send_command(&mut self.writer, type_cmd).await?;
-        let resp = read_response(&mut self.reader).await?;
+        let resp = self.read_and_record().await?;
         if !resp.is_complete() {
             return Err(Error::Http(format!("FTP TYPE failed: {} {}", resp.code, resp.message)));
         }
@@ -648,7 +666,7 @@ impl FtpSession {
         // Send PRET before EPSV/PASV if configured (curl compat: test 1107)
         if let Some(cmd) = pret_cmd {
             send_command(&mut self.writer, &format!("PRET {cmd}")).await?;
-            let pret_resp = read_response(&mut self.reader).await?;
+            let pret_resp = self.read_and_record().await?;
             if pret_resp.code >= 400 {
                 // PRET rejected — CURLE_FTP_PRET_FAILED (84)
                 return Err(Error::Transfer {
@@ -663,7 +681,7 @@ impl FtpSession {
         // Try EPSV first if enabled
         if self.config.use_epsv {
             send_command(&mut self.writer, "EPSV").await?;
-            let epsv_resp = read_response(&mut self.reader).await?;
+            let epsv_resp = self.read_and_record().await?;
             if epsv_resp.code == 229 {
                 let data_port = parse_epsv_response(&epsv_resp.message)?;
                 let data_addr = format!("{}:{data_port}", self.hostname);
@@ -676,7 +694,7 @@ impl FtpSession {
         }
 
         send_command(&mut self.writer, "PASV").await?;
-        let pasv_resp = read_response(&mut self.reader).await?;
+        let pasv_resp = self.read_and_record().await?;
         if pasv_resp.code != 227 {
             return Err(Error::Transfer {
                 code: 13,
@@ -745,7 +763,7 @@ impl FtpSession {
         if local_ip.is_ipv6() || self.config.use_eprt {
             let eprt_cmd = format_eprt_command(&advertise_addr);
             send_command(&mut self.writer, &eprt_cmd).await?;
-            let resp = read_response(&mut self.reader).await?;
+            let resp = self.read_and_record().await?;
             if resp.is_complete() {
                 port_ok = true;
             } else if local_ip.is_ipv6() {
@@ -761,7 +779,7 @@ impl FtpSession {
         if !port_ok && local_ip.is_ipv4() {
             let port_cmd = format_port_command(&advertise_addr);
             send_command(&mut self.writer, &port_cmd).await?;
-            let resp = read_response(&mut self.reader).await?;
+            let resp = self.read_and_record().await?;
             if !resp.is_complete() {
                 return Err(Error::Transfer {
                     code: 30,
@@ -805,7 +823,7 @@ impl FtpSession {
         let mut data_stream = self.open_data_connection().await?;
 
         send_command(&mut self.writer, &format!("RETR {path}")).await?;
-        let retr_resp = read_response(&mut self.reader).await?;
+        let retr_resp = self.read_and_record().await?;
         if !retr_resp.is_preliminary() && !retr_resp.is_complete() {
             return Err(Error::Http(format!(
                 "FTP RETR failed: {} {}",
@@ -820,7 +838,7 @@ impl FtpSession {
             .map_err(|e| Error::Http(format!("FTP data read error: {e}")))?;
         drop(data_stream);
 
-        let complete_resp = read_response(&mut self.reader).await?;
+        let complete_resp = self.read_and_record().await?;
         if !complete_resp.is_complete() {
             return Err(Error::Http(format!(
                 "FTP transfer failed: {} {}",
@@ -842,7 +860,7 @@ impl FtpSession {
 
         // Send REST to set the starting offset
         send_command(&mut self.writer, &format!("REST {offset}")).await?;
-        let rest_resp = read_response(&mut self.reader).await?;
+        let rest_resp = self.read_and_record().await?;
         if !rest_resp.is_intermediate() {
             return Err(Error::Http(format!(
                 "FTP REST failed: {} {}",
@@ -851,7 +869,7 @@ impl FtpSession {
         }
 
         send_command(&mut self.writer, &format!("RETR {path}")).await?;
-        let retr_resp = read_response(&mut self.reader).await?;
+        let retr_resp = self.read_and_record().await?;
         if !retr_resp.is_preliminary() && !retr_resp.is_complete() {
             return Err(Error::Http(format!(
                 "FTP RETR failed: {} {}",
@@ -866,7 +884,7 @@ impl FtpSession {
             .map_err(|e| Error::Http(format!("FTP data read error: {e}")))?;
         drop(data_stream);
 
-        let complete_resp = read_response(&mut self.reader).await?;
+        let complete_resp = self.read_and_record().await?;
         if !complete_resp.is_complete() {
             return Err(Error::Http(format!(
                 "FTP transfer failed: {} {}",
@@ -887,7 +905,7 @@ impl FtpSession {
         let mut data_stream = self.open_data_connection().await?;
 
         send_command(&mut self.writer, &format!("STOR {path}")).await?;
-        let stor_resp = read_response(&mut self.reader).await?;
+        let stor_resp = self.read_and_record().await?;
         if !stor_resp.is_preliminary() && !stor_resp.is_complete() {
             return Err(Error::Http(format!(
                 "FTP STOR failed: {} {}",
@@ -905,7 +923,7 @@ impl FtpSession {
             .map_err(|e| Error::Http(format!("FTP data shutdown error: {e}")))?;
         drop(data_stream);
 
-        let complete_resp = read_response(&mut self.reader).await?;
+        let complete_resp = self.read_and_record().await?;
         if !complete_resp.is_complete() {
             return Err(Error::Http(format!(
                 "FTP upload failed: {} {}",
@@ -926,7 +944,7 @@ impl FtpSession {
         let mut data_stream = self.open_data_connection().await?;
 
         send_command(&mut self.writer, &format!("APPE {path}")).await?;
-        let appe_resp = read_response(&mut self.reader).await?;
+        let appe_resp = self.read_and_record().await?;
         if !appe_resp.is_preliminary() && !appe_resp.is_complete() {
             return Err(Error::Http(format!(
                 "FTP APPE failed: {} {}",
@@ -944,7 +962,7 @@ impl FtpSession {
             .map_err(|e| Error::Http(format!("FTP data shutdown error: {e}")))?;
         drop(data_stream);
 
-        let complete_resp = read_response(&mut self.reader).await?;
+        let complete_resp = self.read_and_record().await?;
         if !complete_resp.is_complete() {
             return Err(Error::Http(format!(
                 "FTP append failed: {} {}",
@@ -964,7 +982,7 @@ impl FtpSession {
         if let Some(dir) = path {
             if !dir.is_empty() && dir != "/" {
                 send_command(&mut self.writer, &format!("CWD {dir}")).await?;
-                let cwd_resp = read_response(&mut self.reader).await?;
+                let cwd_resp = self.read_and_record().await?;
                 if !cwd_resp.is_complete() {
                     return Err(Error::Http(format!(
                         "FTP CWD failed: {} {}",
@@ -977,7 +995,7 @@ impl FtpSession {
         let mut data_stream = self.open_data_connection().await?;
 
         send_command(&mut self.writer, "LIST").await?;
-        let list_resp = read_response(&mut self.reader).await?;
+        let list_resp = self.read_and_record().await?;
         if !list_resp.is_preliminary() && !list_resp.is_complete() {
             return Err(Error::Http(format!(
                 "FTP LIST failed: {} {}",
@@ -992,7 +1010,7 @@ impl FtpSession {
             .map_err(|e| Error::Http(format!("FTP data read error: {e}")))?;
         drop(data_stream);
 
-        let complete_resp = read_response(&mut self.reader).await?;
+        let complete_resp = self.read_and_record().await?;
         if !complete_resp.is_complete() {
             return Err(Error::Http(format!(
                 "FTP transfer failed: {} {}",
@@ -1013,7 +1031,7 @@ impl FtpSession {
 
         let cmd = path.map_or_else(|| "MLSD".to_string(), |p| format!("MLSD {p}"));
         send_command(&mut self.writer, &cmd).await?;
-        let resp = read_response(&mut self.reader).await?;
+        let resp = self.read_and_record().await?;
         if !resp.is_preliminary() && !resp.is_complete() {
             return Err(Error::Http(format!("FTP MLSD failed: {} {}", resp.code, resp.message)));
         }
@@ -1025,7 +1043,7 @@ impl FtpSession {
             .map_err(|e| Error::Http(format!("FTP data read error: {e}")))?;
         drop(data_stream);
 
-        let complete_resp = read_response(&mut self.reader).await?;
+        let complete_resp = self.read_and_record().await?;
         if !complete_resp.is_complete() {
             return Err(Error::Http(format!(
                 "FTP MLSD transfer failed: {} {}",
@@ -1043,7 +1061,7 @@ impl FtpSession {
     /// Returns an error if SIZE is not supported or fails.
     pub async fn size(&mut self, path: &str) -> Result<u64, Error> {
         send_command(&mut self.writer, &format!("SIZE {path}")).await?;
-        let resp = read_response(&mut self.reader).await?;
+        let resp = self.read_and_record().await?;
         if !resp.is_complete() {
             return Err(Error::Http(format!("FTP SIZE failed: {} {}", resp.code, resp.message)));
         }
@@ -1060,7 +1078,7 @@ impl FtpSession {
     /// Returns an error if the directory cannot be created.
     pub async fn mkdir(&mut self, path: &str) -> Result<(), Error> {
         send_command(&mut self.writer, &format!("MKD {path}")).await?;
-        let resp = read_response(&mut self.reader).await?;
+        let resp = self.read_and_record().await?;
         if !resp.is_complete() {
             return Err(Error::Http(format!("FTP MKD failed: {} {}", resp.code, resp.message)));
         }
@@ -1074,7 +1092,7 @@ impl FtpSession {
     /// Returns an error if the directory cannot be removed.
     pub async fn rmdir(&mut self, path: &str) -> Result<(), Error> {
         send_command(&mut self.writer, &format!("RMD {path}")).await?;
-        let resp = read_response(&mut self.reader).await?;
+        let resp = self.read_and_record().await?;
         if !resp.is_complete() {
             return Err(Error::Http(format!("FTP RMD failed: {} {}", resp.code, resp.message)));
         }
@@ -1088,7 +1106,7 @@ impl FtpSession {
     /// Returns an error if the file cannot be deleted.
     pub async fn delete(&mut self, path: &str) -> Result<(), Error> {
         send_command(&mut self.writer, &format!("DELE {path}")).await?;
-        let resp = read_response(&mut self.reader).await?;
+        let resp = self.read_and_record().await?;
         if !resp.is_complete() {
             return Err(Error::Http(format!("FTP DELE failed: {} {}", resp.code, resp.message)));
         }
@@ -1102,7 +1120,7 @@ impl FtpSession {
     /// Returns an error if the rename fails.
     pub async fn rename(&mut self, from: &str, to: &str) -> Result<(), Error> {
         send_command(&mut self.writer, &format!("RNFR {from}")).await?;
-        let rnfr_resp = read_response(&mut self.reader).await?;
+        let rnfr_resp = self.read_and_record().await?;
         if !rnfr_resp.is_intermediate() {
             return Err(Error::Http(format!(
                 "FTP RNFR failed: {} {}",
@@ -1111,7 +1129,7 @@ impl FtpSession {
         }
 
         send_command(&mut self.writer, &format!("RNTO {to}")).await?;
-        let rnto_resp = read_response(&mut self.reader).await?;
+        let rnto_resp = self.read_and_record().await?;
         if !rnto_resp.is_complete() {
             return Err(Error::Http(format!(
                 "FTP RNTO failed: {} {}",
@@ -1128,7 +1146,7 @@ impl FtpSession {
     /// Returns an error if the SITE command fails.
     pub async fn site(&mut self, command: &str) -> Result<FtpResponse, Error> {
         send_command(&mut self.writer, &format!("SITE {command}")).await?;
-        read_response(&mut self.reader).await
+        self.read_and_record().await
     }
 
     /// Print the current working directory (PWD).
@@ -1138,7 +1156,7 @@ impl FtpSession {
     /// Returns an error if the PWD command fails.
     pub async fn pwd(&mut self) -> Result<String, Error> {
         send_command(&mut self.writer, "PWD").await?;
-        let resp = read_response(&mut self.reader).await?;
+        let resp = self.read_and_record().await?;
         if !resp.is_complete() {
             return Err(Error::Http(format!("FTP PWD failed: {} {}", resp.code, resp.message)));
         }
@@ -1159,7 +1177,7 @@ impl FtpSession {
     /// Returns an error if the directory change fails.
     pub async fn cwd(&mut self, path: &str) -> Result<(), Error> {
         send_command(&mut self.writer, &format!("CWD {path}")).await?;
-        let resp = read_response(&mut self.reader).await?;
+        let resp = self.read_and_record().await?;
         if !resp.is_complete() {
             return Err(Error::Http(format!("FTP CWD failed: {} {}", resp.code, resp.message)));
         }
@@ -1223,13 +1241,13 @@ impl FtpSession {
             }
             // Try CWD first — the directory may already exist
             send_command(&mut self.writer, &format!("CWD {component}")).await?;
-            let cwd_resp = read_response(&mut self.reader).await?;
+            let cwd_resp = self.read_and_record().await?;
             if cwd_resp.is_complete() {
                 continue;
             }
             // CWD failed — try MKD then CWD again
             send_command(&mut self.writer, &format!("MKD {component}")).await?;
-            let mkd_resp = read_response(&mut self.reader).await?;
+            let mkd_resp = self.read_and_record().await?;
             if !mkd_resp.is_complete() {
                 return Err(Error::Http(format!(
                     "FTP MKD failed for '{}': {} {}",
@@ -1237,7 +1255,7 @@ impl FtpSession {
                 )));
             }
             send_command(&mut self.writer, &format!("CWD {component}")).await?;
-            let retry_resp = read_response(&mut self.reader).await?;
+            let retry_resp = self.read_and_record().await?;
             if !retry_resp.is_complete() {
                 return Err(Error::Http(format!(
                     "FTP CWD failed after MKD for '{}': {} {}",
@@ -1283,6 +1301,7 @@ pub async fn read_response<S: AsyncRead + Unpin>(
 ) -> Result<FtpResponse, Error> {
     let mut full_message = String::new();
     let mut final_code: Option<u16> = None;
+    let mut raw_bytes = Vec::new();
 
     loop {
         let mut line = String::new();
@@ -1293,6 +1312,17 @@ pub async fn read_response<S: AsyncRead + Unpin>(
 
         if bytes_read == 0 {
             return Err(Error::Http("FTP connection closed unexpectedly".to_string()));
+        }
+
+        // Capture the raw line, normalizing to CRLF for dump-header output.
+        if line.ends_with("\r\n") {
+            raw_bytes.extend_from_slice(line.as_bytes());
+        } else if line.ends_with('\n') {
+            raw_bytes.extend_from_slice(&line.as_bytes()[..line.len() - 1]);
+            raw_bytes.extend_from_slice(b"\r\n");
+        } else {
+            raw_bytes.extend_from_slice(line.as_bytes());
+            raw_bytes.extend_from_slice(b"\r\n");
         }
 
         let line = line.trim_end_matches('\n').trim_end_matches('\r');
@@ -1341,7 +1371,7 @@ pub async fn read_response<S: AsyncRead + Unpin>(
     let code =
         final_code.ok_or_else(|| Error::Http("FTP response has no status code".to_string()))?;
 
-    Ok(FtpResponse { code, message: full_message })
+    Ok(FtpResponse { code, message: full_message, raw_bytes })
 }
 
 /// Send an FTP command on the control connection.
@@ -1613,15 +1643,15 @@ pub async fn perform(
             continue;
         }
         send_command(&mut session.writer, &format!("CWD {component}")).await?;
-        let cwd_resp = read_response(&mut session.reader).await?;
+        let cwd_resp = session.read_and_record().await?;
         if !cwd_resp.is_complete() {
             if config.create_dirs {
                 // --ftp-create-dirs: try MKD then retry CWD
                 send_command(&mut session.writer, &format!("MKD {component}")).await?;
-                let _mkd_resp = read_response(&mut session.reader).await?;
+                let _mkd_resp = session.read_and_record().await?;
                 // Always retry CWD after MKD, even if MKD failed (curl compat)
                 send_command(&mut session.writer, &format!("CWD {component}")).await?;
-                let retry_resp = read_response(&mut session.reader).await?;
+                let retry_resp = session.read_and_record().await?;
                 if !retry_resp.is_complete() {
                     let _ = session.quit().await;
                     return Err(Error::Transfer {
@@ -1653,7 +1683,7 @@ pub async fn perform(
     // Pre-quote commands (sent after CWD, before data transfer)
     for cmd in &config.pre_quote {
         send_command(&mut session.writer, cmd).await?;
-        let resp = read_response(&mut session.reader).await?;
+        let resp = session.read_and_record().await?;
         if !resp.is_complete() && !resp.is_preliminary() {
             let _ = session.quit().await;
             return Err(Error::Transfer {
@@ -1670,9 +1700,12 @@ pub async fn perform(
     // For directory listings (-I on a directory), just QUIT after CWD (curl compat: test 1000).
     if config.nobody {
         if is_dir_list {
+            let raw = std::mem::take(&mut session.header_bytes);
             let _ = session.quit().await;
             let headers = std::collections::HashMap::new();
-            return Ok(Response::new(200, headers, Vec::new(), url.as_str().to_string()));
+            let mut resp = Response::new(200, headers, Vec::new(), url.as_str().to_string());
+            resp.set_raw_headers(raw);
+            return Ok(resp);
         }
         let mut last_modified: Option<String> = None;
         let mut content_length: Option<String> = None;
@@ -1680,7 +1713,7 @@ pub async fn perform(
         // MDTM (modification time)
         if !filename.is_empty() {
             send_command(&mut session.writer, &format!("MDTM {filename}")).await?;
-            let mdtm_resp = read_response(&mut session.reader).await?;
+            let mdtm_resp = session.read_and_record().await?;
             if mdtm_resp.is_complete() {
                 let mdtm_str = mdtm_resp.message.trim();
                 if let Some(date) = format_mdtm_as_http_date(mdtm_str) {
@@ -1691,7 +1724,7 @@ pub async fn perform(
 
         // TYPE I for SIZE
         send_command(&mut session.writer, "TYPE I").await?;
-        let type_resp = read_response(&mut session.reader).await?;
+        let type_resp = session.read_and_record().await?;
         if !type_resp.is_complete() {
             let _ = session.quit().await;
             return Err(Error::Transfer {
@@ -1703,7 +1736,7 @@ pub async fn perform(
         // SIZE
         if !filename.is_empty() {
             send_command(&mut session.writer, &format!("SIZE {filename}")).await?;
-            let size_resp = read_response(&mut session.reader).await?;
+            let size_resp = session.read_and_record().await?;
             if size_resp.is_complete() {
                 content_length = Some(size_resp.message.trim().to_string());
             }
@@ -1711,8 +1744,9 @@ pub async fn perform(
 
         // REST 0 (curl sends this in HEAD mode)
         send_command(&mut session.writer, "REST 0").await?;
-        let _rest_resp = read_response(&mut session.reader).await?;
+        let _rest_resp = session.read_and_record().await?;
 
+        let raw = std::mem::take(&mut session.header_bytes);
         let _ = session.quit().await;
 
         // Build FTP HEAD output as pseudo-HTTP headers (curl compat)
@@ -1736,7 +1770,10 @@ pub async fn perform(
         if let Some(ref lm) = last_modified {
             let _old = headers.insert("last-modified".to_string(), lm.clone());
         }
-        return Ok(Response::new(200, headers, body_text.into_bytes(), url.as_str().to_string()));
+        let mut resp =
+            Response::new(200, headers, body_text.into_bytes(), url.as_str().to_string());
+        resp.set_raw_headers(raw);
+        return Ok(resp);
     }
 
     // For uploads
@@ -1750,10 +1787,13 @@ pub async fn perform(
                 // (curl sends these commands even when nothing to upload)
                 let _ = session.open_data_connection().await;
                 send_command(&mut session.writer, "TYPE I").await?;
-                let _ = read_response(&mut session.reader).await;
+                let _ = session.read_and_record().await;
+                let raw = std::mem::take(&mut session.header_bytes);
                 let _ = session.quit().await;
                 let headers = std::collections::HashMap::new();
-                return Ok(Response::new(200, headers, Vec::new(), url.as_str().to_string()));
+                let mut resp = Response::new(200, headers, Vec::new(), url.as_str().to_string());
+                resp.set_raw_headers(raw);
+                return Ok(resp);
             }
             (&upload_bytes[offset_usize..], true)
         } else {
@@ -1778,7 +1818,7 @@ pub async fn perform(
             _ => "TYPE I",
         };
         send_command(&mut session.writer, upload_type_cmd).await?;
-        let type_resp = read_response(&mut session.reader).await?;
+        let type_resp = session.read_and_record().await?;
         if !type_resp.is_complete() {
             let _ = session.quit().await;
             return Err(Error::Transfer {
@@ -1792,7 +1832,7 @@ pub async fn perform(
         let mut use_appe_effective = use_appe;
         if resume_from.is_some() {
             send_command(&mut session.writer, &format!("SIZE {filename}")).await?;
-            let size_resp = read_response(&mut session.reader).await?;
+            let size_resp = session.read_and_record().await?;
             if !size_resp.is_complete() {
                 // File doesn't exist — use STOR instead of APPE
                 use_appe_effective = false;
@@ -1806,7 +1846,7 @@ pub async fn perform(
             format!("STOR {filename}")
         };
         send_command(&mut session.writer, &stor_cmd).await?;
-        let stor_resp = read_response(&mut session.reader).await?;
+        let stor_resp = session.read_and_record().await?;
         if !stor_resp.is_preliminary() && !stor_resp.is_complete() {
             let _ = session.quit().await;
             return Err(Error::Transfer {
@@ -1835,7 +1875,7 @@ pub async fn perform(
             .map_err(|e| Error::Http(format!("FTP data shutdown error: {e}")))?;
         drop(data_stream);
 
-        let complete_resp = read_response(&mut session.reader).await?;
+        let complete_resp = session.read_and_record().await?;
         if !complete_resp.is_complete() {
             let _ = session.quit().await;
             // 452/552 = disk full (curl returns CURLE_REMOTE_DISK_FULL = 70)
@@ -1852,7 +1892,7 @@ pub async fn perform(
         // Post-quote commands
         for cmd in &config.post_quote {
             send_command(&mut session.writer, cmd).await?;
-            let resp = read_response(&mut session.reader).await?;
+            let resp = session.read_and_record().await?;
             if !resp.is_complete() && !resp.is_preliminary() {
                 let _ = session.quit().await;
                 return Err(Error::Transfer {
@@ -1865,9 +1905,12 @@ pub async fn perform(
             }
         }
 
+        let raw = std::mem::take(&mut session.header_bytes);
         let _ = session.quit().await;
         let headers = std::collections::HashMap::new();
-        return Ok(Response::new(200, headers, Vec::new(), url.as_str().to_string()));
+        let mut resp = Response::new(200, headers, Vec::new(), url.as_str().to_string());
+        resp.set_raw_headers(raw);
+        return Ok(resp);
     }
 
     // Directory listing
@@ -1885,7 +1928,7 @@ pub async fn perform(
 
         // TYPE A for directory listings
         send_command(&mut session.writer, "TYPE A").await?;
-        let type_resp = read_response(&mut session.reader).await?;
+        let type_resp = session.read_and_record().await?;
         if !type_resp.is_complete() {
             let _ = session.quit().await;
             return Err(Error::Transfer {
@@ -1907,14 +1950,17 @@ pub async fn perform(
             list_base.to_string()
         };
         send_command(&mut session.writer, &list_cmd).await?;
-        let list_resp = read_response(&mut session.reader).await?;
+        let list_resp = session.read_and_record().await?;
         // 4xx (transient) on NLST/LIST means "no files found" — treat as empty listing,
         // not error (curl compat: test 144). 5xx (permanent) is still an error (test 145).
         if list_resp.is_negative_transient() {
             drop(data_stream);
+            let raw = std::mem::take(&mut session.header_bytes);
             let _ = session.quit().await;
             let headers = std::collections::HashMap::new();
-            return Ok(Response::new(200, headers, Vec::new(), url.as_str().to_string()));
+            let mut resp = Response::new(200, headers, Vec::new(), url.as_str().to_string());
+            resp.set_raw_headers(raw);
+            return Ok(resp);
         }
         if !list_resp.is_preliminary() && !list_resp.is_complete() {
             let _ = session.quit().await;
@@ -1933,7 +1979,7 @@ pub async fn perform(
 
         // Read 226 Transfer Complete
         if list_resp.is_preliminary() {
-            let complete_resp = read_response(&mut session.reader).await?;
+            let complete_resp = session.read_and_record().await?;
             if !complete_resp.is_complete() {
                 let _ = session.quit().await;
                 return Err(Error::Http(format!(
@@ -1946,7 +1992,7 @@ pub async fn perform(
         // Post-quote commands
         for cmd in &config.post_quote {
             send_command(&mut session.writer, cmd).await?;
-            let resp = read_response(&mut session.reader).await?;
+            let resp = session.read_and_record().await?;
             if !resp.is_complete() && !resp.is_preliminary() {
                 let _ = session.quit().await;
                 return Err(Error::Transfer {
@@ -1959,10 +2005,13 @@ pub async fn perform(
             }
         }
 
+        let raw = std::mem::take(&mut session.header_bytes);
         let _ = session.quit().await;
         let mut headers = std::collections::HashMap::new();
         let _old = headers.insert("content-length".to_string(), data.len().to_string());
-        return Ok(Response::new(200, headers, data, url.as_str().to_string()));
+        let mut resp = Response::new(200, headers, data, url.as_str().to_string());
+        resp.set_raw_headers(raw);
+        return Ok(resp);
     }
 
     // File download (RETR)
@@ -1976,7 +2025,7 @@ pub async fn perform(
     // FTP -z: send MDTM before download to check file modification time
     if let Some((cond_ts, negate)) = config.time_condition {
         send_command(&mut session.writer, &format!("MDTM {filename}")).await?;
-        let mdtm_resp = read_response(&mut session.reader).await?;
+        let mdtm_resp = session.read_and_record().await?;
         if mdtm_resp.is_complete() {
             // Parse MDTM response: "YYYYMMDDHHMMSS"
             let mdtm_str = mdtm_resp.message.trim();
@@ -1989,9 +2038,13 @@ pub async fn perform(
                     file_ts <= cond_ts
                 };
                 if should_skip {
+                    let raw = std::mem::take(&mut session.header_bytes);
                     let _ = session.quit().await;
                     let headers = std::collections::HashMap::new();
-                    return Ok(Response::new(200, headers, Vec::new(), url.as_str().to_string()));
+                    let mut resp =
+                        Response::new(200, headers, Vec::new(), url.as_str().to_string());
+                    resp.set_raw_headers(raw);
+                    return Ok(resp);
                 }
             }
         }
@@ -2015,7 +2068,7 @@ pub async fn perform(
     // TYPE
     let type_cmd = if use_ascii { "TYPE A" } else { "TYPE I" };
     send_command(&mut session.writer, type_cmd).await?;
-    let type_resp = read_response(&mut session.reader).await?;
+    let type_resp = session.read_and_record().await?;
     if !type_resp.is_complete() {
         drop(data_stream);
         let _ = session.quit().await;
@@ -2030,7 +2083,7 @@ pub async fn perform(
     let mut remote_size: Option<u64> = None;
     if !use_ascii && !config.ignore_content_length {
         send_command(&mut session.writer, &format!("SIZE {filename}")).await?;
-        let size_resp = read_response(&mut session.reader).await?;
+        let size_resp = session.read_and_record().await?;
         if size_resp.is_complete() {
             if let Ok(sz) = size_resp.message.trim().parse::<u64>() {
                 remote_size = Some(sz);
@@ -2065,15 +2118,18 @@ pub async fn perform(
             if offset == sz {
                 // File already fully downloaded
                 drop(data_stream);
+                let raw = std::mem::take(&mut session.header_bytes);
                 let _ = session.quit().await;
                 let headers = std::collections::HashMap::new();
-                return Ok(Response::new(200, headers, Vec::new(), url.as_str().to_string()));
+                let mut resp = Response::new(200, headers, Vec::new(), url.as_str().to_string());
+                resp.set_raw_headers(raw);
+                return Ok(resp);
             }
         }
 
         // REST
         send_command(&mut session.writer, &format!("REST {offset}")).await?;
-        let rest_resp = read_response(&mut session.reader).await?;
+        let rest_resp = session.read_and_record().await?;
         if !rest_resp.is_intermediate() {
             drop(data_stream);
             let _ = session.quit().await;
@@ -2086,7 +2142,7 @@ pub async fn perform(
 
     // RETR
     send_command(&mut session.writer, &format!("RETR {filename}")).await?;
-    let retr_resp = read_response(&mut session.reader).await?;
+    let retr_resp = session.read_and_record().await?;
     if !retr_resp.is_preliminary() && !retr_resp.is_complete() {
         drop(data_stream);
         let _ = session.quit().await;
@@ -2112,7 +2168,7 @@ pub async fn perform(
         // Send ABOR to terminate the transfer early
         send_command(&mut session.writer, "ABOR").await?;
         // Ignore response (may be 426 or 226)
-        let _ = read_response(&mut session.reader).await;
+        let _ = session.read_and_record().await;
     } else {
         let _ = data_stream
             .read_to_end(&mut data)
@@ -2132,6 +2188,7 @@ pub async fn perform(
                 let mut headers = std::collections::HashMap::new();
                 let _old = headers.insert("content-length".to_string(), data.len().to_string());
                 let mut resp = Response::new(200, headers, data, url.as_str().to_string());
+                resp.set_raw_headers(std::mem::take(&mut session.header_bytes));
                 resp.set_body_error(Some("partial".to_string()));
                 return Ok(resp);
             }
@@ -2140,7 +2197,7 @@ pub async fn perform(
 
     // Read 226 Transfer Complete
     if retr_resp.is_preliminary() && range_end.is_none() {
-        let complete_resp = read_response(&mut session.reader).await?;
+        let complete_resp = session.read_and_record().await?;
         if !complete_resp.is_complete() {
             let _ = session.quit().await;
             return Err(Error::Http(format!(
@@ -2153,18 +2210,21 @@ pub async fn perform(
     // Post-quote commands
     for cmd in &config.post_quote {
         send_command(&mut session.writer, cmd).await?;
-        let resp = read_response(&mut session.reader).await?;
+        let resp = session.read_and_record().await?;
         if !resp.is_complete() && !resp.is_preliminary() {
             // Post-quote failure is not fatal — continue with QUIT (curl compat)
         }
     }
 
+    let raw = std::mem::take(&mut session.header_bytes);
     let _ = session.quit().await;
 
     let mut headers = std::collections::HashMap::new();
     let _old = headers.insert("content-length".to_string(), data.len().to_string());
 
-    Ok(Response::new(200, headers, data, url.as_str().to_string()))
+    let mut resp = Response::new(200, headers, data, url.as_str().to_string());
+    resp.set_raw_headers(raw);
+    Ok(resp)
 }
 
 /// Percent-decode a URL path component.
@@ -2445,15 +2505,15 @@ mod tests {
 
     #[test]
     fn ftp_response_status_categories() {
-        let preliminary = FtpResponse { code: 150, message: String::new() };
+        let preliminary = FtpResponse { code: 150, message: String::new(), raw_bytes: Vec::new() };
         assert!(preliminary.is_preliminary());
         assert!(!preliminary.is_complete());
 
-        let complete = FtpResponse { code: 226, message: String::new() };
+        let complete = FtpResponse { code: 226, message: String::new(), raw_bytes: Vec::new() };
         assert!(complete.is_complete());
         assert!(!complete.is_intermediate());
 
-        let intermediate = FtpResponse { code: 331, message: String::new() };
+        let intermediate = FtpResponse { code: 331, message: String::new(), raw_bytes: Vec::new() };
         assert!(intermediate.is_intermediate());
         assert!(!intermediate.is_complete());
     }
