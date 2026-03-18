@@ -112,6 +112,18 @@ impl FtpResponse {
     pub const fn is_intermediate(&self) -> bool {
         self.code >= 300 && self.code < 400
     }
+
+    /// Check if this is a negative transient response (4xx).
+    #[must_use]
+    pub const fn is_negative_transient(&self) -> bool {
+        self.code >= 400 && self.code < 500
+    }
+
+    /// Check if this is a negative permanent response (5xx).
+    #[must_use]
+    pub const fn is_negative_permanent(&self) -> bool {
+        self.code >= 500 && self.code < 600
+    }
 }
 
 /// FTP method for traversing directories.
@@ -1856,6 +1868,14 @@ pub async fn perform(
         };
         send_command(&mut session.writer, &list_cmd).await?;
         let list_resp = read_response(&mut session.reader).await?;
+        // 4xx (transient) on NLST/LIST means "no files found" — treat as empty listing,
+        // not error (curl compat: test 144). 5xx (permanent) is still an error (test 145).
+        if list_resp.is_negative_transient() {
+            drop(data_stream);
+            let _ = session.quit().await;
+            let headers = std::collections::HashMap::new();
+            return Ok(Response::new(200, headers, Vec::new(), url.as_str().to_string()));
+        }
         if !list_resp.is_preliminary() && !list_resp.is_complete() {
             let _ = session.quit().await;
             return Err(Error::Transfer {

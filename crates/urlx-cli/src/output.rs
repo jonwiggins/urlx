@@ -413,6 +413,12 @@ pub fn format_write_out(fmt: &str, response: &liburlx::Response) -> String {
             result = result.replace("%{urle.fragment}", &u_fragment);
         }
     }
+    // %{url} is an alias for %{url_effective} — placed after url.*/urle.* to avoid
+    // prefix conflicts (curl compat: test 1029).
+    #[allow(clippy::literal_string_with_formatting_args)]
+    {
+        result = result.replace("%{url}", response.effective_url());
+    }
     // Header sizes: approximate from response headers
     let header_size: usize = response.headers().iter().map(|(k, v)| k.len() + v.len() + 4).sum();
     result = result.replace("%{size_header}", &header_size.to_string());

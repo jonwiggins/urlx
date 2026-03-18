@@ -222,10 +222,40 @@ impl Url {
     }
 
     /// Returns the Host header value (includes port if non-default).
+    ///
+    /// Preserves the original hostname case from the raw input URL so that
+    /// `MiXeDcAsE.cOm` stays as-is in the Host header (curl compat: test 1318).
     #[must_use]
     pub fn host_header_value(&self) -> String {
-        let host = self.host_str().unwrap_or("");
-        self.inner.port().map_or_else(|| host.to_string(), |port| format!("{host}:{port}"))
+        let host = self.raw_host_str().unwrap_or_else(|| self.host_str().unwrap_or("").to_string());
+        match self.inner.port() {
+            Some(port) => format!("{host}:{port}"),
+            None => host,
+        }
+    }
+
+    /// Extract the original-cased hostname from the raw input URL.
+    ///
+    /// The `url` crate normalizes hostnames to lowercase. This method
+    /// recovers the original casing from `raw_input` when available.
+    fn raw_host_str(&self) -> Option<String> {
+        let raw = self.raw_input.as_deref()?;
+        let after_scheme = raw.find("://")?;
+        let rest = &raw[after_scheme + 3..];
+        // Skip userinfo if present (look for @ before first /)
+        let slash_pos = rest.find('/').unwrap_or(rest.len());
+        let host_start = rest[..slash_pos].rfind('@').map_or(0, |at| at + 1);
+        let host_rest = &rest[host_start..];
+        // Find end of host: port separator, path, query, or fragment
+        let host_end = host_rest.find([':', '/', '?', '#']).unwrap_or(host_rest.len());
+        let raw_host = &host_rest[..host_end];
+        // Verify it matches the parsed host (case-insensitively)
+        let parsed_host = self.host_str()?;
+        if raw_host.eq_ignore_ascii_case(parsed_host) {
+            Some(raw_host.to_string())
+        } else {
+            None
+        }
     }
 
     /// Returns the raw input URL string (before normalization).

@@ -3516,6 +3516,10 @@ async fn perform_transfer(
                 let mut next_url =
                     if location.starts_with("http://") || location.starts_with("https://") {
                         Url::parse(location)?
+                    } else if location.starts_with("//") {
+                        // Protocol-relative URL (//host/path) — use current scheme
+                        let scheme = current_url.scheme();
+                        Url::parse(&format!("{scheme}:{location}"))?
                     } else {
                         // Relative URL: build from current URL's base
                         let base = current_url.as_str();

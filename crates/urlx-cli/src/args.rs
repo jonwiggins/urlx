@@ -752,7 +752,7 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
                 let val = require_arg(args, i, "-D")?;
                 opts.dump_header = Some(val.to_string());
             }
-            "-i" | "--include" => {
+            "-i" | "--include" | "--show-headers" => {
                 opts.include_headers = true;
             }
             "--no-include" => {
@@ -1365,9 +1365,13 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
                         let expanded = expand_combined_flags(&full_args);
                         return parse_args_options_with_depth(&expanded, config_depth + 1);
                     }
-                    Err(e) => {
-                        eprintln!("curl: can't read config file '{val}': {e}");
-                        return Err(1);
+                    Err(_e) => {
+                        eprintln!("curl: cannot read config from '{val}'");
+                        eprintln!("curl: option -K: error encountered when reading a file");
+                        eprintln!(
+                            "curl: try 'curl --help' or 'curl --manual' for more information"
+                        );
+                        return Err(26);
                     }
                 }
             }
