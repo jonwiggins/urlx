@@ -11,7 +11,7 @@ use crate::args::{
 };
 use crate::output::{
     content_disposition_filename, format_headers, format_write_out, http_status_text,
-    output_response, write_trace_file,
+    output_response, output_response_with_context, write_trace_file, WriteOutContext,
 };
 
 /// Substitute `#1`, `#2`, etc. in an output filename template with glob match values.
@@ -673,6 +673,7 @@ pub fn run(args: &[String]) -> ExitCode {
             opts.dump_header.as_deref(),
             &opts.per_url_ftp_methods,
             opts.upload_filename.as_deref(),
+            &opts.per_url_easy,
         );
     }
 
@@ -1490,13 +1491,19 @@ pub fn run(args: &[String]) -> ExitCode {
             } else {
                 opts.include_headers
             };
-            let exit = output_response(
+            let ctx = WriteOutContext {
+                filename_effective: opts.output_file.clone().unwrap_or_default(),
+                stderr_file: opts.stderr_file.clone(),
+                ..WriteOutContext::default()
+            };
+            let exit = output_response_with_context(
                 &response,
                 opts.output_file.as_deref(),
                 opts.write_out.as_deref(),
                 effective_include,
                 opts.silent,
                 suppress_body,
+                &ctx,
             );
 
             // --remote-time: set output file's modification time from Last-Modified
@@ -1965,6 +1972,7 @@ pub fn run_multi(
     dump_header: Option<&str>,
     per_url_ftp_methods: &[liburlx::protocol::ftp::FtpMethod],
     upload_filename: Option<&str>,
+    per_url_easy: &[Option<liburlx::Easy>],
 ) -> ExitCode {
     if parallel {
         return run_multi_parallel(
@@ -1993,6 +2001,11 @@ pub fn run_multi(
     let mut last_exit = ExitCode::SUCCESS;
 
     for (i, url) in urls.iter().enumerate() {
+        // Use per-URL Easy handle if available (from --next groups, curl compat: tests 430-432)
+        if let Some(Some(per_easy)) = per_url_easy.get(i) {
+            easy = per_easy.clone();
+        }
+
         // -T upload: for HTTP, only the first URL gets PUT with the upload body;
         // subsequent URLs revert to GET without body (curl compat: test 1065).
         // For FTP, all URLs keep the upload body (curl compat: tests 149, 216).
@@ -2033,6 +2046,31 @@ pub fn run_multi(
             if !silent || show_error {
                 eprintln!("curl: ({}) URL rejected: {e}", 3);
             }
+            // Still produce write-out for invalid URLs (curl compat: test 423)
+            if let Some(wo) = write_out {
+                let dummy_response = liburlx::Response::new(
+                    0,
+                    std::collections::HashMap::new(),
+                    Vec::new(),
+                    url.clone(),
+                );
+                let ctx = WriteOutContext {
+                    urlnum: i,
+                    exitcode: 3,
+                    errormsg: format!("URL rejected: {e}"),
+                    had_error: true,
+                    ..WriteOutContext::default()
+                };
+                let _ = output_response_with_context(
+                    &dummy_response,
+                    None,
+                    Some(wo),
+                    false,
+                    silent,
+                    true,
+                    &ctx,
+                );
+            }
             last_exit = ExitCode::from(3); // CURLE_URL_MALFORMAT
             continue;
         }
@@ -2069,18 +2107,27 @@ pub fn run_multi(
         match rt.block_on(easy.perform_async()) {
             Ok(response) => {
                 if fail_on_error && response.status() >= 400 {
-                    // --fail-with-body: output body before returning error (curl compat: test 361)
-                    if fail_with_body {
-                        let file_for_this = output_files.get(i).map(String::as_str);
-                        let _ = output_response(
-                            &response,
-                            file_for_this,
-                            write_out,
-                            include_headers,
-                            silent,
-                            false,
-                        );
-                    }
+                    let err_msg =
+                        format!("The requested URL returned error: {}", response.status());
+                    // Output write-out and optionally body on --fail (curl compat: tests 361, 1188)
+                    let file_for_this = output_files.get(i).map(String::as_str);
+                    let ctx = WriteOutContext {
+                        urlnum: i,
+                        exitcode: 22,
+                        errormsg: err_msg,
+                        had_error: true,
+                        ..WriteOutContext::default()
+                    };
+                    let suppress = !fail_with_body;
+                    let _ = output_response_with_context(
+                        &response,
+                        file_for_this,
+                        write_out,
+                        include_headers,
+                        silent,
+                        suppress,
+                        &ctx,
+                    );
                     last_exit = ExitCode::from(22); // CURLE_HTTP_RETURNED_ERROR
                     continue;
                 }
@@ -2161,11 +2208,37 @@ pub fn run_multi(
                 if !silent || show_error {
                     eprintln!("curl: transfer {} ({}): {e}", i + 1, url);
                 }
-                let exit = error_to_exit_code(&e);
-                if fail_early {
-                    return exit;
+                let curl_code = error_to_curl_code(&e);
+                // Still produce write-out for failed transfers (curl compat: test 423)
+                if let Some(wo) = write_out {
+                    let dummy_response = liburlx::Response::new(
+                        0,
+                        std::collections::HashMap::new(),
+                        Vec::new(),
+                        url.clone(),
+                    );
+                    let ctx = WriteOutContext {
+                        urlnum: i,
+                        exitcode: curl_code,
+                        errormsg: curl_error_message(&e),
+                        had_error: true,
+                        ..WriteOutContext::default()
+                    };
+                    let _ = output_response_with_context(
+                        &dummy_response,
+                        None,
+                        Some(wo),
+                        false,
+                        silent,
+                        true,
+                        &ctx,
+                    );
                 }
-                last_exit = exit;
+                let exit_code = ExitCode::from(curl_code);
+                if fail_early {
+                    return exit_code;
+                }
+                last_exit = exit_code;
             }
         }
     }

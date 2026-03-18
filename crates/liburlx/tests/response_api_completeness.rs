@@ -243,6 +243,10 @@ fn transfer_info_all_timing_fields() {
         num_retries: 0,
         effective_method: "GET".to_string(),
         referer: String::new(),
+        local_ip: String::new(),
+        local_port: 0,
+        remote_ip: String::new(),
+        remote_port: 0,
     };
 
     assert_eq!(info.time_namelookup, Duration::from_millis(5));
@@ -308,6 +312,10 @@ fn transfer_info_clone_preserves_all_fields() {
         num_retries: 0,
         effective_method: "POST".to_string(),
         referer: String::new(),
+        local_ip: String::new(),
+        local_port: 0,
+        remote_ip: String::new(),
+        remote_port: 0,
     };
     let cloned = info.clone();
     assert_eq!(cloned.time_namelookup, info.time_namelookup);

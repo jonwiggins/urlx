@@ -6,6 +6,23 @@
 use std::io::Write;
 use std::process::ExitCode;
 
+/// Extra context for `--write-out` variable expansion beyond what's in the Response.
+#[derive(Default)]
+pub struct WriteOutContext {
+    /// Effective output filename (set by `-O`, `-J`, `--output`).
+    pub filename_effective: String,
+    /// 0-based URL index in multi-URL mode.
+    pub urlnum: usize,
+    /// Exit code for this transfer (0 on success, 22 for --fail, etc.).
+    pub exitcode: u8,
+    /// Error message for this transfer (empty on success).
+    pub errormsg: String,
+    /// Whether this transfer had an error (controls `%{onerror}`).
+    pub had_error: bool,
+    /// Path to redirect stderr to (from `--stderr`).
+    pub stderr_file: Option<String>,
+}
+
 /// Format response headers as HTTP status line + headers.
 ///
 /// Preserves original header ordering, casing, and duplicates from the server.
@@ -243,6 +260,27 @@ pub fn output_response(
     silent: bool,
     suppress_body: bool,
 ) -> ExitCode {
+    output_response_with_context(
+        response,
+        output_file,
+        write_out,
+        include_headers,
+        silent,
+        suppress_body,
+        &WriteOutContext::default(),
+    )
+}
+
+/// Output a response with additional write-out context.
+pub fn output_response_with_context(
+    response: &liburlx::Response,
+    output_file: Option<&str>,
+    write_out: Option<&str>,
+    include_headers: bool,
+    silent: bool,
+    suppress_body: bool,
+    ctx: &WriteOutContext,
+) -> ExitCode {
     // Build all header text including redirect chain (for -L --include)
     let all_headers = if include_headers {
         let mut h = String::new();
@@ -321,7 +359,7 @@ pub fn output_response(
         } else {
             (None, false, fmt)
         };
-        let output = format_write_out(real_fmt, response, suppress_body);
+        let output = format_write_out_with_context(real_fmt, response, suppress_body, ctx);
         if let Some(path) = out_file {
             use std::io::Write;
             let file = if append_mode {
@@ -334,6 +372,7 @@ pub fn output_response(
             }
         } else {
             // Handle %{stderr} directive: text after it goes to stderr (curl compat: test 1278)
+            // When --stderr is set, stderr output goes to that file (curl compat: test 978)
             if let Some(pos) = output.find("%{stderr}") {
                 let stdout_part = &output[..pos];
                 let stderr_part = &output[pos + "%{stderr}".len()..];
@@ -341,7 +380,17 @@ pub fn output_response(
                     print!("{stdout_part}");
                 }
                 if !stderr_part.is_empty() {
-                    eprint!("{stderr_part}");
+                    if let Some(ref stderr_path) = ctx.stderr_file {
+                        // Route to --stderr file (curl compat: test 978)
+                        use std::io::Write;
+                        if let Ok(mut f) =
+                            std::fs::OpenOptions::new().create(true).append(true).open(stderr_path)
+                        {
+                            let _ = f.write_all(stderr_part.as_bytes());
+                        }
+                    } else {
+                        eprint!("{stderr_part}");
+                    }
                 }
             } else {
                 print!("{output}");
@@ -368,8 +417,29 @@ pub fn format_write_out(
     response: &liburlx::Response,
     time_cond_suppressed: bool,
 ) -> String {
+    format_write_out_with_context(fmt, response, time_cond_suppressed, &WriteOutContext::default())
+}
+
+/// Format a `--write-out` string with additional context.
+#[allow(clippy::too_many_lines)]
+pub fn format_write_out_with_context(
+    fmt: &str,
+    response: &liburlx::Response,
+    time_cond_suppressed: bool,
+    ctx: &WriteOutContext,
+) -> String {
     let info = response.transfer_info();
     let mut result = fmt.to_string();
+
+    // %{onerror}: if no error occurred, suppress everything from %{onerror} to end of string
+    // (curl compat: test 1188). If error occurred, just remove the %{onerror} marker.
+    if let Some(pos) = result.find("%{onerror}") {
+        if ctx.had_error {
+            result = result.replacen("%{onerror}", "", 1);
+        } else {
+            result.truncate(pos);
+        }
+    }
 
     // When body is suppressed by -z time condition, curl simulates a 304 response code
     let effective_status = if time_cond_suppressed { 304 } else { response.status() };
@@ -480,7 +550,7 @@ pub fn format_write_out(
         .replace("%{time_redirect}", &format!("{:.6}", info.time_namelookup.as_secs_f64() * 0.0));
     #[allow(clippy::literal_string_with_formatting_args)]
     {
-        result = result.replace("%{filename_effective}", "");
+        result = result.replace("%{filename_effective}", &ctx.filename_effective);
     }
     // redirect_url: curl resolves the Location URL to absolute (relative to request URL)
     // and normalizes bare hostnames with trailing slash (test 1261).
@@ -538,25 +608,45 @@ pub fn format_write_out(
     #[allow(clippy::literal_string_with_formatting_args)]
     {
         result = result.replace("%{method}", method);
-        result = result.replace("%{errormsg}", "");
-        result = result.replace("%{exitcode}", "0");
+        result = result.replace("%{errormsg}", &ctx.errormsg);
+        result = result.replace("%{exitcode}", &ctx.exitcode.to_string());
+        result = result.replace("%{urlnum}", &ctx.urlnum.to_string());
     }
     result = result.replace("%{num_retries}", &info.num_retries.to_string());
-    // Connection info: use parsed URL components
-    let (_, _, _, rip_host, rip_port, _, _, _) = parse_url_components(response.effective_url());
-    let url_host = rip_host.as_str();
-    let url_port: u16 = rip_port.parse().unwrap_or(0);
-    // Resolve hostname to IP for %{remote_ip}
-    let resolved_ip = std::net::ToSocketAddrs::to_socket_addrs(&(url_host, url_port))
-        .ok()
-        .and_then(|mut addrs| addrs.next())
-        .map_or_else(|| url_host.to_string(), |addr| addr.ip().to_string());
+    // Connection info: use actual TCP socket addresses from TransferInfo
+    let remote_ip = if info.remote_ip.is_empty() {
+        // Fallback: resolve hostname to IP
+        let (_, _, _, rip_host, rip_port, _, _, _) = parse_url_components(response.effective_url());
+        let url_host = rip_host.as_str();
+        let url_port: u16 = rip_port.parse().unwrap_or(0);
+        std::net::ToSocketAddrs::to_socket_addrs(&(url_host, url_port))
+            .ok()
+            .and_then(|mut addrs| addrs.next())
+            .map_or_else(|| url_host.to_string(), |addr| addr.ip().to_string())
+    } else {
+        info.remote_ip.clone()
+    };
+    let remote_port = if info.remote_port > 0 {
+        info.remote_port.to_string()
+    } else {
+        let (_, _, _, _, rip_port, _, _, _) = parse_url_components(response.effective_url());
+        rip_port
+    };
     #[allow(clippy::literal_string_with_formatting_args)]
     {
-        result = result.replace("%{remote_ip}", &resolved_ip);
-        result = result.replace("%{remote_port}", &url_port.to_string());
-        result = result.replace("%{local_ip}", "");
-        result = result.replace("%{local_port}", "0");
+        result = result.replace("%{remote_ip}", &remote_ip);
+        result = result.replace("%{remote_port}", &remote_port);
+        result = result.replace("%{local_ip}", &info.local_ip);
+        result = result.replace("%{local_port}", &info.local_port.to_string());
+    }
+
+    // %{header_json}: format all response headers as a JSON object (curl compat: test 421)
+    if result.contains("%{header_json}") {
+        let json = format_header_json(response);
+        #[allow(clippy::literal_string_with_formatting_args)]
+        {
+            result = result.replace("%{header_json}", &json);
+        }
     }
 
     // Handle %header{name} and %header{name:all:separator} patterns
@@ -568,6 +658,77 @@ pub fn format_write_out(
     result = result.replace("\\t", "\t");
     result = result.replace("\\r", "\r");
 
+    result
+}
+
+/// Format all response headers as a JSON object.
+///
+/// Curl's `%{header_json}` produces output like:
+/// ```json
+/// {"server":["nginx"],
+/// "date":["..."],
+/// "vary":["Accept-Encoding","Accept-Encoding","Accept"],
+/// ...
+/// }
+/// ```
+/// Duplicate header names result in multiple values in the array.
+/// Header names are lowercased. Values have JSON special chars escaped.
+fn format_header_json(response: &liburlx::Response) -> String {
+    use std::fmt::Write;
+    let ordered = response.headers_ordered();
+
+    // Collect headers in order, preserving duplicates
+    let mut header_map: Vec<(String, Vec<String>)> = Vec::new();
+
+    for (name, raw_value) in ordered {
+        let lower_name = name.to_ascii_lowercase();
+        let value: &str =
+            raw_value.strip_prefix(':').map(str::trim_start).unwrap_or(raw_value.as_str());
+
+        if let Some(entry) = header_map.iter_mut().find(|(n, _)| *n == lower_name) {
+            entry.1.push(value.to_string());
+        } else {
+            header_map.push((lower_name, vec![value.to_string()]));
+        }
+    }
+
+    let mut json = String::from("{");
+    for (i, (name, values)) in header_map.iter().enumerate() {
+        if i > 0 {
+            json.push_str(",\n");
+        } else {
+            // No newline before first entry
+        }
+        let _ = write!(json, "\"{}\":[", json_escape_string(name));
+        for (j, val) in values.iter().enumerate() {
+            if j > 0 {
+                json.push(',');
+            }
+            let _ = write!(json, "\"{}\"", json_escape_string(val));
+        }
+        json.push(']');
+    }
+    json.push_str("\n}");
+    json
+}
+
+/// Escape a string for JSON output (without wrapping quotes).
+fn json_escape_string(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => result.push_str("\\\""),
+            '\\' => result.push_str("\\\\"),
+            '\n' => result.push_str("\\n"),
+            '\r' => result.push_str("\\r"),
+            '\t' => result.push_str("\\t"),
+            c if c < '\u{20}' => {
+                use std::fmt::Write;
+                let _ = write!(result, "\\u{:04x}", c as u32);
+            }
+            c => result.push(c),
+        }
+    }
     result
 }
 
@@ -672,6 +833,12 @@ fn collect_header_values(resp: &liburlx::Response, name: &str, values: &mut Vec<
 fn parse_url_components(
     url: &str,
 ) -> (String, String, String, String, String, String, String, String) {
+    // If URL has no scheme separator, all components are empty (curl compat: test 423)
+    let scheme_sep = url.find("://");
+    if scheme_sep.is_none() {
+        let e = String::new();
+        return (e.clone(), e.clone(), e.clone(), e.clone(), e.clone(), e.clone(), e.clone(), e);
+    }
     let scheme = url.split("://").next().unwrap_or("").to_string();
     let rest = url.find("://").map_or("", |p| &url[p + 3..]);
 
