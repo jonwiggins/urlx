@@ -129,6 +129,8 @@ pub struct CliOptions {
     pub(crate) variables: Vec<(String, String)>,
     /// `--skip-existing`: skip download if output file already exists.
     pub(crate) skip_existing: bool,
+    /// `--json` was used — defer Content-Type/Accept headers until after arg parsing.
+    pub(crate) json_mode: bool,
 }
 
 /// Print version information to stdout.
@@ -327,7 +329,7 @@ pub fn parse_args(args: &[String]) -> ParseResult {
     }
 
     // Step 3: Parse options
-    match parse_args_options(&expanded) {
+    match parse_args_options_with_depth(&expanded, 0) {
         Ok(opts) => ParseResult::Options(Box::new(opts)),
         Err(code) => ParseResult::Error(code),
     }
@@ -495,9 +497,14 @@ fn expand_combined_flags(args: &[String]) -> Vec<String> {
     result
 }
 
-/// Internal option parser. Returns `Err(exit_code)` if parsing fails (error already printed).
+/// Maximum recursion depth for config files (`-K`/`--config`).
+/// Matches curl's `CURL_MAX_INPUT_LENGTH` recursion limit of 16.
+const MAX_CONFIG_DEPTH: u32 = 16;
+
+/// Internal option parser with config file recursion depth tracking.
+/// Returns `Err(exit_code)` if parsing fails (error already printed).
 #[allow(clippy::too_many_lines)]
-fn parse_args_options(args: &[String]) -> Result<CliOptions, u8> {
+fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<CliOptions, u8> {
     let mut opts = CliOptions {
         easy: liburlx::Easy::new(),
         urls: Vec::new(),
@@ -581,6 +588,7 @@ fn parse_args_options(args: &[String]) -> Result<CliOptions, u8> {
         custom_request_original: None,
         variables: Vec::new(),
         skip_existing: false,
+        json_mode: false,
     };
 
     let mut i = 1;
@@ -1328,6 +1336,10 @@ fn parse_args_options(args: &[String]) -> Result<CliOptions, u8> {
             "-K" | "--config" => {
                 i += 1;
                 let val = require_arg(args, i, "-K")?;
+                if config_depth >= MAX_CONFIG_DEPTH {
+                    eprintln!("curl: error: config file nesting too deep");
+                    return Err(2);
+                }
                 let contents_result = if val == "-" {
                     // Read config from stdin
                     use std::io::Read as _;
@@ -1351,7 +1363,7 @@ fn parse_args_options(args: &[String]) -> Result<CliOptions, u8> {
                             full_args.push(arg.clone());
                         }
                         let expanded = expand_combined_flags(&full_args);
-                        return parse_args_options(&expanded);
+                        return parse_args_options_with_depth(&expanded, config_depth + 1);
                     }
                     Err(e) => {
                         eprintln!("curl: can't read config file '{val}': {e}");
@@ -1377,6 +1389,7 @@ fn parse_args_options(args: &[String]) -> Result<CliOptions, u8> {
                 let val = require_arg(args, i, "--max-filesize")?;
                 if let Ok(size) = val.parse::<u64>() {
                     opts.max_filesize = Some(size);
+                    opts.easy.max_filesize(size);
                 } else {
                     eprintln!("curl: invalid max-filesize: {val}");
                     return Err(1);
@@ -1484,8 +1497,9 @@ fn parse_args_options(args: &[String]) -> Result<CliOptions, u8> {
                 };
                 // Multiple --json flags: append data (curl compat: test 385)
                 opts.easy.append_body(&json_data);
-                opts.easy.header("Content-Type", "application/json");
-                opts.easy.header("Accept", "application/json");
+                // Mark as JSON mode — headers will be added after all args are parsed
+                // (curl compat: tests 383, 384 — Content-Type/Accept order depends on -H)
+                opts.json_mode = true;
                 if opts.easy.method_is_default() {
                     opts.easy.method("POST");
                 }
@@ -1992,6 +2006,20 @@ fn parse_args_options(args: &[String]) -> Result<CliOptions, u8> {
         // Warn if more -o options than URLs (curl compat: test 371)
         if opts.output_files.len() > opts.urls.len().max(1) {
             eprintln!("Warning: Got more output options than URLs");
+        }
+    }
+
+    // Post-processing: add --json Content-Type and Accept headers AFTER all args
+    // are parsed, only if they're not already set by -H (curl compat: tests 383, 384).
+    // This matches curl's get_args() behavior: --json headers are deferred.
+    if opts.json_mode {
+        let has_ct = opts.easy.has_header("content-type");
+        let has_accept = opts.easy.has_header("accept");
+        if !has_ct {
+            opts.easy.header("Content-Type", "application/json");
+        }
+        if !has_accept {
+            opts.easy.header("Accept", "application/json");
         }
     }
 

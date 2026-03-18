@@ -202,6 +202,9 @@ pub struct FtpConfig {
     pub range_end: Option<u64>,
     /// Skip SIZE command (`--ignore-content-length`).
     pub ignore_content_length: bool,
+    /// Maximum file size allowed for download (`--max-filesize`).
+    /// If SIZE response exceeds this, QUIT before RETR with error code 63.
+    pub max_filesize: Option<u64>,
 }
 
 impl Default for FtpConfig {
@@ -224,6 +227,7 @@ impl Default for FtpConfig {
             time_condition: None,
             range_end: None,
             ignore_content_length: false,
+            max_filesize: None,
         }
     }
 }
@@ -303,10 +307,10 @@ impl FtpSession {
             send_command(&mut session.writer, &acct_cmd).await?;
             let acct_resp = read_response(&mut session.reader).await?;
             if !acct_resp.is_complete() {
-                return Err(Error::Http(format!(
-                    "FTP ACCT failed: {} {}",
-                    acct_resp.code, acct_resp.message
-                )));
+                return Err(Error::Transfer {
+                    code: 11,
+                    message: format!("FTP ACCT failed: {} {}", acct_resp.code, acct_resp.message),
+                });
             }
         }
 
@@ -396,10 +400,10 @@ impl FtpSession {
             send_command(&mut session.writer, &acct_cmd).await?;
             let acct_resp = read_response(&mut session.reader).await?;
             if !acct_resp.is_complete() {
-                return Err(Error::Http(format!(
-                    "FTP ACCT failed: {} {}",
-                    acct_resp.code, acct_resp.message
-                )));
+                return Err(Error::Transfer {
+                    code: 11,
+                    message: format!("FTP ACCT failed: {} {}", acct_resp.code, acct_resp.message),
+                });
             }
         }
 
@@ -1717,8 +1721,12 @@ pub async fn perform(
             }
         };
 
-        // TYPE I for binary upload
-        send_command(&mut session.writer, "TYPE I").await?;
+        // TYPE command for upload: respect ;type=a URL suffix (curl compat: tests 475, 476)
+        let upload_type_cmd = match type_override {
+            Some(TransferType::Ascii) => "TYPE A",
+            _ => "TYPE I",
+        };
+        send_command(&mut session.writer, upload_type_cmd).await?;
         let type_resp = read_response(&mut session.reader).await?;
         if !type_resp.is_complete() {
             let _ = session.quit().await;
@@ -1756,8 +1764,9 @@ pub async fn perform(
             });
         }
 
-        // Write data, optionally converting LF to CRLF
-        if config.crlf {
+        // Write data, converting LF to CRLF for --crlf or ;type=a (ASCII mode)
+        let ascii_upload = config.crlf || type_override == Some(TransferType::Ascii);
+        if ascii_upload {
             let converted = lf_to_crlf(effective_upload_data);
             data_stream
                 .write_all(&converted)
@@ -1963,6 +1972,18 @@ pub async fn perform(
             }
         }
         // SIZE failure is not fatal for download (may fail with 500)
+    }
+
+    // --max-filesize: check SIZE response before RETR (curl compat: test 290)
+    if let (Some(max_size), Some(sz)) = (config.max_filesize, remote_size) {
+        if sz > max_size {
+            drop(data_stream);
+            let _ = session.quit().await;
+            return Err(Error::Transfer {
+                code: 63,
+                message: format!("Maximum file size exceeded ({sz} > {max_size})"),
+            });
+        }
     }
 
     // Resume check: if resume offset >= file size, it's an error
@@ -2245,11 +2266,13 @@ fn split_path_for_method(path: &str, method: FtpMethod) -> (Vec<&str>, String) {
 /// Convert LF line endings to CRLF.
 fn lf_to_crlf(data: &[u8]) -> Vec<u8> {
     let mut result = Vec::with_capacity(data.len() + data.len() / 10);
+    let mut prev = 0u8;
     for &byte in data {
-        if byte == b'\n' {
+        if byte == b'\n' && prev != b'\r' {
             result.push(b'\r');
         }
         result.push(byte);
+        prev = byte;
     }
     result
 }

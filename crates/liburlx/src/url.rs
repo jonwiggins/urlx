@@ -245,11 +245,21 @@ impl Url {
     /// form-encoded spaces).
     #[must_use]
     pub fn request_target(&self) -> String {
-        // Use the parsed URL's path (which normalizes dot segments like `../`)
-        // but decode characters that curl sends raw (e.g., `"` encoded as `%22`
-        // by the url crate). This matches curl's behavior of preserving the
-        // user's encoding while still normalizing paths.
-        let path = self.inner.path().replace("%22", "\"");
+        // Use the raw input path to preserve characters that the url crate normalizes
+        // (e.g., `\` to `/`, `{`/`}` to percent-encoded forms). Then normalize dot
+        // segments (./ and ../) for security. This matches curl's behavior.
+        if let Some(ref raw) = self.raw_input {
+            let raw_path = extract_raw_path_and_query(raw);
+            return normalize_dot_segments(&raw_path);
+        }
+        // Fallback: use the parsed URL's path with curl-compat decoding
+        let path = self
+            .inner
+            .path()
+            .replace("%22", "\"")
+            .replace("%7B", "{")
+            .replace("%7D", "}")
+            .replace("%5C", "\\");
         match self.inner.query() {
             Some(q) => format!("{path}?{}", q.replace("%20", "+")),
             None => path,
@@ -322,6 +332,80 @@ impl Url {
 impl std::fmt::Display for Url {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.inner)
+    }
+}
+
+/// Extract the path and query from a raw URL string (preserving special characters).
+/// Strips the fragment if present.
+fn extract_raw_path_and_query(url_str: &str) -> String {
+    if let Some(scheme_end) = url_str.find("://") {
+        let after_scheme = &url_str[scheme_end + 3..];
+        // Find the start of path: first `/` or `?` after the authority
+        let slash_pos = after_scheme.find('/');
+        let query_pos = after_scheme.find('?');
+        let path_start = match (slash_pos, query_pos) {
+            (Some(s), Some(q)) => Some(s.min(q)),
+            (Some(s), None) => Some(s),
+            (None, Some(q)) => Some(q),
+            (None, None) => None,
+        };
+        if let Some(start) = path_start {
+            let path_and_rest = &after_scheme[start..];
+            // If starts with '?' (no explicit path), prepend '/'
+            let result = if path_and_rest.starts_with('?') {
+                format!("/{path_and_rest}")
+            } else {
+                path_and_rest.to_string()
+            };
+            // Strip fragment if present
+            if let Some(frag_pos) = result.find('#') {
+                return result[..frag_pos].to_string();
+            }
+            return result;
+        }
+        return "/".to_string();
+    }
+    url_str.to_string()
+}
+
+/// Normalize dot segments (`.` and `..`) in a path string per RFC 3986 Section 5.2.4.
+/// Preserves query string. This handles `/../`, `/./`, trailing `/..` and `/.`.
+fn normalize_dot_segments(path_and_query: &str) -> String {
+    // Split path from query
+    let (path, query) = path_and_query.find('?').map_or((path_and_query, None), |q_pos| {
+        (&path_and_query[..q_pos], Some(&path_and_query[q_pos..]))
+    });
+
+    // Split into segments
+    let mut output_segments: Vec<&str> = Vec::new();
+    for segment in path.split('/') {
+        match segment {
+            "." => {
+                // Skip single-dot segments
+            }
+            ".." => {
+                // Pop the last segment (go up one directory)
+                let _ = output_segments.pop();
+            }
+            _ => {
+                output_segments.push(segment);
+            }
+        }
+    }
+
+    let normalized = output_segments.join("/");
+    // Ensure path starts with /
+    let result = if normalized.starts_with('/') {
+        normalized
+    } else if path.starts_with('/') {
+        format!("/{normalized}")
+    } else {
+        normalized
+    };
+
+    match query {
+        Some(q) => format!("{result}{q}"),
+        None => result,
     }
 }
 

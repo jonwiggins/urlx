@@ -113,6 +113,8 @@ pub struct Easy {
     doh_url: Option<String>,
     unrestricted_auth: bool,
     ignore_content_length: bool,
+    /// Maximum file size allowed for download (`--max-filesize`).
+    max_filesize: Option<u64>,
     alt_svc_cache: crate::protocol::http::altsvc::AltSvcCache,
     /// Preserve POST method on 301 redirect (curl --post301).
     post301: bool,
@@ -282,6 +284,7 @@ impl std::fmt::Debug for Easy {
             .field("doh_url", &self.doh_url)
             .field("unrestricted_auth", &self.unrestricted_auth)
             .field("ignore_content_length", &self.ignore_content_length)
+            .field("max_filesize", &self.max_filesize)
             .field("alt_svc_cache", &self.alt_svc_cache)
             .field("post301", &self.post301)
             .field("post302", &self.post302)
@@ -393,6 +396,7 @@ impl Clone for Easy {
             doh_url: self.doh_url.clone(),
             unrestricted_auth: self.unrestricted_auth,
             ignore_content_length: self.ignore_content_length,
+            max_filesize: self.max_filesize,
             alt_svc_cache: self.alt_svc_cache.clone(),
             post301: self.post301,
             post302: self.post302,
@@ -514,6 +518,7 @@ impl Easy {
             doh_url: None,
             unrestricted_auth: false,
             ignore_content_length: false,
+            max_filesize: None,
             alt_svc_cache: crate::protocol::http::altsvc::AltSvcCache::new(),
             post301: false,
             post302: false,
@@ -1439,6 +1444,14 @@ impl Easy {
         self.ignore_content_length = enable;
     }
 
+    /// Set the maximum file size allowed for download.
+    ///
+    /// For FTP, the SIZE response is checked before RETR.
+    /// Equivalent to `CURLOPT_MAXFILESIZE_LARGE`.
+    pub const fn max_filesize(&mut self, size: u64) {
+        self.max_filesize = Some(size);
+    }
+
     /// Connect via a Unix domain socket instead of TCP.
     ///
     /// When set, all connections go through the specified Unix socket path.
@@ -2111,6 +2124,7 @@ impl Easy {
                 let name = match removed.as_str() {
                     "user-agent" => Some("User-Agent"),
                     "accept" => Some("Accept"),
+                    "host" => Some("Host"),
                     _ => None,
                 };
                 if let Some(name) = name {
@@ -2266,6 +2280,7 @@ impl Easy {
             time_condition: self.ftp_time_condition,
             range_end: None,
             ignore_content_length: self.ignore_content_length,
+            max_filesize: self.max_filesize,
         };
 
         let dns_resolver = self.build_dns_resolver();

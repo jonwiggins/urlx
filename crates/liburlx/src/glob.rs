@@ -99,6 +99,24 @@ fn parse_glob(pattern: &str) -> Result<Vec<Segment>, Error> {
 
     while let Some(&ch) = chars.peek() {
         match ch {
+            '\\' => {
+                // Backslash escaping: \{ \} \[ \] produce literal characters
+                let _ = chars.next(); // consume '\'
+                pos += 1;
+                if let Some(&next_ch) = chars.peek() {
+                    if matches!(next_ch, '{' | '}' | '[' | ']') {
+                        literal.push(next_ch);
+                        let _ = chars.next();
+                        pos += next_ch.len_utf8();
+                    } else {
+                        // Not a glob-special char: keep the backslash
+                        literal.push('\\');
+                    }
+                } else {
+                    // Trailing backslash
+                    literal.push('\\');
+                }
+            }
             '{' => {
                 glob_count += 1;
                 if glob_count > MAX_GLOB_PATTERNS {
@@ -336,8 +354,10 @@ pub fn expand_glob(pattern: &str) -> Result<Vec<String>, Error> {
     let segments = parse_glob(pattern)?;
 
     if segments.iter().all(|s| matches!(s, Segment::Literal(_))) {
-        // No expansion needed
-        return Ok(vec![pattern.to_string()]);
+        // No expansion needed — but return the processed string (with escape sequences
+        // resolved, e.g. \{ -> {) rather than the raw pattern (curl compat: test 214)
+        let joined: String = segments.iter().map(|s| s.value_at(0)).collect();
+        return Ok(vec![joined]);
     }
 
     // Compute total combinations
@@ -403,8 +423,9 @@ pub fn expand_glob_with_values(pattern: &str) -> Result<Vec<(String, Vec<String>
         .collect();
 
     if glob_segment_indices.is_empty() {
-        // No expansion needed
-        return Ok(vec![(pattern.to_string(), Vec::new())]);
+        // No expansion needed — return processed string with escape sequences resolved
+        let joined: String = segments.iter().map(|s| s.value_at(0)).collect();
+        return Ok(vec![(joined, Vec::new())]);
     }
 
     // Compute total combinations
