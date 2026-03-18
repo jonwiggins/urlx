@@ -1457,9 +1457,20 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
             "-g" | "--globoff" => {
                 opts.globoff = true;
             }
-            // FTPS: explicit mode (AUTH TLS)
-            "--ftp-ssl" | "--ssl" | "--ftp-ssl-reqd" | "--ssl-reqd" => {
+            // FTPS: explicit mode (AUTH TLS) + STARTTLS for other protocols
+            "--ftp-ssl" | "--ssl" => {
                 opts.easy.ftp_ssl_mode(liburlx::protocol::ftp::FtpSslMode::Explicit);
+                opts.easy.use_ssl(liburlx::protocol::ftp::UseSsl::Try);
+            }
+            "--ftp-ssl-reqd" | "--ssl-reqd" => {
+                opts.easy.ftp_ssl_mode(liburlx::protocol::ftp::FtpSslMode::Explicit);
+                opts.easy.use_ssl(liburlx::protocol::ftp::UseSsl::All);
+            }
+            "--ftp-ssl-control" => {
+                opts.easy.ftp_ssl_control(true);
+            }
+            "--ftp-ssl-ccc" => {
+                opts.easy.ftp_ssl_ccc(true);
             }
             "--ftp-port" => {
                 i += 1;
@@ -1822,8 +1833,6 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
             | "--ntlm-wb"
             | "--proxy-negotiate"
             | "--trace-ids"
-            | "--ftp-ssl-control"
-            | "--ftp-ssl-ccc"
             | "--socks5-gssapi-nec"
             | "-4"
             | "--ipv4"

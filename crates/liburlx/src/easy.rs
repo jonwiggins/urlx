@@ -126,6 +126,12 @@ pub struct Easy {
     proxy_headers: Vec<(String, String)>,
     /// FTP SSL/TLS mode.
     ftp_ssl_mode: crate::protocol::ftp::FtpSslMode,
+    /// SSL/TLS usage level for STARTTLS protocols (curl `CURLOPT_USE_SSL`).
+    use_ssl: crate::protocol::ftp::UseSsl,
+    /// Use TLS only for FTP control connection, not data (curl `--ftp-ssl-control`).
+    ftp_ssl_control: bool,
+    /// Send CCC after PROT (curl `--ftp-ssl-ccc`).
+    ftp_ssl_ccc: bool,
     /// FTP active mode address (None = passive mode).
     ftp_active_port: Option<String>,
     /// Use EPSV (extended passive) mode for FTP (default true).
@@ -293,6 +299,8 @@ impl std::fmt::Debug for Easy {
             .field("post303", &self.post303)
             .field("proxy_headers", &self.proxy_headers)
             .field("ftp_ssl_mode", &self.ftp_ssl_mode)
+            .field("use_ssl", &self.use_ssl)
+            .field("ftp_ssl_control", &self.ftp_ssl_control)
             .field("ftp_active_port", &self.ftp_active_port)
             .field("ftp_use_epsv", &self.ftp_use_epsv)
             .field("ftp_use_eprt", &self.ftp_use_eprt)
@@ -405,6 +413,9 @@ impl Clone for Easy {
             post303: self.post303,
             proxy_headers: self.proxy_headers.clone(),
             ftp_ssl_mode: self.ftp_ssl_mode,
+            use_ssl: self.use_ssl,
+            ftp_ssl_control: self.ftp_ssl_control,
+            ftp_ssl_ccc: self.ftp_ssl_ccc,
             ftp_active_port: self.ftp_active_port.clone(),
             ftp_use_epsv: self.ftp_use_epsv,
             ftp_use_eprt: self.ftp_use_eprt,
@@ -528,6 +539,9 @@ impl Easy {
             post303: false,
             proxy_headers: Vec::new(),
             ftp_ssl_mode: crate::protocol::ftp::FtpSslMode::None,
+            use_ssl: crate::protocol::ftp::UseSsl::None,
+            ftp_ssl_control: false,
+            ftp_ssl_ccc: false,
             ftp_active_port: None,
             ftp_use_epsv: true,
             ftp_use_eprt: true,
@@ -1629,6 +1643,29 @@ impl Easy {
         self.ftp_ssl_mode = mode;
     }
 
+    /// Set the SSL/TLS usage level for STARTTLS-capable protocols.
+    ///
+    /// Controls whether STARTTLS upgrades are attempted for FTP, SMTP,
+    /// IMAP, and POP3 connections.
+    ///
+    /// Equivalent to curl's `CURLOPT_USE_SSL`.
+    pub const fn use_ssl(&mut self, level: crate::protocol::ftp::UseSsl) {
+        self.use_ssl = level;
+    }
+
+    /// Enable FTP CCC (Clear Command Channel) after PROT (curl `--ftp-ssl-ccc`).
+    pub const fn ftp_ssl_ccc(&mut self, enable: bool) {
+        self.ftp_ssl_ccc = enable;
+    }
+
+    /// Enable FTP control-only TLS (curl `--ftp-ssl-control`).
+    ///
+    /// When enabled, PROT C (Clear) is used instead of PROT P (Private)
+    /// so data connections stay unencrypted.
+    pub const fn ftp_ssl_control(&mut self, control_only: bool) {
+        self.ftp_ssl_control = control_only;
+    }
+
     /// Set the address for FTP active mode data connections.
     ///
     /// When set, PORT/EPRT commands are used instead of PASV.
@@ -2295,6 +2332,8 @@ impl Easy {
             range_end: None,
             ignore_content_length: self.ignore_content_length,
             max_filesize: self.max_filesize,
+            ssl_control: self.ftp_ssl_control,
+            ssl_ccc: self.ftp_ssl_ccc,
         };
 
         let dns_resolver = self.build_dns_resolver();
@@ -2350,6 +2389,7 @@ impl Easy {
             self.post302,
             self.post303,
             self.ftp_ssl_mode,
+            self.use_ssl,
             self.ssh_key_path.as_deref(),
             self.proxy_tls_config.as_ref(),
             #[cfg(feature = "http2")]
@@ -2496,6 +2536,7 @@ async fn perform_transfer(
     post302: bool,
     post303: bool,
     ftp_ssl_mode: crate::protocol::ftp::FtpSslMode,
+    use_ssl: crate::protocol::ftp::UseSsl,
     ssh_key_path: Option<&str>,
     proxy_tls_config: Option<&TlsConfig>,
     #[cfg(feature = "http2")] h2_config: &crate::protocol::http::h2::Http2Config,
@@ -2674,6 +2715,7 @@ async fn perform_transfer(
             ignore_content_length,
             speed_limits,
             ftp_ssl_mode,
+            use_ssl,
             ssh_key_path,
             proxy_tls_config,
             alt_svc_cache,
@@ -2761,6 +2803,7 @@ async fn perform_transfer(
                         ignore_content_length,
                         speed_limits,
                         ftp_ssl_mode,
+                        use_ssl,
                         ssh_key_path,
                         proxy_tls_config,
                         alt_svc_cache,
@@ -2889,6 +2932,7 @@ async fn perform_transfer(
                                 ignore_content_length,
                                 speed_limits,
                                 ftp_ssl_mode,
+                                use_ssl,
                                 ssh_key_path,
                                 proxy_tls_config,
                                 alt_svc_cache,
@@ -2989,6 +3033,7 @@ async fn perform_transfer(
                                         ignore_content_length,
                                         speed_limits,
                                         ftp_ssl_mode,
+                                        use_ssl,
                                         ssh_key_path,
                                         proxy_tls_config,
                                         alt_svc_cache,
@@ -3075,6 +3120,7 @@ async fn perform_transfer(
                                 ignore_content_length,
                                 speed_limits,
                                 ftp_ssl_mode,
+                                use_ssl,
                                 ssh_key_path,
                                 proxy_tls_config,
                                 alt_svc_cache,
@@ -3168,6 +3214,7 @@ async fn perform_transfer(
                                         ignore_content_length,
                                         speed_limits,
                                         ftp_ssl_mode,
+                                        use_ssl,
                                         ssh_key_path,
                                         proxy_tls_config,
                                         alt_svc_cache,
@@ -3276,6 +3323,7 @@ async fn perform_transfer(
                                     ignore_content_length,
                                     speed_limits,
                                     ftp_ssl_mode,
+                                    use_ssl,
                                     ssh_key_path,
                                     proxy_tls_config,
                                     alt_svc_cache,
@@ -3385,6 +3433,7 @@ async fn perform_transfer(
                                     ignore_content_length,
                                     speed_limits,
                                     ftp_ssl_mode,
+                                    use_ssl,
                                     ssh_key_path,
                                     proxy_tls_config,
                                     alt_svc_cache,
@@ -3643,6 +3692,7 @@ async fn do_single_request(
     ignore_content_length: bool,
     speed_limits: &SpeedLimits,
     ftp_ssl_mode: crate::protocol::ftp::FtpSslMode,
+    use_ssl: crate::protocol::ftp::UseSsl,
     #[cfg_attr(not(feature = "ssh"), allow(unused_variables))] ssh_key_path: Option<&str>,
     proxy_tls_config: Option<&TlsConfig>,
     #[cfg_attr(not(feature = "http3"), allow(unused_variables))]
@@ -3818,10 +3868,12 @@ async fn do_single_request(
             // Set range_end on ftp_config if needed
             let mut ftp_config_with_range = ftp_config.clone();
             ftp_config_with_range.range_end = ftp_range_end;
+            let ftp_use_ssl = use_ssl;
             return crate::protocol::ftp::perform(
                 url,
                 upload_data,
                 effective_ssl_mode,
+                ftp_use_ssl,
                 tls_config,
                 resume_offset,
                 &ftp_config_with_range,
@@ -3847,19 +3899,25 @@ async fn do_single_request(
                 password: header_creds.as_ref().map(|(_, p)| p.as_str()),
                 login_options: url_login_opts.as_deref(),
             };
-            let use_smtp_tls = url.scheme() == "smtps";
+            let smtp_use_ssl = if url.scheme() == "smtps" {
+                // Implicit TLS: signal with a special value
+                crate::protocol::ftp::UseSsl::All
+            } else {
+                use_ssl
+            };
             return crate::protocol::smtp::send_mail(
                 url,
                 mail_data,
                 &smtp_config,
-                use_smtp_tls,
+                smtp_use_ssl,
                 tls_config,
             )
             .await;
         }
         "imap" | "imaps" => {
             let url_login_opts = extract_login_options_from_url(url);
-            let use_imap_tls = url.scheme() == "imaps";
+            let imap_use_ssl =
+                if url.scheme() == "imaps" { crate::protocol::ftp::UseSsl::All } else { use_ssl };
             return crate::protocol::imap::fetch(
                 url,
                 method,
@@ -3868,7 +3926,7 @@ async fn do_single_request(
                 sasl_ir,
                 oauth2_bearer,
                 url_login_opts.as_deref(),
-                use_imap_tls,
+                imap_use_ssl,
                 tls_config,
             )
             .await;
@@ -3883,7 +3941,8 @@ async fn do_single_request(
                 _ => Some(method),
             };
             let url_login_opts = extract_login_options_from_url(url);
-            let use_pop3_tls = url.scheme() == "pop3s";
+            let pop3_use_ssl =
+                if url.scheme() == "pop3s" { crate::protocol::ftp::UseSsl::All } else { use_ssl };
             return crate::protocol::pop3::retrieve(
                 url,
                 creds_tuple,
@@ -3891,7 +3950,7 @@ async fn do_single_request(
                 sasl_ir,
                 oauth2_bearer,
                 url_login_opts.as_deref(),
-                use_pop3_tls,
+                pop3_use_ssl,
                 tls_config,
             )
             .await;

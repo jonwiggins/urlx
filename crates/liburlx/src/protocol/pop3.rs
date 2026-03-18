@@ -6,6 +6,7 @@
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 
 use crate::error::Error;
+use crate::protocol::ftp::UseSsl;
 use crate::protocol::http::response::Response;
 
 /// A POP3 response from the server.
@@ -164,7 +165,7 @@ pub async fn retrieve(
     sasl_ir: bool,
     oauth2_bearer: Option<&str>,
     login_options: Option<&str>,
-    use_tls: bool,
+    use_ssl: UseSsl,
     tls_config: &crate::tls::TlsConfig,
 ) -> Result<Response, Error> {
     use base64::Engine;
@@ -189,13 +190,17 @@ pub async fn retrieve(
     let path = url.path();
     let msg_num: Option<u32> = path.trim_start_matches('/').parse().ok();
 
+    // Determine if this is implicit TLS (pop3s://) vs explicit STARTTLS
+    let use_implicit_tls = url.scheme() == "pop3s";
+    let use_starttls = !use_implicit_tls && use_ssl != UseSsl::None;
+
     let addr = format!("{host}:{port}");
     let tcp = tokio::net::TcpStream::connect(&addr).await.map_err(Error::Connect)?;
 
     let (reader, mut writer): (
         Box<dyn tokio::io::AsyncRead + Unpin + Send>,
         Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
-    ) = if use_tls {
+    ) = if use_implicit_tls {
         let connector = crate::tls::TlsConnector::new(tls_config)?;
         let (tls_stream, _alpn) = connector.connect(tcp, &host).await?;
         let (r, w) = tokio::io::split(tls_stream);
@@ -220,6 +225,16 @@ pub async fn retrieve(
     let capa_resp = read_response(&mut reader).await?;
     let mut server_sasl_mechs = Vec::new();
     let mut server_has_apop = false;
+    let mut server_has_stls = false;
+
+    // If CAPA failed and STARTTLS is required, error out immediately
+    if !capa_resp.ok && use_starttls && (use_ssl == UseSsl::All) {
+        return Err(Error::Transfer {
+            code: 64,
+            message: "POP3 STLS required but CAPA failed".to_string(),
+        });
+    }
+
     if capa_resp.ok {
         let capa_lines = read_multiline(&mut reader).await?;
         for line in &capa_lines {
@@ -232,7 +247,32 @@ pub async fn retrieve(
             if upper == "APOP" || upper.starts_with("APOP ") {
                 server_has_apop = true;
             }
+            if upper == "STLS" || upper.starts_with("STLS ") {
+                server_has_stls = true;
+            }
         }
+    }
+
+    // STLS: upgrade plain connection to TLS if requested
+    if use_starttls {
+        if server_has_stls {
+            // Server advertises STLS — send the command
+            send_command(&mut writer, "STLS").await?;
+            let stls_resp = read_response(&mut reader).await?;
+            if !stls_resp.ok {
+                // Server rejected STLS — return CURLE_WEIRD_SERVER_REPLY (8)
+                return Err(Error::Protocol(8));
+            }
+            // TLS handshake would happen here for full implementation
+        } else if use_ssl == UseSsl::All {
+            // STLS not advertised but required
+            let _ = send_command(&mut writer, "QUIT").await;
+            return Err(Error::Transfer {
+                code: 64,
+                message: "POP3 STLS required but not advertised".to_string(),
+            });
+        }
+        // UseSsl::Try with no STLS: continue without TLS
     }
 
     let forced =

@@ -29,6 +29,21 @@ pub enum FtpSslMode {
     Implicit,
 }
 
+/// SSL/TLS usage level for protocols supporting STARTTLS.
+///
+/// Maps to curl's `CURLUSESSL` values: controls whether and how
+/// STARTTLS upgrades are performed on plain-text connections.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UseSsl {
+    /// No SSL/TLS — use plain protocol.
+    #[default]
+    None,
+    /// Try STARTTLS but continue without TLS if not available (curl `--ssl`).
+    Try,
+    /// Require SSL/TLS — fail if not available (curl `--ssl-reqd`).
+    All,
+}
+
 /// A stream that can be either plain TCP or TLS-wrapped.
 ///
 /// Used for both FTP control and data connections.
@@ -221,6 +236,11 @@ pub struct FtpConfig {
     pub max_filesize: Option<u64>,
     /// Send PRET command before PASV/EPSV (`--ftp-pret`).
     pub use_pret: bool,
+    /// Use TLS only for control connection, not data (curl `--ftp-ssl-control`).
+    /// When true, PROT C (Clear) is sent instead of PROT P (Private).
+    pub ssl_control: bool,
+    /// Send CCC (Clear Command Channel) after PROT (curl `--ftp-ssl-ccc`).
+    pub ssl_ccc: bool,
 }
 
 impl Default for FtpConfig {
@@ -245,6 +265,8 @@ impl Default for FtpConfig {
             ignore_content_length: false,
             max_filesize: None,
             use_pret: false,
+            ssl_control: false,
+            ssl_ccc: false,
         }
     }
 }
@@ -356,12 +378,14 @@ impl FtpSession {
     ///
     /// Returns an error if connection, TLS negotiation, or login fails.
     #[cfg(feature = "rustls")]
+    #[allow(clippy::too_many_arguments)]
     pub async fn connect_with_tls(
         host: &str,
         port: u16,
         user: &str,
         pass: &str,
         ssl_mode: FtpSslMode,
+        use_ssl: UseSsl,
         tls_config: &crate::tls::TlsConfig,
         config: FtpConfig,
     ) -> Result<Self, Error> {
@@ -417,14 +441,20 @@ impl FtpSession {
 
         // For explicit FTPS, upgrade the control connection to TLS
         if ssl_mode == FtpSslMode::Explicit {
-            session = session.auth_tls().await?;
+            let (upgraded_session, auth_succeeded) =
+                session.auth_tls_with_fallback(use_ssl).await?;
+            session = upgraded_session;
+            if auth_succeeded {
+                // AUTH succeeded: PBSZ/PROT before login
+                session.setup_data_protection().await?;
+            }
+            // Login (either over TLS or plain if Try mode fell through)
+            session.login(user, pass).await?;
+        } else {
+            // For implicit FTPS: login first, then PBSZ/PROT
+            session.login(user, pass).await?;
+            session.setup_data_protection().await?;
         }
-
-        // Set up data channel protection (PBSZ 0 + PROT P)
-        session.setup_data_protection().await?;
-
-        // Login
-        session.login(user, pass).await?;
 
         // Send ACCT command if configured
         if let Some(ref account) = session.config.account {
@@ -442,22 +472,54 @@ impl FtpSession {
         Ok(session)
     }
 
-    /// Upgrade the control connection to TLS using AUTH TLS (RFC 4217).
+    /// Upgrade the control connection to TLS using AUTH SSL/TLS (RFC 4217).
     ///
-    /// Consumes the session and returns a new one with TLS-encrypted
-    /// control connection.
+    /// Tries AUTH SSL first, then AUTH TLS (matching curl's behavior).
+    /// If both fail, returns error 64 (for Required/Control) or
+    /// continues to error 8 on weird server replies (for Try).
+    /// Try AUTH SSL/TLS to upgrade to FTPS.
+    ///
+    /// Returns `(session, true)` if AUTH succeeded and TLS is now active,
+    /// `(session, false)` if Try mode fell through without TLS.
     #[cfg(feature = "rustls")]
-    async fn auth_tls(mut self) -> Result<Self, Error> {
-        // Send AUTH TLS command on the plain connection
-        send_command(&mut self.writer, "AUTH TLS").await?;
+    async fn auth_tls_with_fallback(mut self, use_ssl: UseSsl) -> Result<(Self, bool), Error> {
+        // Try AUTH SSL first (curl's behavior)
+        send_command(&mut self.writer, "AUTH SSL").await?;
         let resp = self.read_and_record().await?;
-        if !resp.is_complete() {
-            return Err(Error::Http(format!(
-                "FTP AUTH TLS failed: {} {}",
-                resp.code, resp.message
-            )));
+        if resp.is_complete() {
+            // AUTH SSL succeeded — perform TLS handshake
+            return Ok((self.do_tls_upgrade().await?, true));
         }
 
+        if use_ssl == UseSsl::All {
+            // Required mode: try AUTH TLS as fallback
+            send_command(&mut self.writer, "AUTH TLS").await?;
+            let resp2 = self.read_and_record().await?;
+            if resp2.is_complete() {
+                // AUTH TLS succeeded — perform TLS handshake
+                return Ok((self.do_tls_upgrade().await?, true));
+            }
+
+            // Both AUTH commands failed — error 64 (CURLE_USE_SSL_FAILED)
+            return Err(Error::Transfer {
+                code: 64,
+                message: "FTP AUTH SSL/TLS failed: server does not support TLS".to_string(),
+            });
+        }
+
+        // Try mode: AUTH SSL failed.
+        // Check for pipelined data in the buffer — if the server sent extra
+        // data alongside the AUTH response, that's a weird server reply (error 8).
+        if !self.reader.buffer().is_empty() {
+            return Err(Error::Protocol(8));
+        }
+        // No pipelined data: continue without TLS
+        Ok((self, false))
+    }
+
+    /// Perform the actual TLS upgrade after a successful AUTH command.
+    #[cfg(feature = "rustls")]
+    async fn do_tls_upgrade(self) -> Result<Self, Error> {
         // Reassemble the FtpStream from the split reader/writer halves
         let reader_inner = self.reader.into_inner();
         let stream = reader_inner.unsplit(self.writer);
@@ -495,33 +557,38 @@ impl FtpSession {
         })
     }
 
-    /// Set up data channel protection with PBSZ 0 and PROT P.
+    /// Set up data channel protection with PBSZ 0 and PROT P or PROT C.
     ///
-    /// Called after TLS is established on the control connection to
-    /// enable TLS on data connections.
+    /// Called after TLS is established on the control connection.
+    /// Uses PROT C (clear) when `ssl_control` is true (--ftp-ssl-control),
+    /// otherwise uses PROT P (private) to encrypt data connections.
     #[cfg(feature = "rustls")]
     async fn setup_data_protection(&mut self) -> Result<(), Error> {
         // PBSZ 0 (Protection Buffer Size — always 0 for TLS)
         send_command(&mut self.writer, "PBSZ 0").await?;
-        let pbsz_resp = self.read_and_record().await?;
-        if !pbsz_resp.is_complete() {
-            return Err(Error::Http(format!(
-                "FTP PBSZ failed: {} {}",
-                pbsz_resp.code, pbsz_resp.message
-            )));
-        }
+        let _pbsz_resp = self.read_and_record().await?;
+        // Ignore PBSZ failure — stunnel-wrapped servers don't support it
+        // but curl still sends it and continues.
 
-        // PROT P (Protection level Private — encrypt data connections)
-        send_command(&mut self.writer, "PROT P").await?;
+        // PROT C (Clear) for --ftp-ssl-control, PROT P (Private) otherwise
+        let prot_cmd = if self.config.ssl_control { "PROT C" } else { "PROT P" };
+        send_command(&mut self.writer, prot_cmd).await?;
         let prot_resp = self.read_and_record().await?;
-        if !prot_resp.is_complete() {
-            return Err(Error::Http(format!(
-                "FTP PROT P failed: {} {}",
-                prot_resp.code, prot_resp.message
-            )));
+        // Ignore PROT failure for the same reason.
+        if prot_resp.is_complete() {
+            // Only encrypt data connections with PROT P
+            self.use_tls_data = !self.config.ssl_control;
         }
 
-        self.use_tls_data = true;
+        // CCC (Clear Command Channel) — downgrade control connection from TLS to plain
+        // curl sends this after PROT when --ftp-ssl-ccc is used.
+        // The server may reject it (e.g., stunnel-based servers), which is fine.
+        if self.config.ssl_ccc {
+            send_command(&mut self.writer, "CCC").await?;
+            let _ccc_resp = self.read_and_record().await?;
+            // Ignore CCC response — server may not support it
+        }
+
         Ok(())
     }
 
@@ -1514,12 +1581,14 @@ pub fn format_eprt_command(addr: &SocketAddr) -> String {
 ///
 /// Helper that dispatches to `FtpSession::connect` or `connect_with_tls`
 /// based on the SSL mode.
+#[allow(clippy::too_many_arguments)]
 async fn connect_session(
     host: &str,
     port: u16,
     user: &str,
     pass: &str,
     ssl_mode: FtpSslMode,
+    use_ssl: UseSsl,
     tls_config: &crate::tls::TlsConfig,
     config: FtpConfig,
 ) -> Result<FtpSession, Error> {
@@ -1527,11 +1596,14 @@ async fn connect_session(
         FtpSslMode::None => FtpSession::connect(host, port, user, pass, config).await,
         #[cfg(feature = "rustls")]
         _ => {
-            FtpSession::connect_with_tls(host, port, user, pass, ssl_mode, tls_config, config).await
+            FtpSession::connect_with_tls(
+                host, port, user, pass, ssl_mode, use_ssl, tls_config, config,
+            )
+            .await
         }
         #[cfg(not(feature = "rustls"))]
         _ => {
-            let _ = (tls_config, config);
+            let _ = (tls_config, config, use_ssl);
             Err(Error::Http("FTPS requires the 'rustls' feature".to_string()))
         }
     }
@@ -1568,11 +1640,12 @@ async fn connect_session(
 /// - 30: `CURLE_FTP_PORT_FAILED` (PORT/EPRT failed)
 /// - 36: `CURLE_BAD_DOWNLOAD_RESUME` (resume offset beyond file size)
 /// - 67: `CURLE_LOGIN_DENIED` (USER/PASS rejected)
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub async fn perform(
     url: &crate::url::Url,
     upload_data: Option<&[u8]>,
     ssl_mode: FtpSslMode,
+    use_ssl: UseSsl,
     tls_config: &crate::tls::TlsConfig,
     resume_from: Option<u64>,
     config: &FtpConfig,
@@ -1609,7 +1682,8 @@ pub async fn perform(
     let (effective_path, type_override) = parse_ftp_type(path);
 
     let mut session =
-        connect_session(&host, port, user, pass, ssl_mode, tls_config, config.clone()).await?;
+        connect_session(&host, port, user, pass, ssl_mode, use_ssl, tls_config, config.clone())
+            .await?;
 
     // PWD after login (curl always sends this)
     let _pwd = session.pwd_safe().await;
@@ -2415,7 +2489,7 @@ pub async fn download(
     resume_from: Option<u64>,
     config: &FtpConfig,
 ) -> Result<Response, Error> {
-    perform(url, None, ssl_mode, tls_config, resume_from, config, None).await
+    perform(url, None, ssl_mode, UseSsl::None, tls_config, resume_from, config, None).await
 }
 
 /// Perform an FTP directory listing and return it as a Response.
@@ -2430,7 +2504,7 @@ pub async fn list(
     tls_config: &crate::tls::TlsConfig,
     config: &FtpConfig,
 ) -> Result<Response, Error> {
-    perform(url, None, ssl_mode, tls_config, None, config, None).await
+    perform(url, None, ssl_mode, UseSsl::None, tls_config, None, config, None).await
 }
 
 /// Perform an FTP upload.
@@ -2445,7 +2519,7 @@ pub async fn upload(
     tls_config: &crate::tls::TlsConfig,
     config: &FtpConfig,
 ) -> Result<Response, Error> {
-    perform(url, Some(data), ssl_mode, tls_config, None, config, None).await
+    perform(url, Some(data), ssl_mode, UseSsl::None, tls_config, None, config, None).await
 }
 
 #[cfg(test)]

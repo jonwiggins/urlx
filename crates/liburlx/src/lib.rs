@@ -46,7 +46,7 @@ pub use throttle::SpeedLimits;
 pub use tls::{TlsConfig, TlsVersion};
 pub use url::Url;
 
-pub use protocol::ftp::{FtpConfig, FtpMethod, FtpSslMode};
+pub use protocol::ftp::{FtpConfig, FtpMethod, FtpSslMode, UseSsl};
 #[cfg(feature = "ssh")]
 pub use protocol::ssh::{SshAuthMethod, SshHostKeyPolicy};
 
