@@ -217,6 +217,8 @@ pub struct FtpConfig {
     /// Maximum file size allowed for download (`--max-filesize`).
     /// If SIZE response exceeds this, QUIT before RETR with error code 63.
     pub max_filesize: Option<u64>,
+    /// Send PRET command before PASV/EPSV (`--ftp-pret`).
+    pub use_pret: bool,
 }
 
 impl Default for FtpConfig {
@@ -240,6 +242,7 @@ impl Default for FtpConfig {
             range_end: None,
             ignore_content_length: false,
             max_filesize: None,
+            use_pret: false,
         }
     }
 }
@@ -611,7 +614,21 @@ impl FtpSession {
             let addr = addr.clone();
             self.open_active_data_connection(&addr).await
         } else {
-            self.open_passive_data_connection().await
+            self.open_passive_data_connection(None).await
+        }
+    }
+
+    /// Open a data connection with an optional PRET command for `--ftp-pret`.
+    ///
+    /// If `pret_cmd` is provided and `config.use_pret` is true, sends
+    /// `PRET <pret_cmd>` before entering passive mode (curl compat: test 1107).
+    async fn open_data_connection_with_pret(&mut self, pret_cmd: &str) -> Result<FtpStream, Error> {
+        if let Some(ref addr) = self.active_port {
+            let addr = addr.clone();
+            self.open_active_data_connection(&addr).await
+        } else {
+            let pret = if self.config.use_pret { Some(pret_cmd) } else { None };
+            self.open_passive_data_connection(pret).await
         }
     }
 
@@ -620,9 +637,29 @@ impl FtpSession {
     /// If `config.use_epsv` is true, tries EPSV first and falls back to PASV.
     /// If `config.skip_pasv_ip` is true, uses the control connection host
     /// instead of the IP from the PASV response.
+    /// If `pret_cmd` is provided, sends `PRET <cmd>` before EPSV/PASV
+    /// (curl compat: test 1107, 1108).
     ///
     /// Returns `Error::Transfer { code: 13, .. }` if both EPSV and PASV fail.
-    async fn open_passive_data_connection(&mut self) -> Result<FtpStream, Error> {
+    async fn open_passive_data_connection(
+        &mut self,
+        pret_cmd: Option<&str>,
+    ) -> Result<FtpStream, Error> {
+        // Send PRET before EPSV/PASV if configured (curl compat: test 1107)
+        if let Some(cmd) = pret_cmd {
+            send_command(&mut self.writer, &format!("PRET {cmd}")).await?;
+            let pret_resp = read_response(&mut self.reader).await?;
+            if pret_resp.code >= 400 {
+                // PRET rejected — CURLE_FTP_PRET_FAILED (84)
+                return Err(Error::Transfer {
+                    code: 84,
+                    message: format!(
+                        "PRET command not accepted: {} {}",
+                        pret_resp.code, pret_resp.message
+                    ),
+                });
+            }
+        }
         // Try EPSV first if enabled
         if self.config.use_epsv {
             send_command(&mut self.writer, "EPSV").await?;
@@ -1723,8 +1760,10 @@ pub async fn perform(
             (upload_bytes, config.append)
         };
 
-        // Open data connection
-        let data_stream_result = session.open_data_connection().await;
+        // Open data connection (with PRET for --ftp-pret)
+        let pret_cmd =
+            if config.append { format!("APPE {filename}") } else { format!("STOR {filename}") };
+        let data_stream_result = session.open_data_connection_with_pret(&pret_cmd).await;
         let mut data_stream = match data_stream_result {
             Ok(s) => s,
             Err(e) => {
@@ -1833,8 +1872,9 @@ pub async fn perform(
 
     // Directory listing
     if is_dir_list {
-        // Open data connection
-        let data_stream_result = session.open_data_connection().await;
+        // Open data connection (with PRET for --ftp-pret; curl compat: test 1107)
+        let list_base = if config.list_only { "NLST" } else { "LIST" };
+        let data_stream_result = session.open_data_connection_with_pret(list_base).await;
         let mut data_stream = match data_stream_result {
             Ok(s) => s,
             Err(e) => {
@@ -1958,11 +1998,16 @@ pub async fn perform(
     }
 
     // Open data connection BEFORE TYPE/SIZE (curl sends EPSV/PASV before TYPE)
-    let data_stream_result = session.open_data_connection().await;
+    // Send PRET before EPSV if --ftp-pret is enabled (curl compat: test 1107)
+    let data_stream_result =
+        session.open_data_connection_with_pret(&format!("RETR {filename}")).await;
     let mut data_stream = match data_stream_result {
         Ok(s) => s,
         Err(e) => {
-            let _ = session.quit().await;
+            // Skip QUIT for PRET failure (84) — curl just disconnects (test 1108)
+            if !matches!(&e, Error::Transfer { code: 84, .. }) {
+                let _ = session.quit().await;
+            }
             return Err(e);
         }
     };

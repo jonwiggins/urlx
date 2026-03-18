@@ -630,11 +630,14 @@ pub fn run(args: &[String]) -> ExitCode {
     // Multiple URLs: use Multi API for concurrent transfers
     if opts.urls.len() > 1 {
         // Build per-URL output filenames:
-        // - With --next: use output_files positionally (each -o pairs with its URL group, test 1134)
-        // - Without --next (glob): expand single -o template with #N substitution (tests 74,86,87)
+        // - Multiple -o/--out-null: use output_files positionally (test 756, 1134)
+        // - Single -o with glob: expand template with #N substitution (tests 74,86,87)
         // - Otherwise, no per-URL output files (all go to stdout)
-        let per_url_output: Vec<String> = if opts.had_next && !opts.output_files.is_empty() {
-            // Per-URL output files from individual -o flags (may be fewer than URLs)
+        let per_url_output: Vec<String> = if opts.output_files.len() > 1 {
+            // Multiple output files from individual -o/--out-null flags (positional)
+            opts.output_files.clone()
+        } else if opts.had_next && !opts.output_files.is_empty() {
+            // Per-URL output files from --next groups
             opts.output_files.clone()
         } else if let Some(ref tmpl) = opts.output_file {
             opts.urls
@@ -1509,7 +1512,7 @@ pub fn run(args: &[String]) -> ExitCode {
                 use std::io::Write as _;
                 // Create a minimal response for write-out formatting
                 let wo = if let Some(resp) = opts.easy.last_response() {
-                    format_write_out(w, resp)
+                    format_write_out(w, resp, false)
                 } else {
                     // No response available — just process escape sequences
                     let mut s = w.replace("\\n", "\n").replace("\\t", "\t").replace("\\r", "\r");
@@ -1567,7 +1570,9 @@ pub fn error_to_curl_code(err: &liburlx::Error) -> u8 {
             }
         }
         liburlx::Error::Http(msg) => {
-            if msg.contains("Weird server reply") || msg.contains("binary zero") {
+            if msg.contains("headers too large") {
+                100 // CURLE_TOO_LARGE (response headers exceeded max size)
+            } else if msg.contains("Weird server reply") || msg.contains("binary zero") {
                 8 // CURLE_WEIRD_SERVER_REPLY
             } else if msg.contains("range not satisfiable") || msg.contains("Range not satisfiable")
             {

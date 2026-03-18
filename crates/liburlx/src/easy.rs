@@ -158,6 +158,8 @@ pub struct Easy {
     mail_auth: Option<String>,
     /// Create missing directories on the FTP server during upload.
     ftp_create_dirs: bool,
+    /// Send PRET before PASV/EPSV (curl `--ftp-pret`).
+    ftp_use_pret: bool,
     /// FTP method for directory traversal.
     ftp_method: FtpMethod,
     /// Use ASCII transfer mode for FTP (curl `--use-ascii` / `-B`).
@@ -419,6 +421,7 @@ impl Clone for Easy {
             mail_rcpt: self.mail_rcpt.clone(),
             mail_auth: self.mail_auth.clone(),
             ftp_create_dirs: self.ftp_create_dirs,
+            ftp_use_pret: self.ftp_use_pret,
             ftp_method: self.ftp_method,
             ftp_use_ascii: self.ftp_use_ascii,
             ftp_append: self.ftp_append,
@@ -541,6 +544,7 @@ impl Easy {
             mail_rcpt: Vec::new(),
             mail_auth: None,
             ftp_create_dirs: false,
+            ftp_use_pret: false,
             ftp_method: FtpMethod::default(),
             ftp_use_ascii: false,
             ftp_append: false,
@@ -1827,6 +1831,15 @@ impl Easy {
         self.ftp_create_dirs = enable;
     }
 
+    /// Enable PRET command before PASV/EPSV (`--ftp-pret`).
+    ///
+    /// When enabled, sends `PRET <command>` before entering passive mode.
+    /// Required by some distributed FTP servers.
+    /// Equivalent to `CURLOPT_FTP_USE_PRET` / curl's `--ftp-pret`.
+    pub const fn ftp_use_pret(&mut self, enable: bool) {
+        self.ftp_use_pret = enable;
+    }
+
     /// Set the FTP method for directory traversal.
     ///
     /// Controls how the path is traversed when accessing files via FTP.
@@ -2268,6 +2281,7 @@ impl Easy {
             skip_pasv_ip: self.ftp_skip_pasv_ip,
             account: self.ftp_account.clone(),
             create_dirs: self.ftp_create_dirs,
+            use_pret: self.ftp_use_pret,
             method: self.ftp_method,
             active_port: self.ftp_active_port.clone(),
             use_ascii: self.ftp_use_ascii,

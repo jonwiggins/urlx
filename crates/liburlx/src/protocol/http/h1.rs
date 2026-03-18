@@ -40,8 +40,9 @@ pub(crate) fn te_compression_encoding(te: &str) -> Option<String> {
     }
 }
 
-/// Maximum response header size (300 KB, same as curl's default `MAX_HTTP_RESP_HEADER_SIZE`).
-const MAX_HEADER_SIZE: usize = 300 * 1024;
+/// Maximum response header size (100 KB, matching curl's default `CURL_MAX_HTTP_HEADER`).
+/// curl returns `CURLE_TOO_LARGE` (exit 100) when headers exceed this limit (test 1154).
+const MAX_HEADER_SIZE: usize = 100 * 1024;
 
 /// Send an HTTP/1.x request and read the response.
 ///

@@ -46,8 +46,11 @@ impl Url {
 
         match url::Url::parse(&input) {
             Ok(inner) => {
-                // Reject hostnames > 255 chars (curl returns CURLE_URL_MALFORMAT: test 399)
-                if inner.host_str().is_some_and(|h| h.len() > 255) {
+                // Reject extremely long hostnames (curl returns CURLE_URL_MALFORMAT: test 399).
+                // Note: hostnames > 255 chars are allowed here because SOCKS5h proxies may
+                // resolve them remotely; the 255-byte SOCKS5 limit is checked at the proxy
+                // layer (curl compat: test 728).
+                if inner.host_str().is_some_and(|h| h.len() > 65535) {
                     return Err(Error::UrlParse("hostname too long".to_string()));
                 }
                 Ok(Self { inner, override_host: None, raw_input: Some(input.clone()) })

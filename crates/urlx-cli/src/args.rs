@@ -730,6 +730,14 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
                 let val = require_arg(args, i, "-o")?;
                 opts.output_files.push(val.to_string());
             }
+            "--out-null" => {
+                // Discard output for this URL (curl compat: test 756).
+                // Map to platform-appropriate null device.
+                #[cfg(unix)]
+                opts.output_files.push("/dev/null".to_string());
+                #[cfg(windows)]
+                opts.output_files.push("NUL".to_string());
+            }
             "-O" | "--remote-name" | "--remote-name-all" => {
                 opts.remote_name = true;
             }
@@ -1555,6 +1563,9 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
             "--ftp-create-dirs" => {
                 opts.easy.ftp_create_dirs(true);
             }
+            "--ftp-pret" => {
+                opts.easy.ftp_use_pret(true);
+            }
             "--ftp-skip-pasv-ip" => {
                 opts.easy.ftp_skip_pasv_ip(true);
             }
@@ -1905,7 +1916,6 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
             | "--tlsuser"
             | "--tlspassword"
             | "--socks5-gssapi-service"
-            | "--ftp-pret"
             | "--ftp-ssl-ccc-mode"
             | "--mail-rcpt-allowfails"
             | "--trace-config" => {
@@ -2736,7 +2746,7 @@ mod tests {
             Vec::new(),
             "http://example.com".to_string(),
         );
-        let result = format_write_out("%{http_code}", &response);
+        let result = format_write_out("%{http_code}", &response, false);
         assert_eq!(result, "200");
     }
 
@@ -2749,7 +2759,7 @@ mod tests {
             "http://example.com".to_string(),
         );
         response.set_http_version(liburlx::ResponseHttpVersion::Http2);
-        let result = format_write_out("%{http_version}", &response);
+        let result = format_write_out("%{http_version}", &response, false);
         assert_eq!(result, "2");
     }
 
@@ -2762,7 +2772,7 @@ mod tests {
             "http://example.com".to_string(),
         );
         response.set_http_version(liburlx::ResponseHttpVersion::Http11);
-        let result = format_write_out("%{http_version}", &response);
+        let result = format_write_out("%{http_version}", &response, false);
         assert_eq!(result, "1.1");
     }
 
@@ -2774,7 +2784,7 @@ mod tests {
             Vec::new(),
             String::new(),
         );
-        let result = format_write_out("a\\nb\\tc", &response);
+        let result = format_write_out("a\\nb\\tc", &response, false);
         assert_eq!(result, "a\nb\tc");
     }
 
@@ -2786,7 +2796,8 @@ mod tests {
             b"body".to_vec(),
             "http://test.com/path".to_string(),
         );
-        let result = format_write_out("%{http_code} %{size_download} %{url_effective}", &response);
+        let result =
+            format_write_out("%{http_code} %{size_download} %{url_effective}", &response, false);
         assert_eq!(result, "404 4 http://test.com/path");
     }
 
@@ -3156,6 +3167,7 @@ mod tests {
         let result = format_write_out(
             "%{http_code} %{response_code} %{url_effective} %{content_type} %{size_download}",
             &response,
+            false,
         );
         assert!(result.contains("201"));
         assert!(result.contains("http://example.com/page"));
@@ -3171,7 +3183,7 @@ mod tests {
             Vec::new(),
             String::new(),
         );
-        let result = format_write_out("a\\rb", &response);
+        let result = format_write_out("a\\rb", &response, false);
         assert_eq!(result, "a\rb");
     }
 
@@ -3183,7 +3195,7 @@ mod tests {
             Vec::new(),
             String::new(),
         );
-        let result = format_write_out("%{content_type}", &response);
+        let result = format_write_out("%{content_type}", &response, false);
         assert_eq!(result, "");
     }
 
@@ -3198,6 +3210,7 @@ mod tests {
         let result = format_write_out(
             "%{time_namelookup} %{time_appconnect} %{time_pretransfer} %{time_starttransfer} %{speed_download} %{speed_upload} %{size_upload}",
             &response,
+            false,
         );
         // All default to zero
         assert!(result.contains("0.000000"));

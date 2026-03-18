@@ -321,7 +321,7 @@ pub fn output_response(
         } else {
             (None, false, fmt)
         };
-        let output = format_write_out(real_fmt, response);
+        let output = format_write_out(real_fmt, response, suppress_body);
         if let Some(path) = out_file {
             use std::io::Write;
             let file = if append_mode {
@@ -358,14 +358,24 @@ pub fn http_version_string(response: &liburlx::Response) -> String {
 }
 
 /// Format a `--write-out` string by replacing `%{variable}` placeholders.
+///
+/// When `time_cond_suppressed` is true, the body was suppressed due to a
+/// `-z`/`--time-cond` check, and curl reports the response code as 304
+/// (curl compat: test 1239).
 #[allow(clippy::too_many_lines)]
-pub fn format_write_out(fmt: &str, response: &liburlx::Response) -> String {
+pub fn format_write_out(
+    fmt: &str,
+    response: &liburlx::Response,
+    time_cond_suppressed: bool,
+) -> String {
     let info = response.transfer_info();
     let mut result = fmt.to_string();
 
+    // When body is suppressed by -z time condition, curl simulates a 304 response code
+    let effective_status = if time_cond_suppressed { 304 } else { response.status() };
     // Replace known variables
-    result = result.replace("%{http_code}", &response.status().to_string());
-    result = result.replace("%{response_code}", &response.status().to_string());
+    result = result.replace("%{http_code}", &effective_status.to_string());
+    result = result.replace("%{response_code}", &effective_status.to_string());
     result = result.replace("%{url_effective}", response.effective_url());
     result = result.replace("%{content_type}", response.content_type().unwrap_or(""));
     result = result.replace("%{size_download}", &response.size_download().to_string());
@@ -451,10 +461,15 @@ pub fn format_write_out(fmt: &str, response: &liburlx::Response) -> String {
     let redirect_url_normalized = if redirect_url_raw.is_empty() {
         redirect_url_raw
     } else {
-        // Resolve relative URLs against the effective (request) URL
-        let resolved = if redirect_url_raw.starts_with("http://")
-            || redirect_url_raw.starts_with("https://")
-        {
+        // Resolve relative URLs against the effective (request) URL.
+        // Any URL with a scheme (e.g., http://, https://, ht3p://) is absolute.
+        let has_scheme = redirect_url_raw.find("://").is_some_and(|pos| {
+            pos > 0
+                && redirect_url_raw[..pos]
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.')
+        });
+        let resolved = if has_scheme {
             redirect_url_raw.clone()
         } else if redirect_url_raw.starts_with('/') {
             // Absolute path — keep scheme + authority from base

@@ -114,6 +114,12 @@ pub async fn connect_socks5(
         connect_request.push(0x04); // IPv6
         connect_request.extend_from_slice(&ipv6.octets());
     } else {
+        // SOCKS5 domain address type uses a single byte for length, max 255
+        if host.len() > 255 {
+            return Err(proxy_err(
+                "SOCKS5: the destination hostname is too long to be resolved remotely by the proxy.".to_string(),
+            ));
+        }
         connect_request.push(0x03); // Domain
         #[allow(clippy::cast_possible_truncation)]
         {
