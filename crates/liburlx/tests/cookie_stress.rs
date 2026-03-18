@@ -39,8 +39,12 @@ fn one_thousand_cookies() {
     assert_eq!(jar.len(), 1000);
 
     let header = jar.cookie_header("example.com", "/", false).unwrap();
+    // curl caps cookies per request at 150 (MAX_COOKIE_SEND_AMOUNT).
+    // First cookies by creation order are sent.
     assert!(header.contains("key0=val0"));
-    assert!(header.contains("key999=val999"));
+    assert!(header.contains("key149=val149"));
+    // key150+ are truncated
+    assert!(!header.contains("key999=val999"));
 }
 
 #[test]
