@@ -2608,8 +2608,30 @@ async fn perform_transfer(
             request_headers.push(("Proxy-Authorization".to_string(), format!("NTLM {type1}")));
         }
         // Suppress body during NTLM Type 1 negotiation (Content-Length: 0, test 239)
-        let ntlm_initial_body =
-            if is_proxy_ntlm && !is_connect_tunnel { None } else { initial_body };
+        // Send Content-Length: 0 for POST/PUT (empty body signals "will resend after auth").
+        // For POST form data: keep Content-Type: application/x-www-form-urlencoded
+        // For multipart: suppress Content-Type entirely (curl compat)
+        let ntlm_initial_body = if is_proxy_ntlm && !is_connect_tunnel {
+            // Remove multipart Content-Type during NTLM Type 1 (no body = no boundary).
+            // Also suppress the auto-generated Content-Type that h1.rs adds for POST.
+            let has_multipart_ct = request_headers
+                .iter()
+                .any(|(k, v)| k.eq_ignore_ascii_case("content-type") && v.contains("boundary="));
+            if has_multipart_ct {
+                request_headers.retain(|(k, v)| {
+                    !(k.eq_ignore_ascii_case("content-type") && v.contains("boundary="))
+                });
+                // Add an empty Content-Type to suppress h1.rs auto-generation
+                request_headers.push(("Content-Type".to_string(), String::new()));
+            }
+            if initial_body.is_some() {
+                Some(&[] as &[u8]) // Empty body → sends Content-Length: 0
+            } else {
+                None
+            }
+        } else {
+            initial_body
+        };
         let mut response = Box::pin(do_single_request(
             &current_url,
             &current_method,
@@ -3182,103 +3204,218 @@ async fn perform_transfer(
             }
         }
 
-        // Handle 407 Proxy Authentication Required for proxy NTLM (non-CONNECT path)
+        // Handle 407 Proxy Authentication Required for proxy NTLM/Digest (non-CONNECT path)
         if response.status() == 407 {
             if let Some(pcreds) = proxy_credentials {
-                if pcreds.method == ProxyAuthMethod::Ntlm {
-                    // We sent Type 1 already; now parse Type 2 and send Type 3
-                    if let Some(proxy_auth) = response.header("proxy-authenticate") {
-                        if let Some(type2_data) = proxy_auth.strip_prefix("NTLM ") {
-                            let challenge = crate::auth::ntlm::parse_type2_message(type2_data)?;
-                            let domain = pcreds.domain.as_deref().unwrap_or("");
-                            let type3 = crate::auth::ntlm::create_type3_message(
-                                &challenge,
-                                &pcreds.username,
-                                &pcreds.password,
-                                domain,
-                            );
+                match pcreds.method {
+                    ProxyAuthMethod::Ntlm => {
+                        // We sent Type 1 already; now parse Type 2 and send Type 3
+                        if let Some(proxy_auth) = response.header("proxy-authenticate") {
+                            if let Some(type2_data) = proxy_auth.strip_prefix("NTLM ") {
+                                let challenge = crate::auth::ntlm::parse_type2_message(type2_data)?;
+                                let domain = pcreds.domain.as_deref().unwrap_or("");
+                                let type3 = crate::auth::ntlm::create_type3_message(
+                                    &challenge,
+                                    &pcreds.username,
+                                    &pcreds.password,
+                                    domain,
+                                );
 
-                            // Save the 407 response for --include output
-                            redirect_chain.push(response.clone());
+                                // Save the 407 response for --include output
+                                redirect_chain.push(response.clone());
 
-                            let mut type3_headers = request_headers.clone();
-                            // Remove the old Proxy-Authorization header (Type 1)
-                            type3_headers
-                                .retain(|(k, _)| !k.eq_ignore_ascii_case("proxy-authorization"));
-                            type3_headers
-                                .push(("Proxy-Authorization".to_string(), format!("NTLM {type3}")));
+                                let mut type3_headers = request_headers.clone();
+                                // Remove the old Proxy-Authorization header (Type 1)
+                                type3_headers.retain(|(k, _)| {
+                                    !k.eq_ignore_ascii_case("proxy-authorization")
+                                });
+                                type3_headers.push((
+                                    "Proxy-Authorization".to_string(),
+                                    format!("NTLM {type3}"),
+                                ));
 
-                            response = Box::pin(do_single_request(
-                                &current_url,
-                                &current_method,
-                                &type3_headers,
-                                current_body.as_deref(),
-                                verbose,
-                                accept_encoding,
-                                connect_timeout,
-                                effective_proxy,
-                                proxy_credentials,
-                                resolve_overrides,
-                                tls_config,
-                                tcp_nodelay,
-                                tcp_keepalive,
-                                unix_socket,
-                                interface,
-                                local_port,
-                                dns_shuffle,
-                                dns_cache,
-                                pool,
-                                #[cfg(feature = "http2")]
-                                h2_pool,
-                                http_version,
-                                expect_100_timeout,
-                                happy_eyeballs_timeout,
-                                ignore_content_length,
-                                speed_limits,
-                                ftp_ssl_mode,
-                                ssh_key_path,
-                                proxy_tls_config,
-                                alt_svc_cache,
-                                #[cfg(feature = "http2")]
-                                h2_config,
-                                dns_resolver,
-                                custom_request_target,
-                                tftp_blksize,
-                                tftp_no_options,
-                                #[cfg(feature = "ssh")]
-                                ssh_host_key_policy,
-                                mail_from,
-                                mail_rcpt,
-                                fresh_connect,
-                                forbid_reuse,
-                                ftp_config,
-                                proxy_headers,
-                                connect_to,
-                                path_as_is,
-                                #[cfg(feature = "ssh")]
-                                ssh_public_keyfile,
-                                #[cfg(not(feature = "ssh"))]
-                                None,
-                                #[cfg(feature = "ssh")]
-                                ssh_auth_types,
-                                #[cfg(not(feature = "ssh"))]
-                                None,
-                                mail_auth,
-                                sasl_authzid,
-                                sasl_ir,
-                                oauth2_bearer,
-                                haproxy_protocol,
-                                abstract_unix_socket,
-                                chunked_upload,
-                                http09_allowed,
-                                deadline,
-                                http_proxy_tunnel,
-                                proxy_http_10,
-                                raw,
-                            ))
-                            .await?;
+                                response = Box::pin(do_single_request(
+                                    &current_url,
+                                    &current_method,
+                                    &type3_headers,
+                                    current_body.as_deref(),
+                                    verbose,
+                                    accept_encoding,
+                                    connect_timeout,
+                                    effective_proxy,
+                                    proxy_credentials,
+                                    resolve_overrides,
+                                    tls_config,
+                                    tcp_nodelay,
+                                    tcp_keepalive,
+                                    unix_socket,
+                                    interface,
+                                    local_port,
+                                    dns_shuffle,
+                                    dns_cache,
+                                    pool,
+                                    #[cfg(feature = "http2")]
+                                    h2_pool,
+                                    http_version,
+                                    expect_100_timeout,
+                                    happy_eyeballs_timeout,
+                                    ignore_content_length,
+                                    speed_limits,
+                                    ftp_ssl_mode,
+                                    ssh_key_path,
+                                    proxy_tls_config,
+                                    alt_svc_cache,
+                                    #[cfg(feature = "http2")]
+                                    h2_config,
+                                    dns_resolver,
+                                    custom_request_target,
+                                    tftp_blksize,
+                                    tftp_no_options,
+                                    #[cfg(feature = "ssh")]
+                                    ssh_host_key_policy,
+                                    mail_from,
+                                    mail_rcpt,
+                                    fresh_connect,
+                                    forbid_reuse,
+                                    ftp_config,
+                                    proxy_headers,
+                                    connect_to,
+                                    path_as_is,
+                                    #[cfg(feature = "ssh")]
+                                    ssh_public_keyfile,
+                                    #[cfg(not(feature = "ssh"))]
+                                    None,
+                                    #[cfg(feature = "ssh")]
+                                    ssh_auth_types,
+                                    #[cfg(not(feature = "ssh"))]
+                                    None,
+                                    mail_auth,
+                                    sasl_authzid,
+                                    sasl_ir,
+                                    oauth2_bearer,
+                                    haproxy_protocol,
+                                    abstract_unix_socket,
+                                    chunked_upload,
+                                    http09_allowed,
+                                    deadline,
+                                    http_proxy_tunnel,
+                                    proxy_http_10,
+                                    raw,
+                                ))
+                                .await?;
+                            }
                         }
                     }
+                    ProxyAuthMethod::Digest => {
+                        // Parse Digest challenge from 407 and retry with credentials
+                        if let Some(proxy_auth) = response.header("proxy-authenticate") {
+                            if let Ok(challenge) =
+                                crate::auth::digest::DigestChallenge::parse(proxy_auth)
+                            {
+                                if verbose {
+                                    #[allow(clippy::print_stderr)]
+                                    {
+                                        eprintln!(
+                                            "* Proxy auth using Digest with realm '{}'",
+                                            challenge.realm
+                                        );
+                                    }
+                                }
+
+                                let uri = current_url.path().to_string();
+                                let cnonce = crate::auth::digest::generate_cnonce();
+                                let auth_value = challenge.respond(
+                                    &pcreds.username,
+                                    &pcreds.password,
+                                    &current_method,
+                                    &uri,
+                                    1,
+                                    &cnonce,
+                                );
+
+                                // Save the 407 response for --include output
+                                redirect_chain.push(response.clone());
+
+                                let mut digest_headers = request_headers.clone();
+                                digest_headers.retain(|(k, _)| {
+                                    !k.eq_ignore_ascii_case("proxy-authorization")
+                                });
+                                digest_headers
+                                    .push(("Proxy-Authorization".to_string(), auth_value));
+
+                                response = Box::pin(do_single_request(
+                                    &current_url,
+                                    &current_method,
+                                    &digest_headers,
+                                    current_body.as_deref(),
+                                    verbose,
+                                    accept_encoding,
+                                    connect_timeout,
+                                    effective_proxy,
+                                    proxy_credentials,
+                                    resolve_overrides,
+                                    tls_config,
+                                    tcp_nodelay,
+                                    tcp_keepalive,
+                                    unix_socket,
+                                    interface,
+                                    local_port,
+                                    dns_shuffle,
+                                    dns_cache,
+                                    pool,
+                                    #[cfg(feature = "http2")]
+                                    h2_pool,
+                                    http_version,
+                                    expect_100_timeout,
+                                    happy_eyeballs_timeout,
+                                    ignore_content_length,
+                                    speed_limits,
+                                    ftp_ssl_mode,
+                                    ssh_key_path,
+                                    proxy_tls_config,
+                                    alt_svc_cache,
+                                    #[cfg(feature = "http2")]
+                                    h2_config,
+                                    dns_resolver,
+                                    custom_request_target,
+                                    tftp_blksize,
+                                    tftp_no_options,
+                                    #[cfg(feature = "ssh")]
+                                    ssh_host_key_policy,
+                                    mail_from,
+                                    mail_rcpt,
+                                    fresh_connect,
+                                    forbid_reuse,
+                                    ftp_config,
+                                    proxy_headers,
+                                    connect_to,
+                                    path_as_is,
+                                    #[cfg(feature = "ssh")]
+                                    ssh_public_keyfile,
+                                    #[cfg(not(feature = "ssh"))]
+                                    None,
+                                    #[cfg(feature = "ssh")]
+                                    ssh_auth_types,
+                                    #[cfg(not(feature = "ssh"))]
+                                    None,
+                                    mail_auth,
+                                    sasl_authzid,
+                                    sasl_ir,
+                                    oauth2_bearer,
+                                    haproxy_protocol,
+                                    abstract_unix_socket,
+                                    chunked_upload,
+                                    http09_allowed,
+                                    deadline,
+                                    http_proxy_tunnel,
+                                    proxy_http_10,
+                                    raw,
+                                ))
+                                .await?;
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -4758,7 +4895,10 @@ where
                             .await?;
 
                             if retry_status == 200 {
-                                return Ok((stream, raw_retry));
+                                // Concatenate 407 + 200 raw bytes for --include output
+                                let mut combined = raw_connect.clone();
+                                combined.extend_from_slice(&raw_retry);
+                                return Ok((stream, combined));
                             }
 
                             return Err(Error::Http(format!(
@@ -4794,7 +4934,10 @@ where
                             .await?;
 
                             if status3 == 200 {
-                                return Ok((stream, raw3));
+                                // Concatenate 407 + 200 raw bytes for --include output
+                                let mut combined = raw_connect.clone();
+                                combined.extend_from_slice(&raw3);
+                                return Ok((stream, combined));
                             }
 
                             return Err(Error::Http(format!(
@@ -4893,8 +5036,8 @@ where
 
     stream.flush().await.map_err(|e| Error::Http(format!("proxy CONNECT flush failed: {e}")))?;
 
-    // Read the proxy's response
-    let mut buf = vec![0u8; 4096];
+    // Read the proxy's response headers
+    let mut buf = vec![0u8; 65536];
     let mut total = 0;
 
     loop {
@@ -4970,11 +5113,73 @@ where
 
             // Return the raw response bytes for --include output
             let raw_bytes = buf[..end].to_vec();
+
+            // For non-200 responses (e.g. 407), drain the response body so the
+            // stream is clean for the retry request. Check Content-Length and
+            // Transfer-Encoding: chunked.
+            if status != 200 {
+                // Count how many body bytes we already have past the header end
+                let already_read_body = total - end;
+
+                // Check for Content-Length
+                let content_length = find_header(&response_headers, "content-length")
+                    .and_then(|v| v.parse::<usize>().ok());
+
+                let is_chunked = find_header(&response_headers, "transfer-encoding")
+                    .is_some_and(|v| v.eq_ignore_ascii_case("chunked"));
+
+                if let Some(cl) = content_length {
+                    // Drain exactly `cl` bytes of body
+                    if already_read_body < cl {
+                        let remaining = cl - already_read_body;
+                        let mut drain_buf = vec![0u8; 8192];
+                        let mut drained = 0;
+                        while drained < remaining {
+                            let to_read = std::cmp::min(drain_buf.len(), remaining - drained);
+                            let n = stream.read(&mut drain_buf[..to_read]).await.map_err(|e| {
+                                Error::Http(format!("proxy CONNECT body drain failed: {e}"))
+                            })?;
+                            if n == 0 {
+                                break;
+                            }
+                            drained += n;
+                        }
+                    }
+                } else if is_chunked {
+                    // Drain chunked body: read until we see "0\r\n\r\n" terminator.
+                    // Start with any body bytes already buffered past headers.
+                    let mut chunk_buf = Vec::new();
+                    chunk_buf.extend_from_slice(&buf[end..total]);
+                    let mut tmp = [0u8; 8192];
+                    loop {
+                        // Check for chunked terminator in accumulated data
+                        if chunk_buf.windows(5).any(|w| w == b"0\r\n\r\n") {
+                            break;
+                        }
+                        // Also accept bare-LF variant
+                        if chunk_buf.windows(3).any(|w| w == b"0\n\n") {
+                            break;
+                        }
+                        let n = stream.read(&mut tmp).await.map_err(|e| {
+                            Error::Http(format!("proxy CONNECT chunked drain failed: {e}"))
+                        })?;
+                        if n == 0 {
+                            break;
+                        }
+                        chunk_buf.extend_from_slice(&tmp[..n]);
+                        // Safety limit: don't drain more than 1MB
+                        if chunk_buf.len() > 1_048_576 {
+                            break;
+                        }
+                    }
+                }
+            }
+
             return Ok((status, response_headers, raw_bytes));
         }
 
         if total >= buf.len() {
-            return Err(Error::Http("proxy CONNECT response too large".to_string()));
+            buf.resize(buf.len() * 2, 0);
         }
     }
 }

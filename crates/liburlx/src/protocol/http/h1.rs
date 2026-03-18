@@ -246,6 +246,10 @@ where
             }
             if name.eq_ignore_ascii_case("content-type") {
                 content_type_emitted = true;
+                // Empty Content-Type → suppress entirely (NTLM Type 1 probe, test 170)
+                if value.is_empty() {
+                    continue;
+                }
             }
             if value.is_empty() {
                 // Empty value from -H "Name;" → send header with no value
