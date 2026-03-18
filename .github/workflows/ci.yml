@@ -21,7 +21,7 @@ jobs:
           fetch-depth: 0
       - name: Validate conventional commits
         run: |
-          commits=$(git log --format="%s" origin/${{ github.base_ref }}..HEAD)
+          commits=$(git log --no-merges --format="%s" origin/${{ github.base_ref }}..HEAD)
           regex="^(feat|fix|refactor|test|docs|chore|ci|perf|build|style|revert)(\(.+\))?(!)?: .+"
           failed=0
           while IFS= read -r msg; do
