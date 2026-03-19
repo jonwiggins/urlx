@@ -749,10 +749,14 @@ impl Easy {
     }
 
     /// Returns true if an Authorization header has been set.
+    ///
+    /// Checks both explicit `Authorization` headers and auto-generated ones
+    /// (e.g., from `basic_auth()` which uses `_auto_Authorization`).
     #[must_use]
     pub fn has_auth_header(&self) -> bool {
-        self.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("Authorization"))
-            || self.auth_credentials.is_some()
+        self.headers.iter().any(|(k, _)| {
+            k.eq_ignore_ascii_case("Authorization") || k.eq_ignore_ascii_case("_auto_Authorization")
+        }) || self.auth_credentials.is_some()
     }
 
     /// Set the expected upload size in bytes.

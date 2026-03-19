@@ -26,6 +26,15 @@ pub struct NetrcEntry {
 #[derive(Debug, Clone)]
 pub struct NetrcSyntaxError;
 
+/// Check whether a credential string contains ASCII control characters (bytes < 0x20).
+///
+/// Used to reject netrc credentials for protocols that cannot handle control codes
+/// (e.g., POP3, SMTP, FTP). HTTP allows control chars in credentials.
+#[must_use]
+pub fn has_control_chars(s: &str) -> bool {
+    s.bytes().any(|b| b < 0x20)
+}
+
 /// Parse a `.netrc` file and look up credentials for a host.
 ///
 /// Returns the matching entry for the given hostname, or the `default`
@@ -48,8 +57,10 @@ pub fn lookup(contents: &str, hostname: &str) -> Result<Option<NetrcEntry>, Netr
 
 /// Parse a `.netrc` file and look up credentials for a host and specific user.
 ///
-/// Returns the matching entry for the given hostname and login name, or `None`
-/// if no entry matches both host and user.
+/// When multiple entries match the hostname and username, prefers the first entry
+/// that also has a password set. If no entry with a password exists, returns the
+/// first matching entry (curl compat: test 478).
+///
 /// # Errors
 ///
 /// Returns [`NetrcSyntaxError`] for syntax errors (e.g., unterminated quotes).
@@ -59,10 +70,22 @@ pub fn lookup_user(
     username: &str,
 ) -> Result<Option<NetrcEntry>, NetrcSyntaxError> {
     let entries = parse(contents)?;
-    Ok(entries.into_iter().find(|e| {
-        e.machine.as_ref().is_some_and(|m| m.eq_ignore_ascii_case(hostname))
-            && e.login.as_ref().is_some_and(|l| l == username)
-    }))
+
+    let matching: Vec<_> = entries
+        .into_iter()
+        .filter(|e| {
+            e.machine.as_ref().is_some_and(|m| m.eq_ignore_ascii_case(hostname))
+                && e.login.as_ref().is_some_and(|l| l == username)
+        })
+        .collect();
+
+    // Prefer the first entry that has a password (curl compat: test 478).
+    // If none has a password, return the first matching entry.
+    let with_password = matching.iter().find(|e| e.password.is_some());
+    if let Some(entry) = with_password {
+        return Ok(Some(entry.clone()));
+    }
+    Ok(matching.into_iter().next())
 }
 
 /// Parse all entries from a `.netrc` file.
@@ -124,10 +147,16 @@ fn parse(contents: &str) -> Result<Vec<NetrcEntry>, NetrcSyntaxError> {
 
 /// Tokenize a `.netrc` file, handling comments and quoted strings with escape sequences.
 ///
+/// NULL bytes in the content are treated as line terminators (matching curl's behavior
+/// where C strings are truncated at NULL bytes).
+///
 /// Returns `Err(NetrcSyntaxError)` if a quoted string is unterminated.
 fn tokenize(contents: &str) -> Result<Vec<String>, NetrcSyntaxError> {
     let mut tokens = Vec::new();
     for line in contents.lines() {
+        // Truncate line at NULL byte (curl compat: test 793).
+        // In curl, file contents are stored as C strings where NULL terminates.
+        let line = line.find('\0').map_or(line, |null_pos| &line[..null_pos]);
         let line = line.trim();
         if line.starts_with('#') {
             continue;
@@ -170,10 +199,10 @@ fn tokenize(contents: &str) -> Result<Vec<String>, NetrcSyntaxError> {
                 }
                 tokens.push(value);
             } else {
-                // Unquoted word
+                // Unquoted word: stop at whitespace, '#', or NULL
                 let mut word = String::new();
                 while let Some(&c) = chars.peek() {
-                    if c.is_whitespace() || c == '#' {
+                    if c.is_whitespace() || c == '#' || c == '\0' {
                         break;
                     }
                     word.push(c);
@@ -282,5 +311,52 @@ mod tests {
     fn parse_unterminated_quote() {
         let contents = "machine example.com\nlogin user1\npassword \"unterminated\n";
         assert!(lookup(contents, "example.com").is_err());
+    }
+
+    #[test]
+    fn lookup_user_multiple_entries_prefer_with_password() {
+        // curl test 478: multiple entries for same host/user, prefer one with password
+        let contents = "\
+machine host.com\nlogin debbie\n\n\
+machine host.com\nlogin debbie\npassword secret\n";
+        let entry = lookup_user(contents, "host.com", "debbie").unwrap().unwrap();
+        assert_eq!(entry.login.as_deref(), Some("debbie"));
+        assert_eq!(entry.password.as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn lookup_user_first_match_with_password() {
+        // curl test 682: multiple users, pick first matching
+        let contents = "machine host.com login user1 password passwd1\nmachine host.com login user2 password passwd2\n";
+        let entry = lookup_user(contents, "host.com", "user1").unwrap().unwrap();
+        assert_eq!(entry.password.as_deref(), Some("passwd1"));
+    }
+
+    #[test]
+    fn lookup_user_second_match() {
+        // curl test 683: pick the entry matching specific user
+        let contents = "machine host.com login user1 password passwd1\nmachine host.com login user2 password passwd2\n";
+        let entry = lookup_user(contents, "host.com", "user2").unwrap().unwrap();
+        assert_eq!(entry.password.as_deref(), Some("passwd2"));
+    }
+
+    #[test]
+    fn null_byte_truncates_line() {
+        // curl test 793: NULL byte truncates the rest of the line
+        let contents = "machine host.com login username \"password\"\0 hello\n";
+        let entry = lookup(contents, "host.com").unwrap().unwrap();
+        assert_eq!(entry.login.as_deref(), Some("username"));
+        // After NULL truncation, "password" is a token, not a keyword value
+        // The line becomes: machine host.com login username
+        assert!(entry.password.is_none());
+    }
+
+    #[test]
+    fn has_control_chars_detects_cr_lf() {
+        assert!(has_control_chars("hello\r\nworld"));
+        assert!(has_control_chars("password\rcommand"));
+        assert!(has_control_chars("password\ncommand"));
+        assert!(!has_control_chars("normalpassword"));
+        assert!(!has_control_chars("with spaces"));
     }
 }
