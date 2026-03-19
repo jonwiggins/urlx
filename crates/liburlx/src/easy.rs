@@ -186,6 +186,8 @@ pub struct Easy {
     ftp_time_condition: Option<(i64, bool)>,
     /// SASL authorization identity.
     sasl_authzid: Option<String>,
+    /// SASL login options (e.g. `AUTH=PLAIN`).
+    login_options: Option<String>,
     /// Send SASL initial response in first message.
     sasl_ir: bool,
     /// Connect-to host:port mapping (`from_host:from_port:to_host:to_port`).
@@ -324,6 +326,7 @@ impl std::fmt::Debug for Easy {
             .field("ftp_create_dirs", &self.ftp_create_dirs)
             .field("ftp_method", &self.ftp_method)
             .field("sasl_authzid", &self.sasl_authzid)
+            .field("login_options", &self.login_options)
             .field("sasl_ir", &self.sasl_ir)
             .field("connect_to", &self.connect_to)
             .field("haproxy_protocol", &self.haproxy_protocol)
@@ -448,6 +451,7 @@ impl Clone for Easy {
             ftp_post_quote: self.ftp_post_quote.clone(),
             ftp_time_condition: self.ftp_time_condition,
             sasl_authzid: self.sasl_authzid.clone(),
+            login_options: self.login_options.clone(),
             sasl_ir: self.sasl_ir,
             connect_to: self.connect_to.clone(),
             haproxy_protocol: self.haproxy_protocol,
@@ -576,6 +580,7 @@ impl Easy {
             ftp_post_quote: Vec::new(),
             ftp_time_condition: None,
             sasl_authzid: None,
+            login_options: None,
             sasl_ir: false,
             connect_to: Vec::new(),
             haproxy_protocol: false,
@@ -2026,6 +2031,14 @@ impl Easy {
         self.sasl_authzid = Some(authzid.to_string());
     }
 
+    /// Set SASL login options.
+    ///
+    /// e.g. `AUTH=PLAIN` or `AUTH=+LOGIN`.
+    /// Equivalent to `CURLOPT_LOGIN_OPTIONS` / curl's `--login-options`.
+    pub fn login_options(&mut self, options: &str) {
+        self.login_options = Some(options.to_string());
+    }
+
     /// Enable SASL initial response.
     ///
     /// When enabled, the initial response is sent in the first SASL message.
@@ -2504,6 +2517,7 @@ impl Easy {
             self.ssh_auth_types,
             self.mail_auth.as_deref(),
             self.sasl_authzid.as_deref(),
+            self.login_options.as_deref(),
             self.sasl_ir,
             self.oauth2_bearer.as_deref(),
             self.haproxy_protocol,
@@ -2655,8 +2669,9 @@ async fn perform_transfer(
     #[cfg_attr(not(feature = "ssh"), allow(unused_variables))] ssh_auth_types: Option<u32>,
     mail_auth: Option<&str>,
     sasl_authzid: Option<&str>,
+    login_options: Option<&str>,
     sasl_ir: bool,
-    oauth2_bearer: Option<&str>,
+    mut oauth2_bearer: Option<&str>,
     haproxy_protocol: bool,
     abstract_unix_socket: Option<&str>,
     chunked_upload: bool,
@@ -2682,6 +2697,7 @@ async fn perform_transfer(
     let mut digest_state: Option<(crate::auth::digest::DigestChallenge, String, u32)> = None; // (challenge, cnonce, nc)
                                                                                               // Track Basic auth header from AnyAuth challenge for redirect re-application (test 1088)
     let mut basic_auth_header: Option<String> = None;
+    let mut redirected_from_http = false;
 
     loop {
         // Determine effective proxy for this URL
@@ -2906,6 +2922,7 @@ async fn perform_transfer(
             None,
             mail_auth,
             sasl_authzid,
+            login_options,
             sasl_ir,
             oauth2_bearer,
             haproxy_protocol,
@@ -2917,6 +2934,7 @@ async fn perform_transfer(
             proxy_http_10,
             raw,
             ftp_session,
+            redirected_from_http,
         ))
         .await?;
 
@@ -2999,6 +3017,7 @@ async fn perform_transfer(
                         None,
                         mail_auth,
                         sasl_authzid,
+                        login_options,
                         sasl_ir,
                         oauth2_bearer,
                         haproxy_protocol,
@@ -3010,6 +3029,7 @@ async fn perform_transfer(
                         proxy_http_10,
                         raw,
                         ftp_session,
+                        redirected_from_http,
                     ))
                     .await?;
                 }
@@ -3154,6 +3174,7 @@ async fn perform_transfer(
                                 None,
                                 mail_auth,
                                 sasl_authzid,
+                                login_options,
                                 sasl_ir,
                                 oauth2_bearer,
                                 haproxy_protocol,
@@ -3165,6 +3186,7 @@ async fn perform_transfer(
                                 proxy_http_10,
                                 raw,
                                 ftp_session,
+                                redirected_from_http,
                             ))
                             .await?;
 
@@ -3260,6 +3282,7 @@ async fn perform_transfer(
                                         None,
                                         mail_auth,
                                         sasl_authzid,
+                                        login_options,
                                         sasl_ir,
                                         oauth2_bearer,
                                         haproxy_protocol,
@@ -3271,6 +3294,7 @@ async fn perform_transfer(
                                         proxy_http_10,
                                         raw,
                                         ftp_session,
+                                        redirected_from_http,
                                     ))
                                     .await?;
                                 }
@@ -3348,6 +3372,7 @@ async fn perform_transfer(
                                 None,
                                 mail_auth,
                                 sasl_authzid,
+                                login_options,
                                 sasl_ir,
                                 oauth2_bearer,
                                 haproxy_protocol,
@@ -3359,6 +3384,7 @@ async fn perform_transfer(
                                 proxy_http_10,
                                 raw,
                                 ftp_session,
+                                redirected_from_http,
                             ))
                             .await?;
                         }
@@ -3443,6 +3469,7 @@ async fn perform_transfer(
                                         None,
                                         mail_auth,
                                         sasl_authzid,
+                                        login_options,
                                         sasl_ir,
                                         oauth2_bearer,
                                         haproxy_protocol,
@@ -3454,6 +3481,7 @@ async fn perform_transfer(
                                         proxy_http_10,
                                         raw,
                                         ftp_session,
+                                        redirected_from_http,
                                     ))
                                     .await?;
                                 }
@@ -3531,6 +3559,7 @@ async fn perform_transfer(
                             None,
                             mail_auth,
                             sasl_authzid,
+                            login_options,
                             sasl_ir,
                             oauth2_bearer,
                             haproxy_protocol,
@@ -3542,6 +3571,7 @@ async fn perform_transfer(
                             proxy_http_10,
                             raw,
                             ftp_session,
+                            redirected_from_http,
                         ))
                         .await?;
                     }
@@ -3644,6 +3674,7 @@ async fn perform_transfer(
                                     None,
                                     mail_auth,
                                     sasl_authzid,
+                                    login_options,
                                     sasl_ir,
                                     oauth2_bearer,
                                     haproxy_protocol,
@@ -3655,6 +3686,7 @@ async fn perform_transfer(
                                     proxy_http_10,
                                     raw,
                                     ftp_session,
+                                    redirected_from_http,
                                 ))
                                 .await?;
                             }
@@ -3757,6 +3789,7 @@ async fn perform_transfer(
                                     None,
                                     mail_auth,
                                     sasl_authzid,
+                                    login_options,
                                     sasl_ir,
                                     oauth2_bearer,
                                     haproxy_protocol,
@@ -3768,6 +3801,7 @@ async fn perform_transfer(
                                     proxy_http_10,
                                     raw,
                                     ftp_session,
+                                    redirected_from_http,
                                 ))
                                 .await?;
                             }
@@ -3853,6 +3887,7 @@ async fn perform_transfer(
                                         None,
                                         mail_auth,
                                         sasl_authzid,
+                                        login_options,
                                         sasl_ir,
                                         oauth2_bearer,
                                         haproxy_protocol,
@@ -3863,6 +3898,8 @@ async fn perform_transfer(
                                         http_proxy_tunnel,
                                         proxy_http_10,
                                         raw,
+                                        ftp_session,
+                                        redirected_from_http,
                                     ))
                                     .await?;
 
@@ -3950,6 +3987,7 @@ async fn perform_transfer(
                                                     None,
                                                     mail_auth,
                                                     sasl_authzid,
+                                                    login_options,
                                                     sasl_ir,
                                                     oauth2_bearer,
                                                     haproxy_protocol,
@@ -3960,6 +3998,8 @@ async fn perform_transfer(
                                                     http_proxy_tunnel,
                                                     proxy_http_10,
                                                     raw,
+                                                    ftp_session,
+                                                    redirected_from_http,
                                                 ))
                                                 .await?;
                                             }
@@ -4048,6 +4088,7 @@ async fn perform_transfer(
                                             None,
                                             mail_auth,
                                             sasl_authzid,
+                                            login_options,
                                             sasl_ir,
                                             oauth2_bearer,
                                             haproxy_protocol,
@@ -4058,6 +4099,8 @@ async fn perform_transfer(
                                             http_proxy_tunnel,
                                             proxy_http_10,
                                             raw,
+                                            ftp_session,
+                                            redirected_from_http,
                                         ))
                                         .await?;
                                     }
@@ -4166,6 +4209,7 @@ async fn perform_transfer(
                                     None,
                                     mail_auth,
                                     sasl_authzid,
+                                    login_options,
                                     sasl_ir,
                                     oauth2_bearer,
                                     haproxy_protocol,
@@ -4176,6 +4220,8 @@ async fn perform_transfer(
                                     http_proxy_tunnel,
                                     proxy_http_10,
                                     raw,
+                                    ftp_session,
+                                    redirected_from_http,
                                 ))
                                 .await?;
                             }
@@ -4278,18 +4324,18 @@ async fn perform_transfer(
                 }
 
                 // Resolve relative URLs against current URL
-                let mut next_url =
-                    if location.starts_with("http://") || location.starts_with("https://") {
-                        Url::parse(location)?
-                    } else if location.starts_with("//") {
-                        // Protocol-relative URL (//host/path) — use current scheme
-                        let scheme = current_url.scheme();
-                        Url::parse(&format!("{scheme}:{location}"))?
-                    } else {
-                        // Relative URL: build from current URL's base
-                        let base = current_url.as_str();
-                        Url::parse(&resolve_relative(base, location))?
-                    };
+                let mut next_url = if location.contains("://") {
+                    // Absolute URL with scheme (http://, https://, imap://, etc.)
+                    Url::parse(location)?
+                } else if location.starts_with("//") {
+                    // Protocol-relative URL (//host/path) — use current scheme
+                    let scheme = current_url.scheme();
+                    Url::parse(&format!("{scheme}:{location}"))?
+                } else {
+                    // Relative URL: build from current URL's base
+                    let base = current_url.as_str();
+                    Url::parse(&resolve_relative(base, location))?
+                };
                 // Clear raw_input so redirect uses normalized path (not user's original)
                 next_url.clear_raw_input();
 
@@ -4334,6 +4380,19 @@ async fn perform_transfer(
                     current_method = "GET".to_string();
                     current_body = None;
                     body_dropped_on_redirect = true;
+                }
+
+                // When redirecting from HTTP to a non-HTTP protocol (e.g. imap://),
+                // strip OAuth2 bearer token and auth headers (curl compat: test 779).
+                // The bearer token is only for the HTTP protocol context.
+                let next_scheme = next_url.scheme().to_lowercase();
+                let cur_scheme = current_url.scheme().to_lowercase();
+                let cross_protocol = (cur_scheme == "http" || cur_scheme == "https")
+                    && next_scheme != "http"
+                    && next_scheme != "https";
+                if cross_protocol {
+                    oauth2_bearer = None;
+                    redirected_from_http = true;
                 }
 
                 // Capture intermediate redirect response for -L --include output
@@ -4433,6 +4492,7 @@ async fn do_single_request(
     #[cfg_attr(not(feature = "ssh"), allow(unused_variables))] ssh_auth_types: Option<u32>,
     mail_auth: Option<&str>,
     sasl_authzid: Option<&str>,
+    login_options: Option<&str>,
     sasl_ir: bool,
     oauth2_bearer: Option<&str>,
     haproxy_protocol: bool,
@@ -4444,6 +4504,7 @@ async fn do_single_request(
     proxy_http_10: bool,
     raw: bool,
     ftp_session: &mut Option<crate::protocol::ftp::FtpSession>,
+    redirected_from_http: bool,
 ) -> Result<Response, Error> {
     // Handle non-HTTP schemes directly
     match url.scheme() {
@@ -4604,8 +4665,10 @@ async fn do_single_request(
         "smtp" | "smtps" => {
             let mail_data = body.unwrap_or(&[]);
             let header_creds = extract_basic_auth_from_headers(headers);
-            // Extract ;AUTH= from URL username (e.g. "user;AUTH=EXTERNAL")
-            let url_login_opts = extract_login_options_from_url(url);
+            // CLI --login-options takes priority over ;AUTH= from URL
+            let effective_login_opts = login_options
+                .map(ToString::to_string)
+                .or_else(|| extract_login_options_from_url(url));
             let smtp_config = crate::protocol::smtp::SmtpConfig {
                 mail_from,
                 mail_rcpt,
@@ -4617,7 +4680,7 @@ async fn do_single_request(
                 crlf: false,
                 username: header_creds.as_ref().map(|(u, _)| u.as_str()),
                 password: header_creds.as_ref().map(|(_, p)| p.as_str()),
-                login_options: url_login_opts.as_deref(),
+                login_options: effective_login_opts.as_deref(),
             };
             let smtp_use_ssl = if url.scheme() == "smtps" {
                 // Implicit TLS: signal with a special value
@@ -4635,9 +4698,15 @@ async fn do_single_request(
             .await;
         }
         "imap" | "imaps" => {
-            let url_login_opts = extract_login_options_from_url(url);
+            // CLI --login-options takes priority over ;AUTH= from URL
+            let effective_login_opts = login_options
+                .map(ToString::to_string)
+                .or_else(|| extract_login_options_from_url(url));
             let imap_use_ssl =
                 if url.scheme() == "imaps" { crate::protocol::ftp::UseSsl::All } else { use_ssl };
+            // curl uses 'A' + N for IMAP tags where N is the connection number.
+            // Direct IMAP = 'A' (first connection), redirect from HTTP = 'B' (second connection).
+            let tag_prefix = if redirected_from_http { 'B' } else { 'A' };
             return crate::protocol::imap::fetch(
                 url,
                 method,
@@ -4645,7 +4714,10 @@ async fn do_single_request(
                 custom_request_target,
                 sasl_ir,
                 oauth2_bearer,
-                url_login_opts.as_deref(),
+                effective_login_opts.as_deref(),
+                sasl_authzid,
+                resolve_overrides,
+                tag_prefix,
                 imap_use_ssl,
                 tls_config,
             )
@@ -4660,7 +4732,10 @@ async fn do_single_request(
                 }
                 _ => Some(method),
             };
-            let url_login_opts = extract_login_options_from_url(url);
+            // CLI --login-options takes priority over ;AUTH= from URL
+            let effective_login_opts = login_options
+                .map(ToString::to_string)
+                .or_else(|| extract_login_options_from_url(url));
             let pop3_use_ssl =
                 if url.scheme() == "pop3s" { crate::protocol::ftp::UseSsl::All } else { use_ssl };
             return crate::protocol::pop3::retrieve(
@@ -4669,7 +4744,8 @@ async fn do_single_request(
                 custom_cmd,
                 sasl_ir,
                 oauth2_bearer,
-                url_login_opts.as_deref(),
+                effective_login_opts.as_deref(),
+                sasl_authzid,
                 pop3_use_ssl,
                 tls_config,
             )
