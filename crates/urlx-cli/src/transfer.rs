@@ -1153,9 +1153,33 @@ pub fn run(args: &[String]) -> ExitCode {
     }
 
     match result {
-        Ok(response) => {
+        Ok(mut response) => {
             if opts.show_progress && !opts.silent {
                 eprintln!();
+            }
+
+            // --suppress-connect-headers: remove CONNECT response from redirect chain
+            // but preserve total header size for %{size_header} (curl compat: test 1288)
+            if opts.suppress_connect_headers {
+                // Compute total_header_size BEFORE suppressing CONNECT headers
+                let mut total_header_size: usize = 0;
+                for redir in response.redirect_responses() {
+                    if let Some(raw) = redir.raw_headers() {
+                        total_header_size += raw.len();
+                    }
+                }
+                if let Some(raw) = response.raw_headers() {
+                    total_header_size += raw.len();
+                } else {
+                    total_header_size += response
+                        .headers()
+                        .iter()
+                        .map(|(k, v)| k.len() + v.len() + 4)
+                        .sum::<usize>();
+                }
+                // Store the pre-suppression header size for write-out
+                response.set_total_header_size(total_header_size);
+                response.suppress_connect_headers();
             }
 
             // --etag-save: save ETag from response header

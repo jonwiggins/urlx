@@ -373,9 +373,9 @@ pub fn format_write_out(
 
     // When body is suppressed by -z time condition, curl simulates a 304 response code
     let effective_status = if time_cond_suppressed { 304 } else { response.status() };
-    // Replace known variables
-    result = result.replace("%{http_code}", &effective_status.to_string());
-    result = result.replace("%{response_code}", &effective_status.to_string());
+    // Replace known variables — curl always formats as 3-digit code
+    result = result.replace("%{http_code}", &format!("{effective_status:03}"));
+    result = result.replace("%{response_code}", &format!("{effective_status:03}"));
     result = result.replace("%{url_effective}", response.effective_url());
     result = result.replace("%{content_type}", response.content_type().unwrap_or(""));
     result = result.replace("%{size_download}", &response.size_download().to_string());
@@ -433,8 +433,31 @@ pub fn format_write_out(
     {
         result = result.replace("%{url}", response.effective_url());
     }
-    // Header sizes: approximate from response headers
-    let header_size: usize = response.headers().iter().map(|(k, v)| k.len() + v.len() + 4).sum();
+    // %{http_connect}: CONNECT tunnel response status code (0 if no tunnel)
+    #[allow(clippy::literal_string_with_formatting_args)]
+    {
+        result = result.replace("%{http_connect}", &response.connect_code().to_string());
+    }
+    // Header sizes: use pre-computed size if available (from --suppress-connect-headers),
+    // otherwise compute from raw_headers including redirect/CONNECT responses.
+    let header_size: usize = if response.total_header_size() > 0 {
+        response.total_header_size()
+    } else {
+        let mut total: usize = 0;
+        // Count redirect/CONNECT response headers
+        for redir in response.redirect_responses() {
+            if let Some(raw) = redir.raw_headers() {
+                total += raw.len();
+            }
+        }
+        // Count final response headers
+        if let Some(raw) = response.raw_headers() {
+            total += raw.len();
+        } else {
+            total += response.headers().iter().map(|(k, v)| k.len() + v.len() + 4).sum::<usize>();
+        }
+        total
+    };
     result = result.replace("%{size_header}", &header_size.to_string());
     // num_connects: 1 for the initial request, +1 for each redirect that required
     // a new connection (Connection: close or different host).
