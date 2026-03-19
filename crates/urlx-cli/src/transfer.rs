@@ -2426,13 +2426,21 @@ pub fn run_multi(
 
         match rt.block_on(easy.perform_async()) {
             Ok(response) => {
-                // Downgrade HTTP version if server responded with HTTP/1.0 (curl compat: test 1074).
-                // Subsequent requests on the same connection should use HTTP/1.0.
+                // Downgrade HTTP version if server responded with HTTP/1.0 AND the
+                // connection is being kept alive (curl compat: test 1074).
+                // Only downgrade when connection reuse is expected — if the server
+                // closes the connection, the next request creates a fresh connection
+                // which should use HTTP/1.1 (curl compat: test 1258).
                 if response.http_version()
                     == liburlx::protocol::http::response::ResponseHttpVersion::Http10
                 {
-                    easy.http_version(liburlx::HttpVersion::Http10);
-                    downgraded_http10 = true;
+                    let has_keepalive = response
+                        .header("connection")
+                        .is_some_and(|v| v.eq_ignore_ascii_case("keep-alive"));
+                    if has_keepalive {
+                        easy.http_version(liburlx::HttpVersion::Http10);
+                        downgraded_http10 = true;
+                    }
                 }
                 if fail_on_error && response.status() >= 400 {
                     let err_msg =
