@@ -71,6 +71,8 @@ pub struct TransferInfo {
     pub num_retries: u32,
     /// The effective HTTP method used for the transfer (e.g., "GET", "POST").
     pub effective_method: String,
+    /// The Referer header value used in the last request (for `%{referer}` write-out).
+    pub referer: String,
 }
 
 /// An HTTP response with status, headers, and body.
@@ -452,6 +454,14 @@ impl Response {
     /// preserve all other response metadata (headers, status, `raw_headers`, etc.).
     pub fn set_body(&mut self, body: Vec<u8>) {
         self.body = body;
+    }
+
+    /// Prepend data before the existing body.
+    pub fn prepend_body(&mut self, prefix: &[u8]) {
+        let mut new_body = Vec::with_capacity(prefix.len() + self.body.len());
+        new_body.extend_from_slice(prefix);
+        new_body.extend_from_slice(&self.body);
+        self.body = new_body;
     }
 }
 

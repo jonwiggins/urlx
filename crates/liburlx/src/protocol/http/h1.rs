@@ -195,6 +195,13 @@ where
         req.push_str("Accept: */*\r\n");
     }
 
+    // Emit Proxy-Connection right after Accept (curl compat: test 317, 318)
+    for (i, (name, value)) in custom_headers.iter().enumerate() {
+        if keep[i] && name.eq_ignore_ascii_case("proxy-connection") {
+            let _ = write!(req, "{name}: {value}\r\n");
+        }
+    }
+
     // Compute chunked/TE state before emitting remaining headers.
     let has_content_length =
         custom_headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("content-length"));
@@ -235,7 +242,8 @@ where
             && auto_auth_prefixes.iter().any(|p| value.starts_with(p));
         let is_ua = name.eq_ignore_ascii_case("user-agent");
         let is_host = name.eq_ignore_ascii_case("host");
-        if keep[i] && !is_priority && !is_auto_auth && !is_ua && !is_host {
+        let is_proxy_conn = name.eq_ignore_ascii_case("proxy-connection");
+        if keep[i] && !is_priority && !is_auto_auth && !is_ua && !is_host && !is_proxy_conn {
             // Defer form/multipart Content-Type to after Content-Length (curl compat)
             // Keep other Content-Types (like application/json) in place (test 383)
             if name.eq_ignore_ascii_case("content-type")
