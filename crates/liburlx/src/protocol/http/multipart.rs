@@ -1,17 +1,33 @@
 //! Multipart form-data request body builder.
 //!
 //! Implements RFC 2046 multipart/form-data encoding for file uploads
-//! and form field submissions.
+//! and form field submissions. Also supports SMTP multipart/mixed MIME.
 
 use std::path::Path;
 
 use crate::error::Error;
+
+/// Controls how double-quote characters in filenames are escaped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FilenameEscapeMode {
+    /// Percent-encode `"` as `%22` (curl's default).
+    #[default]
+    PercentEncode,
+    /// Backslash-escape `"` as `\"` (curl's `--form-escape`).
+    BackslashEscape,
+}
 
 /// A multipart form builder that produces `multipart/form-data` request bodies.
 #[derive(Debug, Clone)]
 pub struct MultipartForm {
     boundary: String,
     parts: Vec<Part>,
+    /// Whether user overrode the Content-Type (use "attachment" instead of "form-data").
+    use_attachment: bool,
+    /// Whether this is an SMTP MIME body (multipart/mixed, different formatting).
+    smtp_mode: bool,
+    /// Filename escape mode.
+    escape_mode: FilenameEscapeMode,
 }
 
 /// A single part in a multipart form.
@@ -21,19 +37,60 @@ struct Part {
     filename: Option<String>,
     content_type: Option<String>,
     data: Vec<u8>,
+    /// Sub-files for multipart/mixed (multi-file upload).
+    sub_files: Vec<SubFile>,
+    /// Whether the content type was explicitly set (vs guessed from filename).
+    explicit_type: bool,
+}
+
+/// A file within a multipart/mixed sub-part.
+#[derive(Debug, Clone)]
+struct SubFile {
+    filename: String,
+    content_type: String,
+    data: Vec<u8>,
 }
 
 impl MultipartForm {
     /// Create a new multipart form with a random boundary.
     #[must_use]
     pub fn new() -> Self {
-        Self { boundary: generate_boundary(), parts: Vec::new() }
+        Self {
+            boundary: generate_boundary(),
+            parts: Vec::new(),
+            use_attachment: false,
+            smtp_mode: false,
+            escape_mode: FilenameEscapeMode::default(),
+        }
     }
 
     /// Create a new multipart form with a specific boundary (for testing).
     #[must_use]
     pub fn with_boundary(boundary: &str) -> Self {
-        Self { boundary: boundary.to_string(), parts: Vec::new() }
+        Self {
+            boundary: boundary.to_string(),
+            parts: Vec::new(),
+            use_attachment: false,
+            smtp_mode: false,
+            escape_mode: FilenameEscapeMode::default(),
+        }
+    }
+
+    /// Set whether to use "attachment" disposition instead of "form-data".
+    ///
+    /// curl uses "attachment" when the user overrides `Content-Type` with `-H`.
+    pub const fn set_use_attachment(&mut self, val: bool) {
+        self.use_attachment = val;
+    }
+
+    /// Set SMTP MIME mode (multipart/mixed with Mime-Version header).
+    pub const fn set_smtp_mode(&mut self, val: bool) {
+        self.smtp_mode = val;
+    }
+
+    /// Set the filename escape mode.
+    pub const fn set_escape_mode(&mut self, mode: FilenameEscapeMode) {
+        self.escape_mode = mode;
     }
 
     /// Add a text field to the form.
@@ -43,6 +100,8 @@ impl MultipartForm {
             filename: None,
             content_type: None,
             data: value.as_bytes().to_vec(),
+            sub_files: Vec::new(),
+            explicit_type: false,
         });
     }
 
@@ -53,6 +112,8 @@ impl MultipartForm {
             filename: None,
             content_type: Some(content_type.to_string()),
             data: value.as_bytes().to_vec(),
+            sub_files: Vec::new(),
+            explicit_type: true,
         });
     }
 
@@ -79,6 +140,8 @@ impl MultipartForm {
             filename: Some(filename),
             content_type: Some(content_type),
             data,
+            sub_files: Vec::new(),
+            explicit_type: false,
         });
 
         Ok(())
@@ -91,6 +154,22 @@ impl MultipartForm {
             filename: Some(filename.to_string()),
             content_type: Some(guess_content_type(filename)),
             data: data.to_vec(),
+            sub_files: Vec::new(),
+            explicit_type: false,
+        });
+    }
+
+    /// Add data as a file part with filename but no content type.
+    ///
+    /// Used for text values with `;filename=` but no `;type=` (SMTP compat).
+    pub fn file_data_no_type(&mut self, name: &str, filename: &str, data: &[u8]) {
+        self.parts.push(Part {
+            name: name.to_string(),
+            filename: Some(filename.to_string()),
+            content_type: None,
+            data: data.to_vec(),
+            sub_files: Vec::new(),
+            explicit_type: false,
         });
     }
 
@@ -107,13 +186,37 @@ impl MultipartForm {
             filename: Some(filename.to_string()),
             content_type: Some(content_type.to_string()),
             data: data.to_vec(),
+            sub_files: Vec::new(),
+            explicit_type: true,
+        });
+    }
+
+    /// Add a multi-file part (creates a multipart/mixed sub-boundary).
+    ///
+    /// Each tuple is `(filename, content_type, data)`.
+    pub fn multi_file(&mut self, name: &str, files: Vec<(String, String, Vec<u8>)>) {
+        let sub_files: Vec<SubFile> = files
+            .into_iter()
+            .map(|(filename, content_type, data)| SubFile { filename, content_type, data })
+            .collect();
+        self.parts.push(Part {
+            name: name.to_string(),
+            filename: None,
+            content_type: None,
+            data: Vec::new(),
+            sub_files,
+            explicit_type: false,
         });
     }
 
     /// Get the `Content-Type` header value including the boundary.
     #[must_use]
     pub fn content_type(&self) -> String {
-        format!("multipart/form-data; boundary={}", self.boundary)
+        if self.smtp_mode {
+            format!("multipart/mixed; boundary={}", self.boundary)
+        } else {
+            format!("multipart/form-data; boundary={}", self.boundary)
+        }
     }
 
     /// Get the boundary string.
@@ -122,10 +225,150 @@ impl MultipartForm {
         &self.boundary
     }
 
+    /// Escape a filename for Content-Disposition header.
+    fn escape_filename(&self, filename: &str) -> String {
+        match self.escape_mode {
+            FilenameEscapeMode::PercentEncode => filename.replace('"', "%22"),
+            FilenameEscapeMode::BackslashEscape => {
+                // Backslash-escape: `\` → `\\`, `"` → `\"`
+                let mut result = String::with_capacity(filename.len());
+                for ch in filename.chars() {
+                    match ch {
+                        '"' => result.push_str("\\\""),
+                        '\\' => result.push_str("\\\\"),
+                        _ => result.push(ch),
+                    }
+                }
+                result
+            }
+        }
+    }
+
+    /// Get the disposition type string.
+    const fn disposition(&self) -> &str {
+        if self.use_attachment || self.smtp_mode {
+            "attachment"
+        } else {
+            "form-data"
+        }
+    }
+
     /// Build the encoded multipart body.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
+        if self.smtp_mode {
+            return self.encode_smtp();
+        }
         let mut body = Vec::new();
+        let disposition = self.disposition();
+
+        for part in &self.parts {
+            // Multi-file part: emit multipart/mixed sub-boundary
+            if !part.sub_files.is_empty() {
+                let sub_boundary = generate_boundary();
+
+                // Outer part header
+                body.extend_from_slice(b"--");
+                body.extend_from_slice(self.boundary.as_bytes());
+                body.extend_from_slice(b"\r\n");
+
+                body.extend_from_slice(b"Content-Disposition: ");
+                body.extend_from_slice(disposition.as_bytes());
+                body.extend_from_slice(b"; name=\"");
+                body.extend_from_slice(part.name.as_bytes());
+                body.extend_from_slice(b"\"\r\n");
+
+                body.extend_from_slice(b"Content-Type: multipart/mixed; boundary=");
+                body.extend_from_slice(sub_boundary.as_bytes());
+                body.extend_from_slice(b"\r\n");
+                body.extend_from_slice(b"\r\n");
+
+                // Each sub-file is preceded by the inner boundary delimiter
+                for sub in &part.sub_files {
+                    // Inner boundary before each sub-file
+                    body.extend_from_slice(b"--");
+                    body.extend_from_slice(sub_boundary.as_bytes());
+                    body.extend_from_slice(b"\r\n");
+
+                    body.extend_from_slice(b"Content-Disposition: attachment; filename=\"");
+                    body.extend_from_slice(self.escape_filename(&sub.filename).as_bytes());
+                    body.extend_from_slice(b"\"\r\n");
+                    body.extend_from_slice(b"Content-Type: ");
+                    body.extend_from_slice(sub.content_type.as_bytes());
+                    body.extend_from_slice(b"\r\n\r\n");
+                    body.extend_from_slice(&sub.data);
+                    body.extend_from_slice(b"\r\n");
+                }
+
+                // Inner closing boundary
+                body.extend_from_slice(b"--");
+                body.extend_from_slice(sub_boundary.as_bytes());
+                body.extend_from_slice(b"--\r\n");
+
+                body.extend_from_slice(b"\r\n");
+                continue;
+            }
+
+            // Boundary delimiter
+            body.extend_from_slice(b"--");
+            body.extend_from_slice(self.boundary.as_bytes());
+            body.extend_from_slice(b"\r\n");
+
+            // Content-Disposition header
+            body.extend_from_slice(b"Content-Disposition: ");
+            body.extend_from_slice(disposition.as_bytes());
+
+            // Only add name if non-empty (curl compat: test 1293 `-F =` produces
+            // `Content-Disposition: form-data` without name)
+            if !part.name.is_empty() {
+                body.extend_from_slice(b"; name=\"");
+                body.extend_from_slice(part.name.as_bytes());
+                body.push(b'"');
+            }
+
+            if let Some(ref filename) = part.filename {
+                body.extend_from_slice(b"; filename=\"");
+                body.extend_from_slice(self.escape_filename(filename).as_bytes());
+                body.push(b'"');
+            }
+            body.extend_from_slice(b"\r\n");
+
+            // Content-Type header (only for file parts or explicit type)
+            if let Some(ref ct) = part.content_type {
+                body.extend_from_slice(b"Content-Type: ");
+                body.extend_from_slice(ct.as_bytes());
+                body.extend_from_slice(b"\r\n");
+            }
+
+            // Empty line separating headers from body
+            body.extend_from_slice(b"\r\n");
+
+            // Part body
+            body.extend_from_slice(&part.data);
+            body.extend_from_slice(b"\r\n");
+        }
+
+        // Closing boundary
+        body.extend_from_slice(b"--");
+        body.extend_from_slice(self.boundary.as_bytes());
+        body.extend_from_slice(b"--\r\n");
+
+        body
+    }
+
+    /// Encode as SMTP multipart/mixed MIME body.
+    ///
+    /// The body includes:
+    /// - `Content-Type: multipart/mixed; boundary=...`
+    /// - `Mime-Version: 1.0`
+    /// - Parts with `Content-Disposition: attachment` for file parts, no disposition for text parts.
+    fn encode_smtp(&self) -> Vec<u8> {
+        let mut body = Vec::new();
+
+        // MIME headers
+        body.extend_from_slice(b"Content-Type: multipart/mixed; boundary=");
+        body.extend_from_slice(self.boundary.as_bytes());
+        body.extend_from_slice(b"\r\nMime-Version: 1.0\r\n\r\n");
 
         for part in &self.parts {
             // Boundary delimiter
@@ -133,25 +376,23 @@ impl MultipartForm {
             body.extend_from_slice(self.boundary.as_bytes());
             body.extend_from_slice(b"\r\n");
 
-            // Content-Disposition header
-            body.extend_from_slice(b"Content-Disposition: form-data; name=\"");
-            body.extend_from_slice(part.name.as_bytes());
-            body.push(b'"');
-
+            // For SMTP: text parts (no filename) have no Content-Disposition.
+            // File parts have Content-Disposition: attachment; filename="..."
             if let Some(ref filename) = part.filename {
-                body.extend_from_slice(b"; filename=\"");
-                // Percent-encode double quotes in filename (curl compat)
-                let encoded = filename.replace('"', "%22");
-                body.extend_from_slice(encoded.as_bytes());
-                body.push(b'"');
+                body.extend_from_slice(b"Content-Disposition: attachment; filename=\"");
+                // SMTP always uses backslash escaping for filenames
+                let escaped = escape_filename_backslash(filename);
+                body.extend_from_slice(escaped.as_bytes());
+                body.extend_from_slice(b"\"\r\n");
             }
-            body.extend_from_slice(b"\r\n");
 
-            // Content-Type header (only for file parts)
-            if let Some(ref ct) = part.content_type {
-                body.extend_from_slice(b"Content-Type: ");
-                body.extend_from_slice(ct.as_bytes());
-                body.extend_from_slice(b"\r\n");
+            // Content-Type header only when explicitly set (not guessed)
+            if part.explicit_type {
+                if let Some(ref ct) = part.content_type {
+                    body.extend_from_slice(b"Content-Type: ");
+                    body.extend_from_slice(ct.as_bytes());
+                    body.extend_from_slice(b"\r\n");
+                }
             }
 
             // Empty line separating headers from body
@@ -175,6 +416,19 @@ impl Default for MultipartForm {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Backslash-escape a filename (for SMTP MIME).
+fn escape_filename_backslash(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '"' => result.push_str("\\\""),
+            '\\' => result.push_str("\\\\"),
+            _ => result.push(ch),
+        }
+    }
+    result
 }
 
 /// Generate a random boundary string.
@@ -321,6 +575,72 @@ mod tests {
     fn guess_content_type_unknown() {
         assert_eq!(guess_content_type("file.xyz"), "application/octet-stream");
         assert_eq!(guess_content_type("noext"), "application/octet-stream");
+    }
+
+    #[test]
+    fn empty_name_no_name_attr() {
+        let mut form = MultipartForm::with_boundary("b");
+        form.field("", "empty");
+
+        let body = form.encode();
+        let body_str = String::from_utf8(body).unwrap();
+
+        assert!(body_str.contains("Content-Disposition: form-data\r\n"));
+        assert!(!body_str.contains("name="));
+    }
+
+    #[test]
+    fn attachment_disposition() {
+        let mut form = MultipartForm::with_boundary("b");
+        form.set_use_attachment(true);
+        form.field("name", "daniel");
+
+        let body = form.encode();
+        let body_str = String::from_utf8(body).unwrap();
+
+        assert!(body_str.contains("Content-Disposition: attachment; name=\"name\""));
+    }
+
+    #[test]
+    fn backslash_escape_mode() {
+        let mut form = MultipartForm::with_boundary("b");
+        form.set_escape_mode(FilenameEscapeMode::BackslashEscape);
+        form.file_data_with_type("f", "test\".txt", "text/plain", b"data");
+
+        let body = form.encode();
+        let body_str = String::from_utf8(body).unwrap();
+
+        assert!(body_str.contains("filename=\"test\\\".txt\""));
+    }
+
+    #[test]
+    fn percent_encode_mode() {
+        let mut form = MultipartForm::with_boundary("b");
+        form.set_escape_mode(FilenameEscapeMode::PercentEncode);
+        form.file_data_with_type("f", "test\".txt", "text/plain", b"data");
+
+        let body = form.encode();
+        let body_str = String::from_utf8(body).unwrap();
+
+        assert!(body_str.contains("filename=\"test%22.txt\""));
+    }
+
+    #[test]
+    fn smtp_mode_encoding() {
+        let mut form = MultipartForm::with_boundary("b");
+        form.set_smtp_mode(true);
+        form.field("", "Hello world");
+        form.file_data_with_type("", "file.txt", "text/plain", b"file data");
+
+        let body = form.encode();
+        let body_str = String::from_utf8(body).unwrap();
+
+        assert!(body_str.contains("Content-Type: multipart/mixed; boundary=b\r\n"));
+        assert!(body_str.contains("Mime-Version: 1.0\r\n"));
+        // Text part has no Content-Disposition
+        assert!(body_str.contains("--b\r\n\r\nHello world\r\n"));
+        // File part has attachment disposition
+        assert!(body_str.contains("Content-Disposition: attachment; filename=\"file.txt\""));
     }
 
     /// Helper: check if a byte slice contains a sub-slice.

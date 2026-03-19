@@ -426,11 +426,28 @@ where
     while (100..200).contains(&ph.status) {
         // Preserve this 1xx response's raw headers (already includes trailing blank line)
         informational_prefix.extend_from_slice(&header_bytes);
-        // The body_prefix may contain the start of the next response
-        let next = read_response_headers_with_prefix(stream, body_prefix).await?;
-        header_bytes = next.0;
-        body_prefix = next.1;
-        ph = parse_headers(&header_bytes)?;
+        // The body_prefix may contain the start of the next response.
+        // If the server closes after 1xx (e.g., only sent 100 Continue), output the
+        // 1xx headers as the response body and return CURLE_GOT_NOTHING (52).
+        if let Ok(next) = read_response_headers_with_prefix(stream, body_prefix).await {
+            header_bytes = next.0;
+            body_prefix = next.1;
+            ph = parse_headers(&header_bytes)?;
+        } else {
+            // Server closed after 1xx — return the 1xx headers as raw_headers
+            // so --include outputs them. Body is empty. (curl compat: test 158)
+            let resp_ph = parse_headers(&informational_prefix)?;
+            let mut resp =
+                Response::new(resp_ph.status, resp_ph.headers, Vec::new(), url.to_string());
+            resp.set_raw_headers(informational_prefix);
+            resp.set_status_reason(resp_ph.reason);
+            resp.set_uses_crlf(resp_ph.uses_crlf);
+            resp.set_http_version(resp_ph.version);
+            resp.set_header_original_names(resp_ph.original_names);
+            resp.set_headers_ordered(resp_ph.headers_ordered);
+            resp.set_body_error(Some("empty response".to_string()));
+            return Ok((resp, false));
+        }
     }
 
     // Validate Content-Length header (curl returns CURLE_WEIRD_SERVER_REPLY = 8).

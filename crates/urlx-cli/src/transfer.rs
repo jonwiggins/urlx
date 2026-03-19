@@ -1585,6 +1585,12 @@ pub fn run(args: &[String]) -> ExitCode {
                     }
                     return ExitCode::from(8);
                 }
+                if body_err.contains("empty response") {
+                    if !opts.silent || opts.show_error {
+                        eprintln!("curl: (52) Empty reply from server");
+                    }
+                    return ExitCode::from(52); // CURLE_GOT_NOTHING
+                }
                 if body_err.contains("timeout") {
                     if !opts.silent || opts.show_error {
                         let timeout_str = opts
