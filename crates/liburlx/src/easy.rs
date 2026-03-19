@@ -243,6 +243,9 @@ pub struct Easy {
     /// Last response received, even if the transfer ultimately failed.
     /// This allows callers to output partial response data on error (curl compat).
     last_response: Option<Response>,
+    /// Netrc file contents for credential lookup during redirects.
+    /// When set, the redirect handler can look up credentials for new hosts.
+    netrc_content: Option<String>,
 }
 
 #[allow(clippy::missing_fields_in_debug, clippy::too_many_lines)] // h2_pool is cfg-gated and opaque
@@ -486,6 +489,7 @@ impl Clone for Easy {
             tftp_no_options: self.tftp_no_options,
             ftp_session: None,   // ephemeral — not cloned (connection state)
             last_response: None, // ephemeral — not cloned
+            netrc_content: self.netrc_content.clone(),
         }
     }
 }
@@ -619,6 +623,7 @@ impl Easy {
             tftp_no_options: false,
             ftp_session: None,
             last_response: None,
+            netrc_content: None,
         }
     }
 
@@ -1677,6 +1682,14 @@ impl Easy {
         self.auto_referer = enable;
     }
 
+    /// Set netrc file contents for credential lookup during redirects.
+    ///
+    /// When set, the redirect handler can look up credentials for new hosts
+    /// from the netrc content (curl compat: test 257).
+    pub fn set_netrc_content(&mut self, content: &str) {
+        self.netrc_content = Some(content.to_string());
+    }
+
     /// Check if a non-Basic auth method is configured (Digest, NTLM, `AnyAuth`).
     ///
     /// When challenge-response auth is configured, callers should not add
@@ -2379,6 +2392,13 @@ impl Easy {
         self.custom_request_target = Some(target.to_string());
     }
 
+    /// Clear the custom request target.
+    ///
+    /// After clearing, the request target is derived from the URL path + query.
+    pub fn clear_custom_request_target(&mut self) {
+        self.custom_request_target = None;
+    }
+
     /// Set the TFTP block size for transfers.
     ///
     /// Valid values are 8-65464 (RFC 2348). Defaults to 512.
@@ -2787,6 +2807,7 @@ impl Easy {
             self.form_data,
             self.allowed_protocols.as_deref(),
             &mut self.ftp_session,
+            self.netrc_content.as_deref(),
         );
 
         // Apply total transfer timeout if set.
@@ -2947,6 +2968,7 @@ async fn perform_transfer(
     form_data: bool,
     allowed_protocols: Option<&[String]>,
     ftp_session: &mut Option<crate::protocol::ftp::FtpSession>,
+    netrc_content: Option<&str>,
 ) -> Result<Response, Error> {
     let transfer_start = Instant::now();
     let original_url = url.clone();
@@ -3005,6 +3027,22 @@ async fn perform_transfer(
                         && !k.eq_ignore_ascii_case("_auto_authorization")
                         && !k.eq_ignore_ascii_case("cookie")
                 });
+                // Look up netrc credentials for the new host (curl compat: test 257)
+                if let Some(netrc) = netrc_content {
+                    if let Ok(Some(entry)) = crate::netrc::lookup(netrc, cur_host) {
+                        let login = entry.login.as_deref().unwrap_or("");
+                        let password = entry.password.as_deref().unwrap_or("");
+                        if !login.is_empty() {
+                            use base64::Engine;
+                            let encoded = base64::engine::general_purpose::STANDARD
+                                .encode(format!("{login}:{password}"));
+                            request_headers.push((
+                                "_auto_Authorization".to_string(),
+                                format!("Basic {encoded}"),
+                            ));
+                        }
+                    }
+                }
             }
             if !orig_host.eq_ignore_ascii_case(cur_host) {
                 // Drop custom Host header on cross-host redirect (curl compat: test 184)
@@ -4905,9 +4943,33 @@ async fn perform_transfer(
                 }
 
                 // Cross-protocol redirect to FTP: perform FTP transfer
-                // (curl compat: tests 973, 1028, 1055)
+                // (curl compat: tests 973, 975, 1028, 1055)
                 if next_scheme == "ftp" || next_scheme == "ftps" {
                     redirect_chain.push(response);
+
+                    // When --location-trusted is set, carry credentials to the FTP URL
+                    // (curl compat: test 975). Check auth_credentials first, then
+                    // fall back to extracting from Basic auth header.
+                    let ftp_url = if unrestricted_auth {
+                        let (ftp_user, ftp_pass) = auth_credentials.map_or_else(
+                            || {
+                                // Extract from _auto_Authorization or Authorization header
+                                extract_basic_credentials(&request_headers).unwrap_or_default()
+                            },
+                            |auth| (auth.username.clone(), auth.password.clone()),
+                        );
+                        if ftp_user.is_empty() {
+                            next_url.clone()
+                        } else if let Ok(mut u) = url::Url::parse(next_url.as_str()) {
+                            let _ = u.set_username(&ftp_user);
+                            let _ = u.set_password(Some(&ftp_pass));
+                            Url::parse(u.as_str()).unwrap_or_else(|_| next_url.clone())
+                        } else {
+                            next_url.clone()
+                        }
+                    } else {
+                        next_url.clone()
+                    };
 
                     let effective_ssl_mode = if next_scheme == "ftps" {
                         crate::protocol::ftp::FtpSslMode::Implicit
@@ -4918,7 +4980,7 @@ async fn perform_transfer(
                     let ftp_upload_data = current_body.as_deref();
                     let ftp_resume_offset = None;
                     let ftp_result = crate::protocol::ftp::perform(
-                        &next_url,
+                        &ftp_url,
                         ftp_upload_data,
                         effective_ssl_mode,
                         use_ssl,
@@ -7155,6 +7217,29 @@ fn resolve_request_target(custom: Option<&str>, url: &Url, path_as_is: bool) -> 
     } else {
         url.request_target()
     }
+}
+
+/// Extract username and password from Basic auth headers.
+///
+/// Looks for `_auto_Authorization` or `Authorization` headers with `Basic` scheme
+/// and decodes the base64 credentials.
+fn extract_basic_credentials(headers: &[(String, String)]) -> Option<(String, String)> {
+    use base64::Engine;
+    for (k, v) in headers {
+        if k.eq_ignore_ascii_case("_auto_authorization") || k.eq_ignore_ascii_case("authorization")
+        {
+            if let Some(encoded) = v.strip_prefix("Basic ") {
+                if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(encoded) {
+                    if let Ok(creds) = String::from_utf8(decoded) {
+                        if let Some((user, pass)) = creds.split_once(':') {
+                            return Some((user.to_string(), pass.to_string()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Strip the raw header value prefix that `headers_ordered` includes.

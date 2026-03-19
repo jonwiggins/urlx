@@ -787,6 +787,8 @@ pub fn run(args: &[String]) -> ExitCode {
             if let Some(ref netrc_path) = opts.netrc_file {
                 match std::fs::read_to_string(netrc_path) {
                     Ok(contents) => {
+                        // Store netrc content for redirect credential lookup (test 257)
+                        opts.easy.set_netrc_content(&contents);
                         let host = extract_hostname(&url);
                         let url_user = extract_url_username(&url);
                         let url_pass = extract_url_password(&url);
@@ -1208,10 +1210,13 @@ pub fn run(args: &[String]) -> ExitCode {
 
     // For non-HTTP protocols, -X sets a custom protocol command (not HTTP request target).
     // Only set custom_request_target for non-HTTP schemes to avoid breaking HTTP -X behavior.
+    // For HTTP schemes, clear any stale custom_request_target (curl compat: tests 794, 796).
     if let Some(ref custom_req) = opts.custom_request_original {
         let scheme = opts.easy.url_ref().map(|u| u.scheme().to_lowercase()).unwrap_or_default();
         if matches!(scheme.as_str(), "smtp" | "smtps" | "imap" | "imaps" | "pop3" | "pop3s") {
             opts.easy.custom_request_target(custom_req);
+        } else {
+            opts.easy.clear_custom_request_target();
         }
     }
 
