@@ -2657,7 +2657,14 @@ impl Easy {
         let ssh_host_key_policy = ();
 
         let last_resp_store = std::sync::Arc::new(std::sync::Mutex::new(None::<Response>));
-        let deadline = self.timeout.map(|d| tokio::time::Instant::now() + d);
+        // Inner deadline is slightly earlier than outer timeout to allow post-processing
+        // (e.g. content decompression) before the outer timeout cancels everything.
+        // This ensures that when body reading stalls (e.g. Content-Length > actual data),
+        // we can still detect bad Content-Encoding before the outer timeout fires (test 223).
+        let deadline = self.timeout.map(|d| {
+            let buffer = std::time::Duration::from_millis(500).min(d / 10);
+            tokio::time::Instant::now() + d.saturating_sub(buffer)
+        });
         let fut = perform_transfer(
             last_resp_store.clone(),
             deadline,
@@ -5069,7 +5076,7 @@ async fn do_single_request(
                         if !forbid_reuse {
                             h2_pool.put(&host, port, h2_client);
                         }
-                        return Ok(maybe_decompress(resp, accept_encoding));
+                        return Ok(maybe_decompress_inner(resp, accept_encoding, raw));
                     }
                     Err(_) => {
                         if verbose {
@@ -5121,7 +5128,7 @@ async fn do_single_request(
                     if can_reuse && !forbid_reuse {
                         pool.put(&host, port, is_tls, stream);
                     }
-                    return Ok(maybe_decompress(response, accept_encoding));
+                    return Ok(maybe_decompress_inner(response, accept_encoding, raw));
                 }
                 Err(_) => {
                     // Pooled connection was stale — fall through to create new one
@@ -5235,7 +5242,7 @@ async fn do_single_request(
         .await?;
         let time_starttransfer = request_start.elapsed();
 
-        let mut resp = maybe_decompress(resp, accept_encoding);
+        let mut resp = maybe_decompress_inner(resp, accept_encoding, raw);
         let mut info = resp.transfer_info().clone();
         info.time_namelookup = time_namelookup;
         info.time_connect = time_connect;
@@ -5466,7 +5473,7 @@ async fn do_single_request(
                     )
                     .await?;
                     let time_starttransfer = request_start.elapsed();
-                    let mut resp = maybe_decompress(resp, accept_encoding);
+                    let mut resp = maybe_decompress_inner(resp, accept_encoding, raw);
                     let mut info = resp.transfer_info().clone();
                     info.time_namelookup = time_namelookup;
                     info.time_connect = time_connect;
@@ -5561,7 +5568,7 @@ async fn do_single_request(
                     .await?;
                     let time_starttransfer = request_start.elapsed();
 
-                    let mut resp = maybe_decompress(resp, accept_encoding);
+                    let mut resp = maybe_decompress_inner(resp, accept_encoding, raw);
                     let mut info = resp.transfer_info().clone();
                     info.time_namelookup = time_namelookup;
                     info.time_connect = time_connect;
@@ -5642,7 +5649,7 @@ async fn do_single_request(
                         h2_pool.put(&host, port, h2_client);
                     }
                     let time_starttransfer = request_start.elapsed();
-                    let mut resp = maybe_decompress(resp, accept_encoding);
+                    let mut resp = maybe_decompress_inner(resp, accept_encoding, raw);
                     let mut info = resp.transfer_info().clone();
                     info.time_namelookup = time_namelookup;
                     info.time_connect = time_connect;
@@ -5883,7 +5890,7 @@ async fn do_single_request(
         response.set_transfer_info(info);
     }
 
-    Ok(maybe_decompress(response, accept_encoding))
+    Ok(maybe_decompress_inner(response, accept_encoding, raw))
 }
 
 /// Decompress response body if Content-Encoding is present and decompression was requested.
@@ -5921,10 +5928,35 @@ const fn hex_val(b: u8) -> Option<u8> {
 /// Maximum number of content/transfer encodings allowed (curl compat: test 387).
 const MAX_ENCODING_LAYERS: usize = 5;
 
-fn maybe_decompress(mut response: Response, accept_encoding: bool) -> Response {
+/// Decompress response body if Content-Encoding or Transfer-Encoding compression is present.
+///
+/// When `raw` is true, all decompression is skipped (curl `--raw`).
+fn maybe_decompress_inner(mut response: Response, accept_encoding: bool, raw: bool) -> Response {
+    // In raw mode, skip all decompression (curl --raw: test 319)
+    if raw {
+        return response;
+    }
+
     // Transfer-Encoding decompression (hop-by-hop): always decompress regardless of
     // --compressed flag. Chunked is already handled at the framing layer; here we
     // handle gzip/deflate/br/zstd that may appear alongside chunked.
+    //
+    // Count total TE encodings across ALL Transfer-Encoding headers (wire order)
+    // to catch "more than 5" even when they appear as separate headers (test 418).
+    {
+        let mut total_te_count: usize = 0;
+        for (name, raw_val) in response.headers_ordered() {
+            if name.eq_ignore_ascii_case("Transfer-Encoding") {
+                let val = strip_raw_header_value(raw_val);
+                total_te_count += val.split(',').map(str::trim).filter(|s| !s.is_empty()).count();
+            }
+        }
+        if total_te_count > MAX_ENCODING_LAYERS {
+            response.set_body(Vec::new());
+            response.set_body_error(Some("too_many_content_encodings".to_string()));
+            return response;
+        }
+    }
     if let Some(te) = response.header("transfer-encoding") {
         if let Some(compression) = crate::protocol::http::h1::te_compression_encoding(te) {
             // Walk encodings in reverse order (outermost first, but chunked already stripped)
@@ -5933,12 +5965,6 @@ fn maybe_decompress(mut response: Response, accept_encoding: bool) -> Response {
             // like "deflate, gzip" (applied left-to-right, so decompress right-to-left).
             let parts: Vec<&str> =
                 compression.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
-            // Reject overly long encoding chains (curl compat: test 387)
-            if parts.len() > MAX_ENCODING_LAYERS {
-                response.set_body(Vec::new());
-                response.set_body_error(Some("too_many_content_encodings".to_string()));
-                return response;
-            }
             let mut ok = true;
             for enc in parts.iter().rev() {
                 if let Ok(decompressed) = crate::protocol::http::decompress::decompress(&body, enc)
@@ -5962,18 +5988,31 @@ fn maybe_decompress(mut response: Response, accept_encoding: bool) -> Response {
     if accept_encoding {
         if let Some(encoding) = response.header("content-encoding") {
             if encoding != "identity" && !encoding.eq_ignore_ascii_case("none") {
+                // Split by comma for multi-layer encoding (e.g. "deflate, identity, gzip")
+                // Applied innermost-to-outermost in the header, so decode outermost first
+                // (reverse order).  (curl compat: test 230)
+                let ce_parts: Vec<&str> =
+                    encoding.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
                 // Check encoding chain length limit (curl compat: test 387)
-                if encoding.split(',').map(str::trim).filter(|s| !s.is_empty()).count()
-                    > MAX_ENCODING_LAYERS
-                {
+                if ce_parts.len() > MAX_ENCODING_LAYERS {
                     response.set_body(Vec::new());
                     response.set_body_error(Some("too_many_content_encodings".to_string()));
                     return response;
                 }
-                if let Ok(decompressed) =
-                    crate::protocol::http::decompress::decompress(response.body(), encoding)
-                {
-                    response.set_body(decompressed);
+                let mut body = response.body().to_vec();
+                let mut ok = true;
+                for enc in ce_parts.iter().rev() {
+                    if let Ok(decompressed) =
+                        crate::protocol::http::decompress::decompress(&body, enc)
+                    {
+                        body = decompressed;
+                    } else {
+                        ok = false;
+                        break;
+                    }
+                }
+                if ok {
+                    response.set_body(body);
                 } else {
                     // Decompression failed: preserve headers, clear body,
                     // set body_error for exit code handling (curl compat).

@@ -1369,10 +1369,34 @@ pub fn run(args: &[String]) -> ExitCode {
                 // If Content-Length is present but unparseable (e.g., too large), treat as exceeded
                 let cl_exceeded =
                     cl_header.is_some_and(|v| v.parse::<u64>().map_or(true, |cl| cl > max_size));
-                let exceeded = cl_exceeded || response.body().len() as u64 > max_size;
-                if exceeded {
+                if cl_exceeded {
+                    // Content-Length known upfront: error without output
                     if !opts.silent || opts.show_error {
                         eprintln!("curl: maximum file size exceeded",);
+                    }
+                    return ExitCode::from(63);
+                }
+                // For chunked/no-CL responses the body was already received.
+                // curl truncates at max-filesize bytes and outputs what fits,
+                // then returns error 63 (curl compat: test 457).
+                let body_exceeded = response.body().len() as u64 > max_size;
+                if body_exceeded {
+                    // Truncate body to max-filesize bytes before outputting
+                    let trunc_len =
+                        usize::try_from(max_size).unwrap_or_else(|_| response.body().len());
+                    let truncated_body = response.body()[..trunc_len].to_vec();
+                    response.set_body(truncated_body);
+                    // Output the response (headers + truncated body) first
+                    let _ = output_response(
+                        &response,
+                        opts.output_file.as_deref(),
+                        None,
+                        opts.include_headers,
+                        opts.silent,
+                        false, // don't suppress body
+                    );
+                    if !opts.silent || opts.show_error {
+                        eprintln!("curl: (63) Maximum file size exceeded",);
                     }
                     return ExitCode::from(63);
                 }
