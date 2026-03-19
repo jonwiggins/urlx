@@ -181,6 +181,7 @@ pub async fn retrieve(
     url: &crate::url::Url,
     credentials: Option<(&str, &str)>,
     custom_request: Option<&str>,
+    list_only: bool,
     sasl_ir: bool,
     oauth2_bearer: Option<&str>,
     login_options: Option<&str>,
@@ -349,9 +350,10 @@ pub async fn retrieve(
         send_command(&mut writer, &full_cmd).await?;
         let cmd_resp = read_response(&mut reader).await?;
         if !cmd_resp.ok {
-            send_command(&mut writer, "QUIT").await?;
+            let _ = send_command(&mut writer, "QUIT").await;
             let _ = read_response(&mut reader).await;
-            return Err(Error::Http(format!("POP3 {cmd} failed: {}", cmd_resp.message)));
+            // -ERR → CURLE_WEIRD_SERVER_REPLY (8; curl compat: tests 852, 855)
+            return Err(Error::Protocol(8));
         }
         // Some custom commands (TOP, RETR) return multiline data
         let cmd_upper = cmd.to_uppercase();
@@ -374,12 +376,32 @@ pub async fn retrieve(
             return Ok(Response::new(200, headers, body, url.as_str().to_string()));
         }
         // Simple commands (DELE, NOOP) — just QUIT
+    } else if list_only && msg_num.is_some() {
+        // LIST specific message (curl -l with message number; curl compat: test 852)
+        let num = msg_num.unwrap_or(0);
+        send_command(&mut writer, &format!("LIST {num}")).await?;
+        let list_resp = read_response(&mut reader).await?;
+        if !list_resp.ok {
+            // -ERR → QUIT + CURLE_WEIRD_SERVER_REPLY (8)
+            let _ = send_command(&mut writer, "QUIT").await;
+            let _ = read_response(&mut reader).await;
+            return Err(Error::Protocol(8));
+        }
+        let body = format!("{}\r\n", list_resp.message).into_bytes();
+        send_command(&mut writer, "QUIT").await?;
+        let _ = read_response(&mut reader).await;
+        let mut headers = std::collections::HashMap::new();
+        let _old = headers.insert("content-length".to_string(), body.len().to_string());
+        return Ok(Response::new(200, headers, body, url.as_str().to_string()));
     } else if let Some(num) = msg_num {
         // RETR specific message
         send_command(&mut writer, &format!("RETR {num}")).await?;
         let retr_resp = read_response(&mut reader).await?;
         if !retr_resp.ok {
-            return Err(Error::Http(format!("POP3 RETR failed: {}", retr_resp.message)));
+            // -ERR → QUIT + CURLE_WEIRD_SERVER_REPLY (8; curl compat: test 855)
+            let _ = send_command(&mut writer, "QUIT").await;
+            let _ = read_response(&mut reader).await;
+            return Err(Error::Protocol(8));
         }
         let lines = read_multiline(&mut reader).await?;
         let mut body_str = lines.join("\r\n");

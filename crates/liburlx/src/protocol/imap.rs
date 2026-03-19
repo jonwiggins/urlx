@@ -231,7 +231,7 @@ struct ImapParams {
 /// - `/mailbox;UIDVALIDITY=N/...` — verify uidvalidity after select
 /// - `?query` — search query
 fn parse_imap_url(path: &str, query: Option<&str>) -> ImapParams {
-    let path = path.trim_start_matches('/');
+    let path = path.trim_start_matches('/').trim_end_matches('/');
     let mut params = ImapParams::default();
 
     if let Some(q) = query {
@@ -370,7 +370,8 @@ pub async fn fetch(
 
     // Read greeting
     let greeting = read_greeting(&mut reader).await?;
-    if !greeting.contains("OK") {
+    let is_preauth = greeting.contains("PREAUTH");
+    if !greeting.contains("OK") && !is_preauth {
         return Err(Error::Http(format!("IMAP server rejected: {greeting}")));
     }
 
@@ -430,40 +431,45 @@ pub async fn fetch(
         // UseSsl::Try with no STARTTLS: continue without TLS
     }
 
-    let forced =
-        login_options.and_then(|lo| lo.strip_prefix("AUTH=").or_else(|| lo.strip_prefix("auth=")));
+    // Skip authentication if PREAUTH was received (curl compat: test 846).
+    // The server already authenticated the connection (e.g. via TLS client cert).
+    if !is_preauth {
+        let forced = login_options
+            .and_then(|lo| lo.strip_prefix("AUTH=").or_else(|| lo.strip_prefix("auth=")));
 
-    // Check if forced mechanism is +LOGIN (plain LOGIN command, not SASL AUTHENTICATE LOGIN)
-    let force_login_cmd =
-        forced.is_some_and(|f| f.eq_ignore_ascii_case("+LOGIN") || f.eq_ignore_ascii_case("LOGIN"));
+        // Check if forced mechanism is +LOGIN (plain LOGIN command, not SASL AUTHENTICATE LOGIN)
+        let force_login_cmd = forced
+            .is_some_and(|f| f.eq_ignore_ascii_case("+LOGIN") || f.eq_ignore_ascii_case("LOGIN"));
 
-    // Authenticate using the best available mechanism
-    // Order: EXTERNAL > OAUTHBEARER > XOAUTH2 > CRAM-MD5 > NTLM > LOGIN > PLAIN > LOGIN command
-    // With downgrade: if CRAM-MD5 or NTLM fails with bad challenge, cancel and try next
-    let auth_result = do_imap_auth(
-        &mut reader,
-        &mut writer,
-        &mut tags,
-        &user,
-        &pass,
-        sasl_ir,
-        server_sasl_ir,
-        oauth2_bearer,
-        sasl_authzid,
-        &host,
-        port,
-        force_login_cmd,
-        forced,
-        &server_auth_mechs,
-    )
-    .await;
+        // Authenticate using the best available mechanism
+        // Order: EXTERNAL > OAUTHBEARER > XOAUTH2 > CRAM-MD5 > NTLM > LOGIN > PLAIN > LOGIN cmd
+        // With downgrade: if CRAM-MD5 or NTLM fails with bad challenge, cancel and try next
+        let auth_result = do_imap_auth(
+            &mut reader,
+            &mut writer,
+            &mut tags,
+            &user,
+            &pass,
+            sasl_ir,
+            server_sasl_ir,
+            oauth2_bearer,
+            sasl_authzid,
+            &host,
+            port,
+            force_login_cmd,
+            forced,
+            &server_auth_mechs,
+        )
+        .await;
 
-    // Auth failed — do NOT send LOGOUT (curl compat: tests 830, 831, 844, 845, 849)
-    // The multi interface considers a broken "CONNECT" as a prematurely broken
-    // transfer and such a connection will not get a "LOGOUT"
-    auth_result?;
+        // Auth failed — do NOT send LOGOUT (curl compat: tests 830, 831, 844, 845, 849)
+        // The multi interface considers a broken "CONNECT" as a prematurely broken
+        // transfer and such a connection will not get a "LOGOUT"
+        auth_result?;
+    }
 
     // Determine what operation to perform
+    let mut selected_mailbox: Option<String> = None;
     let result = dispatch_imap_operation(
         &mut reader,
         &mut writer,
@@ -472,6 +478,7 @@ pub async fn fetch(
         method,
         body,
         custom_request,
+        &mut selected_mailbox,
     )
     .await;
 
@@ -490,6 +497,199 @@ pub async fn fetch(
     // a non-HTTP protocol response.
     resp.set_raw_headers(Vec::new());
     Ok(resp)
+}
+
+/// A single IMAP operation descriptor for use with [`fetch_multi`].
+#[derive(Debug)]
+pub struct ImapOperation<'a> {
+    /// The IMAP URL for this operation.
+    pub url: &'a crate::url::Url,
+    /// HTTP method (e.g. "GET", "PUT").
+    pub method: &'a str,
+    /// Upload body data (for APPEND via `-T`).
+    pub body: Option<&'a [u8]>,
+    /// Custom IMAP command (from `-X`).
+    pub custom_request: Option<&'a str>,
+}
+
+/// Execute multiple IMAP operations on a single connection.
+///
+/// Opens one connection, authenticates once, then dispatches each operation
+/// in sequence, reusing SELECT state to avoid redundant SELECTs on the same
+/// mailbox (curl compat: tests 804, 815, 816).
+///
+/// Returns one `Response` per operation.
+///
+/// # Errors
+///
+/// Returns an error if connection, authentication, or any operation fails.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+pub async fn fetch_multi(
+    ops: &[ImapOperation<'_>],
+    sasl_ir: bool,
+    oauth2_bearer: Option<&str>,
+    login_options: Option<&str>,
+    sasl_authzid: Option<&str>,
+    resolve_overrides: &[(String, String)],
+    tag_prefix: char,
+    use_ssl: UseSsl,
+    tls_config: &crate::tls::TlsConfig,
+) -> Result<Vec<Response>, Error> {
+    if ops.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Use the first URL for connection setup
+    let first_url = ops[0].url;
+    let path = first_url.path();
+
+    let (host, port) = first_url.host_and_port()?;
+    let creds = first_url.credentials();
+    let user = creds.map_or_else(String::new, |(raw_user, _)| {
+        let decoded_user = percent_decode(raw_user);
+        strip_auth_from_username(&decoded_user)
+    });
+    let pass = creds.map_or_else(String::new, |(_, raw_pass)| percent_decode(raw_pass));
+
+    let use_implicit_tls = first_url.scheme() == "imaps";
+    let use_starttls = !use_implicit_tls && use_ssl != UseSsl::None;
+
+    let resolved_host =
+        resolve_overrides
+            .iter()
+            .find_map(|(pattern, target)| {
+                if pattern.eq_ignore_ascii_case(&host) {
+                    Some(target.as_str())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(&host);
+    let addr = format!("{resolved_host}:{port}");
+    let tcp = tokio::net::TcpStream::connect(&addr).await.map_err(Error::Connect)?;
+
+    let (reader, mut writer): (
+        Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+        Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
+    ) = if use_implicit_tls {
+        let connector = crate::tls::TlsConnector::new(tls_config)?;
+        let (tls_stream, _alpn) = connector.connect(tcp, &host).await?;
+        let (r, w) = tokio::io::split(tls_stream);
+        (Box::new(r), Box::new(w))
+    } else {
+        let (r, w) = tokio::io::split(tcp);
+        (Box::new(r), Box::new(w))
+    };
+    let mut reader = BufReader::new(reader);
+    let mut tags = TagCounter::new(tag_prefix);
+
+    // Read greeting
+    let greeting = read_greeting(&mut reader).await?;
+    let is_preauth = greeting.contains("PREAUTH");
+    if !greeting.contains("OK") && !is_preauth {
+        return Err(Error::Http(format!("IMAP server rejected: {greeting}")));
+    }
+
+    // CAPABILITY
+    let tag = tags.next_tag();
+    send_command(&mut writer, &tag, "CAPABILITY").await?;
+    let cap_resp = read_response(&mut reader, &tag).await?;
+
+    if !cap_resp.is_ok() && use_starttls && (use_ssl == UseSsl::All) {
+        return Err(Error::Transfer {
+            code: 64,
+            message: "IMAP STARTTLS required but CAPABILITY failed".to_string(),
+        });
+    }
+
+    let mut server_auth_mechs = Vec::new();
+    let mut server_sasl_ir = false;
+    let mut _has_starttls = false;
+    for line in &cap_resp.data {
+        for token in line.split_whitespace() {
+            if let Some(mech) = token.strip_prefix("AUTH=").or_else(|| token.strip_prefix("auth="))
+            {
+                server_auth_mechs.push(mech.to_uppercase());
+            }
+            if token.eq_ignore_ascii_case("SASL-IR") {
+                server_sasl_ir = true;
+            }
+            if token.eq_ignore_ascii_case("STARTTLS") {
+                _has_starttls = true;
+            }
+        }
+    }
+
+    // Authenticate (skip if PREAUTH)
+    if !is_preauth {
+        let forced = login_options
+            .and_then(|lo| lo.strip_prefix("AUTH=").or_else(|| lo.strip_prefix("auth=")));
+        let force_login_cmd = forced
+            .is_some_and(|f| f.eq_ignore_ascii_case("+LOGIN") || f.eq_ignore_ascii_case("LOGIN"));
+        let auth_result = do_imap_auth(
+            &mut reader,
+            &mut writer,
+            &mut tags,
+            &user,
+            &pass,
+            sasl_ir,
+            server_sasl_ir,
+            oauth2_bearer,
+            sasl_authzid,
+            &host,
+            port,
+            force_login_cmd,
+            forced,
+            &server_auth_mechs,
+        )
+        .await;
+        auth_result?;
+    }
+
+    // Execute each operation, reusing SELECT state
+    let mut selected_mailbox: Option<String> = None;
+    let mut results = Vec::with_capacity(ops.len());
+
+    for op in ops {
+        let op_path = op.url.path();
+        // Reject CR/LF in path
+        let lower_path = op_path.to_lowercase();
+        if lower_path.contains("%0d")
+            || lower_path.contains("%0a")
+            || op_path.contains('\r')
+            || op_path.contains('\n')
+        {
+            return Err(Error::UrlParse("URL contains CR or LF characters".to_string()));
+        }
+
+        let imap_params = parse_imap_url(op_path, op.url.query());
+        let result = dispatch_imap_operation(
+            &mut reader,
+            &mut writer,
+            &mut tags,
+            &imap_params,
+            op.method,
+            op.body,
+            op.custom_request,
+            &mut selected_mailbox,
+        )
+        .await;
+
+        let response_body = result?;
+        let headers = std::collections::HashMap::new();
+        let mut resp = Response::new(200, headers, response_body, op.url.as_str().to_string());
+        resp.set_raw_headers(Vec::new());
+        results.push(resp);
+    }
+
+    // LOGOUT
+    let tag = tags.next_tag();
+    if send_command(&mut writer, &tag, "LOGOUT").await.is_ok() {
+        let _ = read_response(&mut reader, &tag).await;
+    }
+
+    let _ = path; // suppress warning
+    Ok(results)
 }
 
 /// Perform IMAP authentication with mechanism negotiation and downgrade support.
@@ -810,10 +1010,13 @@ async fn do_imap_auth<S: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 
 /// Dispatch the appropriate IMAP operation based on URL parameters and options.
 ///
+/// `selected_mailbox` tracks which mailbox is already `SELECT`ed to avoid
+/// redundant SELECT commands when reusing a connection (curl compat: test 804).
+///
 /// # Errors
 ///
 /// Returns an error if any IMAP command fails.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments, clippy::items_after_statements)]
 async fn dispatch_imap_operation<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut BufReader<R>,
     writer: &mut W,
@@ -822,8 +1025,33 @@ async fn dispatch_imap_operation<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     method: &str,
     body: Option<&[u8]>,
     custom_request: Option<&str>,
+    selected_mailbox: &mut Option<String>,
 ) -> Result<Vec<u8>, Error> {
     let has_mailbox = !params.mailbox.is_empty();
+
+    /// Helper: SELECT a mailbox if not already selected.
+    async fn select_if_needed<R2: AsyncRead + Unpin, W2: AsyncWrite + Unpin>(
+        reader: &mut BufReader<R2>,
+        writer: &mut W2,
+        tags: &mut TagCounter,
+        mailbox: &str,
+        selected: &mut Option<String>,
+    ) -> Result<Option<ImapResponse>, Error> {
+        if selected.as_deref() == Some(mailbox) {
+            return Ok(None);
+        }
+        let tag = tags.next_tag();
+        send_command(writer, &tag, &format!("SELECT {mailbox}")).await?;
+        let resp = read_response(reader, &tag).await?;
+        if !resp.is_ok() {
+            return Err(Error::Http(format!(
+                "IMAP SELECT failed: {} {}",
+                resp.status, resp.message
+            )));
+        }
+        *selected = Some(mailbox.to_string());
+        Ok(Some(resp))
+    }
 
     // Upload via -T: IMAP APPEND command.
     // Check this BEFORE custom_request, since -T sets method=PUT and
@@ -869,15 +1097,8 @@ async fn dispatch_imap_operation<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         // Determine if this custom command needs a mailbox SELECT first.
         // curl selects the mailbox when the URL path specifies one.
         if has_mailbox {
-            let tag = tags.next_tag();
-            send_command(writer, &tag, &format!("SELECT {}", params.mailbox)).await?;
-            let select_resp = read_response(reader, &tag).await?;
-            if !select_resp.is_ok() {
-                return Err(Error::Http(format!(
-                    "IMAP SELECT failed: {} {}",
-                    select_resp.status, select_resp.message
-                )));
-            }
+            let _ =
+                select_if_needed(reader, writer, tags, &params.mailbox, selected_mailbox).await?;
         }
 
         let tag = tags.next_tag();
@@ -889,15 +1110,8 @@ async fn dispatch_imap_operation<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     // SEARCH: URL has a query string (e.g. ?NEW)
     if let Some(ref search_query) = params.search {
         if has_mailbox {
-            let tag = tags.next_tag();
-            send_command(writer, &tag, &format!("SELECT {}", params.mailbox)).await?;
-            let select_resp = read_response(reader, &tag).await?;
-            if !select_resp.is_ok() {
-                return Err(Error::Http(format!(
-                    "IMAP SELECT failed: {} {}",
-                    select_resp.status, select_resp.message
-                )));
-            }
+            let _ =
+                select_if_needed(reader, writer, tags, &params.mailbox, selected_mailbox).await?;
         }
         let tag = tags.next_tag();
         send_command(writer, &tag, &format!("SEARCH {search_query}")).await?;
@@ -909,21 +1123,16 @@ async fn dispatch_imap_operation<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     if params.uid.is_some() || params.mailindex.is_some() {
         // SELECT mailbox first
         if has_mailbox {
-            let tag = tags.next_tag();
-            send_command(writer, &tag, &format!("SELECT {}", params.mailbox)).await?;
-            let select_resp = read_response(reader, &tag).await?;
-            if !select_resp.is_ok() {
-                return Err(Error::Http(format!(
-                    "IMAP SELECT failed: {} {}",
-                    select_resp.status, select_resp.message
-                )));
-            }
+            let select_resp =
+                select_if_needed(reader, writer, tags, &params.mailbox, selected_mailbox).await?;
 
-            // Verify UIDVALIDITY if requested
-            if let Some(ref expected_uidvalidity) = params.uidvalidity {
+            // Verify UIDVALIDITY if requested (only when SELECT was actually sent)
+            if let (Some(ref expected_uidvalidity), Some(ref resp)) =
+                (&params.uidvalidity, &select_resp)
+            {
                 // Lines from read_response include "* " prefix.
                 // Look for: * OK [UIDVALIDITY <val>] ...
-                let found = select_resp.data.iter().any(|line| {
+                let found = resp.data.iter().any(|line| {
                     // Strip optional "* " prefix
                     let stripped = line.strip_prefix("* ").unwrap_or(line);
                     stripped.strip_prefix("OK [UIDVALIDITY ").is_some_and(|rest| {
@@ -981,9 +1190,14 @@ async fn dispatch_imap_operation<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 ///
 /// Each line gets a `\r\n` line ending.  The lines in `data` already
 /// include the `* ` prefix from `read_response`.
+///
+/// Trailing `)` lines are stripped because they are part of the IMAP
+/// FETCH envelope framing, not actual data (curl compat: test 841).
 fn format_untagged_data(data: &[String]) -> Vec<u8> {
     let mut out = Vec::new();
-    for line in data {
+    let end =
+        if data.last().is_some_and(|l| l.trim() == ")") { data.len() - 1 } else { data.len() };
+    for line in &data[..end] {
         out.extend_from_slice(line.as_bytes());
         out.extend_from_slice(b"\r\n");
     }
@@ -1010,9 +1224,14 @@ fn extract_fetch_body(data: &[String]) -> Vec<u8> {
     let is_fetch_framing = first.contains("FETCH") && first.contains('{');
 
     if is_fetch_framing && data.len() >= 2 {
-        // Skip first line (FETCH framing) and last line if it's just ")"
-        let end =
-            if data.last().is_some_and(|l| l.trim() == ")") { data.len() - 1 } else { data.len() };
+        // Skip first line (FETCH framing) and last line if it ends with ")"
+        // (the closing paren of the FETCH envelope, possibly with post-fetch metadata;
+        // curl compat: test 897)
+        let end = if data.last().is_some_and(|l| l.trim().ends_with(')')) {
+            data.len() - 1
+        } else {
+            data.len()
+        };
         let body_lines = &data[1..end];
         let mut out = Vec::new();
         for line in body_lines {

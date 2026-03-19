@@ -2114,6 +2114,74 @@ impl Easy {
         self.sasl_ir = enable;
     }
 
+    // ── Getters for IMAP batch support (curl compat: tests 804, 815, 816) ──
+
+    /// Get the effective HTTP method for this handle.
+    #[must_use]
+    pub fn effective_method(&self) -> &str {
+        self.method.as_deref().unwrap_or("GET")
+    }
+
+    /// Get the custom request target (`-X` flag value).
+    #[must_use]
+    pub fn custom_request(&self) -> Option<&str> {
+        self.custom_request_target.as_deref()
+    }
+
+    /// Get a reference to the upload body data.
+    #[must_use]
+    pub fn body_ref(&self) -> Option<&[u8]> {
+        self.body.as_deref()
+    }
+
+    /// Get whether SASL initial response is enabled.
+    #[must_use]
+    pub const fn get_sasl_ir(&self) -> bool {
+        self.sasl_ir
+    }
+
+    /// Get the `OAuth2` bearer token.
+    #[must_use]
+    pub fn get_oauth2_bearer(&self) -> Option<&str> {
+        self.oauth2_bearer.as_deref()
+    }
+
+    /// Get the login options string.
+    #[must_use]
+    pub fn get_login_options(&self) -> Option<&str> {
+        self.login_options.as_deref()
+    }
+
+    /// Get the SASL authorization identity.
+    #[must_use]
+    pub fn get_sasl_authzid(&self) -> Option<&str> {
+        self.sasl_authzid.as_deref()
+    }
+
+    /// Get a clone of the resolve overrides.
+    #[must_use]
+    pub fn get_resolve_overrides(&self) -> &[(String, String)] {
+        &self.resolve_overrides
+    }
+
+    /// Get a reference to the TLS configuration.
+    #[must_use]
+    pub const fn get_tls_config(&self) -> &TlsConfig {
+        &self.tls_config
+    }
+
+    /// Get the SSL/TLS usage level.
+    #[must_use]
+    pub const fn get_use_ssl(&self) -> crate::protocol::ftp::UseSsl {
+        self.use_ssl
+    }
+
+    /// Get the CRLF conversion flag.
+    #[must_use]
+    pub const fn get_crlf(&self) -> bool {
+        self.ftp_crlf
+    }
+
     /// Add a `--connect-to` mapping: `from_host:from_port:to_host:to_port`.
     ///
     /// Redirects connections meant for `from_host:from_port` to `to_host:to_port`.
@@ -2765,6 +2833,10 @@ async fn perform_transfer(
                                                                                               // Track Basic auth header from AnyAuth challenge for redirect re-application (test 1088)
     let mut basic_auth_header: Option<String> = None;
     let mut redirected_from_http = false;
+    // Auth override from redirect URL credentials (curl compat: test 899).
+    // When redirecting to `http://user:pass@host/...`, these credentials replace
+    // any existing auth headers.
+    let mut redirect_url_auth: Option<String> = None;
 
     loop {
         // Determine effective proxy for this URL
@@ -2802,6 +2874,14 @@ async fn perform_transfer(
             if !orig_host.eq_ignore_ascii_case(cur_host) {
                 // Drop custom Host header on cross-host redirect (curl compat: test 184)
                 request_headers.retain(|(k, _)| !k.eq_ignore_ascii_case("host"));
+            }
+            // Apply credentials from redirect URL (curl compat: test 899)
+            if let Some(ref auth_val) = redirect_url_auth {
+                request_headers.retain(|(k, _)| {
+                    !k.eq_ignore_ascii_case("authorization")
+                        && !k.eq_ignore_ascii_case("_auto_authorization")
+                });
+                request_headers.push(("_auto_Authorization".to_string(), auth_val.clone()));
             }
             // Re-apply Basic auth from AnyAuth challenge on redirect (test 1088)
             if let Some(ref basic_hdr) = basic_auth_header {
@@ -4466,6 +4546,18 @@ async fn perform_transfer(
                     redirected_from_http = true;
                 }
 
+                // If the redirect URL has embedded credentials (user:pass@host),
+                // update auth headers to use those credentials (curl compat: test 899).
+                #[allow(clippy::items_after_statements)]
+                if let Some((redir_user, redir_pass)) = next_url.credentials() {
+                    use base64::Engine;
+                    let redir_user = percent_decode_str(redir_user);
+                    let redir_pass = percent_decode_str(redir_pass);
+                    let encoded = base64::engine::general_purpose::STANDARD
+                        .encode(format!("{redir_user}:{redir_pass}"));
+                    redirect_url_auth = Some(format!("Basic {encoded}"));
+                }
+
                 // Capture intermediate redirect response for -L --include output
                 redirect_chain.push(response);
 
@@ -4748,7 +4840,7 @@ async fn do_single_request(
                 sasl_ir,
                 custom_request: custom_request_target,
                 oauth2_bearer,
-                crlf: false,
+                crlf: ftp_config.crlf,
                 username: header_creds.as_ref().map(|(u, _)| u.as_str()),
                 password: header_creds.as_ref().map(|(_, p)| p.as_str()),
                 login_options: effective_login_opts.as_deref(),
@@ -4813,6 +4905,7 @@ async fn do_single_request(
                 url,
                 creds_tuple,
                 custom_cmd,
+                ftp_config.list_only,
                 sasl_ir,
                 oauth2_bearer,
                 effective_login_opts.as_deref(),
