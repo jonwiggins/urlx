@@ -642,7 +642,7 @@ async fn do_auth<S: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             // Parse Type 2 and generate Type 3
             let challenge_b64 = resp2.message.trim();
             if let Ok(challenge) = crate::auth::ntlm::parse_type2_message(challenge_b64) {
-                let type3 = crate::auth::ntlm::create_type3_message(&challenge, user, pass, "");
+                let type3 = crate::auth::ntlm::create_type3_message(&challenge, user, pass, "")?;
                 send_command(writer, &type3).await?;
                 let auth_resp = read_response(reader).await?;
                 if auth_resp.is_ok() {

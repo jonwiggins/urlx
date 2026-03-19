@@ -3731,12 +3731,25 @@ async fn perform_transfer(
                                 if let Some(type2_data) = www_auth.strip_prefix("NTLM ") {
                                     let challenge =
                                         crate::auth::ntlm::parse_type2_message(type2_data)?;
-                                    let type3 = crate::auth::ntlm::create_type3_message(
+                                    let type3 = match crate::auth::ntlm::create_type3_message(
                                         &challenge,
                                         &auth.username,
                                         &auth.password,
                                         domain,
-                                    );
+                                    ) {
+                                        Ok(t3) => t3,
+                                        Err(e) => {
+                                            // NTLM Type 3 too large: store the 401
+                                            // headers (without body) so the CLI can
+                                            // output them before the error (curl compat: test 775).
+                                            let mut headers_only = response.clone();
+                                            headers_only.set_body(Vec::new());
+                                            if let Ok(mut guard) = last_resp_store.lock() {
+                                                *guard = Some(headers_only);
+                                            }
+                                            return Err(e);
+                                        }
+                                    };
 
                                     // Save the Type 2 401 response for --include output
                                     redirect_chain.push(response.clone());
@@ -3934,7 +3947,7 @@ async fn perform_transfer(
                                     &pcreds.username,
                                     &pcreds.password,
                                     domain,
-                                );
+                                )?;
 
                                 // Save the 407 response for --include output
                                 redirect_chain.push(response.clone());
@@ -4250,12 +4263,13 @@ async fn perform_transfer(
                                                         type2_data,
                                                     )?;
                                                 let domain = pcreds.domain.as_deref().unwrap_or("");
-                                                let type3 = crate::auth::ntlm::create_type3_message(
-                                                    &challenge,
-                                                    &pcreds.username,
-                                                    &pcreds.password,
-                                                    domain,
-                                                );
+                                                let type3 =
+                                                    crate::auth::ntlm::create_type3_message(
+                                                        &challenge,
+                                                        &pcreds.username,
+                                                        &pcreds.password,
+                                                        domain,
+                                                    )?;
                                                 redirect_chain.push(type1_resp);
                                                 let mut type3_headers = request_headers.clone();
                                                 type3_headers.retain(|(k, _)| {
@@ -6761,7 +6775,7 @@ where
                                 &creds.username,
                                 &creds.password,
                                 domain,
-                            );
+                            )?;
 
                             // Send CONNECT with Type 3
                             let (status3, _, raw3) = send_connect_request(
@@ -6849,7 +6863,7 @@ where
                                                 &creds.username,
                                                 &creds.password,
                                                 domain,
-                                            );
+                                            )?;
                                             let (status3, _, raw3) = send_connect_request(
                                                 &mut stream,
                                                 target_host,

@@ -967,7 +967,7 @@ async fn do_imap_auth<S: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         let cont2 = read_continuation(reader).await?;
         let challenge_b64 = cont2.trim_start_matches('+').trim();
         if let Ok(challenge) = crate::auth::ntlm::parse_type2_message(challenge_b64) {
-            let type3 = crate::auth::ntlm::create_type3_message(&challenge, user, pass, "");
+            let type3 = crate::auth::ntlm::create_type3_message(&challenge, user, pass, "")?;
             send_raw(writer, type3.as_bytes()).await?;
             let auth_resp = read_response(reader, &tag).await?;
             if auth_resp.is_ok() {

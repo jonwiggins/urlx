@@ -687,7 +687,7 @@ async fn do_pop3_auth<S: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         let _ = reader.read_line(&mut line2).await;
         let challenge_b64 = line2.trim().trim_start_matches('+').trim();
         if let Ok(challenge) = crate::auth::ntlm::parse_type2_message(challenge_b64) {
-            let type3 = crate::auth::ntlm::create_type3_message(&challenge, user, pass, "");
+            let type3 = crate::auth::ntlm::create_type3_message(&challenge, user, pass, "")?;
             writer
                 .write_all(format!("{type3}\r\n").as_bytes())
                 .await
