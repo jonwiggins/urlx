@@ -44,6 +44,30 @@ impl Url {
             }
         }
 
+        // Handle IPv6 scope IDs: [::1%259999] → strip %259999 for URL parsing,
+        // as the `url` crate doesn't support zone IDs (curl compat: test 1056).
+        // The scope ID is ignored for actual connections (OS strips it).
+        let input = if input.contains("%25") {
+            if let Some(bracket_start) = input.find('[') {
+                if let Some(bracket_end) = input[bracket_start..].find(']') {
+                    let bracket_end = bracket_start + bracket_end;
+                    let host_part = &input[bracket_start..=bracket_end];
+                    if let Some(pct_pos) = host_part.find("%25") {
+                        // Strip zone ID: [::1%259999] → [::1]
+                        format!("{}{}", &input[..bracket_start + pct_pos], &input[bracket_end..])
+                    } else {
+                        input
+                    }
+                } else {
+                    input
+                }
+            } else {
+                input
+            }
+        } else {
+            input
+        };
+
         match url::Url::parse(&input) {
             Ok(inner) => {
                 // Reject extremely long hostnames (curl returns CURLE_URL_MALFORMAT: test 399).
