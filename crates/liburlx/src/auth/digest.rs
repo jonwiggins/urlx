@@ -73,9 +73,19 @@ impl DigestChallenge {
             let value = unquote(value);
 
             match key.to_lowercase().as_str() {
-                "realm" => realm = Some(value.to_string()),
-                "nonce" => nonce = Some(value.to_string()),
-                "qop" => qop = Some(value.to_string()),
+                "realm" => realm = Some(value),
+                "nonce" => nonce = Some(value),
+                "qop" => {
+                    // qop can be a comma-separated list like "auth, auth-int".
+                    // Select "auth" if available (test 388).
+                    let selected = value
+                        .split(',')
+                        .map(str::trim)
+                        .find(|q| q.eq_ignore_ascii_case("auth"))
+                        .map(ToString::to_string)
+                        .unwrap_or(value);
+                    qop = Some(selected);
+                }
                 "algorithm" => {
                     algorithm_specified = true;
                     algorithm = match value.to_uppercase().as_str() {
@@ -83,7 +93,7 @@ impl DigestChallenge {
                         _ => DigestAlgorithm::Md5,
                     };
                 }
-                "opaque" => opaque = Some(value.to_string()),
+                "opaque" => opaque = Some(value),
                 "stale" => stale = value.eq_ignore_ascii_case("true"),
                 _ => {} // Ignore unknown parameters
             }
@@ -134,10 +144,10 @@ impl DigestChallenge {
 
         // Escape `\` and `"` in quoted-string values (RFC 7616 §3.4)
         let username_escaped = username.replace('\\', "\\\\").replace('"', "\\\"");
+        let realm_escaped = self.realm.replace('\\', "\\\\").replace('"', "\\\"");
         let uri_escaped = uri.replace('"', "\\\"");
         let mut header = format!(
-            "Digest username=\"{username_escaped}\", realm=\"{realm}\", nonce=\"{nonce}\", uri=\"{uri_escaped}\", response=\"{response}\"",
-            realm = self.realm,
+            "Digest username=\"{username_escaped}\", realm=\"{realm_escaped}\", nonce=\"{nonce}\", uri=\"{uri_escaped}\", response=\"{response}\"",
             nonce = self.nonce,
         );
 
@@ -173,16 +183,22 @@ pub fn generate_cnonce() -> String {
     hex::encode(bytes)
 }
 
-/// Split comma-separated parameters, respecting quoted strings.
+/// Split comma-separated parameters, respecting quoted strings with escaped quotes.
 fn split_params(s: &str) -> Vec<&str> {
     let mut params = Vec::new();
     let mut start = 0;
     let mut in_quotes = false;
+    let bytes = s.as_bytes();
 
-    for (i, c) in s.char_indices() {
-        match c {
-            '"' => in_quotes = !in_quotes,
-            ',' if !in_quotes => {
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' if in_quotes => {
+                i += 2; // Skip escaped character (e.g., \")
+                continue;
+            }
+            b'"' => in_quotes = !in_quotes,
+            b',' if !in_quotes => {
                 let param = s[start..i].trim();
                 if !param.is_empty() {
                     params.push(param);
@@ -191,6 +207,7 @@ fn split_params(s: &str) -> Vec<&str> {
             }
             _ => {}
         }
+        i += 1;
     }
 
     let last = s[start..].trim();
@@ -210,9 +227,24 @@ fn split_kv(s: &str) -> (&str, &str) {
     }
 }
 
-/// Remove surrounding quotes from a value.
-fn unquote(s: &str) -> &str {
-    s.strip_prefix('"').and_then(|s| s.strip_suffix('"')).unwrap_or(s)
+/// Remove surrounding quotes from a value and unescape backslash-escaped chars.
+fn unquote(s: &str) -> String {
+    let inner = s.strip_prefix('"').and_then(|s| s.strip_suffix('"')).unwrap_or(s);
+    // Unescape \" and \\ sequences (RFC 7616 §3.3)
+    let mut result = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(next) = chars.next() {
+                result.push(next);
+            } else {
+                result.push(c);
+            }
+        } else {
+            result.push(c);
+        }
+    }
+    result
 }
 
 #[cfg(test)]
@@ -376,5 +408,17 @@ mod tests {
         assert_eq!(unquote(r#""hello""#), "hello");
         assert_eq!(unquote("hello"), "hello");
         assert_eq!(unquote("\""), "\"");
+    }
+
+    #[test]
+    fn unquote_escaped_quotes() {
+        assert_eq!(unquote(r#""test \"this\" realm!!""#), r#"test "this" realm!!"#);
+    }
+
+    #[test]
+    fn parse_multiple_qop_values() {
+        let header = r#"Digest realm="test", nonce="abc", qop=" crazy, auth""#;
+        let challenge = DigestChallenge::parse(header).unwrap();
+        assert_eq!(challenge.qop.as_deref(), Some("auth"));
     }
 }

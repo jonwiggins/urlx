@@ -91,6 +91,10 @@ pub struct CliOptions {
     pub(crate) retry_all_errors: bool,
     pub(crate) no_progress_meter: bool,
     pub(crate) location_trusted: bool,
+    /// Track --location/-L was seen (for duplicate warning with --follow)
+    saw_location: bool,
+    /// Track --follow was seen (for duplicate warning with --location)
+    saw_follow: bool,
     pub(crate) time_cond: Option<String>,
     /// Parsed time condition timestamp (seconds since epoch) for body suppression.
     pub(crate) time_cond_ts: Option<i64>,
@@ -569,6 +573,8 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
         retry_all_errors: false,
         no_progress_meter: false,
         location_trusted: false,
+        saw_location: false,
+        saw_follow: false,
         time_cond: None,
         time_cond_ts: None,
         time_cond_negate: false,
@@ -704,7 +710,18 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
                 }
                 opts.easy.set_form_data(true);
             }
-            "-L" | "--location" | "--follow" => {
+            "-L" | "--location" => {
+                if opts.saw_follow {
+                    eprintln!("Warning: --follow overrides --location");
+                }
+                opts.saw_location = true;
+                opts.easy.follow_redirects(true);
+            }
+            "--follow" => {
+                if opts.saw_location {
+                    eprintln!("Warning: --follow overrides --location");
+                }
+                opts.saw_follow = true;
                 opts.easy.follow_redirects(true);
             }
             "--location-trusted" => {
@@ -747,7 +764,12 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
             "-e" | "--referer" => {
                 i += 1;
                 let val = require_arg(args, i, "-e")?;
-                opts.easy.header("Referer", val);
+                if let Some(referer) = val.strip_suffix(";auto") {
+                    opts.easy.header("Referer", referer);
+                    opts.easy.auto_referer(true);
+                } else {
+                    opts.easy.header("Referer", val);
+                }
             }
             "-G" | "--get" => {
                 opts.get_mode = true;

@@ -390,6 +390,10 @@ pub fn format_write_out(
         .replace("%{time_starttransfer}", &format!("{:.6}", info.time_starttransfer.as_secs_f64()));
     result = result.replace("%{time_total}", &format!("{:.6}", info.time_total.as_secs_f64()));
     result = result.replace("%{num_redirects}", &info.num_redirects.to_string());
+    #[allow(clippy::literal_string_with_formatting_args)]
+    {
+        result = result.replace("%{referer}", &info.referer);
+    }
     result = result.replace("%{speed_download}", &format!("{:.3}", info.speed_download));
     result = result.replace("%{speed_upload}", &format!("{:.3}", info.speed_upload));
     result = result.replace("%{size_upload}", &info.size_upload.to_string());

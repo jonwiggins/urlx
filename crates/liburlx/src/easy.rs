@@ -112,6 +112,8 @@ pub struct Easy {
     dns_servers: Option<Vec<std::net::SocketAddr>>,
     doh_url: Option<String>,
     unrestricted_auth: bool,
+    /// Auto-update Referer header on redirects (curl --referer "url;auto").
+    auto_referer: bool,
     ignore_content_length: bool,
     /// Maximum file size allowed for download (`--max-filesize`).
     max_filesize: Option<u64>,
@@ -397,6 +399,7 @@ impl Clone for Easy {
             dns_servers: self.dns_servers.clone(),
             doh_url: self.doh_url.clone(),
             unrestricted_auth: self.unrestricted_auth,
+            auto_referer: self.auto_referer,
             ignore_content_length: self.ignore_content_length,
             max_filesize: self.max_filesize,
             alt_svc_cache: self.alt_svc_cache.clone(),
@@ -520,6 +523,7 @@ impl Easy {
             dns_servers: None,
             doh_url: None,
             unrestricted_auth: false,
+            auto_referer: false,
             ignore_content_length: false,
             max_filesize: None,
             alt_svc_cache: crate::protocol::http::altsvc::AltSvcCache::new(),
@@ -754,6 +758,12 @@ impl Easy {
     #[must_use]
     pub const fn has_body(&self) -> bool {
         self.body.is_some()
+    }
+
+    /// Returns a reference to the request body, if set.
+    #[must_use]
+    pub fn peek_body(&self) -> Option<&[u8]> {
+        self.body.as_deref()
     }
 
     /// Returns true if multipart form data has been set.
@@ -1437,6 +1447,25 @@ impl Easy {
     /// Equivalent to `CURLOPT_UNRESTRICTED_AUTH`.
     pub const fn unrestricted_auth(&mut self, enable: bool) {
         self.unrestricted_auth = enable;
+    }
+
+    /// Auto-update Referer header on redirects.
+    ///
+    /// When enabled, the Referer header is set to the previous URL on each
+    /// redirect hop. Equivalent to `CURLOPT_AUTOREFERER`.
+    pub const fn auto_referer(&mut self, enable: bool) {
+        self.auto_referer = enable;
+    }
+
+    /// Check if a non-Basic auth method is configured (Digest, NTLM, `AnyAuth`).
+    ///
+    /// When challenge-response auth is configured, callers should not add
+    /// `Authorization: Basic` headers since the auth flow handles credentials.
+    #[must_use]
+    pub fn uses_challenge_auth(&self) -> bool {
+        self.auth_credentials.as_ref().is_some_and(|a| {
+            matches!(a.method, AuthMethod::Digest | AuthMethod::Ntlm | AuthMethod::AnyAuth)
+        })
     }
 
     /// Ignore the Content-Length header in responses.
@@ -2343,6 +2372,7 @@ impl Easy {
             self.expect_100_timeout,
             self.happy_eyeballs_timeout,
             self.unrestricted_auth,
+            self.auto_referer,
             self.ignore_content_length,
             &mut self.alt_svc_cache,
             &speed_limits,
@@ -2381,6 +2411,8 @@ impl Easy {
             self.http_proxy_tunnel,
             self.proxy_http_10,
             self.raw,
+            self.form_data,
+            self.allowed_protocols.as_deref(),
         );
 
         // Apply total transfer timeout if set.
@@ -2489,6 +2521,7 @@ async fn perform_transfer(
     expect_100_timeout: Option<Duration>,
     happy_eyeballs_timeout: Option<Duration>,
     unrestricted_auth: bool,
+    auto_referer: bool,
     ignore_content_length: bool,
     alt_svc_cache: &mut crate::protocol::http::altsvc::AltSvcCache,
     speed_limits: &SpeedLimits,
@@ -2527,6 +2560,8 @@ async fn perform_transfer(
     http_proxy_tunnel: bool,
     proxy_http_10: bool,
     raw: bool,
+    form_data: bool,
+    allowed_protocols: Option<&[String]>,
 ) -> Result<Response, Error> {
     let transfer_start = Instant::now();
     let original_url = url.clone();
@@ -2536,6 +2571,12 @@ async fn perform_transfer(
     let mut redirects_followed: u32 = 0;
     let mut redirect_chain: Vec<Response> = Vec::new();
     let mut body_dropped_on_redirect = false;
+    // Track previous URL for auto-referer (test 1067)
+    let mut previous_url: Option<Url> = None;
+    // Persist Digest auth state across redirects so nc increments (test 1286)
+    let mut digest_state: Option<(crate::auth::digest::DigestChallenge, String, u32)> = None; // (challenge, cnonce, nc)
+                                                                                              // Track Basic auth header from AnyAuth challenge for redirect re-application (test 1088)
+    let mut basic_auth_header: Option<String> = None;
 
     loop {
         // Determine effective proxy for this URL
@@ -2543,6 +2584,13 @@ async fn perform_transfer(
 
         // Build headers, stripping auth on cross-origin redirects unless unrestricted
         let mut request_headers = headers.to_vec();
+        // Auto-update Referer header on redirect (curl --referer "url;auto", test 1067)
+        if auto_referer {
+            if let Some(ref prev) = previous_url {
+                request_headers.retain(|(k, _)| !k.eq_ignore_ascii_case("referer"));
+                request_headers.push(("Referer".to_string(), prev.as_str().to_string()));
+            }
+        }
         // Remove Content-Type on redirect when body was dropped (302→GET, curl compat: test 796)
         if body_dropped_on_redirect {
             request_headers.retain(|(k, _)| !k.eq_ignore_ascii_case("content-type"));
@@ -2560,6 +2608,18 @@ async fn perform_transfer(
                 }
                 // Drop custom Host header on cross-host redirect (curl compat: test 184)
                 request_headers.retain(|(k, _)| !k.eq_ignore_ascii_case("host"));
+            }
+            // Re-apply Basic auth from AnyAuth challenge on redirect (test 1088)
+            if let Some(ref basic_hdr) = basic_auth_header {
+                let same_host = original_url
+                    .host_str()
+                    .unwrap_or("")
+                    .eq_ignore_ascii_case(current_url.host_str().unwrap_or(""));
+                if (same_host || unrestricted_auth)
+                    && !request_headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+                {
+                    request_headers.push(("Authorization".to_string(), basic_hdr.clone()));
+                }
             }
         }
         if let Some(ref jar) = cookie_jar {
@@ -2584,18 +2644,44 @@ async fn perform_transfer(
             }
         }
 
+        // If we already have Digest state (from a previous 401 exchange), re-apply auth
+        // for redirects to the same host (or if unrestricted_auth).
+        let has_digest_state = digest_state.is_some();
+        if let Some((ref challenge, ref cnonce, ref mut nc)) = digest_state {
+            let same_host = original_url
+                .host_str()
+                .unwrap_or("")
+                .eq_ignore_ascii_case(current_url.host_str().unwrap_or(""));
+            if same_host || unrestricted_auth {
+                let uri = resolve_request_target(custom_request_target, &current_url, path_as_is);
+                *nc += 1;
+                let auth_header = challenge.respond(
+                    auth_credentials.map_or("", |a| &a.username),
+                    auth_credentials.map_or("", |a| &a.password),
+                    &current_method,
+                    &uri,
+                    *nc,
+                    cnonce,
+                );
+                request_headers.push(("Authorization".to_string(), auth_header));
+            }
+        }
+
         // For Digest, don't send body on initial request — it will be
         // rejected with 401 anyway. Send body only on the retry with credentials.
         // Send Content-Length: 0 for PUT/POST to match curl behavior.
         // For AnyAuth, send the full body on the first request (it's a "try without auth"
         // approach — if the server responds 200, we're done).
         // For NTLM, send Content-Length: 0 (body will be sent after Type3).
-        let is_challenge_response =
-            auth_credentials.as_ref().is_some_and(|a| matches!(a.method, AuthMethod::Digest));
+        let is_challenge_response = !has_digest_state
+            && auth_credentials.as_ref().is_some_and(|a| matches!(a.method, AuthMethod::Digest));
         let is_ntlm_probe =
             auth_credentials.as_ref().is_some_and(|a| matches!(a.method, AuthMethod::Ntlm));
         let initial_body = if is_challenge_response || is_ntlm_probe {
             if current_body.is_some() {
+                // Remove user's Content-Length during auth probe — h1.rs will
+                // compute Content-Length: 0 from the empty body (test 1284, 1285).
+                request_headers.retain(|(k, _)| !k.eq_ignore_ascii_case("content-length"));
                 Some(&[] as &[u8]) // Empty body → sends Content-Length: 0
             } else {
                 None
@@ -2725,7 +2811,11 @@ async fn perform_transfer(
         // challenge us (response is not 401), re-send the request with the full body.
         // This handles the case where --digest/--ntlm is used but the server doesn't
         // require auth (curl tests 175, 176).
-        if (is_challenge_response || is_ntlm_probe) && response.status() != 401 {
+        // Don't retry if the response is a redirect — just follow it (test 177).
+        if (is_challenge_response || is_ntlm_probe)
+            && response.status() != 401
+            && !response.is_redirect()
+        {
             if let Some(body) = current_body.as_deref() {
                 if !body.is_empty() {
                     redirect_chain.push(response.clone());
@@ -2808,6 +2898,21 @@ async fn perform_transfer(
 
         // Handle 401: Digest, NTLM, and AnyAuth challenge-response flows.
         if response.status() == 401 {
+            // Downgrade HTTP version if server responded with HTTP/1.0 (test 1071)
+            #[allow(clippy::shadow_unrelated)]
+            let http_version = if response.http_version()
+                == crate::protocol::http::response::ResponseHttpVersion::Http10
+            {
+                HttpVersion::Http10
+            } else {
+                http_version
+            };
+            // HTTP/1.0 + chunked upload = incompatible, fail (test 1072)
+            if http_version == HttpVersion::Http10 && chunked_upload {
+                return Err(Error::Http(
+                    "upload failed: HTTP/1.0 does not support chunked encoding".to_string(),
+                ));
+            }
             if let Some(auth) = auth_credentials {
                 // Determine which auth method to use for this 401
                 let effective_method = if auth.method == AuthMethod::AnyAuth {
@@ -2832,7 +2937,14 @@ async fn perform_transfer(
                             });
                         if let Some(challenge) = digest_challenge {
                             // Save the 401 response for --include output (curl compat)
-                            redirect_chain.push(response.clone());
+                            // Clear body — 401 challenge body is not output (test 1079)
+                            let mut auth_resp = response.clone();
+                            auth_resp.set_body(Vec::new());
+                            // Update last_response store with body-free version
+                            if let Ok(mut guard) = last_resp_store.lock() {
+                                *guard = Some(auth_resp.clone());
+                            }
+                            redirect_chain.push(auth_resp);
                             if verbose {
                                 #[allow(clippy::print_stderr)]
                                 {
@@ -2857,6 +2969,9 @@ async fn perform_transfer(
                                 1,
                                 &cnonce,
                             );
+
+                            // Save Digest state for redirect re-auth (test 1286)
+                            digest_state = Some((challenge, cnonce.clone(), 1));
 
                             let mut auth_headers = request_headers.clone();
                             auth_headers.push(("Authorization".to_string(), auth_header));
@@ -2944,7 +3059,9 @@ async fn perform_transfer(
                                     .filter(|c| c.stale);
 
                                 if let Some(new_challenge) = stale_challenge {
-                                    redirect_chain.push(response.clone());
+                                    let mut stale_resp = response.clone();
+                                    stale_resp.set_body(Vec::new());
+                                    redirect_chain.push(stale_resp);
                                     let uri = resolve_request_target(
                                         custom_request_target,
                                         &current_url,
@@ -2959,6 +3076,8 @@ async fn perform_transfer(
                                         1,
                                         &cnonce,
                                     );
+                                    // Update Digest state with new nonce
+                                    digest_state = Some((new_challenge, cnonce.clone(), 1));
                                     let mut stale_headers = request_headers.clone();
                                     stale_headers.push(("Authorization".to_string(), auth_header));
                                     response = Box::pin(do_single_request(
@@ -3212,6 +3331,89 @@ async fn perform_transfer(
                                 }
                             }
                         }
+                    }
+                    Some(AuthMethod::Basic) => {
+                        // Basic auth: retry with Authorization header
+                        use base64::Engine;
+                        let encoded = base64::engine::general_purpose::STANDARD
+                            .encode(format!("{}:{}", auth.username, auth.password));
+                        let basic_val = format!("Basic {encoded}");
+                        // Save for redirect re-application (test 1088)
+                        basic_auth_header = Some(basic_val.clone());
+                        let mut basic_resp = response.clone();
+                        basic_resp.set_body(Vec::new());
+                        redirect_chain.push(basic_resp);
+                        let mut auth_headers = request_headers.clone();
+                        auth_headers.push(("Authorization".to_string(), basic_val));
+                        response = Box::pin(do_single_request(
+                            &current_url,
+                            &current_method,
+                            &auth_headers,
+                            current_body.as_deref(),
+                            verbose,
+                            accept_encoding,
+                            connect_timeout,
+                            effective_proxy,
+                            proxy_credentials,
+                            resolve_overrides,
+                            tls_config,
+                            tcp_nodelay,
+                            tcp_keepalive,
+                            unix_socket,
+                            interface,
+                            local_port,
+                            dns_shuffle,
+                            dns_cache,
+                            pool,
+                            #[cfg(feature = "http2")]
+                            h2_pool,
+                            http_version,
+                            expect_100_timeout,
+                            happy_eyeballs_timeout,
+                            ignore_content_length,
+                            speed_limits,
+                            ftp_ssl_mode,
+                            ssh_key_path,
+                            proxy_tls_config,
+                            alt_svc_cache,
+                            #[cfg(feature = "http2")]
+                            h2_config,
+                            dns_resolver,
+                            custom_request_target,
+                            tftp_blksize,
+                            tftp_no_options,
+                            #[cfg(feature = "ssh")]
+                            ssh_host_key_policy,
+                            mail_from,
+                            mail_rcpt,
+                            fresh_connect,
+                            forbid_reuse,
+                            ftp_config,
+                            proxy_headers,
+                            connect_to,
+                            path_as_is,
+                            #[cfg(feature = "ssh")]
+                            ssh_public_keyfile,
+                            #[cfg(not(feature = "ssh"))]
+                            None,
+                            #[cfg(feature = "ssh")]
+                            ssh_auth_types,
+                            #[cfg(not(feature = "ssh"))]
+                            None,
+                            mail_auth,
+                            sasl_authzid,
+                            sasl_ir,
+                            oauth2_bearer,
+                            haproxy_protocol,
+                            abstract_unix_socket,
+                            chunked_upload,
+                            http09_allowed,
+                            deadline,
+                            http_proxy_tunnel,
+                            proxy_http_10,
+                            raw,
+                        ))
+                        .await?;
                     }
                     _ => {}
                 }
@@ -3542,9 +3744,17 @@ async fn perform_transfer(
                 // Clear raw_input so redirect uses normalized path (not user's original)
                 next_url.clear_raw_input();
 
-                // Check redirect protocol restriction
+                // Check redirect protocol restriction.
+                // Both --proto and --proto-redir must allow the scheme.
+                let scheme = next_url.scheme().to_lowercase();
+                if let Some(allowed) = allowed_protocols {
+                    if !allowed.iter().any(|p| p.as_str() == scheme) {
+                        return Err(Error::UnsupportedProtocol(format!(
+                            "Protocol \"{scheme}\" not supported or disabled in libcurl"
+                        )));
+                    }
+                }
                 if let Some(allowed) = redir_protocols {
-                    let scheme = next_url.scheme().to_lowercase();
                     if !allowed.iter().any(|p| p.as_str() == scheme) {
                         return Err(Error::UnsupportedProtocol(format!(
                             "Protocol \"{scheme}\" not supported or disabled in libcurl"
@@ -3566,9 +3776,11 @@ async fn perform_transfer(
                 // On 303: always change to GET (unless --post303 preserves POST)
                 // On 301/302: change POST to GET (curl compat) unless --post301/--post302
                 //   Only POST is changed; PUT and other methods are preserved (test 1051)
+                //   But: if -d was used with -X <custom>, treat as POST-like (test 794/796)
                 let is_post = current_method.eq_ignore_ascii_case("POST");
+                let is_post_like = is_post || (form_data && current_body.is_some());
                 let should_change_to_get = (status == 303 && !(post303 && is_post))
-                    || ((status == 301 && !post301 || status == 302 && !post302) && is_post);
+                    || ((status == 301 && !post301 || status == 302 && !post302) && is_post_like);
                 if should_change_to_get {
                     current_method = "GET".to_string();
                     current_body = None;
@@ -3578,6 +3790,8 @@ async fn perform_transfer(
                 // Capture intermediate redirect response for -L --include output
                 redirect_chain.push(response);
 
+                // Track previous URL for auto-referer (test 1067)
+                previous_url = Some(current_url.clone());
                 current_url = next_url;
                 redirects_followed += 1;
                 continue;
@@ -3600,6 +3814,10 @@ async fn perform_transfer(
         info.speed_upload = speed_upload;
         info.size_upload = upload_size;
         info.effective_method.clone_from(&current_method);
+        // Set referer for %{referer} write-out (test 1067)
+        if let Some(ref prev) = previous_url {
+            info.referer = prev.as_str().to_string();
+        }
         response.set_transfer_info(info);
         if !redirect_chain.is_empty() {
             response.set_redirect_responses(redirect_chain);
@@ -4670,11 +4888,19 @@ async fn do_single_request(
                 // Add proxy-specific headers for non-tunnel HTTP proxy requests
                 let mut proxy_effective_headers = effective_headers.clone();
                 if is_http_proxy {
-                    // Insert Proxy-Connection before Cookie header (curl compat: test 179)
+                    // Insert Proxy-Connection after Accept but before custom headers
+                    // (curl compat: test 317, 318). The Accept header is one of the
+                    // last "standard" headers before custom ones.
+                    let accept_pos = proxy_effective_headers
+                        .iter()
+                        .position(|(k, _)| k.eq_ignore_ascii_case("accept"));
                     let cookie_pos = proxy_effective_headers
                         .iter()
                         .position(|(k, _)| k.eq_ignore_ascii_case("cookie"));
-                    let insert_pos = cookie_pos.unwrap_or(proxy_effective_headers.len());
+                    // Prefer: after Accept (test 317/318), before Cookie (test 179)
+                    let insert_pos = cookie_pos
+                        .or_else(|| accept_pos.map(|p| p + 1))
+                        .unwrap_or(proxy_effective_headers.len());
                     proxy_effective_headers.insert(
                         insert_pos,
                         ("Proxy-Connection".to_string(), "Keep-Alive".to_string()),
@@ -5516,11 +5742,17 @@ fn resolve_relative(base: &str, relative: &str) -> String {
             }
         }
         format!("{base}{relative}")
+    } else if relative.starts_with('?') {
+        // Query-string-only redirect — keep the full base path, replace query
+        let base_no_query = base.split('?').next().unwrap_or(base);
+        format!("{base_no_query}{relative}")
     } else {
-        // Relative path — replace last path segment
-        base.rfind('/').map_or_else(
-            || format!("{base}/{relative}"),
-            |idx| format!("{}{relative}", &base[..=idx]),
+        // Relative path — replace last path segment.
+        // Must strip query string from base first to find the correct last '/'.
+        let base_no_query = base.split('?').next().unwrap_or(base);
+        base_no_query.rfind('/').map_or_else(
+            || format!("{base_no_query}/{relative}"),
+            |idx| format!("{}{relative}", &base_no_query[..=idx]),
         )
     }
 }

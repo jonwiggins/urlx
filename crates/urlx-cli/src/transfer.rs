@@ -993,6 +993,21 @@ pub fn run(args: &[String]) -> ExitCode {
     }
 
     // PUT with -C offset: handle HTTP vs FTP resume differently
+    // For -C - (auto_resume) with uploads, add Content-Range: bytes 0-N/total (test 1041)
+    if opts.is_upload && opts.auto_resume {
+        let is_ftp_upload =
+            opts.urls.first().is_some_and(|u| u.starts_with("ftp://") || u.starts_with("ftps://"));
+        if !is_ftp_upload {
+            if let Some(body_data) = opts.easy.peek_body() {
+                let total = body_data.len() as u64;
+                if total > 0 {
+                    let end = total - 1;
+                    opts.easy.header("Content-Range", &format!("bytes 0-{end}/{total}"));
+                }
+            }
+            opts.easy.clear_range();
+        }
+    }
     if opts.is_upload {
         if let Some(offset) = opts.resume_offset {
             if offset > 0 {
@@ -1174,7 +1189,30 @@ pub fn run(args: &[String]) -> ExitCode {
             if opts.resume_check && !opts.is_upload && !is_ftp && !is_file {
                 let status = response.status();
                 if status == 416 {
-                    // File already complete — output headers only, exit success
+                    // File already complete — keep existing file, append headers
+                    // (curl compat: test 1040, 1273).
+                    // Output order: existing_data + response_headers
+                    if opts.auto_resume {
+                        if let Some(ref path) = opts.output_file {
+                            if let Ok(existing) = std::fs::read(path) {
+                                use std::io::Write as _;
+                                let headers_bytes = if opts.include_headers {
+                                    crate::output::format_headers(&response).into_bytes()
+                                } else {
+                                    Vec::new()
+                                };
+                                // Build combined output: existing + headers
+                                let mut combined = existing;
+                                combined.extend_from_slice(&headers_bytes);
+                                if path == "-" {
+                                    let _ = std::io::stdout().write_all(&combined);
+                                } else {
+                                    let _ = std::fs::write(path, &combined);
+                                }
+                                return ExitCode::SUCCESS;
+                            }
+                        }
+                    }
                     let exit = output_response(
                         &response,
                         opts.output_file.as_deref(),
@@ -1188,8 +1226,34 @@ pub fn run(args: &[String]) -> ExitCode {
                 // 200 with Content-Range is a valid resume response (curl compat: test 188)
                 let has_content_range = response.header("content-range").is_some();
                 if status != 206 && !(status == 200 && has_content_range) {
-                    // Output headers but suppress body. When auto-resuming (-C -),
-                    // don't write to the output file (it's the resume source).
+                    // Output existing file content + headers (test 1042)
+                    if let Some(ref path) = opts.output_file {
+                        if let Ok(existing) = std::fs::read(path) {
+                            if !existing.is_empty() {
+                                use std::io::Write as _;
+                                let headers_str = if opts.include_headers {
+                                    crate::output::format_headers(&response)
+                                } else {
+                                    String::new()
+                                };
+                                let is_stdout = path == "-";
+                                if is_stdout {
+                                    let _ = std::io::stdout().write_all(&existing);
+                                    let _ = std::io::stdout().write_all(headers_str.as_bytes());
+                                } else if let Ok(mut file) = std::fs::File::create(path) {
+                                    let _ = file.write_all(&existing);
+                                    let _ = file.write_all(headers_str.as_bytes());
+                                }
+                                if !opts.silent || opts.show_error {
+                                    eprintln!(
+                                        "curl: server returned {status} but resume was requested"
+                                    );
+                                }
+                                return ExitCode::from(33);
+                            }
+                        }
+                    }
+                    // Output headers but suppress body.
                     let out_file =
                         if opts.auto_resume { None } else { opts.output_file.as_deref() };
                     let _exit = output_response(
@@ -1351,6 +1415,47 @@ pub fn run(args: &[String]) -> ExitCode {
                 })
             });
 
+            // For auto-resume with 206, write existing file content to output file
+            // BEFORE the response (test 1043). Output order: existing_data + headers + new_body
+            if opts.auto_resume && response.status() == 206 {
+                if let Some(ref path) = opts.output_file {
+                    if path != "-" {
+                        if let Ok(existing) = std::fs::read(path) {
+                            // Write existing content, then output_response will append
+                            // headers + new body. We need to write to a temp location
+                            // since output_response will truncate the file.
+                            // Instead, prepend to the response body (output_response writes
+                            // headers then body, so existing+body after headers).
+                            // BUT the test expects existing BEFORE headers.
+                            // Solution: write existing to file, then use append mode.
+                            use std::io::Write as _;
+                            let headers_str = if opts.include_headers {
+                                crate::output::format_headers(&response)
+                            } else {
+                                String::new()
+                            };
+                            if let Ok(mut file) = std::fs::File::create(path) {
+                                let _ = file.write_all(&existing);
+                                let _ = file.write_all(headers_str.as_bytes());
+                                let _ = file.write_all(response.body());
+                            }
+                            // Handle write-out
+                            if let Some(ref fmt) = opts.write_out {
+                                let real_fmt = if let Some(path) = fmt.strip_prefix('@') {
+                                    std::fs::read_to_string(path).unwrap_or_default()
+                                } else {
+                                    fmt.clone()
+                                };
+                                let output =
+                                    crate::output::format_write_out(&real_fmt, &response, false);
+                                eprint!("{output}");
+                            }
+                            return ExitCode::SUCCESS;
+                        }
+                    }
+                }
+            }
+
             // When dump-header goes to stdout and include_headers is active,
             // headers were already output as doubled lines above. Skip include
             // in output_response to avoid triple output.
@@ -1472,16 +1577,45 @@ pub fn run(args: &[String]) -> ExitCode {
                             let _ = std::io::stdout().write_all(h.as_bytes());
                         }
                     }
-                } else {
-                    // For 416 with resume, suppress body (file already downloaded)
-                    let suppress = opts.resume_check && resp.status() == 416;
+                } else if opts.resume_check && resp.status() == 416 {
+                    // 416 with resume: file already complete.
+                    // Prepend existing file content before headers (test 1040, 1273).
+                    if opts.auto_resume {
+                        if let Some(ref path) = opts.output_file {
+                            if let Ok(existing) = std::fs::read(path) {
+                                use std::io::Write as _;
+                                let headers_bytes = if opts.include_headers {
+                                    format_headers(resp).into_bytes()
+                                } else {
+                                    Vec::new()
+                                };
+                                let mut combined = existing;
+                                combined.extend_from_slice(&headers_bytes);
+                                if path == "-" {
+                                    let _ = std::io::stdout().write_all(&combined);
+                                } else {
+                                    let _ = std::fs::write(path, &combined);
+                                }
+                                return ExitCode::SUCCESS;
+                            }
+                        }
+                    }
                     let _ = output_response(
                         resp,
                         opts.output_file.as_deref(),
                         opts.write_out.as_deref(),
                         opts.include_headers,
                         opts.silent,
-                        suppress,
+                        true, // suppress body
+                    );
+                } else {
+                    let _ = output_response(
+                        resp,
+                        opts.output_file.as_deref(),
+                        opts.write_out.as_deref(),
+                        opts.include_headers,
+                        opts.silent,
+                        false,
                     );
                 }
             }
@@ -1860,17 +1994,25 @@ pub fn run_multi(
 
         // Apply per-URL credentials: -u flag takes priority, then URL userinfo.
         // Remove old Authorization header before setting new credentials (curl compat: test 1134).
-        if let Some(Some((ref user, ref pass))) = per_url_credentials.get(i) {
-            easy.remove_header("Authorization");
-            easy.basic_auth(user, pass);
-        } else {
-            let url_user = extract_url_username_raw(url);
-            let url_pass = extract_url_password(url);
-            if url_user.is_some() || url_pass.is_some() {
-                let user = url_user.unwrap_or_default();
-                let pass = url_pass.unwrap_or_default();
+        // Skip when Digest/NTLM/AnyAuth is configured — those use challenge-response
+        // and the auth_credentials handle the credentials (curl compat: test 388).
+        if !easy.uses_challenge_auth() {
+            if let Some(Some((ref user, ref pass))) = per_url_credentials.get(i) {
                 easy.remove_header("Authorization");
-                easy.basic_auth(&user, &pass);
+                easy.basic_auth(user, pass);
+            } else {
+                let url_user = extract_url_username_raw(url);
+                let url_pass = extract_url_password(url);
+                if url_user.is_some() || url_pass.is_some() {
+                    let user = url_user.unwrap_or_default();
+                    let pass = url_pass.unwrap_or_default();
+                    easy.remove_header("Authorization");
+                    easy.basic_auth(&user, &pass);
+                } else {
+                    // No credentials for this URL — remove stale auth from previous URL
+                    // (curl compat: test 999)
+                    easy.remove_header("Authorization");
+                }
             }
         }
 
