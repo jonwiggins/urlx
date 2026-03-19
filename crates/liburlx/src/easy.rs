@@ -2937,7 +2937,14 @@ async fn perform_transfer(
                             });
                         if let Some(challenge) = digest_challenge {
                             // Save the 401 response for --include output (curl compat)
-                            redirect_chain.push(response.clone());
+                            // Clear body — 401 challenge body is not output (test 1079)
+                            let mut auth_resp = response.clone();
+                            auth_resp.set_body(Vec::new());
+                            // Update last_response store with body-free version
+                            if let Ok(mut guard) = last_resp_store.lock() {
+                                *guard = Some(auth_resp.clone());
+                            }
+                            redirect_chain.push(auth_resp);
                             if verbose {
                                 #[allow(clippy::print_stderr)]
                                 {
@@ -3052,7 +3059,9 @@ async fn perform_transfer(
                                     .filter(|c| c.stale);
 
                                 if let Some(new_challenge) = stale_challenge {
-                                    redirect_chain.push(response.clone());
+                                    let mut stale_resp = response.clone();
+                                    stale_resp.set_body(Vec::new());
+                                    redirect_chain.push(stale_resp);
                                     let uri = resolve_request_target(
                                         custom_request_target,
                                         &current_url,
@@ -3331,7 +3340,9 @@ async fn perform_transfer(
                         let basic_val = format!("Basic {encoded}");
                         // Save for redirect re-application (test 1088)
                         basic_auth_header = Some(basic_val.clone());
-                        redirect_chain.push(response.clone());
+                        let mut basic_resp = response.clone();
+                        basic_resp.set_body(Vec::new());
+                        redirect_chain.push(basic_resp);
                         let mut auth_headers = request_headers.clone();
                         auth_headers.push(("Authorization".to_string(), basic_val));
                         response = Box::pin(do_single_request(
