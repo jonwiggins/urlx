@@ -687,6 +687,45 @@ pub fn run(args: &[String]) -> ExitCode {
         }
     }
 
+    // --etag-save with bad path + --next: skip affected transfers (curl compat: test 369).
+    // curl prints a warning and skips the transfer, continuing with --next groups.
+    // For single-URL case without --next, the etag check in run() handles error 26 (test 370).
+    if opts.had_next {
+        if let Some(ref path) = opts.etag_save_file {
+            if let Some(parent) = std::path::Path::new(path).parent() {
+                if !parent.as_os_str().is_empty() && !parent.exists() && !opts.create_dirs {
+                    eprintln!(
+                    "Warning: Failed creating file for saving etags: \"{path}\". Skip this transfer"
+                );
+                    // Remove URLs from the first group (group 0 = the group with etag-save)
+                    let first_group = opts.per_url_group.first().copied().unwrap_or(0);
+                    let mut i = 0;
+                    while i < opts.urls.len() {
+                        if opts.per_url_group.get(i).copied().unwrap_or(0) == first_group {
+                            let _ = opts.urls.remove(i);
+                            let _ = opts.per_url_credentials.remove(i);
+                            let _ = opts.per_url_ftp_methods.remove(i);
+                            let _ = opts.per_url_easy.remove(i);
+                            let _ = opts.per_url_upload_files.remove(i);
+                            let _ = opts.per_url_group.remove(i);
+                            let _ = opts.glob_values.remove(i);
+                            if i < opts.output_files.len() {
+                                let _ = opts.output_files.remove(i);
+                            }
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    opts.etag_save_file = None;
+                    // If no URLs left after removal, exit successfully
+                    if opts.urls.is_empty() {
+                        return ExitCode::SUCCESS;
+                    }
+                }
+            }
+        }
+    }
+
     // Multiple URLs: use Multi API for concurrent transfers
     if opts.urls.len() > 1 {
         // Build per-URL output filenames:
@@ -1258,12 +1297,9 @@ pub fn run(args: &[String]) -> ExitCode {
                         return ExitCode::FAILURE;
                     }
                 } else {
-                    if !opts.silent || opts.show_error {
-                        eprintln!(
-                            "urlx: (26) Failed to open/read local data from file/application"
-                        );
-                    }
-                    return ExitCode::from(26); // CURLE_READ_ERROR
+                    // curl returns CURLE_READ_ERROR (26) for bad etag-save path
+                    // (curl compat: test 370)
+                    return ExitCode::from(26);
                 }
             }
         }

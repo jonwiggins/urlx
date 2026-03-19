@@ -1012,6 +1012,13 @@ impl Easy {
         if other.hsts_cache.is_some() {
             self.hsts_cache = other.hsts_cache.take();
         }
+        // Transfer connection pool so --next groups can reuse connections
+        // (curl compat: test 338 — ANYAUTH connection reuse across --next boundary).
+        self.pool = std::mem::replace(&mut other.pool, ConnectionPool::new());
+        #[cfg(feature = "http2")]
+        {
+            self.h2_pool = std::mem::replace(&mut other.h2_pool, crate::pool::H2Pool::new());
+        }
     }
 
     /// Set the proxy URL.
