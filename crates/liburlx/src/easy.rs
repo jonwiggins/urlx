@@ -5026,6 +5026,99 @@ async fn perform_transfer(
                     }
                 }
 
+                // Cross-protocol redirect to IMAP: perform IMAP transfer
+                // (curl compat: test 795)
+                if next_scheme == "imap" || next_scheme == "imaps" {
+                    redirect_chain.push(response);
+
+                    let imap_result = Box::pin(do_single_request(
+                        &next_url,
+                        "GET",
+                        &[],
+                        None,
+                        verbose,
+                        false,
+                        connect_timeout,
+                        proxy.cloned().as_ref(),
+                        proxy_credentials,
+                        resolve_overrides,
+                        tls_config,
+                        tcp_nodelay,
+                        tcp_keepalive,
+                        unix_socket,
+                        interface,
+                        local_port,
+                        dns_shuffle,
+                        dns_cache,
+                        pool,
+                        #[cfg(feature = "http2")]
+                        h2_pool,
+                        http_version,
+                        expect_100_timeout,
+                        happy_eyeballs_timeout,
+                        ignore_content_length,
+                        speed_limits,
+                        ftp_ssl_mode,
+                        use_ssl,
+                        ssh_key_path,
+                        proxy_tls_config,
+                        alt_svc_cache,
+                        #[cfg(feature = "http2")]
+                        h2_config,
+                        dns_resolver,
+                        custom_request_target,
+                        tftp_blksize,
+                        tftp_no_options,
+                        #[cfg(feature = "ssh")]
+                        ssh_host_key_policy,
+                        mail_from,
+                        mail_rcpt,
+                        fresh_connect,
+                        forbid_reuse,
+                        ftp_config,
+                        proxy_headers,
+                        connect_to,
+                        path_as_is,
+                        #[cfg(feature = "ssh")]
+                        ssh_public_keyfile,
+                        #[cfg(not(feature = "ssh"))]
+                        None,
+                        #[cfg(feature = "ssh")]
+                        ssh_auth_types,
+                        #[cfg(not(feature = "ssh"))]
+                        None,
+                        mail_auth,
+                        sasl_authzid,
+                        login_options,
+                        sasl_ir,
+                        oauth2_bearer,
+                        haproxy_protocol,
+                        abstract_unix_socket,
+                        chunked_upload,
+                        http09_allowed,
+                        deadline,
+                        http_proxy_tunnel,
+                        proxy_http_10,
+                        raw,
+                        ftp_session,
+                        true,
+                    ))
+                    .await;
+
+                    match imap_result {
+                        Ok(mut imap_resp) => {
+                            // Clear IMAP protocol headers and body — don't include them
+                            // in output when redirecting from HTTP to IMAP.
+                            // Only the HTTP redirect headers are shown (curl compat: test 795).
+                            imap_resp.set_raw_headers(Vec::new());
+                            imap_resp.set_body(Vec::new());
+                            imap_resp.set_redirect_responses(redirect_chain);
+                            return Ok(imap_resp);
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+
                 // Capture intermediate redirect response for -L --include output
                 redirect_chain.push(response);
 

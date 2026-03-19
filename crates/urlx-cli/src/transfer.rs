@@ -6,8 +6,7 @@
 use std::process::ExitCode;
 
 use crate::args::{
-    parse_args, parse_proto_spec, percent_encode, print_usage, print_version, CliOptions,
-    ParseResult,
+    parse_args, parse_proto_spec, print_usage, print_version, CliOptions, ParseResult,
 };
 use crate::output::{
     content_disposition_filename, format_headers, format_write_out, http_status_text,
@@ -372,6 +371,46 @@ fn strip_url_credentials(url: &str) -> String {
     }
 }
 
+/// Percent-encode a credential string for embedding in a URL's userinfo.
+///
+/// Encodes characters that are not safe in RFC 3986 userinfo:
+/// unreserved chars (A-Z, a-z, 0-9, `-`, `_`, `.`, `~`) and sub-delims
+/// (except `@` and `:`) are left as-is; everything else is percent-encoded.
+fn percent_encode_credential(input: &str) -> String {
+    let mut result = String::with_capacity(input.len());
+    for byte in input.bytes() {
+        match byte {
+            b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'-'
+            | b'_'
+            | b'.'
+            | b'~'
+            | b'!'
+            | b'$'
+            | b'&'
+            | b'\''
+            | b'('
+            | b')'
+            | b'*'
+            | b'+'
+            | b','
+            | b';'
+            | b'=' => {
+                result.push(byte as char);
+            }
+            _ => {
+                const HEX: &[u8; 16] = b"0123456789ABCDEF";
+                result.push('%');
+                result.push(HEX[(byte >> 4) as usize] as char);
+                result.push(HEX[(byte & 0x0F) as usize] as char);
+            }
+        }
+    }
+    result
+}
+
 /// URL-decode a percent-encoded string.
 fn url_decode(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
@@ -401,26 +440,56 @@ fn url_decode(s: &str) -> String {
     result
 }
 
-/// Append query parameters to a URL string.
+/// Append query parameters to a URL string (implements curl's `--url-query`).
 ///
-/// Each query string is appended with `&` if the URL already has a `?`,
-/// or with `?` if it doesn't. Values containing `=` are used as-is;
-/// plain values are URL-encoded.
+/// Supports the following formats (matching curl):
+/// - `content` — form-urlencode entire string, append
+/// - `=content` — append content as-is (no encoding)
+/// - `name=content` — form-urlencode only the content, append `name=encoded`
+/// - `@filename` — read file, form-urlencode contents, append
+/// - `name@filename` — read file, form-urlencode contents, append `name=encoded`
+/// - `+content` — content is already encoded, append as-is (strip `+` prefix)
 pub fn append_url_queries(url: &str, queries: &[String]) -> String {
+    use crate::args::form_urlencode;
+
     let mut result = url.to_string();
     for query in queries {
         let separator = if result.contains('?') { '&' } else { '?' };
         result.push(separator);
-        if query.contains('=') {
-            // name=value format: encode only the value
-            if let Some((name, value)) = query.split_once('=') {
+
+        if let Some(already_encoded) = query.strip_prefix('+') {
+            // +content: already encoded, use as-is
+            result.push_str(already_encoded);
+        } else if let Some(filename) = query.strip_prefix('@') {
+            // @filename: read file, encode contents
+            let data = std::fs::read_to_string(filename).unwrap_or_default();
+            result.push_str(&form_urlencode(&data));
+        } else if let Some(at_pos) = query.find('@') {
+            let eq_pos = query.find('=');
+            if eq_pos.is_none() || at_pos < eq_pos.unwrap_or(usize::MAX) {
+                // name@filename: read file, encode contents, prepend name=
+                let name = &query[..at_pos];
+                let filename = &query[at_pos + 1..];
+                let data = std::fs::read_to_string(filename).unwrap_or_default();
                 result.push_str(name);
                 result.push('=');
-                result.push_str(&percent_encode(value));
+                result.push_str(&form_urlencode(&data));
+            } else {
+                // name=content (with @ in content): encode value only
+                // unwrap_or: split_once guaranteed to succeed since eq_pos was Some
+                let (name, value) = query.split_once('=').unwrap_or((query, ""));
+                result.push_str(name);
+                result.push('=');
+                result.push_str(&form_urlencode(value));
             }
+        } else if let Some((name, value)) = query.split_once('=') {
+            // name=value: encode only the value
+            result.push_str(name);
+            result.push('=');
+            result.push_str(&form_urlencode(value));
         } else {
-            // Plain string: use as-is (already encoded or literal)
-            result.push_str(query);
+            // Plain string: encode the whole thing
+            result.push_str(&form_urlencode(query));
         }
     }
     result
@@ -1079,31 +1148,25 @@ pub fn run(args: &[String]) -> ExitCode {
                 || url.starts_with("pop3://")
                 || url.starts_with("pop3s://")
             {
-                // Percent-encode special chars in credentials for URL embedding
-                // (curl compat: test 895/896 — `"`, `{`, `}` in credentials)
-                let encode_userinfo = |s: &str| -> String {
-                    let mut out = String::with_capacity(s.len());
-                    for c in s.chars() {
-                        match c {
-                            '"' => out.push_str("%22"),
-                            '{' => out.push_str("%7B"),
-                            '}' => out.push_str("%7D"),
-                            '@' => out.push_str("%40"),
-                            ':' => out.push_str("%3A"),
-                            _ => out.push(c),
-                        }
+                // Reject credentials with special characters only when --login-options
+                // is used (curl compat: test 896). Without --login-options, percent-encode
+                // special chars so they survive URL embedding (curl compat: tests 800, 847).
+                let has_bad_char = |s: &str| s.contains('"') || s.contains('{') || s.contains('}');
+                if (has_bad_char(user) || has_bad_char(pass))
+                    && opts.easy.get_login_options().is_some()
+                {
+                    if !opts.silent || opts.show_error {
+                        eprintln!("curl: (3) URL using bad/illegal format or missing URL");
                     }
-                    out
-                };
-                let encoded_user = encode_userinfo(user);
-                let encoded_pass = encode_userinfo(pass);
+                    return ExitCode::from(3);
+                }
                 let base_url = strip_url_credentials(&url);
                 let scheme_end = base_url.find("://").map_or(0, |p| p + 3);
                 let new_url = format!(
                     "{}{}:{}@{}",
                     &base_url[..scheme_end],
-                    encoded_user,
-                    encoded_pass,
+                    percent_encode_credential(user),
+                    percent_encode_credential(pass),
                     &base_url[scheme_end..]
                 );
                 if let Err(e) = opts.easy.url(&new_url) {
@@ -2584,8 +2647,8 @@ pub fn run_multi(
                     let new_url = format!(
                         "{}{}:{}@{}",
                         &base_url[..scheme_end],
-                        user,
-                        pass,
+                        percent_encode_credential(user),
+                        percent_encode_credential(pass),
                         &base_url[scheme_end..]
                     );
                     let _ = easy.url(&new_url);

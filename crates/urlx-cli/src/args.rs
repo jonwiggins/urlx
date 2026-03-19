@@ -717,8 +717,10 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
                 let val = require_arg(args, i, "-X")?;
                 opts.easy.method(val);
                 // Store original case value for non-HTTP protocols
-                // (IMAP/POP3/SMTP use -X as custom protocol command)
+                // (IMAP/POP3/SMTP use -X as custom protocol command).
+                // Also set on the Easy handle so --next clones preserve it.
                 opts.custom_request_original = Some(val.to_string());
+                opts.easy.custom_request_target(val);
             }
             "-H" | "--header" => {
                 i += 1;
@@ -2234,6 +2236,7 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
                 opts.easy.clear_body();
                 opts.has_post_data = false;
                 opts.easy.reset_method();
+                opts.easy.clear_custom_request_target();
                 opts.easy.set_form_data(false);
                 opts.json_mode = false;
                 opts.next_needs_url = true;
@@ -2393,15 +2396,41 @@ pub fn read_data_source(path: &str) -> Result<Vec<u8>, std::io::Error> {
     }
 }
 
-/// If the value contains `=`, only the part after the first `=` is encoded
-/// (the name is passed through as-is). Otherwise the entire value is encoded.
+/// Encode a string for form-URL-encoding (application/x-www-form-urlencoded).
+///
+/// Supports the following formats (matching curl):
+/// - `content` — encode entire string
+/// - `=content` — use content as-is (no encoding)
+/// - `name=content` — encode only the content, prepend `name=`
+/// - `@filename` — read file, encode contents
+/// - `name@filename` — read file, encode contents, prepend `name=`
 #[cfg(test)]
-fn urlencoded(input: &str) -> String {
+pub fn urlencoded(input: &str) -> String {
+    // Check for @filename (starts with @)
+    if let Some(filename) = input.strip_prefix('@') {
+        let data = std::fs::read_to_string(filename).unwrap_or_default();
+        return form_urlencode(&data);
+    }
+    // Check for =content (starts with =) — use as-is
+    if let Some(content) = input.strip_prefix('=') {
+        return content.to_string();
+    }
+    // Check for name@filename (has @ before any =)
+    if let Some(at_pos) = input.find('@') {
+        let eq_pos = input.find('=');
+        if eq_pos.is_none() || at_pos < eq_pos.unwrap_or(usize::MAX) {
+            let name = &input[..at_pos];
+            let filename = &input[at_pos + 1..];
+            let data = std::fs::read_to_string(filename).unwrap_or_default();
+            return format!("{}={}", name, form_urlencode(&data));
+        }
+    }
+    // name=content or plain content
     if let Some((name, value)) = input.split_once('=') {
-        let encoded = percent_encode(value);
+        let encoded = form_urlencode(value);
         format!("{name}={encoded}")
     } else {
-        percent_encode(input)
+        form_urlencode(input)
     }
 }
 
@@ -2476,6 +2505,7 @@ pub fn curl_urlencode(input: &str) -> String {
 }
 
 /// Percent-encode a string per RFC 3986 (unreserved characters are not encoded).
+#[cfg(test)]
 pub fn percent_encode(input: &str) -> String {
     let mut result = String::with_capacity(input.len());
     for byte in input.bytes() {
@@ -2493,8 +2523,36 @@ pub fn percent_encode(input: &str) -> String {
     result
 }
 
-/// Hex lookup table for percent encoding.
+/// Form-URL-encode a string (application/x-www-form-urlencoded).
+///
+/// Like `percent_encode` but encodes spaces as `+` instead of `%20`,
+/// matching curl's `--data-urlencode` and `--url-query` behavior.
+/// Uses lowercase hex digits to match curl's output.
+pub fn form_urlencode(input: &str) -> String {
+    let mut result = String::with_capacity(input.len());
+    for byte in input.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                result.push(byte as char);
+            }
+            b' ' => {
+                result.push('+');
+            }
+            _ => {
+                result.push('%');
+                result.push(char::from(HEX_CHARS_LOWER[(byte >> 4) as usize]));
+                result.push(char::from(HEX_CHARS_LOWER[(byte & 0x0F) as usize]));
+            }
+        }
+    }
+    result
+}
+
+/// Hex lookup table for percent encoding (uppercase, used by `percent_encode`).
 const HEX_CHARS: [u8; 16] = *b"0123456789ABCDEF";
+
+/// Hex lookup table for percent encoding (lowercase, used by `form_urlencode`).
+const HEX_CHARS_LOWER: [u8; 16] = *b"0123456789abcdef";
 
 /// Extract filename from URL for `-O/--remote-name`.
 ///
@@ -4481,19 +4539,20 @@ mod tests {
 
     #[test]
     fn urlencoded_basic() {
-        assert_eq!(urlencoded("hello world"), "hello%20world");
+        // form_urlencode uses + for spaces (matching curl's --data-urlencode)
+        assert_eq!(urlencoded("hello world"), "hello+world");
     }
 
     #[test]
     fn urlencoded_with_name() {
-        assert_eq!(urlencoded("key=hello world"), "key=hello%20world");
+        assert_eq!(urlencoded("key=hello world"), "key=hello+world");
     }
 
     #[test]
     fn urlencoded_special_chars() {
         // Input has '=' so it splits: name="a&b", value="c" → "a&b=c"
         assert_eq!(urlencoded("a&b=c"), "a&b=c");
-        // Without '=', the whole string is encoded
+        // Without '=', the whole string is encoded (lowercase hex)
         assert_eq!(urlencoded("a&b"), "a%26b");
     }
 
@@ -5396,7 +5455,7 @@ mod tests {
             "http://example.com",
             &["a=1".to_string(), "b=hello world".to_string()],
         );
-        assert!(result.starts_with("http://example.com?a=1&b=hello%20world"));
+        assert!(result.starts_with("http://example.com?a=1&b=hello+world"));
     }
 
     #[test]
