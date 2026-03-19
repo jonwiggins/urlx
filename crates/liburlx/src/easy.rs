@@ -4403,6 +4403,150 @@ async fn perform_transfer(
                                         .await?;
                                     }
                                 }
+                                Some(ProxyAuthMethod::Basic) => {
+                                    // Proxy selected Basic auth: retry with
+                                    // Proxy-Authorization: Basic base64(user:pass)
+                                    // Store cookies from the 407 response first so
+                                    // they are available for the retry (test 1331).
+                                    if let Some(ref mut jar) = cookie_jar {
+                                        let cookie_host = headers
+                                            .iter()
+                                            .find(|(k, _)| k.eq_ignore_ascii_case("host"))
+                                            .map_or_else(
+                                                || current_url.host_str().unwrap_or(""),
+                                                |(_, v)| v.split(':').next().unwrap_or(v),
+                                            );
+                                        let cpath = current_url.path();
+                                        let is_secure = current_url.scheme() == "https"
+                                            || cookie_host.eq_ignore_ascii_case("localhost");
+                                        jar.store_from_headers(
+                                            response.headers(),
+                                            cookie_host,
+                                            cpath,
+                                            is_secure,
+                                        );
+                                    }
+                                    let encoded = {
+                                        use base64::Engine;
+                                        base64::engine::general_purpose::STANDARD.encode(format!(
+                                            "{}:{}",
+                                            pcreds.username, pcreds.password
+                                        ))
+                                    };
+                                    let basic_value = format!("Basic {encoded}");
+                                    redirect_chain.push(response.clone());
+                                    let mut basic_headers = request_headers.clone();
+                                    basic_headers.retain(|(k, _)| {
+                                        !k.eq_ignore_ascii_case("proxy-authorization")
+                                    });
+                                    saved_proxy_auth = Some((
+                                        "Proxy-Authorization".to_string(),
+                                        basic_value.clone(),
+                                    ));
+                                    basic_headers
+                                        .push(("Proxy-Authorization".to_string(), basic_value));
+                                    // Add cookies from the jar (including those just
+                                    // stored from the 407 response) to the retry headers.
+                                    if let Some(ref jar) = cookie_jar {
+                                        let cookie_host = basic_headers
+                                            .iter()
+                                            .find(|(k, _)| k.eq_ignore_ascii_case("host"))
+                                            .map_or_else(
+                                                || current_url.host_str().unwrap_or(""),
+                                                |(_, v)| v.split(':').next().unwrap_or(v.as_str()),
+                                            );
+                                        let cpath = current_url.path();
+                                        let is_sec = current_url.scheme() == "https"
+                                            || cookie_host.eq_ignore_ascii_case("localhost");
+                                        if let Some(cookie_hdr) =
+                                            jar.cookie_header(cookie_host, cpath, is_sec)
+                                        {
+                                            if let Some(existing) = basic_headers
+                                                .iter_mut()
+                                                .find(|(k, _)| k.eq_ignore_ascii_case("cookie"))
+                                            {
+                                                existing.1 =
+                                                    format!("{}; {}", cookie_hdr, existing.1);
+                                            } else {
+                                                basic_headers
+                                                    .push(("Cookie".to_string(), cookie_hdr));
+                                            }
+                                        }
+                                    }
+                                    response = Box::pin(do_single_request(
+                                        &current_url,
+                                        &current_method,
+                                        &basic_headers,
+                                        current_body.as_deref(),
+                                        verbose,
+                                        accept_encoding,
+                                        connect_timeout,
+                                        effective_proxy,
+                                        proxy_credentials,
+                                        resolve_overrides,
+                                        tls_config,
+                                        tcp_nodelay,
+                                        tcp_keepalive,
+                                        unix_socket,
+                                        interface,
+                                        local_port,
+                                        dns_shuffle,
+                                        dns_cache,
+                                        pool,
+                                        #[cfg(feature = "http2")]
+                                        h2_pool,
+                                        http_version,
+                                        expect_100_timeout,
+                                        happy_eyeballs_timeout,
+                                        ignore_content_length,
+                                        speed_limits,
+                                        ftp_ssl_mode,
+                                        use_ssl,
+                                        ssh_key_path,
+                                        proxy_tls_config,
+                                        alt_svc_cache,
+                                        #[cfg(feature = "http2")]
+                                        h2_config,
+                                        dns_resolver,
+                                        custom_request_target,
+                                        tftp_blksize,
+                                        tftp_no_options,
+                                        #[cfg(feature = "ssh")]
+                                        ssh_host_key_policy,
+                                        mail_from,
+                                        mail_rcpt,
+                                        fresh_connect,
+                                        forbid_reuse,
+                                        ftp_config,
+                                        proxy_headers,
+                                        connect_to,
+                                        path_as_is,
+                                        #[cfg(feature = "ssh")]
+                                        ssh_public_keyfile,
+                                        #[cfg(not(feature = "ssh"))]
+                                        None,
+                                        #[cfg(feature = "ssh")]
+                                        ssh_auth_types,
+                                        #[cfg(not(feature = "ssh"))]
+                                        None,
+                                        mail_auth,
+                                        sasl_authzid,
+                                        login_options,
+                                        sasl_ir,
+                                        oauth2_bearer,
+                                        haproxy_protocol,
+                                        abstract_unix_socket,
+                                        chunked_upload,
+                                        http09_allowed,
+                                        deadline,
+                                        http_proxy_tunnel,
+                                        proxy_http_10,
+                                        raw,
+                                        ftp_session,
+                                        redirected_from_http,
+                                    ))
+                                    .await?;
+                                }
                                 _ => {}
                             }
                         }

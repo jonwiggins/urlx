@@ -607,6 +607,19 @@ impl CookieJar {
             path = path.trim_end_matches('/').to_string();
         }
 
+        // Secure cookie eviction protection (RFC 6265bis §5.4.6, curl compat: test 414).
+        // Non-secure origins cannot overwrite existing cookies that have the Secure flag.
+        // This prevents HTTP sites from evicting HTTPS-set secure cookies.
+        if !is_secure_origin {
+            let has_existing_secure = self
+                .cookies
+                .iter()
+                .any(|c| c.secure && c.name == name && domain_matches(&domain, &c.domain));
+            if has_existing_secure {
+                return;
+            }
+        }
+
         // Replace existing cookie with same name+domain+path.
         // Normalize paths by stripping trailing slashes for comparison (curl compat:
         // paths "/overwrite/" and "/overwrite" refer to the same cookie).
