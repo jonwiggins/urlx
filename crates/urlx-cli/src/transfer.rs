@@ -2094,7 +2094,10 @@ pub fn run_multi(
     for (i, url) in urls.iter().enumerate() {
         // Use per-URL Easy handle if available (from --next groups, curl compat: tests 430-432)
         if let Some(Some(per_easy)) = per_url_easy.get(i) {
-            easy = per_easy.clone();
+            let mut new_easy = per_easy.clone();
+            // Preserve FTP session for connection reuse across URLs (curl compat: tests 146, 210, 698)
+            new_easy.take_ftp_session_from(&mut easy);
+            easy = new_easy;
         }
 
         // -T upload: for HTTP, only the first URL gets PUT with the upload body;

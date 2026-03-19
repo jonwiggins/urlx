@@ -625,6 +625,15 @@ impl Easy {
         self.ftp_session = None;
     }
 
+    /// Transfer the FTP session from another Easy handle into this one.
+    ///
+    /// Used in multi-URL mode when switching between per-URL Easy handles
+    /// (e.g., `--next` groups) to preserve FTP connection reuse. The session
+    /// is moved, leaving the source handle with no session.
+    pub fn take_ftp_session_from(&mut self, other: &mut Self) {
+        self.ftp_session = other.ftp_session.take();
+    }
+
     /// Set the URL to transfer.
     ///
     /// # Errors
