@@ -2898,6 +2898,21 @@ async fn perform_transfer(
 
         // Handle 401: Digest, NTLM, and AnyAuth challenge-response flows.
         if response.status() == 401 {
+            // Downgrade HTTP version if server responded with HTTP/1.0 (test 1071)
+            #[allow(clippy::shadow_unrelated)]
+            let http_version = if response.http_version()
+                == crate::protocol::http::response::ResponseHttpVersion::Http10
+            {
+                HttpVersion::Http10
+            } else {
+                http_version
+            };
+            // HTTP/1.0 + chunked upload = incompatible, fail (test 1072)
+            if http_version == HttpVersion::Http10 && chunked_upload {
+                return Err(Error::Http(
+                    "upload failed: HTTP/1.0 does not support chunked encoding".to_string(),
+                ));
+            }
             if let Some(auth) = auth_credentials {
                 // Determine which auth method to use for this 401
                 let effective_method = if auth.method == AuthMethod::AnyAuth {
