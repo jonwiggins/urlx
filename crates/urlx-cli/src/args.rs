@@ -3098,6 +3098,7 @@ fn warn_filename_like_flag(val: &str) {
 ///
 /// Protocol list format matches curl: comma-separated protocol names,
 /// optionally prefixed with `=` for exact set (e.g., `=http,https`).
+#[allow(dead_code)]
 pub fn is_protocol_allowed(url: &str, proto_list: &str) -> bool {
     let scheme = url.split("://").next().unwrap_or("").to_lowercase();
     if scheme.is_empty() {
@@ -3141,13 +3142,23 @@ pub fn parse_proto_spec(spec: &str) -> Vec<String> {
             continue;
         }
         if let Some(proto) = part.strip_prefix('+') {
-            let proto = proto.to_lowercase();
-            if !allowed.contains(&proto) {
-                allowed.push(proto);
+            if proto.eq_ignore_ascii_case("all") {
+                // +all means add all protocols
+                allowed = all_protocols.iter().map(|s| s.to_string()).collect();
+            } else {
+                let proto = proto.to_lowercase();
+                if !allowed.contains(&proto) {
+                    allowed.push(proto);
+                }
             }
         } else if let Some(proto) = part.strip_prefix('-') {
-            let proto = proto.to_lowercase();
-            allowed.retain(|p| p != &proto);
+            if proto.eq_ignore_ascii_case("all") {
+                // -all means remove all protocols
+                allowed.clear();
+            } else {
+                let proto = proto.to_lowercase();
+                allowed.retain(|p| p != &proto);
+            }
         } else if part.eq_ignore_ascii_case("all") {
             allowed = all_protocols.iter().map(|s| s.to_string()).collect();
         } else {

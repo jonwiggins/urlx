@@ -6,8 +6,8 @@
 use std::process::ExitCode;
 
 use crate::args::{
-    is_protocol_allowed, parse_args, parse_proto_spec, percent_encode, print_usage, print_version,
-    CliOptions, ParseResult,
+    parse_args, parse_proto_spec, percent_encode, print_usage, print_version, CliOptions,
+    ParseResult,
 };
 use crate::output::{
     content_disposition_filename, format_headers, format_write_out, http_status_text,
@@ -300,8 +300,8 @@ pub fn extract_hostname(url: &str) -> String {
 #[allow(clippy::option_if_let_else)]
 fn extract_url_username(url: &str) -> Option<String> {
     let without_scheme = url.find("://").map_or(url, |pos| &url[pos + 3..]);
-    // Only look for @ in the authority part (before first / or ?)
-    let authority_end = without_scheme.find(['/', '?']).unwrap_or(without_scheme.len());
+    // Only look for @ in the authority part (before first /, ?, or #)
+    let authority_end = without_scheme.find(['/', '?', '#']).unwrap_or(without_scheme.len());
     let authority = &without_scheme[..authority_end];
     if let Some(at_pos) = authority.rfind('@') {
         let userinfo = &authority[..at_pos];
@@ -324,8 +324,8 @@ fn extract_url_username(url: &str) -> Option<String> {
 #[allow(clippy::option_if_let_else)]
 fn extract_url_username_raw(url: &str) -> Option<String> {
     let without_scheme = url.find("://").map_or(url, |pos| &url[pos + 3..]);
-    // Only look for @ in the authority part (before first / or ?)
-    let authority_end = without_scheme.find(['/', '?']).unwrap_or(without_scheme.len());
+    // Only look for @ in the authority part (before first /, ?, or #)
+    let authority_end = without_scheme.find(['/', '?', '#']).unwrap_or(without_scheme.len());
     let authority = &without_scheme[..authority_end];
     if let Some(at_pos) = authority.rfind('@') {
         let userinfo = &authority[..at_pos];
@@ -342,8 +342,8 @@ fn extract_url_username_raw(url: &str) -> Option<String> {
 #[allow(clippy::option_if_let_else)]
 fn extract_url_password(url: &str) -> Option<String> {
     let without_scheme = url.find("://").map_or(url, |pos| &url[pos + 3..]);
-    // Only look for @ in the authority part (before first / or ?)
-    let authority_end = without_scheme.find(['/', '?']).unwrap_or(without_scheme.len());
+    // Only look for @ in the authority part (before first /, ?, or #)
+    let authority_end = without_scheme.find(['/', '?', '#']).unwrap_or(without_scheme.len());
     let authority = &without_scheme[..authority_end];
     if let Some(at_pos) = authority.rfind('@') {
         let userinfo = &authority[..at_pos];
@@ -362,8 +362,8 @@ fn extract_url_password(url: &str) -> Option<String> {
 fn strip_url_credentials(url: &str) -> String {
     let scheme_end = url.find("://").map_or(0, |p| p + 3);
     let rest = &url[scheme_end..];
-    // Only look for @ in the authority part (before first / or ?)
-    let authority_end = rest.find(['/', '?']).unwrap_or(rest.len());
+    // Only look for @ in the authority part (before first /, ?, or #)
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let authority = &rest[..authority_end];
     if let Some(at_pos) = authority.find('@') {
         format!("{}{}", &url[..scheme_end], &rest[at_pos + 1..])
@@ -737,13 +737,18 @@ pub fn run(args: &[String]) -> ExitCode {
             url
         };
 
-        // --proto: validate URL scheme against allowed protocols
+        // --proto: validate URL scheme against allowed protocols.
+        // Use parse_proto_spec to properly interpret +all/-proto syntax.
         if let Some(ref proto_list) = opts.proto {
-            if !is_protocol_allowed(&url, proto_list) {
+            let allowed = parse_proto_spec(proto_list);
+            let scheme = url.split("://").next().unwrap_or("").to_lowercase();
+            if !scheme.is_empty() && !allowed.iter().any(|p| p == &scheme) {
                 if !opts.silent || opts.show_error {
-                    eprintln!("curl: protocol not allowed by --proto");
+                    eprintln!(
+                        "curl: (1) Protocol \"{scheme}\" not supported or disabled in libcurl"
+                    );
                 }
-                return ExitCode::FAILURE;
+                return ExitCode::from(1);
             }
         }
 
@@ -1207,6 +1212,15 @@ pub fn run(args: &[String]) -> ExitCode {
         let scheme = opts.easy.url_ref().map(|u| u.scheme().to_lowercase()).unwrap_or_default();
         if matches!(scheme.as_str(), "smtp" | "smtps" | "imap" | "imaps" | "pop3" | "pop3s") {
             opts.easy.custom_request_target(custom_req);
+        }
+    }
+
+    // --proto: pass allowed protocols to library for redirect checking too.
+    // curl's --proto restricts both initial requests AND redirect targets (test 1245).
+    if let Some(ref proto) = opts.proto {
+        let allowed = parse_proto_spec(proto);
+        if !allowed.is_empty() {
+            opts.easy.set_protocols_str(&allowed.join(","));
         }
     }
 

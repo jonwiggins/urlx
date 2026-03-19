@@ -90,6 +90,7 @@ const MAX_GLOB_PATTERNS: usize = 100;
 /// # Errors
 ///
 /// Returns an error if the glob pattern is malformed or exceeds the pattern limit.
+#[allow(clippy::too_many_lines)]
 fn parse_glob(pattern: &str) -> Result<Vec<Segment>, Error> {
     let mut segments = Vec::new();
     let mut chars = pattern.chars().peekable();
@@ -140,25 +141,80 @@ fn parse_glob(pattern: &str) -> Result<Vec<Segment>, Error> {
                 segments.push(set);
             }
             '[' => {
-                glob_count += 1;
-                if glob_count > MAX_GLOB_PATTERNS {
-                    let display_pos = pos + 1;
-                    let truncated: String = pattern.chars().take(pos + 2).collect();
-                    return Err(Error::UrlGlob {
-                        message: format!("too many [] sets in URL position {display_pos}:"),
-                        url: truncated,
-                        position: pos,
-                    });
+                // Peek ahead to decide how to handle the bracket:
+                // 1. Empty brackets `[]` → literal (curl compat: test 1290)
+                // 2. IPv6 address `[::1]` or `[::1%25scope]` → literal (test 1056)
+                // 3. Otherwise → glob range pattern
+                //
+                // IPv6 detection: scan to closing `]` and check if content looks
+                // like an IPv6 address (contains multiple colons, or starts with
+                // a colon, or contains `%` for scope IDs). A glob range never has
+                // colons before the step separator, so any `:` before a `-` range
+                // dash indicates IPv6.
+                #[allow(clippy::unused_peekable)]
+                let treat_as_literal = {
+                    let mut scan = chars.clone();
+                    let _ = scan.next(); // skip '['
+                    let mut bracket_content = String::new();
+                    let mut found_close = false;
+                    for c in scan {
+                        if c == ']' {
+                            found_close = true;
+                            break;
+                        }
+                        bracket_content.push(c);
+                    }
+                    if !found_close {
+                        false // unclosed bracket — let normal parser handle the error
+                    } else if bracket_content.is_empty() {
+                        true // empty brackets `[]`
+                    } else {
+                        // IPv6 heuristic: starts with `:` or hex digit followed
+                        // by `:`, or contains `%` (scope ID separator).
+                        // A valid glob range looks like `N-M` or `N-M:S` — never
+                        // starts with `:` and has at most one `:` (the step sep).
+                        let colon_count = bracket_content.chars().filter(|&c| c == ':').count();
+                        bracket_content.starts_with(':')
+                            || colon_count >= 2
+                            || bracket_content.contains('%')
+                    }
+                };
+
+                if treat_as_literal {
+                    // Consume everything from '[' to ']' as literal text
+                    literal.push('[');
+                    let _ = chars.next(); // consume '['
+                    pos += 1;
+                    // Consume up to and including ']'
+                    while let Some(&c) = chars.peek() {
+                        literal.push(c);
+                        let _ = chars.next();
+                        pos += c.len_utf8();
+                        if c == ']' {
+                            break;
+                        }
+                    }
+                } else {
+                    glob_count += 1;
+                    if glob_count > MAX_GLOB_PATTERNS {
+                        let display_pos = pos + 1;
+                        let truncated: String = pattern.chars().take(pos + 2).collect();
+                        return Err(Error::UrlGlob {
+                            message: format!("too many [] sets in URL position {display_pos}:"),
+                            url: truncated,
+                            position: pos,
+                        });
+                    }
+                    if !literal.is_empty() {
+                        segments.push(Segment::Literal(std::mem::take(&mut literal)));
+                    }
+                    let open_pos = pos;
+                    let _ = chars.next(); // consume '['
+                    pos += 1;
+                    let (range, consumed) = parse_range_with_len(&mut chars, pattern, open_pos)?;
+                    pos += consumed;
+                    segments.push(range);
                 }
-                if !literal.is_empty() {
-                    segments.push(Segment::Literal(std::mem::take(&mut literal)));
-                }
-                let open_pos = pos;
-                let _ = chars.next(); // consume '['
-                pos += 1;
-                let (range, consumed) = parse_range_with_len(&mut chars, pattern, open_pos)?;
-                pos += consumed;
-                segments.push(range);
             }
             _ => {
                 literal.push(ch);
