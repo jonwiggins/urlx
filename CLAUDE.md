@@ -121,17 +121,16 @@ Full test suite run: 878 pass / 385 fail / 130 skip (tests 1-1400, 30s timeout).
 |---|-----|--------|--------|---------|
 | 1 | **HTTP proxy CONNECT + NTLM proxy auth** | ~40 | 3-4 days | NTLM Type 1 repeated instead of Type 3; body sent during auth negotiation; CONNECT tunnel not reused; Digest proxy auth broken |
 | 2 | **SMTP QUIT + advanced auth + MIME** | ~30 | 2 days | Missing QUIT after some auth paths; need CRAM-MD5/NTLM/XOAUTH2; VRFY/EXPN commands; multipart MIME upload; long lines truncated |
-| 3 | **FTP connection reuse** | ~15 | 1-2 days | QUIT+reconnect instead of CWD / to reset; affects all multi-URL FTP tests (146, 149, 210-216, 407, 698, 1010+) |
-| 4 | **Cookie/HSTS fixes** | ~20 | 1-2 days | -b file vs string detection; cookie count 151→150; 8KB header cap; Max-Age=0; secure cookies; HSTS trailing dots |
-| 5 | **--write-out variables** | ~14 | 1 day | Missing %{certs}, %{header_json}, %{url.*} variables |
-| 6 | **Auth credential stripping on redirect** | ~13 | 1 day | Authorization/Cookie header leaks cross-host; --oauth2-bearer not stripped |
-| 7 | **Content/chunked encoding** | ~15 | 1-2 days | --raw chunked passthrough; broken deflate; trailer headers; --max-filesize with chunked; JSON Unicode |
-| 8 | **Expect: 100-continue** | ~10 | 1 day | Body sent before 100 response; Content-Length wrong when body suppressed |
-| 9 | **FTP misc** | ~20 | 1-2 days | URL encoding in paths (%0a, %0d); NLST; active PORT quirks; --ftp-method nocwd; quote commands |
-| 10 | **--next + --expand-data + URL encoding** | ~16 | 1-2 days | Headers leak between --next requests; {{var:func}} not expanded; { } escaping |
-| 11 | **SOCKS proxy** | ~10 | 1 day | SOCKS5 auth; SOCKS4 long usernames; hostname-mode; --connect-to with SOCKS |
-| 12 | **HTTP resume (GET)** | ~5 | 0.5 day | Resume from end of file, beyond end, with --fail |
-| 13 | **Misc CLI** | ~30 | 2-3 days | Header line folding; TE header; -K config file bugs; flag-like filename warnings; --no-remote-name; various small fixes |
+| 3 | **Cookie/HSTS fixes** | ~20 | 1-2 days | -b file vs string detection; cookie count 151→150; 8KB header cap; Max-Age=0; secure cookies; HSTS trailing dots |
+| 4 | **--write-out variables** | ~14 | 1 day | Missing %{certs}, %{header_json}, %{url.*} variables |
+| 5 | **Auth credential stripping on redirect** | ~13 | 1 day | Authorization/Cookie header leaks cross-host; --oauth2-bearer not stripped |
+| 6 | **Content/chunked encoding** | ~15 | 1-2 days | --raw chunked passthrough; broken deflate; trailer headers; --max-filesize with chunked; JSON Unicode |
+| 7 | **Expect: 100-continue** | ~10 | 1 day | Body sent before 100 response; Content-Length wrong when body suppressed |
+| 8 | **FTP misc** | ~20 | 1-2 days | URL encoding in paths (%0a, %0d); NLST; active PORT quirks; --ftp-method nocwd; quote commands |
+| 9 | **--next + --expand-data + URL encoding** | ~16 | 1-2 days | Headers leak between --next requests; {{var:func}} not expanded; { } escaping |
+| 10 | **SOCKS proxy** | ~10 | 1 day | SOCKS5 auth; SOCKS4 long usernames; hostname-mode; --connect-to with SOCKS |
+| 11 | **HTTP resume (GET)** | ~5 | 0.5 day | Resume from end of file, beyond end, with --fail |
+| 12 | **Misc CLI** | ~30 | 2-3 days | Header line folding; TE header; -K config file bugs; flag-like filename warnings; --no-remote-name; various small fixes |
 
 ### New Features Needed
 
@@ -179,13 +178,16 @@ All 31 tests pass. Complete FTP protocol rewrite: USER/PASS/PWD/CWD/EPSV/TYPE/LI
 62/149 pass (additional tests beyond previously passing). Fixed: file:// read/write/resume, decompression preserving raw_headers, null byte detection, chunked premature close, bare-LF chunked, --json @file, --etag-save/compare, --dump-header validation, --max-filesize Content-Length, --fail-with-body interaction, URL credential extraction for HTTP.
 
 ### HTTP-6 / NETRC / MISC (tests 550-700) — PARTIAL
-14/63 pass (tests 500-550 are all libtests/skipped). Fixed: chunked transfer with mixed \r\n/\n line endings, netrc quoted password parsing with escape sequences, --remote-name-all/--no-remote-name, --next exit code, -O trailing slash defaults to "curl_response", --output-dir with -O, --create-dirs for --etag-save, SOCKS4 proxy Connection header, redirect query string space encoding via proxy, multipart Content-Type boundary merging, FTP 332 ACCT response, URL credentials in multi-URL mode. Remaining: FTP connection reuse (698).
+14/63 pass (tests 500-550 are all libtests/skipped). Fixed: chunked transfer with mixed \r\n/\n line endings, netrc quoted password parsing with escape sequences, --remote-name-all/--no-remote-name, --next exit code, -O trailing slash defaults to "curl_response", --output-dir with -O, --create-dirs for --etag-save, SOCKS4 proxy Connection header, redirect query string space encoding via proxy, multipart Content-Type boundary merging, FTP 332 ACCT response, URL credentials in multi-URL mode.
 
 ### SFTP / SCP (tests 600-665) — PARTIAL
 20/45 pass. Enabled ssh feature, patched sshserver.pl for Ed25519 keys + russh-compatible KexAlgorithms. Fixed: SFTP/SCP download/upload, file creation, error code mapping (78 for file-not-found, 67 for login-denied). Remaining: SFTP quote commands (-Q), multi-URL SSH reuse, byte ranges, --ftp-create-dirs for SFTP, host key verification edge cases.
 
 ### HTTP-7 / Content-Length / Redirect (tests 700-800) — PARTIAL
 22/48 pass. Fixed: Content-Length validation (trailing chars, comma-separated, conflicting duplicates), duplicate Location headers, --follow flag, 302/308 redirect method conversion, NETRC env var, -f header output, --variable flag with byte ranges.
+
+### FTP Connection Reuse (tests 146, 149, 210-212, 215-216, 407, 698, 1010, 1096, 1149) — COMPLETE
+All 12 tests pass. FTP control connection reused across multi-URL transfers: CWD / to reset between different directories, skip CWD when same directory, EPSV/PASV/PORT fallback persisted, TYPE command cached, QUIT only sent at end. Session stored in Easy handle and transferred across --next boundaries.
 
 ### --variable (tests 784-791) — COMPLETE
 All 7 tests pass. Implemented --variable and --expand-data flags with file loading, stdin, byte ranges, and {{variable}} expansion.
