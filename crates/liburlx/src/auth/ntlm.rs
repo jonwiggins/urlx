@@ -123,19 +123,30 @@ pub fn parse_type2_message(base64_msg: &str) -> Result<NtlmChallenge, Error> {
     Ok(NtlmChallenge { server_challenge, flags, target_info })
 }
 
+/// Maximum buffer size for NTLM Type 3 messages, matching curl's `NTLM_BUFSIZE`.
+const NTLM_BUFSIZE: usize = 1024;
+
+/// Size of the NTLM Type 3 message header (signature + type + 6 field descriptors + flags).
+const NTLM_TYPE3_HEADER_SIZE: usize = 64;
+
 /// Generate an NTLM Type 3 (Authenticate) message using `NTLMv1`.
 ///
 /// Uses `NTLMv1` (24-byte LM and NT responses) with OEM encoding,
 /// matching curl's NTLM implementation. Includes the `WORKSTATION` hostname.
 ///
-/// Returns the base64-encoded message.
-#[must_use]
+/// Returns the base64-encoded message, or an error if the credentials are
+/// too large (matching curl's `CURLE_TOO_LARGE` = 100 behavior).
+///
+/// # Errors
+///
+/// Returns [`Error::Transfer`] with code 100 if the combined size of domain,
+/// username, and workstation fields would exceed the NTLM buffer limit.
 pub fn create_type3_message(
     challenge: &NtlmChallenge,
     username: &str,
     password: &str,
     domain: &str,
-) -> String {
+) -> Result<String, Error> {
     use base64::Engine as _;
 
     let nt_hash = compute_nt_hash(password);
@@ -149,6 +160,22 @@ pub fn create_type3_message(
     let domain_bytes = domain.as_bytes().to_vec();
     let username_bytes = username.as_bytes().to_vec();
     let workstation_bytes = WORKSTATION.as_bytes().to_vec();
+
+    // Check total message size against NTLM buffer limit (curl compat: test 775).
+    // curl uses a fixed 1024-byte buffer for Type 3 messages and returns
+    // CURLE_TOO_LARGE (100) if domain + username + hostname exceed available space.
+    let payload_size = NTLM_TYPE3_HEADER_SIZE
+        + lm_response.len()
+        + nt_response.len()
+        + domain_bytes.len()
+        + username_bytes.len()
+        + workstation_bytes.len();
+    if payload_size >= NTLM_BUFSIZE {
+        return Err(Error::Transfer {
+            code: 100,
+            message: "user + domain + hostname too big for NTLM".to_string(),
+        });
+    }
 
     // Calculate offsets — Type 3 header is 64 bytes:
     // 8 (sig) + 4 (type) + 6*8 (fields) + 4 (flags) = 64
@@ -214,7 +241,7 @@ pub fn create_type3_message(
     msg.extend_from_slice(&username_bytes);
     msg.extend_from_slice(&workstation_bytes);
 
-    base64::engine::general_purpose::STANDARD.encode(&msg)
+    Ok(base64::engine::general_purpose::STANDARD.encode(&msg))
 }
 
 /// Compute the NT hash: `MD4(UTF-16LE(password))`.
@@ -420,7 +447,7 @@ mod tests {
             target_info: None,
         };
 
-        let msg = create_type3_message(&challenge, "user", "password", "DOMAIN");
+        let msg = create_type3_message(&challenge, "user", "password", "DOMAIN").unwrap();
         let data = base64::engine::general_purpose::STANDARD.decode(&msg).unwrap();
 
         // Verify signature
@@ -451,7 +478,7 @@ mod tests {
             target_info: None,
         };
 
-        let msg = create_type3_message(&challenge, "testuser", "testpass", "");
+        let msg = create_type3_message(&challenge, "testuser", "testpass", "").unwrap();
         let data = base64::engine::general_purpose::STANDARD.decode(&msg).unwrap();
 
         // Username should be OEM (ASCII), not UTF-16LE
@@ -480,7 +507,7 @@ mod tests {
         let type2_b64 = "TlRMTVNTUAACAAAAAgACADAAAACGggEAc51AYVDgyNcAAAAAAAAAAG4AbgAyAAAAQ0MCAAQAQwBDAAEAEgBFAEwASQBTAEEAQgBFAFQASAAEABgAYwBjAC4AaQBjAGUAZABlAHYALgBuAHUAAwAsAGUAbABpAHMAYQBiAGUAdABoAC4AYwBjAC4AaQBjAGUAZABlAHYALgBuAHUAAAAAAA==";
         let challenge = parse_type2_message(type2_b64).unwrap();
 
-        let msg = create_type3_message(&challenge, "testuser", "testpass", "");
+        let msg = create_type3_message(&challenge, "testuser", "testpass", "").unwrap();
         let actual = base64::engine::general_purpose::STANDARD.decode(&msg).unwrap();
 
         // Verify structural match (LM/NT responses will differ due to DES determinism,
@@ -525,7 +552,7 @@ mod tests {
         let type2_b64 = "TlRMTVNTUAACAAAAAgACADAAAACGggEAc51AYVDgyNcAAAAAAAAAAG4AbgAyAAAAQ0MCAAQAQwBDAAEAEgBFAEwASQBTAEEAQgBFAFQASAAEABgAYwBjAC4AaQBjAGUAZABlAHYALgBuAHUAAwAsAGUAbABpAHMAYQBiAGUAdABoAC4AYwBjAC4AaQBjAGUAZABlAHYALgBuAHUAAAAAAA==";
         let challenge = parse_type2_message(type2_b64).unwrap();
 
-        let msg = create_type3_message(&challenge, "myself", "secret", "mydomain");
+        let msg = create_type3_message(&challenge, "myself", "secret", "mydomain").unwrap();
         let actual = base64::engine::general_purpose::STANDARD.decode(&msg).unwrap();
 
         assert_eq!(actual.len(), expected.len(), "Type3 length must match for test 91");
@@ -540,8 +567,8 @@ mod tests {
             target_info: None,
         };
 
-        let msg1 = create_type3_message(&challenge, "user1", "pass", "DOM");
-        let msg2 = create_type3_message(&challenge, "user2", "pass", "DOM");
+        let msg1 = create_type3_message(&challenge, "user1", "pass", "DOM").unwrap();
+        let msg2 = create_type3_message(&challenge, "user2", "pass", "DOM").unwrap();
         assert_ne!(msg1, msg2);
     }
 
@@ -606,12 +633,27 @@ mod tests {
         };
 
         // Step 3: Create Type 3 with credentials
-        let type3 = create_type3_message(&challenge, "admin", "secret", "WORKGROUP");
+        let type3 = create_type3_message(&challenge, "admin", "secret", "WORKGROUP").unwrap();
         let type3_data = base64::engine::general_purpose::STANDARD.decode(&type3).unwrap();
         assert_eq!(
             u32::from_le_bytes([type3_data[8], type3_data[9], type3_data[10], type3_data[11]]),
             AUTHENTICATE_MESSAGE
         );
+    }
+
+    #[test]
+    fn type3_too_long_username_returns_error() {
+        // curl test 775: username longer than ~900 chars exceeds NTLM_BUFSIZE (1024)
+        let challenge = NtlmChallenge {
+            server_challenge: [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08],
+            flags: NTLMSSP_NEGOTIATE_NTLM | NTLMSSP_NEGOTIATE_OEM,
+            target_info: None,
+        };
+
+        // testuser + 1100 * 'A' = 1108 chars — exceeds 1024 buffer
+        let long_user = format!("testuser{}", "A".repeat(1100));
+        let result = create_type3_message(&challenge, &long_user, "testpass", "");
+        assert!(result.is_err(), "Too-long username must return an error");
     }
 
     #[test]

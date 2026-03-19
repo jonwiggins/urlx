@@ -944,22 +944,31 @@ pub fn run(args: &[String]) -> ExitCode {
                 || url.starts_with("pop3://")
                 || url.starts_with("pop3s://")
             {
-                // Reject credentials with characters that break URL parsing
-                // (curl compat: test 896 — `"` and `{` in credentials)
-                let has_bad_char = |s: &str| s.contains('"') || s.contains('{') || s.contains('}');
-                if has_bad_char(user) || has_bad_char(pass) {
-                    if !opts.silent || opts.show_error {
-                        eprintln!("curl: (3) URL using bad/illegal format or missing URL");
+                // Percent-encode special chars in credentials for URL embedding
+                // (curl compat: test 895/896 — `"`, `{`, `}` in credentials)
+                let encode_userinfo = |s: &str| -> String {
+                    let mut out = String::with_capacity(s.len());
+                    for c in s.chars() {
+                        match c {
+                            '"' => out.push_str("%22"),
+                            '{' => out.push_str("%7B"),
+                            '}' => out.push_str("%7D"),
+                            '@' => out.push_str("%40"),
+                            ':' => out.push_str("%3A"),
+                            _ => out.push(c),
+                        }
                     }
-                    return ExitCode::from(3);
-                }
+                    out
+                };
+                let encoded_user = encode_userinfo(user);
+                let encoded_pass = encode_userinfo(pass);
                 let base_url = strip_url_credentials(&url);
                 let scheme_end = base_url.find("://").map_or(0, |p| p + 3);
                 let new_url = format!(
                     "{}{}:{}@{}",
                     &base_url[..scheme_end],
-                    user,
-                    pass,
+                    encoded_user,
+                    encoded_pass,
                     &base_url[scheme_end..]
                 );
                 if let Err(e) = opts.easy.url(&new_url) {
