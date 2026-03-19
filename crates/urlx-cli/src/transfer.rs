@@ -643,6 +643,37 @@ pub fn run(args: &[String]) -> ExitCode {
                 }
             }
         }
+        // Apply Content-Range + body slicing for resumed uploads in multi-URL mode
+        // (curl compat: test 1002 — -T file -C 2 with multiple URLs)
+        if opts.is_upload {
+            if let Some(offset) = opts.resume_offset {
+                if offset > 0 {
+                    let is_ftp_upload = opts
+                        .urls
+                        .first()
+                        .is_some_and(|u| u.starts_with("ftp://") || u.starts_with("ftps://"));
+                    if !is_ftp_upload {
+                        if let Some(body_data) = opts.easy.take_body() {
+                            let total = body_data.len() as u64;
+                            let end = total.saturating_sub(1);
+                            if offset <= end {
+                                #[allow(clippy::cast_possible_truncation)]
+                                let start = offset as usize;
+                                let sliced = &body_data[start..];
+                                opts.easy.header(
+                                    "Content-Range",
+                                    &format!("bytes {offset}-{end}/{total}"),
+                                );
+                                opts.easy.body(sliced);
+                            } else {
+                                opts.easy.body(&[]);
+                            }
+                        }
+                        opts.easy.clear_range();
+                    }
+                }
+            }
+        }
     }
 
     // Refresh per_url_easy entries to pick up modifications made in run() after
@@ -714,6 +745,7 @@ pub fn run(args: &[String]) -> ExitCode {
             &opts.per_url_easy,
             &opts.per_url_upload_files,
             &opts.per_url_group,
+            opts.resume_offset,
         );
     }
 
@@ -2148,6 +2180,7 @@ pub fn run_multi(
     per_url_easy: &[Option<liburlx::Easy>],
     per_url_upload_files: &[Option<String>],
     per_url_group: &[usize],
+    resume_offset: Option<u64>,
 ) -> ExitCode {
     if parallel {
         return run_multi_parallel(
@@ -2254,11 +2287,38 @@ pub fn run_multi(
         if is_upload && i > 0 && !is_ftp_url {
             let has_own_upload = per_url_upload_files.get(i).is_some_and(|f| f.is_some());
             if has_own_upload {
-                // This URL has its own -T flag: re-read the file and PUT
+                // This URL has its own -T flag: re-read the file
                 if let Some(Some(ref path)) = per_url_upload_files.get(i) {
                     if let Ok(data) = std::fs::read(path) {
-                        easy.body(&data);
-                        easy.method("PUT");
+                        // Apply resume offset if set (Content-Range + body slicing, curl compat: test 1002)
+                        if let Some(offset) = resume_offset {
+                            if offset > 0 {
+                                let total = data.len() as u64;
+                                let end = total.saturating_sub(1);
+                                if offset <= end {
+                                    #[allow(clippy::cast_possible_truncation)]
+                                    let start = offset as usize;
+                                    let sliced = &data[start..];
+                                    easy.remove_header("Content-Range");
+                                    easy.header(
+                                        "Content-Range",
+                                        &format!("bytes {offset}-{end}/{total}"),
+                                    );
+                                    easy.body(sliced);
+                                } else {
+                                    easy.body(&[]);
+                                }
+                            } else {
+                                easy.body(&data);
+                            }
+                        } else {
+                            easy.body(&data);
+                        }
+                        // Only default to PUT if no explicit -X method was set
+                        // (curl compat: test 1002 — -X GET overrides -T's PUT)
+                        if easy.method_is_default() {
+                            easy.method("PUT");
+                        }
                     }
                 }
             } else if easy.has_body() {

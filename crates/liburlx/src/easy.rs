@@ -5411,7 +5411,10 @@ async fn do_single_request(
     let (host, port) = url.host_and_port()?;
     let host_header = url.host_header_value();
     let is_tls = url.scheme() == "https";
-    let use_pool = proxy.is_none() && !fresh_connect;
+    // Pool direct connections and CONNECT tunnel connections (the tunnel stream
+    // acts like a direct connection after establishment). Non-tunnel proxy
+    // connections are not pooled (curl compat: tests 275, 1078).
+    let use_pool = (proxy.is_none() || http_proxy_tunnel) && !fresh_connect;
 
     // Build effective headers (add Accept-Encoding if decompression enabled)
     let mut effective_headers: Vec<(String, String)> = headers.to_vec();
@@ -5484,12 +5487,26 @@ async fn do_single_request(
 
             let request_target = resolve_request_target(custom_request_target, url, path_as_is);
             let use_http10 = http_version == HttpVersion::Http10;
+            // For reused CONNECT tunnel connections, strip proxy-related headers
+            // since proxy auth was handled by the original CONNECT (curl compat: tests 275, 1078)
+            let reuse_headers: Vec<(String, String)> = if http_proxy_tunnel {
+                effective_headers
+                    .iter()
+                    .filter(|(k, _)| {
+                        !k.eq_ignore_ascii_case("proxy-authorization")
+                            && !k.eq_ignore_ascii_case("proxy-connection")
+                    })
+                    .cloned()
+                    .collect()
+            } else {
+                effective_headers.clone()
+            };
             let result = crate::protocol::http::h1::request(
                 &mut stream,
                 method,
                 &host_header,
                 &request_target,
-                &effective_headers,
+                &reuse_headers,
                 body,
                 url.as_str(),
                 true,
@@ -5931,6 +5948,12 @@ async fn do_single_request(
                                 time_connect,
                             ));
                         }
+                        ConnectTunnelResult::NeedReconnect { .. } => {
+                            return Err(Error::Http(
+                                "proxy auth reconnection not supported for HTTPS tunnels"
+                                    .to_string(),
+                            ));
+                        }
                     };
 
                     let tls = crate::tls::TlsConnector::new(tls_config)?;
@@ -6002,6 +6025,12 @@ async fn do_single_request(
                                 url.as_str(),
                                 time_namelookup,
                                 time_connect,
+                            ));
+                        }
+                        ConnectTunnelResult::NeedReconnect { .. } => {
+                            return Err(Error::Http(
+                                "proxy auth reconnection not supported for HTTPS tunnels"
+                                    .to_string(),
                             ));
                         }
                     }
@@ -6138,6 +6167,67 @@ async fn do_single_request(
                 )
                 .await?;
 
+                let tunnel_result = match tunnel_result {
+                    ConnectTunnelResult::NeedReconnect { method, raw_407 } => {
+                        // Proxy closed connection after 407 — reconnect and retry
+                        // with pre-selected auth method (curl compat: test 1021)
+                        if verbose {
+                            #[allow(clippy::print_stderr)]
+                            {
+                                eprintln!("* Proxy connection closed, reconnecting for auth");
+                            }
+                        }
+                        let connect_addr = format!("{connect_host}:{connect_port}");
+                        let new_stream = if let Some(timeout_dur) = connect_timeout {
+                            tokio::time::timeout(
+                                timeout_dur,
+                                tokio::net::TcpStream::connect(&connect_addr),
+                            )
+                            .await
+                            .map_err(|_| Error::Timeout(timeout_dur))?
+                            .map_err(Error::Connect)?
+                        } else {
+                            tokio::net::TcpStream::connect(&connect_addr)
+                                .await
+                                .map_err(Error::Connect)?
+                        };
+                        // Set proxy credentials to the selected method for retry
+                        let retry_creds = proxy_credentials.map(|c| ProxyAuthCredentials {
+                            username: c.username.clone(),
+                            password: c.password.clone(),
+                            method,
+                            domain: c.domain.clone(),
+                        });
+                        establish_connect_tunnel(
+                            new_stream,
+                            &host,
+                            port,
+                            &effective_headers,
+                            retry_creds.as_ref(),
+                            proxy_headers,
+                            verbose,
+                            proxy_http_10,
+                        )
+                        .await
+                        .map(|r| match r {
+                            ConnectTunnelResult::Connected {
+                                stream,
+                                raw_connect: raw_retry,
+                                connect_status,
+                            } => {
+                                let mut combined = raw_407;
+                                combined.extend_from_slice(&raw_retry);
+                                ConnectTunnelResult::Connected {
+                                    stream,
+                                    raw_connect: combined,
+                                    connect_status,
+                                }
+                            }
+                            other => other,
+                        })?
+                    }
+                    other => other,
+                };
                 let (tunnel_stream, raw_connect, connect_status) = match tunnel_result {
                     ConnectTunnelResult::Connected { stream, raw_connect, connect_status } => {
                         (stream, raw_connect, connect_status)
@@ -6151,6 +6241,9 @@ async fn do_single_request(
                             time_connect,
                         ));
                     }
+                    ConnectTunnelResult::NeedReconnect { .. } => {
+                        return Err(Error::Http("proxy auth reconnection failed".to_string()));
+                    }
                 };
 
                 let request_target = resolve_request_target(custom_request_target, url, path_as_is);
@@ -6163,7 +6256,7 @@ async fn do_single_request(
                     .filter(|(k, _)| !k.eq_ignore_ascii_case("proxy-authorization"))
                     .cloned()
                     .collect();
-                let (resp, _can_reuse) = crate::protocol::http::h1::request(
+                let (resp, can_reuse) = crate::protocol::http::h1::request(
                     &mut stream,
                     method,
                     &host_header,
@@ -6171,7 +6264,7 @@ async fn do_single_request(
                     &tunnel_headers,
                     body,
                     url.as_str(),
-                    true, // Suppress Connection: close (tunneled request acts like direct)
+                    use_pool, // Allow connection reuse for tunnel (curl compat: tests 275, 1078)
                     use_http10,
                     expect_100_timeout,
                     ignore_content_length,
@@ -6183,6 +6276,12 @@ async fn do_single_request(
                 )
                 .await?;
                 let time_starttransfer = request_start.elapsed();
+
+                // Pool the tunnel stream for reuse by subsequent requests to
+                // the same target host (curl compat: tests 275, 1078)
+                if can_reuse && use_pool && !forbid_reuse {
+                    pool.put(&host, port, false, stream);
+                }
 
                 let mut resp = resp;
                 resp.set_connect_code(connect_status);
@@ -6511,6 +6610,14 @@ enum ConnectTunnelResult<S> {
         /// Raw CONNECT response bytes (for output).
         raw_response: Vec<u8>,
     },
+    /// Proxy returned 407 with Connection: close; caller must reconnect
+    /// and retry with the specified auth method (curl compat: test 1021).
+    NeedReconnect {
+        /// The auth method selected from the 407 response.
+        method: ProxyAuthMethod,
+        /// Raw 407 response bytes (for --include output).
+        raw_407: Vec<u8>,
+    },
 }
 
 /// Establish an HTTP CONNECT tunnel through a proxy.
@@ -6699,6 +6806,20 @@ where
                     // AnyAuth in CONNECT: parse Proxy-Authenticate and select method
                     if let Some(ref auth_header) = proxy_auth_header {
                         let selected = select_proxy_auth_method(auth_header);
+
+                        // Check if proxy closed the connection (curl compat: test 1021).
+                        // If so, caller must reconnect before retrying.
+                        let conn_close = find_header(&response_headers, "connection")
+                            .is_some_and(|v| v.eq_ignore_ascii_case("close"));
+                        if conn_close {
+                            if let Some(method) = selected {
+                                return Ok(ConnectTunnelResult::NeedReconnect {
+                                    method,
+                                    raw_407: raw_connect,
+                                });
+                            }
+                        }
+
                         match selected {
                             Some(ProxyAuthMethod::Ntlm) => {
                                 // Need to send Type 1 — the initial CONNECT had no auth
