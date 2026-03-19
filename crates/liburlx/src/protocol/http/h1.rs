@@ -40,9 +40,9 @@ pub(crate) fn te_compression_encoding(te: &str) -> Option<String> {
     }
 }
 
-/// Maximum response header size (100 KB, matching curl's default `CURL_MAX_HTTP_HEADER`).
-/// curl returns `CURLE_TOO_LARGE` (exit 100) when headers exceed this limit (test 1154).
-const MAX_HEADER_SIZE: usize = 100 * 1024;
+/// Maximum response header size (300 KB, matching curl's `CURL_MAX_HTTP_HEADER` = 300 * 1024).
+/// curl returns `CURLE_RECV_ERROR` (exit 56) when headers exceed this limit (test 497).
+const MAX_HEADER_SIZE: usize = 300 * 1024;
 
 /// Send an HTTP/1.x request and read the response.
 ///
@@ -131,10 +131,14 @@ where
     }
 
     // Emit custom Host header immediately (if user provided one via -H)
+    // Empty value means "suppress Host header entirely" (curl compat: test 461)
     if custom_host {
         for (i, (name, value)) in custom_headers.iter().enumerate() {
             if keep[i] && name.eq_ignore_ascii_case("host") {
-                let _ = write!(req, "{name}: {value}\r\n");
+                if !value.is_empty() {
+                    let _ = write!(req, "{name}: {value}\r\n");
+                }
+                // Empty value: intentionally suppress Host header
                 break;
             }
         }
@@ -826,7 +830,7 @@ where
 
         if buf.len() > MAX_HEADER_SIZE {
             return Err(Error::Http(format!(
-                "response headers too large: {} bytes (max {MAX_HEADER_SIZE})",
+                "Too large response headers: {} > {MAX_HEADER_SIZE}",
                 buf.len()
             )));
         }
@@ -880,7 +884,7 @@ where
 
         if buf.len() > MAX_HEADER_SIZE {
             return Err(Error::Http(format!(
-                "response headers too large: {} bytes (max {MAX_HEADER_SIZE})",
+                "Too large response headers: {} > {MAX_HEADER_SIZE}",
                 buf.len()
             )));
         }
@@ -949,7 +953,7 @@ fn parse_headers(data: &[u8]) -> Result<ParsedHeaders, Error> {
 
     if header_len > MAX_HEADER_SIZE {
         return Err(Error::Http(format!(
-            "response headers too large: {header_len} bytes (max {MAX_HEADER_SIZE})"
+            "Too large response headers: {header_len} > {MAX_HEADER_SIZE}"
         )));
     }
 
@@ -1068,7 +1072,7 @@ fn parse_headers_large(data: &[u8]) -> Result<ParsedHeaders, Error> {
 
     if header_len > MAX_HEADER_SIZE {
         return Err(Error::Http(format!(
-            "response headers too large: {header_len} bytes (max {MAX_HEADER_SIZE})"
+            "Too large response headers: {header_len} > {MAX_HEADER_SIZE}"
         )));
     }
 
@@ -1916,7 +1920,7 @@ pub fn parse_response(data: &[u8], effective_url: &str, is_head: bool) -> Result
 
     if header_len > MAX_HEADER_SIZE {
         return Err(Error::Http(format!(
-            "response headers too large: {header_len} bytes (max {MAX_HEADER_SIZE})"
+            "Too large response headers: {header_len} > {MAX_HEADER_SIZE}"
         )));
     }
 

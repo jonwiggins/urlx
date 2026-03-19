@@ -521,12 +521,15 @@ pub fn run(args: &[String]) -> ExitCode {
     if !opts.globoff {
         let mut expanded_urls = Vec::new();
         let mut expanded_values = Vec::new();
-        for url in &opts.urls {
+        let mut expanded_groups = Vec::new();
+        for (url_idx, url) in opts.urls.iter().enumerate() {
+            let group = opts.per_url_group.get(url_idx).copied().unwrap_or(0);
             match liburlx::glob::expand_glob_with_values(url) {
                 Ok(entries) => {
                     for (expanded_url, values) in entries {
                         expanded_urls.push(expanded_url);
                         expanded_values.push(values);
+                        expanded_groups.push(group);
                     }
                 }
                 Err(e) => {
@@ -539,6 +542,7 @@ pub fn run(args: &[String]) -> ExitCode {
         }
         opts.urls = expanded_urls;
         opts.glob_values = expanded_values;
+        opts.per_url_group = expanded_groups;
     }
 
     // -G/--get: move POST body data into URL query string
@@ -561,6 +565,20 @@ pub fn run(args: &[String]) -> ExitCode {
         // Remove auto-added Content-Type for form data
         opts.easy.remove_header("Content-Type");
         opts.easy.set_form_data(false);
+        opts.has_post_data = false;
+
+        // Also clear body/Content-Type from per-URL Easy handles (curl compat: test 48)
+        for per_easy in opts.per_url_easy.iter_mut().flatten() {
+            let _ = per_easy.take_body();
+            per_easy.remove_header("Content-Type");
+            per_easy.set_form_data(false);
+            // Apply the same method logic
+            let m = per_easy.method_str().map(String::from);
+            match m.as_deref() {
+                None | Some("POST") => per_easy.method("GET"),
+                _ => {}
+            }
+        }
     }
 
     // -z/--time-cond: set If-Modified-Since or If-Unmodified-Since header.
@@ -695,6 +713,7 @@ pub fn run(args: &[String]) -> ExitCode {
             opts.upload_filename.as_deref(),
             &opts.per_url_easy,
             &opts.per_url_upload_files,
+            &opts.per_url_group,
         );
     }
 
@@ -1831,8 +1850,8 @@ pub fn error_to_curl_code(err: &liburlx::Error) -> u8 {
             }
         }
         liburlx::Error::Http(msg) => {
-            if msg.contains("headers too large") {
-                100 // CURLE_TOO_LARGE (response headers exceeded max size)
+            if msg.contains("Too large response headers") || msg.contains("headers too large") {
+                56 // CURLE_RECV_ERROR (response headers exceeded max size, curl compat: test 497)
             } else if msg.contains("Weird server reply") || msg.contains("binary zero") {
                 8 // CURLE_WEIRD_SERVER_REPLY
             } else if msg.contains("range not satisfiable") || msg.contains("Range not satisfiable")
@@ -2078,6 +2097,7 @@ pub fn run_multi(
     upload_filename: Option<&str>,
     per_url_easy: &[Option<liburlx::Easy>],
     per_url_upload_files: &[Option<String>],
+    per_url_group: &[usize],
 ) -> ExitCode {
     if parallel {
         return run_multi_parallel(
@@ -2144,17 +2164,27 @@ pub fn run_multi(
         }
     }
 
+    // Track current --next group to detect group transitions.
+    // Only replace the Easy handle when crossing a --next boundary,
+    // preserving connection pool for URLs within the same group (curl compat: test 48).
+    let mut current_group: Option<usize> = None;
+
     for (i, url) in urls.iter().enumerate() {
         // Use per-URL Easy handle if available (from --next groups, curl compat: tests 430-432)
-        if let Some(Some(per_easy)) = per_url_easy.get(i) {
-            let mut new_easy = per_easy.clone();
-            // Preserve FTP session for connection reuse across URLs (curl compat: tests 146, 210, 698)
-            new_easy.take_ftp_session_from(&mut easy);
-            // Transfer accumulated cookie jar and HSTS cache from the previous
-            // Easy handle so cookies persist across sequential URLs (curl compat:
-            // tests 327, 329, 331, 392, 1218, 1228, 1258).
-            new_easy.transfer_state_from(&mut easy);
-            easy = new_easy;
+        // Only switch Easy handle when entering a new --next group.
+        let this_group = per_url_group.get(i).copied().unwrap_or(0);
+        if current_group != Some(this_group) {
+            if let Some(Some(per_easy)) = per_url_easy.get(i) {
+                let mut new_easy = per_easy.clone();
+                // Preserve FTP session for connection reuse across URLs (curl compat: tests 146, 210, 698)
+                new_easy.take_ftp_session_from(&mut easy);
+                // Transfer accumulated cookie jar and HSTS cache from the previous
+                // Easy handle so cookies persist across sequential URLs (curl compat:
+                // tests 327, 329, 331, 392, 1218, 1228, 1258).
+                new_easy.transfer_state_from(&mut easy);
+                easy = new_easy;
+            }
+            current_group = Some(this_group);
         }
 
         // Apply HTTP/1.0 downgrade from previous response (curl compat: test 1074)
