@@ -1563,6 +1563,37 @@ pub fn run(args: &[String]) -> ExitCode {
                 })
             });
 
+            // FTP auto-resume download: append new data to existing file
+            // (curl compat: test 1036). FTP responses always have status 200.
+            let is_ftp = opts
+                .urls
+                .first()
+                .is_some_and(|u| u.starts_with("ftp://") || u.starts_with("ftps://"));
+            if opts.auto_resume && is_ftp && !opts.is_upload {
+                if let Some(ref path) = opts.output_file {
+                    if path != "-" {
+                        use std::io::Write as _;
+                        if let Ok(mut file) =
+                            std::fs::OpenOptions::new().create(true).append(true).open(path)
+                        {
+                            let _ = file.write_all(response.body());
+                        }
+                        // Handle write-out
+                        if let Some(ref fmt) = opts.write_out {
+                            let real_fmt = if let Some(p) = fmt.strip_prefix('@') {
+                                std::fs::read_to_string(p).unwrap_or_default()
+                            } else {
+                                fmt.clone()
+                            };
+                            let wo = format_write_out(&real_fmt, &response, false);
+                            let _ = std::io::stdout().write_all(wo.as_bytes());
+                            let _ = std::io::stdout().flush();
+                        }
+                        return ExitCode::SUCCESS;
+                    }
+                }
+            }
+
             // For auto-resume with 206, write existing file content to output file
             // BEFORE the response (test 1043). Output order: existing_data + headers + new_body
             if opts.auto_resume && response.status() == 206 {
