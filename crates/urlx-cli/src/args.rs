@@ -132,7 +132,8 @@ pub struct CliOptions {
     /// Original -X value preserving case (for non-HTTP protocol commands).
     pub(crate) custom_request_original: Option<String>,
     /// Variables set via `--variable` for `--expand-*` expansion.
-    pub(crate) variables: Vec<(String, String)>,
+    /// Values are stored as raw bytes to support binary data (null bytes etc.).
+    pub(crate) variables: Vec<(String, Vec<u8>)>,
     /// `--skip-existing`: skip download if output file already exists.
     pub(crate) skip_existing: bool,
     /// `--json` was used — defer Content-Type/Accept headers until after arg parsing.
@@ -140,6 +141,11 @@ pub struct CliOptions {
     /// Per-URL FTP method (indexed by URL position).
     /// Supports `--next` changing `--ftp-method` between URL groups (test 1096).
     pub(crate) per_url_ftp_methods: Vec<liburlx::protocol::ftp::FtpMethod>,
+    /// Per-URL Easy handles for `--next` groups (indexed by URL position).
+    /// Each entry records the Easy handle state for that URL's group.
+    pub(crate) per_url_easy: Vec<Option<liburlx::Easy>>,
+    /// URL index where the current --next group starts (for per-URL Easy handles).
+    pub(crate) group_easy_start: usize,
 }
 
 /// Print version information to stdout.
@@ -337,11 +343,79 @@ pub fn parse_args(args: &[String]) -> ParseResult {
         }
     }
 
+    // Step 2b: Check if -K/--config or -q was explicitly given.
+    // If not, auto-load .curlrc from standard locations (curl compat: tests 433, 436).
+    let has_explicit_config = expanded
+        .iter()
+        .skip(1)
+        .any(|a| a == "-K" || a == "--config" || a == "-q" || a == "--disable");
+    let mut final_args = expanded;
+    if !has_explicit_config {
+        if let Some(rc_path) = find_curlrc() {
+            if let Ok(contents) = std::fs::read_to_string(&rc_path) {
+                let config_args = parse_config_file(&contents);
+                if !config_args.is_empty() {
+                    // Emit note about reading config file (curl compat: tests 433, 436)
+                    eprintln!("Note: Read config file from '{rc_path}'");
+                    // Insert config args after program name, before user args
+                    let mut with_rc = vec![final_args[0].clone()];
+                    with_rc.extend(config_args);
+                    with_rc.extend_from_slice(&final_args[1..]);
+                    final_args = with_rc;
+                }
+            }
+        }
+    }
+
     // Step 3: Parse options
-    match parse_args_options_with_depth(&expanded, 0) {
+    match parse_args_options_with_depth(&final_args, 0) {
         Ok(opts) => ParseResult::Options(Box::new(opts)),
         Err(code) => ParseResult::Error(code),
     }
+}
+
+/// Find the .curlrc configuration file in standard locations.
+///
+/// Search order (curl compat: tests 433, 436):
+/// 1. `$CURL_HOME/.curlrc`
+/// 2. `$XDG_CONFIG_HOME/curlrc` (note: NOT `.curlrc`, just `curlrc`)
+/// 3. `$HOME/.curlrc`
+fn find_curlrc() -> Option<String> {
+    // Check $CURL_HOME/.curlrc then $CURL_HOME/.config/curlrc
+    if let Ok(curl_home) = std::env::var("CURL_HOME") {
+        if !curl_home.is_empty() {
+            let path = format!("{curl_home}/.curlrc");
+            if std::path::Path::new(&path).exists() {
+                return Some(path);
+            }
+            let path = format!("{curl_home}/.config/curlrc");
+            if std::path::Path::new(&path).exists() {
+                return Some(path);
+            }
+        }
+    }
+
+    // Check $XDG_CONFIG_HOME/curlrc (NOT .curlrc)
+    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+        if !xdg.is_empty() {
+            let path = format!("{xdg}/curlrc");
+            if std::path::Path::new(&path).exists() {
+                return Some(path);
+            }
+        }
+    }
+
+    // Check $HOME/.curlrc
+    if let Ok(home) = std::env::var("HOME") {
+        if !home.is_empty() {
+            let path = format!("{home}/.curlrc");
+            if std::path::Path::new(&path).exists() {
+                return Some(path);
+            }
+        }
+    }
+
+    None
 }
 
 /// Expand combined short flags into individual flags.
@@ -467,6 +541,8 @@ fn expand_combined_flags(args: &[String]) -> Vec<String> {
                         | "--proxy-ciphers"
                         | "--variable"
                         | "--expand-data"
+                        | "--expand-url"
+                        | "--expand-output"
                         | "--json"
                         | "--mail-from"
                         | "--mail-rcpt"
@@ -603,6 +679,8 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
         skip_existing: false,
         json_mode: false,
         per_url_ftp_methods: Vec::new(),
+        per_url_easy: Vec::new(),
+        group_easy_start: 0,
     };
 
     let mut i = 1;
@@ -1398,7 +1476,10 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
                 };
                 match contents_result {
                     Ok(contents) => {
-                        let config_args = parse_config_file(&contents);
+                        let config_args = parse_config_file_with_path(
+                            &contents,
+                            if val == "-" { None } else { Some(val) },
+                        );
                         // Re-parse with: args before -K, config args, args after -K
                         let mut full_args = vec!["urlx".to_string()];
                         // Include CLI args that came before -K (skip program name at [0])
@@ -1784,6 +1865,7 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
                 opts.urls.push(val.to_string());
                 opts.per_url_credentials.push(opts.user_credentials.clone());
                 opts.per_url_ftp_methods.push(current_ftp_method);
+                opts.per_url_easy.push(None);
                 opts.next_needs_url = false;
             }
             "--output-dir" => {
@@ -1824,18 +1906,39 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
                 i += 1;
                 let val = require_arg(args, i, "--variable")?;
                 let (name, value) = parse_variable(val)?;
-                opts.variables.push((name, value));
+                // Duplicate variable names override (curl compat: test 451)
+                if let Some(existing) = opts.variables.iter_mut().find(|(n, _)| *n == name) {
+                    existing.1 = value;
+                } else {
+                    opts.variables.push((name, value));
+                }
             }
             "--expand-data" => {
                 i += 1;
                 let val = require_arg(args, i, "--expand-data")?;
-                let expanded = expand_variables(val, &opts.variables);
+                let expanded = expand_variables(val, &opts.variables)?;
                 opts.easy.body(expanded.as_bytes());
                 opts.has_post_data = true;
                 if opts.easy.method_is_default() {
                     opts.easy.method("POST");
                 }
                 opts.easy.set_form_data(true);
+            }
+            "--expand-url" => {
+                i += 1;
+                let val = require_arg(args, i, "--expand-url")?;
+                let expanded = expand_variables(val, &opts.variables)?;
+                opts.urls.push(expanded);
+                opts.per_url_credentials.push(opts.user_credentials.clone());
+                opts.per_url_easy.push(None);
+                opts.next_needs_url = false;
+            }
+            "--expand-output" => {
+                i += 1;
+                let val = require_arg(args, i, "--expand-output")?;
+                let expanded = expand_variables(val, &opts.variables)?;
+                opts.output_file = Some(expanded.clone());
+                opts.output_files.push(expanded);
             }
             // No-op flags for compatibility (accepted but not implemented)
             "-N"
@@ -1984,9 +2087,23 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
                 for slot in opts.per_url_ftp_methods[group_start_idx..].iter_mut() {
                     *slot = current_ftp_method;
                 }
+                // Save per-URL Easy handles for the current group
+                let current_easy = opts.easy.clone();
+                for slot in opts.per_url_easy[opts.group_easy_start..].iter_mut() {
+                    if slot.is_none() {
+                        *slot = Some(current_easy.clone());
+                    }
+                }
+                opts.group_easy_start = opts.per_url_easy.len();
                 group_start_idx = opts.per_url_credentials.len();
                 opts.user_credentials = None;
                 current_ftp_method = liburlx::protocol::ftp::FtpMethod::default();
+                // Reset per-request state (curl compat: tests 430-432)
+                opts.easy.clear_headers();
+                opts.easy.clear_body();
+                opts.has_post_data = false;
+                opts.easy.reset_method();
+                opts.easy.set_form_data(false);
                 opts.next_needs_url = true;
                 opts.had_next = true;
             }
@@ -2010,6 +2127,7 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
                 opts.urls.push(url.to_string());
                 opts.per_url_credentials.push(opts.user_credentials.clone());
                 opts.per_url_ftp_methods.push(current_ftp_method);
+                opts.per_url_easy.push(None); // Will be filled on --next or at end
                 opts.next_needs_url = false;
             }
         }
@@ -2029,6 +2147,16 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
     // Assign last group's ftp_method to all URLs in the last group
     for slot in opts.per_url_ftp_methods[group_start_idx..].iter_mut() {
         *slot = current_ftp_method;
+    }
+
+    // Assign last group's Easy handle to URLs that weren't assigned yet
+    {
+        let current_easy = opts.easy.clone();
+        for slot in opts.per_url_easy[opts.group_easy_start..].iter_mut() {
+            if slot.is_none() {
+                *slot = Some(current_easy.clone());
+            }
+        }
     }
 
     // --next at the end with no URL is a parse error (curl returns exit code 2)
@@ -2188,21 +2316,54 @@ pub fn parse_rate_limit(input: &str) -> Option<u64> {
 /// - Lines may contain `--flag value`, `--flag=value`, or `-f value`
 /// - Values may be quoted with `"` or `'`
 /// - Backslash escaping is supported within double quotes
+///
+/// If `file_path` is provided, emits warnings about unquoted whitespace.
 pub fn parse_config_file(contents: &str) -> Vec<String> {
+    parse_config_file_with_path(contents, None)
+}
+
+/// Parse config file, optionally with a file path for warning messages.
+pub fn parse_config_file_with_path(contents: &str, file_path: Option<&str>) -> Vec<String> {
     let mut args = Vec::new();
-    for line in contents.lines() {
+    for (line_num, line) in contents.lines().enumerate() {
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
 
-        // Handle --flag=value syntax
+        // Helper to check for unquoted whitespace in values and warn
+        let warn_unquoted_whitespace = |flag: &str, value: &str| {
+            // Only warn if value is unquoted and contains whitespace
+            if !value.starts_with('"') && !value.starts_with('\'') && value.contains(' ') {
+                if let Some(path) = file_path {
+                    eprintln!(
+                        "Warning: {path}:{} Option '{}' uses argument with unquoted whitespace. ",
+                        line_num + 1,
+                        flag
+                    );
+                    eprintln!("Warning: This may cause side-effects. Consider double quotes.");
+                }
+            }
+        };
+
+        // Handle --flag syntax
         if let Some(rest) = trimmed.strip_prefix("--") {
-            if let Some(eq_pos) = rest.find('=') {
+            // Check for = in the flag name only (before any whitespace)
+            // This distinguishes `--flag=value` from `--flag value_with_=`
+            let first_ws = rest.find(char::is_whitespace).unwrap_or(rest.len());
+            let eq_in_flag = rest[..first_ws].find('=');
+            if let Some(eq_pos) = eq_in_flag {
                 let flag = &rest[..eq_pos];
                 let value = rest[eq_pos + 1..].trim();
                 args.push(format!("--{flag}"));
-                args.push(unquote(value));
+                warn_unquoted_whitespace(flag, value);
+                // For unquoted values with whitespace, only take the first word (curl compat: test 459)
+                let effective_value = if !value.starts_with('"') && !value.starts_with('\'') {
+                    value.split_whitespace().next().unwrap_or(value)
+                } else {
+                    value
+                };
+                args.push(unquote(effective_value));
             } else {
                 // --flag or --flag value
                 let parts: Vec<&str> = rest.splitn(2, char::is_whitespace).collect();
@@ -2237,7 +2398,14 @@ pub fn parse_config_file(contents: &str) -> Vec<String> {
             let value = trimmed[eq_pos + 1..].trim();
             args.push(format!("--{flag}"));
             if !value.is_empty() {
-                args.push(unquote(value));
+                warn_unquoted_whitespace(flag, value);
+                // For unquoted values with whitespace, only take the first word
+                let effective_value = if !value.starts_with('"') && !value.starts_with('\'') {
+                    value.split_whitespace().next().unwrap_or(value)
+                } else {
+                    value
+                };
+                args.push(unquote(effective_value));
             }
         } else {
             let parts: Vec<&str> = trimmed.splitn(2, char::is_whitespace).collect();
@@ -2596,14 +2764,34 @@ pub fn parse_proto_spec(spec: &str) -> Vec<String> {
 ///
 /// Formats:
 ///   - `name=value` — direct assignment
-///   - `name@file` — load from file
+///   - `name@file` — load from file (binary)
 ///   - `name@-` — load from stdin
 ///   - `name[start-end]=value` — byte range from direct value
 ///   - `name[start-end]@file` — byte range from file
 ///   - `name[start-]@file` — byte range from start to end of data
+///   - `%ENV` — load from environment variable ENV
+///   - `%ENV=default` — load from env var, fallback to default if unset
 ///
-/// Returns `(name, value)` after applying byte range if specified.
-fn parse_variable(spec: &str) -> Result<(String, String), u8> {
+/// Returns `(name, value_bytes)` after applying byte range if specified.
+fn parse_variable(spec: &str) -> Result<(String, Vec<u8>), u8> {
+    // Check for %ENV syntax (environment variable)
+    if let Some(env_spec) = spec.strip_prefix('%') {
+        // Split on '=' for default value
+        let (env_name, default_value) = env_spec
+            .split_once('=')
+            .map_or((env_spec, None), |(name, default)| (name, Some(default)));
+        // Look up the environment variable
+        if let Ok(val) = std::env::var(env_name) {
+            return Ok((env_name.to_string(), val.into_bytes()));
+        }
+        if let Some(default) = default_value {
+            return Ok((env_name.to_string(), default.as_bytes().to_vec()));
+        }
+        // Missing env var without default is an error (curl compat: test 462)
+        eprintln!("curl: variable: importing \"{env_name}\" failed, and no default was given");
+        return Err(2);
+    }
+
     // Parse optional byte range: name[start-end]
     let (name, byte_range, rest) = if let Some(bracket_start) = spec.find('[') {
         let bracket_end = spec[bracket_start..].find(']').map(|p| bracket_start + p);
@@ -2639,16 +2827,16 @@ fn parse_variable(spec: &str) -> Result<(String, String), u8> {
     };
 
     // Parse value source: =value or @file
-    let raw_value = if let Some(rest) = rest.strip_prefix('=') {
-        rest.to_string()
+    let raw_value: Vec<u8> = if let Some(rest) = rest.strip_prefix('=') {
+        rest.as_bytes().to_vec()
     } else if let Some(rest) = rest.strip_prefix('@') {
         if rest == "-" {
             use std::io::Read as _;
-            let mut buf = String::new();
-            let _ = std::io::stdin().read_to_string(&mut buf);
+            let mut buf = Vec::new();
+            let _ = std::io::stdin().read_to_end(&mut buf);
             buf
         } else {
-            std::fs::read_to_string(rest).map_err(|e| {
+            std::fs::read(rest).map_err(|e| {
                 eprintln!("curl: can't read variable file '{rest}': {e}");
                 2
             })?
@@ -2657,18 +2845,18 @@ fn parse_variable(spec: &str) -> Result<(String, String), u8> {
         // No range and no = or @ — check the original spec for = or @
         if let Some(eq_pos) = name.find('=') {
             let (n, v) = name.split_at(eq_pos);
-            return Ok((n.to_string(), v[1..].to_string()));
+            return Ok((n.to_string(), v.as_bytes()[1..].to_vec()));
         }
         if let Some(at_pos) = name.find('@') {
             let (n, f) = name.split_at(at_pos);
             let file = &f[1..];
-            let content = if file == "-" {
+            let content: Vec<u8> = if file == "-" {
                 use std::io::Read as _;
-                let mut buf = String::new();
-                let _ = std::io::stdin().read_to_string(&mut buf);
+                let mut buf = Vec::new();
+                let _ = std::io::stdin().read_to_end(&mut buf);
                 buf
             } else {
-                std::fs::read_to_string(file).map_err(|e| {
+                std::fs::read(file).map_err(|e| {
                     eprintln!("curl: can't read variable file '{file}': {e}");
                     2
                 })?
@@ -2676,19 +2864,18 @@ fn parse_variable(spec: &str) -> Result<(String, String), u8> {
             return Ok((n.to_string(), content));
         }
         // No value source specified — empty value
-        String::new()
+        Vec::new()
     } else {
-        String::new()
+        Vec::new()
     };
 
     // Apply byte range
     let value = if let Some((start, end)) = byte_range {
-        let bytes = raw_value.as_bytes();
-        if start >= bytes.len() {
-            String::new()
+        if start >= raw_value.len() {
+            Vec::new()
         } else {
-            let end = end.map_or(bytes.len() - 1, |e| e.min(bytes.len() - 1));
-            String::from_utf8_lossy(&bytes[start..=end]).to_string()
+            let end = end.map_or(raw_value.len() - 1, |e| e.min(raw_value.len() - 1));
+            raw_value[start..=end].to_vec()
         }
     } else {
         raw_value
@@ -2723,63 +2910,195 @@ fn simple_base64_encode(data: &[u8]) -> String {
     result
 }
 
-fn expand_variables(template: &str, variables: &[(String, String)]) -> String {
+/// Apply a single transform function to a value (as bytes).
+///
+/// Returns `Ok(transformed)` or `Err(2)` for unknown functions.
+fn apply_variable_function(value: &[u8], func: &str) -> Result<Vec<u8>, u8> {
+    match func {
+        "trim" => {
+            // Trim ASCII whitespace from both ends
+            let start = value.iter().position(|b| !b.is_ascii_whitespace()).unwrap_or(value.len());
+            let end = value.iter().rposition(|b| !b.is_ascii_whitespace()).map_or(start, |p| p + 1);
+            Ok(value[start..end].to_vec())
+        }
+        "url" | "urlencode" => {
+            let mut s = String::with_capacity(value.len());
+            for &byte in value {
+                match byte {
+                    b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                        s.push(byte as char);
+                    }
+                    _ => {
+                        s.push('%');
+                        s.push(char::from(HEX_CHARS[(byte >> 4) as usize]));
+                        s.push(char::from(HEX_CHARS[(byte & 0x0F) as usize]));
+                    }
+                }
+            }
+            Ok(s.into_bytes())
+        }
+        "b64" | "base64" => Ok(simple_base64_encode(value).into_bytes()),
+        "64dec" | "b64dec" | "base64dec" => {
+            // Base64 decode
+            Ok(simple_base64_decode(value))
+        }
+        "json" => {
+            // JSON string escaping (no wrapping quotes — curl compat)
+            let mut s = String::with_capacity(value.len());
+            for &byte in value {
+                match byte {
+                    b'"' => s.push_str("\\\""),
+                    b'\\' => s.push_str("\\\\"),
+                    b'\n' => s.push_str("\\n"),
+                    b'\r' => s.push_str("\\r"),
+                    b'\t' => s.push_str("\\t"),
+                    b if b < 0x20 => {
+                        use std::fmt::Write;
+                        let _ = write!(s, "\\u{:04x}", b);
+                    }
+                    b => s.push(b as char),
+                }
+            }
+            Ok(s.into_bytes())
+        }
+        _ => {
+            eprintln!("curl: unknown variable function: {func}");
+            Err(2)
+        }
+    }
+}
+
+/// Simple base64 decoder.
+fn simple_base64_decode(data: &[u8]) -> Vec<u8> {
+    const fn decode_char(c: u8) -> Option<u8> {
+        match c {
+            b'A'..=b'Z' => Some(c - b'A'),
+            b'a'..=b'z' => Some(c - b'a' + 26),
+            b'0'..=b'9' => Some(c - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let mut result = Vec::with_capacity(data.len() * 3 / 4);
+    let filtered: Vec<u8> = data
+        .iter()
+        .copied()
+        .filter(|&b| b != b'=' && b != b'\n' && b != b'\r' && b != b' ')
+        .collect();
+    for chunk in filtered.chunks(4) {
+        let mut buf = [0u8; 4];
+        let mut count = 0;
+        for &b in chunk {
+            if let Some(v) = decode_char(b) {
+                buf[count] = v;
+                count += 1;
+            }
+        }
+        if count >= 2 {
+            result.push((buf[0] << 2) | (buf[1] >> 4));
+        }
+        if count >= 3 {
+            result.push((buf[1] << 4) | (buf[2] >> 2));
+        }
+        if count >= 4 {
+            result.push((buf[2] << 6) | buf[3]);
+        }
+    }
+    result
+}
+
+/// Maximum variable name length (curl uses 128).
+const MAX_VARIABLE_NAME_LEN: usize = 128;
+
+fn expand_variables(template: &str, variables: &[(String, Vec<u8>)]) -> Result<String, u8> {
     let mut result = String::with_capacity(template.len());
     let mut i = 0;
     let bytes = template.as_bytes();
     while i < bytes.len() {
+        // Check for backslash-escaped {{ → literal {{
+        if i + 2 < bytes.len() && bytes[i] == b'\\' && bytes[i + 1] == b'{' && bytes[i + 2] == b'{'
+        {
+            result.push_str("{{");
+            i += 3;
+            // Find the closing }} and output it literally too
+            if let Some(end) = template[i..].find("}}") {
+                result.push_str(&template[i..i + end + 2]);
+                i += end + 2;
+            }
+            continue;
+        }
         if i + 1 < bytes.len() && bytes[i] == b'{' && bytes[i + 1] == b'{' {
             // Find closing }}
             if let Some(end) = template[i + 2..].find("}}") {
                 let inner = &template[i + 2..i + 2 + end];
-                // Check for name:function syntax
-                let (var_name, func) = inner.split_once(':').unwrap_or((inner, ""));
+
+                // Empty inner → leave as literal {{}} (curl compat: test 428)
+                if inner.is_empty() {
+                    result.push_str("{{}}");
+                    i += 2 + end + 2;
+                    continue;
+                }
+
+                // Variable name length check (>=128 chars → leave unexpanded, curl compat: test 429/448)
+                let var_name = inner.split(':').next().unwrap_or(inner);
+                if var_name.len() >= MAX_VARIABLE_NAME_LEN {
+                    result.push_str(&template[i..i + 2 + end + 2]);
+                    i += 2 + end + 2;
+                    continue;
+                }
+
+                // Parse function chain: name:func1:func2:...
+                let parts: Vec<&str> = inner.splitn(2, ':').collect();
+                let var_name = parts[0];
+                let func_chain_str = if parts.len() > 1 { parts[1] } else { "" };
+
+                // Validate function chain: split by ':' and validate each
+                let functions: Vec<&str> = if func_chain_str.is_empty() {
+                    Vec::new()
+                } else {
+                    func_chain_str.split(':').collect()
+                };
+
+                // Check for invalid function separators (commas etc.)
+                for func in &functions {
+                    if func.contains(',') || func.contains(';') || func.contains(' ') {
+                        eprintln!("curl: bad function in variable expansion");
+                        return Err(2);
+                    }
+                }
+
                 if let Some((_, value)) = variables.iter().find(|(n, _)| n == var_name) {
-                    let transformed = match func {
-                        "" => value.clone(),
-                        "trim" => value.trim().to_string(),
-                        "url" | "urlencode" => percent_encode(value),
-                        "b64" | "base64" => simple_base64_encode(value.as_bytes()),
-                        "json" => {
-                            // JSON string escaping (no wrapping quotes — curl compat: test 268)
-                            let mut s = String::with_capacity(value.len());
-                            for c in value.chars() {
-                                match c {
-                                    '"' => s.push_str("\\\""),
-                                    '\\' => s.push_str("\\\\"),
-                                    '\n' => s.push_str("\\n"),
-                                    '\r' => s.push_str("\\r"),
-                                    '\t' => s.push_str("\\t"),
-                                    c if c < '\u{20}' => {
-                                        // Control characters: \u00XX
-                                        let _ = std::fmt::Write::write_fmt(
-                                            &mut s,
-                                            format_args!("\\u{:04x}", c as u32),
-                                        );
-                                    }
-                                    c => s.push(c),
-                                }
-                            }
-                            s
-                        }
-                        _ => {
-                            // Unknown function: leave as-is (curl returns error 2)
-                            result.push_str(&template[i..i + 2 + end + 2]);
-                            i += 2 + end + 2;
-                            continue;
-                        }
-                    };
-                    result.push_str(&transformed);
+                    let mut current_value: Vec<u8> = value.clone();
+
+                    // Apply function chain
+                    for func in &functions {
+                        current_value = apply_variable_function(&current_value, func)?;
+                    }
+
+                    // If no functions applied (raw expansion), check for null bytes
+                    if functions.is_empty() && current_value.contains(&0) {
+                        eprintln!("curl: (2) expanded variable contains null bytes");
+                        return Err(2);
+                    }
+
+                    result.push_str(&String::from_utf8_lossy(&current_value));
+                } else if inner.contains('.') {
+                    // Variables with dots (like {{not.good}}) are left as-is (curl compat: test 428)
+                    result.push_str(&template[i..i + 2 + end + 2]);
                 }
                 // Else: undefined variable — expand to empty string
                 i += 2 + end + 2;
                 continue;
             }
+            // No closing }} found → leave the {{ and rest as literal (unbalanced braces)
+            result.push_str(&template[i..]);
+            break;
         }
         result.push(bytes[i] as char);
         i += 1;
     }
-    result
+    Ok(result)
 }
 
 #[cfg(test)]

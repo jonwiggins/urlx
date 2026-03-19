@@ -73,6 +73,14 @@ pub struct TransferInfo {
     pub effective_method: String,
     /// The Referer header value used in the last request (for `%{referer}` write-out).
     pub referer: String,
+    /// Local IP address of the connection.
+    pub local_ip: String,
+    /// Local port of the connection.
+    pub local_port: u16,
+    /// Remote IP address of the connection.
+    pub remote_ip: String,
+    /// Remote port of the connection.
+    pub remote_port: u16,
 }
 
 /// An HTTP response with status, headers, and body.

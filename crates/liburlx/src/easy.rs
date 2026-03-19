@@ -675,6 +675,16 @@ impl Easy {
         self.body = Some(data.to_vec());
     }
 
+    /// Clear the request body (used by `--next` to reset per-request state).
+    pub fn clear_body(&mut self) {
+        self.body = None;
+    }
+
+    /// Reset the HTTP method to default (used by `--next` to reset per-request state).
+    pub fn reset_method(&mut self) {
+        self.method = None;
+    }
+
     /// Append data to the request body (used for multiple --json flags).
     ///
     /// If no body exists yet, this creates a new one. Otherwise, it appends
@@ -828,6 +838,11 @@ impl Easy {
     #[must_use]
     pub fn header_list(&self) -> &[(String, String)] {
         &self.headers
+    }
+
+    /// Clear all custom headers (used by `--next` to reset per-request state).
+    pub fn clear_headers(&mut self) {
+        self.headers.clear();
     }
 
     /// Set the TCP connection timeout.
@@ -5094,6 +5109,10 @@ async fn do_single_request(
     .await?;
     let time_connect = request_start.elapsed();
 
+    // Capture local/remote socket addresses for write-out variables
+    let conn_local_addr = tcp_stream.local_addr().ok();
+    let conn_peer_addr = tcp_stream.peer_addr().ok();
+
     if verbose {
         #[allow(clippy::print_stderr)]
         if let Ok(peer) = tcp_stream.peer_addr() {
@@ -5159,7 +5178,7 @@ async fn do_single_request(
         tcp_stream
     };
 
-    let response = match url.scheme() {
+    let mut response = match url.scheme() {
         "https" => {
             // HTTP/3 over QUIC — bypasses TCP/TLS, uses UDP transport
             // Triggered by explicit --http3 flag OR Alt-Svc cache indicating h3 support
@@ -5627,6 +5646,20 @@ async fn do_single_request(
         }
         scheme => return Err(Error::UnsupportedProtocol(scheme.to_string())),
     };
+
+    // Populate connection address info on the response (for -w %{local_ip} etc.)
+    {
+        let mut info = response.transfer_info().clone();
+        if let Some(local) = conn_local_addr {
+            info.local_ip = local.ip().to_string();
+            info.local_port = local.port();
+        }
+        if let Some(peer) = conn_peer_addr {
+            info.remote_ip = peer.ip().to_string();
+            info.remote_port = peer.port();
+        }
+        response.set_transfer_info(info);
+    }
 
     Ok(maybe_decompress(response, accept_encoding))
 }
