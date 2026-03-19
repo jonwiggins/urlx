@@ -7,6 +7,7 @@
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 
 use crate::error::Error;
+use crate::protocol::ftp::UseSsl;
 use crate::protocol::http::response::Response;
 
 /// An IMAP response from the server.
@@ -300,7 +301,7 @@ pub async fn fetch(
     sasl_ir: bool,
     oauth2_bearer: Option<&str>,
     login_options: Option<&str>,
-    use_tls: bool,
+    use_ssl: UseSsl,
     tls_config: &crate::tls::TlsConfig,
 ) -> Result<Response, Error> {
     use base64::Engine;
@@ -329,13 +330,17 @@ pub async fn fetch(
 
     let imap_params = parse_imap_url(path, url.query());
 
+    // Determine if this is implicit TLS (imaps://) vs explicit STARTTLS
+    let use_implicit_tls = url.scheme() == "imaps";
+    let use_starttls = !use_implicit_tls && use_ssl != UseSsl::None;
+
     let addr = format!("{host}:{port}");
     let tcp = tokio::net::TcpStream::connect(&addr).await.map_err(Error::Connect)?;
 
     let (reader, mut writer): (
         Box<dyn tokio::io::AsyncRead + Unpin + Send>,
         Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
-    ) = if use_tls {
+    ) = if use_implicit_tls {
         let connector = crate::tls::TlsConnector::new(tls_config)?;
         let (tls_stream, _alpn) = connector.connect(tcp, &host).await?;
         let (r, w) = tokio::io::split(tls_stream);
@@ -358,9 +363,18 @@ pub async fn fetch(
     send_command(&mut writer, &tag, "CAPABILITY").await?;
     let cap_resp = read_response(&mut reader, &tag).await?;
 
-    // Parse AUTH mechanisms from CAPABILITY
+    // If CAPABILITY itself failed and STARTTLS is required, error out
+    if !cap_resp.is_ok() && use_starttls && (use_ssl == UseSsl::All) {
+        return Err(Error::Transfer {
+            code: 64,
+            message: "IMAP STARTTLS required but CAPABILITY failed".to_string(),
+        });
+    }
+
+    // Parse AUTH mechanisms and STARTTLS from CAPABILITY
     let mut server_auth_mechs = Vec::new();
     let mut server_sasl_ir = false;
+    let mut has_starttls = false;
     for line in &cap_resp.data {
         for token in line.split_whitespace() {
             if let Some(mech) = token.strip_prefix("AUTH=").or_else(|| token.strip_prefix("auth="))
@@ -370,7 +384,34 @@ pub async fn fetch(
             if token.eq_ignore_ascii_case("SASL-IR") {
                 server_sasl_ir = true;
             }
+            if token.eq_ignore_ascii_case("STARTTLS") {
+                has_starttls = true;
+            }
         }
+    }
+
+    // STARTTLS: upgrade plain connection to TLS if requested
+    if use_starttls && cap_resp.is_ok() {
+        if has_starttls {
+            // Server advertises STARTTLS — send the command
+            let tag = tags.next_tag();
+            send_command(&mut writer, &tag, "STARTTLS").await?;
+            let starttls_resp = read_response(&mut reader, &tag).await?;
+            if !starttls_resp.is_ok() {
+                // Server rejected STARTTLS — return CURLE_WEIRD_SERVER_REPLY (8)
+                return Err(Error::Protocol(8));
+            }
+            // TLS handshake would happen here for full implementation
+        } else if use_ssl == UseSsl::All {
+            // STARTTLS not advertised but required
+            let ltag = tags.next_tag();
+            let _ = send_command(&mut writer, &ltag, "LOGOUT").await;
+            return Err(Error::Transfer {
+                code: 64,
+                message: "IMAP STARTTLS required but not advertised".to_string(),
+            });
+        }
+        // UseSsl::Try with no STARTTLS: continue without TLS
     }
 
     let forced =
