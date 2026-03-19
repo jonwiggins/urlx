@@ -7,25 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **STARTTLS** — TLS upgrade support for FTPS, SMTP, IMAP, and POP3 (explicit TLS via `STARTTLS`/`AUTH TLS`)
+- **Implicit TLS** — `smtps://`, `imaps://`, `pop3s://` connect directly over TLS
+- **SASL authentication** — CRAM-MD5, NTLM, EXTERNAL, OAUTHBEARER, XOAUTH2, APOP, PLAIN, LOGIN for email protocols
+- **NTLMv2 authentication** — Full challenge-response NTLM for HTTP and proxy auth
+- **SCRAM-SHA-256** — SASL SCRAM-SHA-256 authentication mechanism
+- **SFTP quote commands** — `-Q` commands for SFTP (rename, mkdir, rmdir, chmod, etc.), byte ranges, `--ftp-create-dirs`
+- **FTP connection reuse** — Control connection reused across multi-URL transfers with proper CWD reset
+- **IMAP protocol** — RFC 5092 URL parsing (UIDVALIDITY, SECTION), LIST/SEARCH/EXAMINE/FETCH, APPEND uploads, AUTHENTICATE
+- **POP3 protocol** — AUTH mechanisms, RETR/LIST/DELE/UIDL/CAPA, custom commands
+- **SMTP protocol rewrite** — VRFY/EXPN, multipart MIME upload, long line handling, custom commands, AUTH negotiation
+- **MQTT protocol** — CONNECT/PUBLISH/SUBSCRIBE with QoS 0/1/2 (7 curl tests passing)
+- **`--variable` and `--expand-data`** — Variable expansion with `{{var}}` syntax, file/stdin loading, byte ranges, function transforms
+- **`--write-out` variables** — `%{certs}`, `%{header_json}`, `%{url.*}`, `%{method}`, `%{remote_ip}`, `%{remote_port}`, `%{stderr}`, `%output{file}`
+- **`--skip-existing`** — Skip download if output file already exists
+- **`--json`** — Shorthand for JSON POST with appropriate Content-Type and Accept headers
+
 ### Fixed
 
-- **HTTP response parsing** — Preserve raw header bytes for exact wire-format `--include` output, correctly handling mixed CRLF/LF line endings and no-space-after-colon headers (e.g., `Set-Cookie:value`)
-- **Header end detection** — Handle mixed line ending patterns (`\n\r\n`) and always find the earliest terminator, preventing body data from being parsed as headers
-- **HEAD response hang** — Correctly detect HEAD responses and skip body reading
-- **Resume hang** — Skip body read for failed Range requests without Content-Length, avoiding infinite wait when servers don't close the connection
-- **Redirect hang** — Skip body read for 3xx redirects without Content-Length when server says Connection: close but doesn't close
-- **Resume error handling** — 416 Range Not Satisfiable treated as success (file already downloaded), output headers only; non-206 resume errors output headers but preserve auto-resume source files
-- **User-Agent suppression** — `-A ""` now fully suppresses the User-Agent header instead of sending an empty one
-- **Digest auth** — Only emit `algorithm=` in Authorization header when server explicitly specified it in the challenge
-- **Cookie jar output** — Write all cookies (not just persistent), track include_subdomains flag and domain display for Netscape format, validate Set-Cookie domain against request host
-- **Config file parsing** — Handle `flag = value` syntax with `=` separator
-- **Time condition** — Parse `-z` timestamp and suppress body when condition is not met
-- **Version string** — Match curl's feature flag format for test suite compatibility
-- **Test infrastructure** — Fix `urlx-as-curl` wrapper to default to release binary; export `URLX_BIN` from `run-curl-tests.sh`
+- **HTTP proxy CONNECT** — NTLM/Digest proxy auth for CONNECT tunnels, tunnel reuse, body suppression during auth negotiation
+- **Auth credential stripping** — Authorization and Cookie headers properly stripped on cross-host redirects; `--oauth2-bearer` stripped
+- **Cookie engine** — `-b` file vs string detection, 150-cookie-per-request cap, 8KB header cap, `Max-Age=0` expiry, secure cookie filtering, domain validation, jar preservation across multi-URL transfers, IP address domain handling
+- **HSTS** — Trailing dot handling, proper enforcement
+- **Content/chunked encoding** — `--raw` chunked passthrough, deflate decompression, trailer headers, `--max-filesize` with chunked, mixed CRLF/LF line endings
+- **Expect: 100-continue** — Body sent only after 100 response, correct Content-Length when body suppressed, proper ordering
+- **FTP** — URL encoding in paths (`%0a`, `%0d`), `NLST`, active `PORT` quirks, `--ftp-method nocwd`, quote commands, resume, `PASV`/`EPSV` fallback, `ACCT`, `TYPE A`, 421 service unavailable, 552 disk full, root CWD, cross-protocol redirects
+- **SOCKS proxy** — SOCKS5 auth, SOCKS4 long usernames, hostname-mode, IPv4 address type, Proxy-Authorization header leak
+- **HTTP resume** — Resume from end of file, beyond end, with `--fail`, 416 as success
+- **Redirect handling** — 302/308 method conversion, duplicate Location headers, query string space encoding via proxy, `--follow` flag, credential forwarding
+- **Content-Length** — Trailing char validation, comma-separated, conflicting duplicates, overflow detection
+- **Multipart forms** — Content-Type boundary merging, `-F type=` parsing
+- **Netrc** — Quoted password parsing with escape sequences, `NETRC` env var, multi-URL credential isolation
+- **CLI** — `--next` header isolation, `-O` trailing slash defaults, `--output-dir`, `--create-dirs` for `--etag-save`, flag-like filename warnings, `--remote-name-all`/`--no-remote-name`, config file `=` separator, config recursion guard, `--long=value` syntax, glob escaping, `--fail-early`
+- **SSH/SFTP/SCP** — Error code mapping (78 for file-not-found, 67 for login-denied), download/upload edge cases
+- **HTTP misc** — 1xx intermediate headers, Host header first-wins, HTTP/0.9 denied by default, HTTP/1.0 body handling, version downgrade on auth retry, `-X` request target, IPv6 scope IDs, header line folding
 
 ### Changed
 
-- curl test suite compatibility: **69/98 tests passing** (tests 1–99), up from 8/19
+- **curl test suite compatibility: 1,171 pass / 102 fail / 54 skip** (tests 1–1400, 92% pass rate), up from 69/98 at v0.1.0
+- **2,655 Rust tests**, up from 2,288
+- **141 source files, ~72,000 lines of Rust**
+- **261 long + 46 short CLI flags** (up from ~150)
+- **156 CURLOPT, 49 CURLINFO, 41 CURLcode** in FFI layer
 
 ## [0.1.0] - 2026-03-10
 

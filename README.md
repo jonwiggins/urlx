@@ -15,7 +15,7 @@
 
 ---
 
-urlx is a from-scratch rewrite of [curl](https://curl.se/) in Rust. Zero `unsafe` outside the FFI boundary. Built on [tokio](https://tokio.rs/) and [rustls](https://github.com/rustls/rustls) — no OpenSSL. Behavioral compatibility with curl is the goal.
+urlx is a from-scratch rewrite of [curl](https://curl.se/) in Rust. Zero `unsafe` outside the FFI boundary. Built on [tokio](https://tokio.rs/) and [rustls](https://github.com/rustls/rustls) — no OpenSSL. **92% of curl's own test suite passes against urlx** (1,171 / 1,273 tests).
 
 ## Highlights
 
@@ -24,8 +24,8 @@ urlx is a from-scratch rewrite of [curl](https://curl.se/) in Rust. Zero `unsafe
 - **Drop-in CLI** — `urlx` aims to accept the same flags and produce the same output as `curl`
 - **Drop-in C library** — `liburlx-ffi` exposes the libcurl C ABI so existing C/C++ programs can link against it
 - **Idiomatic Rust API** — `liburlx` provides a clean async/sync API modeled on curl's Easy/Multi handles
-- **Broad protocol support** — HTTP/1.1, HTTP/2, HTTP/3 (QUIC), FTP/FTPS, SFTP/SCP, WebSocket, SMTP, IMAP, POP3, MQTT
-- **2,200+ tests** — unit, integration (against real servers), property-based, and fuzz harnesses
+- **Broad protocol support** — HTTP/1.1, HTTP/2, HTTP/3 (QUIC), FTP/FTPS, SFTP/SCP, WebSocket, SMTP, IMAP, POP3, MQTT, DICT, TFTP
+- **2,600+ tests** — unit, integration (against real servers), property-based, and fuzz harnesses
 - **Async core** — tokio runtime with a blocking `Easy` wrapper and native async `Multi` API
 
 ## Quick Start
@@ -95,16 +95,17 @@ cargo test --workspace                 # run the test suite
 | HTTP/1.1 | ~97% | Chunked encoding, trailers, `Expect: 100-continue`, decompression (gzip/br/zstd) |
 | HTTP/2 | ~80% | ALPN negotiation, multiplexing, flow control, PING keep-alive |
 | HTTP/3 | ~55% | QUIC via quinn, Alt-Svc upgrade, 0-RTT |
-| TLS | ~85% | rustls, TLS 1.2/1.3, cert pinning, cipher selection, session cache |
-| Authentication | ~60% | Basic, Bearer, Digest (MD5/SHA-256), AWS SigV4, NTLM skeleton |
-| Cookies | ~95% | Netscape file format, domain-indexed jar, public suffix list |
-| Proxy | ~90% | HTTP CONNECT, SOCKS4/4a/5, HTTPS tunnels (TLS-in-TLS), proxy auth |
+| TLS | ~85% | rustls, TLS 1.2/1.3, cert pinning, cipher selection, STARTTLS |
+| Authentication | ~80% | Basic, Bearer, Digest (MD5/SHA-256), NTLMv2, SCRAM-SHA-256, AWS SigV4, SASL (CRAM-MD5, OAUTHBEARER, XOAUTH2, EXTERNAL) |
+| Cookies | ~95% | Netscape file format, domain-indexed jar, public suffix list, SameSite |
+| Proxy | ~90% | HTTP CONNECT, SOCKS4/4a/5, HTTPS tunnels (TLS-in-TLS), NTLM/Digest proxy auth |
 | DNS | ~85% | Cache, Happy Eyeballs, DoH, DoT, custom servers, hickory-dns |
-| FTP/FTPS | ~87% | Upload, resume, directory ops, explicit/implicit TLS, active mode |
-| SSH/SFTP/SCP | ~60% | Download, upload, password + pubkey auth |
+| FTP/FTPS | ~90% | Upload, resume, directory ops, explicit/implicit TLS, active mode, connection reuse |
+| SSH/SFTP/SCP | ~75% | Download, upload, password + pubkey auth, quote commands, byte ranges |
+| SMTP/IMAP/POP3 | ~70% | STARTTLS, SASL auth, MIME upload, custom commands |
 | WebSocket | ~85% | RFC 6455, close codes, fragmentation |
-| CLI flags | ~55% | ~150 of ~250 curl flags implemented |
-| FFI (libcurl C ABI) | ~60% | 116 `CURLOPT`, 43 `CURLINFO`, 32 `CURLcode`, 56 functions |
+| CLI flags | ~95% | 261 long + 46 short flags (~250 curl-compatible) |
+| FFI (libcurl C ABI) | ~65% | 156 `CURLOPT`, 49 `CURLINFO`, 41 `CURLcode`, 57 functions |
 
 ## Architecture
 
@@ -134,7 +135,7 @@ cargo test --workspace                 # run the test suite
 
 ## Feature Flags
 
-Default features: `http`, `http2`, `rustls`, `decompression`.
+Default features: `http`, `http2`, `rustls`, `cookies`, `decompression`.
 
 | Flag | Description |
 |---|---|
