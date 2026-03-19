@@ -40,9 +40,17 @@ pub(crate) fn te_compression_encoding(te: &str) -> Option<String> {
     }
 }
 
-/// Maximum response header size (300 KB, matching curl's `CURL_MAX_HTTP_HEADER` = 300 * 1024).
-/// curl returns `CURLE_RECV_ERROR` (exit 56) when headers exceed this limit (test 497).
-const MAX_HEADER_SIZE: usize = 300 * 1024;
+/// Maximum size of a single response header line (100 KB, matching curl's
+/// `CURL_MAX_HTTP_HEADER`).  curl returns `CURLE_TOO_LARGE` (exit 100) when a
+/// *single* header exceeds this limit (test 1154).
+const MAX_HEADER_LINE_SIZE: usize = 100 * 1024;
+
+/// Maximum total response header section size per response.
+/// This is the same as curl's `MAX_HTTP_RESP_HEADER_SIZE` (6000 * 1024).
+/// Individual responses are allowed to have large headers as long as the total
+/// stays under this limit; the cumulative limit across redirects is enforced
+/// separately in the redirect loop.
+const MAX_HEADER_SIZE: usize = 6000 * 1024;
 
 /// Send an HTTP/1.x request and read the response.
 ///
@@ -664,10 +672,12 @@ where
     // Prepend 1xx informational response headers so --include shows them.
     // Normalize raw headers for output (unfold continuation lines, collapse whitespace).
     if informational_prefix.is_empty() {
+        resp.set_total_header_size(header_bytes.len());
         resp.set_raw_headers(normalize_raw_headers_for_output(&header_bytes));
     } else {
         let mut combined = informational_prefix;
         combined.extend_from_slice(&header_bytes);
+        resp.set_total_header_size(combined.len());
         resp.set_raw_headers(normalize_raw_headers_for_output(&combined));
     }
     if !trailers.is_empty() {
@@ -903,6 +913,7 @@ struct ParsedHeaders {
 }
 
 /// Parse raw header bytes into structured response headers.
+#[allow(clippy::too_many_lines)]
 fn parse_headers(data: &[u8]) -> Result<ParsedHeaders, Error> {
     // Find the end of headers (double CRLF or double LF)
     let header_end = data
@@ -969,6 +980,18 @@ fn parse_headers(data: &[u8]) -> Result<ParsedHeaders, Error> {
     };
     // Detect line ending style: if we find \r\n it's CRLF, otherwise bare LF
     let uses_crlf = data.windows(2).any(|w| w == b"\r\n");
+
+    // Check individual header line sizes (curl: CURLE_TOO_LARGE = 100, test 1154)
+    for header in parsed.headers.iter() {
+        // Total line size: "Name: Value\r\n"
+        let line_size = header.name.len() + 2 + header.value.len() + 2;
+        if line_size > MAX_HEADER_LINE_SIZE {
+            return Err(Error::Transfer {
+                code: 100,
+                message: format!("Too large response header: {line_size} > {MAX_HEADER_LINE_SIZE}"),
+            });
+        }
+    }
 
     // Extract raw header values from the wire data (httparse trims whitespace,
     // but curl preserves it in -i output)
@@ -1087,6 +1110,21 @@ fn parse_headers_large(data: &[u8]) -> Result<ParsedHeaders, Error> {
         }
     };
     let uses_crlf = data.windows(2).any(|w| w == b"\r\n");
+
+    // Check individual header line sizes (curl: CURLE_TOO_LARGE = 100, test 1154)
+    for header in parsed.headers.iter() {
+        if header.name.is_empty() {
+            break;
+        }
+        let line_size = header.name.len() + 2 + header.value.len() + 2;
+        if line_size > MAX_HEADER_LINE_SIZE {
+            return Err(Error::Transfer {
+                code: 100,
+                message: format!("Too large response header: {line_size} > {MAX_HEADER_LINE_SIZE}"),
+            });
+        }
+    }
+
     let raw_values = extract_raw_header_values(&data[..header_len]);
 
     let mut headers = HashMap::with_capacity(parsed.headers.len());

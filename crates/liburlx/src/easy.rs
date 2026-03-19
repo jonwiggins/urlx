@@ -2935,6 +2935,11 @@ async fn perform_transfer(
     // When redirecting to `http://user:pass@host/...`, these credentials replace
     // any existing auth headers.
     let mut redirect_url_auth: Option<String> = None;
+    // Track cumulative response header size across redirect chain.
+    // curl's MAX_HTTP_RESP_HEADER_SIZE = 6000 * 1024 = 6,144,000 bytes.
+    // Exceeding this limit returns CURLE_RECV_ERROR (56) (test 498).
+    let max_cumulative_header_size: usize = 6000 * 1024;
+    let mut cumulative_header_size: usize = 0;
 
     loop {
         // Determine effective proxy for this URL
@@ -4541,6 +4546,24 @@ async fn perform_transfer(
             }
         }
 
+        // Track cumulative response header size across redirect chain (test 498).
+        // curl's MAX_HTTP_RESP_HEADER_SIZE = 6000 * 1024.
+        // Use total_header_size if set, otherwise fall back to raw_headers length.
+        let resp_header_size = if response.total_header_size() > 0 {
+            response.total_header_size()
+        } else {
+            response.raw_headers().map_or(0, <[u8]>::len)
+        };
+        cumulative_header_size += resp_header_size;
+        if cumulative_header_size > max_cumulative_header_size {
+            return Err(Error::Transfer {
+                code: 56,
+                message: format!(
+                    "Too large response headers: {cumulative_header_size} > {max_cumulative_header_size}"
+                ),
+            });
+        }
+
         // Check for redirects
         if follow_redirects && response.is_redirect() {
             if redirects_followed >= max_redirects {
@@ -4569,6 +4592,11 @@ async fn perform_transfer(
             }
 
             if let Some(location) = response.header("location") {
+                // Normalize redirect URLs with triple slash (http:///host/path).
+                // curl treats http:///host as http://host (test 1141) but rejects
+                // http:////path (test 1142) as having too many slashes.
+                let location = normalize_redirect_slashes(location);
+
                 // Reject redirect URLs with empty authority (e.g. http:////path).
                 // curl returns CURLE_URL_MALFORMAT for these (test 1142).
                 if let Some(rest) = location.strip_prefix("http://") {
@@ -4587,9 +4615,20 @@ async fn perform_transfer(
                 }
 
                 // Resolve relative URLs against current URL
-                let mut next_url = if location.contains("://") {
+                // Only treat as absolute if "://" appears in the scheme portion
+                // (before any path/query/fragment). A query string like
+                // `?moo=http://foo` should not be treated as absolute (test 45).
+                let has_scheme = location.find("://").is_some_and(|pos| {
+                    let before = &location[..pos];
+                    // A scheme must be all alphanumeric/+/-./ and cannot contain ?, #, or /
+                    !before.is_empty()
+                        && !before.contains('?')
+                        && !before.contains('#')
+                        && !before.contains('/')
+                });
+                let mut next_url = if has_scheme {
                     // Absolute URL with scheme (http://, https://, imap://, etc.)
-                    Url::parse(location)?
+                    Url::parse(&location)?
                 } else if location.starts_with("//") {
                     // Protocol-relative URL (//host/path) — use current scheme
                     let scheme = current_url.scheme();
@@ -4597,7 +4636,7 @@ async fn perform_transfer(
                 } else {
                     // Relative URL: build from current URL's base
                     let base = current_url.as_str();
-                    Url::parse(&resolve_relative(base, location))?
+                    Url::parse(&resolve_relative(base, &location))?
                 };
                 // Clear raw_input so redirect uses normalized path (not user's original)
                 next_url.clear_raw_input();
@@ -4625,6 +4664,25 @@ async fn perform_transfer(
                     {
                         eprintln!("* Following redirect to {next_url}");
                     }
+                }
+
+                // If we used chunked upload and the server is HTTP/1.0, refuse to
+                // follow the redirect because HTTP/1.0 doesn't support chunked
+                // encoding for a re-sent upload (curl returns CURLE_UPLOAD_FAILED = 25,
+                // test 1073).
+                if chunked_upload
+                    && response.http_version()
+                        == crate::protocol::http::response::ResponseHttpVersion::Http10
+                {
+                    // Store the response so the CLI can output the headers (test 1073)
+                    if let Ok(mut guard) = last_resp_store.lock() {
+                        *guard = Some(response);
+                    }
+                    return Err(Error::Transfer {
+                        code: 25,
+                        message: "Upload failed (chunked encoding not supported by HTTP/1.0)"
+                            .to_string(),
+                    });
                 }
 
                 // 307/308: always preserve method and body
@@ -5840,7 +5898,14 @@ async fn do_single_request(
                 } else if is_http_proxy {
                     // Strip fragment and credentials from proxy request URL
                     // Credentials go in Authorization header, not the Request-URI
-                    let full = strip_url_credentials(&url.to_full_string());
+                    // When path_as_is is set, use raw_input to preserve dot segments
+                    // (curl compat: test 1241).
+                    let full = if path_as_is {
+                        let raw = url.raw_input().unwrap_or_else(|| url.as_str());
+                        strip_url_credentials(raw)
+                    } else {
+                        strip_url_credentials(&url.to_full_string())
+                    };
                     let full = full
                         .split_once('#')
                         .map_or_else(|| full.clone(), |(base, _)| base.to_string());
@@ -7015,6 +7080,25 @@ const fn proxy_type_to_scheme(ptype: u32) -> &'static str {
         // 0 = HTTP, 1 = HTTP 1.0, and any unknown type default to HTTP
         _ => "http",
     }
+}
+
+/// Normalize redirect Location URLs with extra slashes.
+///
+/// `http:///host/path` (triple slash) is treated as `http://host/path` by curl
+/// (test 1141). Only one extra slash is removed; `http:////path` (four or more
+/// slashes) is left unchanged and rejected later as an empty-authority URL.
+fn normalize_redirect_slashes(location: &str) -> String {
+    // Check for http:///X or https:///X where X is NOT another slash
+    for prefix in &["http:///", "https:///"] {
+        if let Some(rest) = location.strip_prefix(*prefix) {
+            if !rest.starts_with('/') {
+                // Triple slash with a host after — collapse to double slash
+                let scheme = &prefix[..prefix.len() - 3]; // "http:" or "https:"
+                return format!("{scheme}//{rest}");
+            }
+        }
+    }
+    location.to_string()
 }
 
 /// Resolve a relative URL against a base URL.

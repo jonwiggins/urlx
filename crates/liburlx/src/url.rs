@@ -68,15 +68,11 @@ impl Url {
                     if let Some(after_scheme) = input.find("://") {
                         let host_start = after_scheme + 3;
                         let rest = &input[host_start..];
-                        // Skip userinfo if present
-                        let host_part_start = rest.find('@').map_or(0, |at_pos| {
-                            let slash_pos = rest.find('/').unwrap_or(rest.len());
-                            if at_pos < slash_pos {
-                                at_pos + 1
-                            } else {
-                                0
-                            }
-                        });
+                        // Find end of authority (before path, query, or fragment)
+                        let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+                        let authority = &rest[..authority_end];
+                        // Skip userinfo if present (only look for @ within the authority)
+                        let host_part_start = authority.find('@').map_or(0, |at_pos| at_pos + 1);
                         let host_rest = &rest[host_part_start..];
                         // Find end of host (: for port, / for path, ? for query, # for fragment)
                         let host_end =
