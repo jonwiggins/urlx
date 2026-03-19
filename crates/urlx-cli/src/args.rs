@@ -120,6 +120,11 @@ pub struct CliOptions {
     pub(crate) upload_filename: Option<String>,
     /// File path from `-T` for deferred reading at transfer time.
     pub(crate) upload_file_path: Option<String>,
+    /// Per-URL upload file paths. If a `-T` flag precedes each URL, the corresponding
+    /// entry is `Some(path)`. If a URL has no preceding `-T`, it is `None`.
+    /// This allows distinguishing `-T file URL1 -T file URL2` (both PUT) from
+    /// `-T file URL1 URL2` (first PUT, second GET).
+    pub(crate) per_url_upload_files: Vec<Option<String>>,
     /// Accumulated inline cookie values from `-b` (joined with "; " before sending).
     pub(crate) inline_cookies: Vec<String>,
     /// Whether `--next` was seen without a following URL (parse error if true at end).
@@ -670,6 +675,7 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
         is_stdin_upload: false,
         upload_filename: None,
         upload_file_path: None,
+        per_url_upload_files: Vec::new(),
         inline_cookies: Vec::new(),
         next_needs_url: false,
         had_next: false,
@@ -686,6 +692,8 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
     let mut i = 1;
     let mut group_start_idx: usize = 0;
     let mut current_ftp_method = liburlx::protocol::ftp::FtpMethod::default();
+    // Track pending -T upload file: set when -T is encountered, consumed when the next URL is added
+    let mut pending_upload_file: Option<String> = None;
     while i < args.len() {
         match args[i].as_str() {
             "-X" | "--request" => {
@@ -761,7 +769,8 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
                 if let Some(path) = val.strip_prefix('@') {
                     match read_data_source(path) {
                         Ok(data) => {
-                            // curl's -d @file strips ALL \r and \n (unlike --data-binary)
+                            // curl's -d @file strips ALL \r and \n from the data
+                            // (unlike --data-binary which keeps them).
                             let data: Vec<u8> =
                                 data.into_iter().filter(|&b| b != b'\r' && b != b'\n').collect();
                             opts.easy.body(&data);
@@ -1224,6 +1233,8 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
                     }
                     // Store file path; read at transfer time
                     opts.upload_file_path = Some(val.to_string());
+                    // Track pending upload for per-URL association
+                    pending_upload_file = Some(val.to_string());
                 }
             }
             "-b" | "--cookie" => {
@@ -1311,8 +1322,11 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
             "--expect100-timeout" => {
                 i += 1;
                 let val = require_arg(args, i, "--expect100-timeout")?;
-                if let Ok(ms) = val.parse::<u64>() {
-                    opts.easy.expect_100_timeout(std::time::Duration::from_millis(ms));
+                // curl's --expect100-timeout is in seconds (integer or decimal)
+                if let Ok(secs) = val.parse::<f64>() {
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    let millis = (secs * 1000.0) as u64;
+                    opts.easy.expect_100_timeout(std::time::Duration::from_millis(millis));
                 } else {
                     eprintln!("curl: invalid expect100-timeout value: {val}");
                     return Err(1);
@@ -1886,6 +1900,7 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
                 opts.per_url_credentials.push(opts.user_credentials.clone());
                 opts.per_url_ftp_methods.push(current_ftp_method);
                 opts.per_url_easy.push(None);
+                opts.per_url_upload_files.push(pending_upload_file.take());
                 opts.next_needs_url = false;
             }
             "--output-dir" => {
@@ -1951,6 +1966,7 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
                 opts.urls.push(expanded);
                 opts.per_url_credentials.push(opts.user_credentials.clone());
                 opts.per_url_easy.push(None);
+                opts.per_url_upload_files.push(pending_upload_file.take());
                 opts.next_needs_url = false;
             }
             "--expand-output" => {
@@ -2148,6 +2164,8 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
                 opts.per_url_credentials.push(opts.user_credentials.clone());
                 opts.per_url_ftp_methods.push(current_ftp_method);
                 opts.per_url_easy.push(None); // Will be filled on --next or at end
+                                              // Associate pending -T upload file with this URL (if any)
+                opts.per_url_upload_files.push(pending_upload_file.take());
                 opts.next_needs_url = false;
             }
         }
