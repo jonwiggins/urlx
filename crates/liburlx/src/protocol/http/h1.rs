@@ -142,31 +142,27 @@ where
 
     // Headers that curl emits before User-Agent (priority headers).
     // curl emits Proxy-Authorization before User-Agent always.
-    // Auto-generated Authorization (Basic/Digest/NTLM/Bearer) is also prioritized.
-    // Custom -H "Authorization: ..." stays in its original position (curl compat: test 317).
-    let priority_order: &[&str] = &["proxy-authorization", "range", "content-range"];
-    let auto_auth_prefixes = ["Basic ", "Digest ", "NTLM ", "Bearer ", "Negotiate "];
+    // Auto-generated Authorization (from -u/--basic) is also prioritized via "_auto_Authorization".
+    // Custom -H "Authorization: ..." stays in its original position (curl compat: test 317, 898).
+    let priority_order: &[&str] =
+        &["proxy-authorization", "_auto_authorization", "range", "content-range"];
 
     // Emit priority custom headers right after Host (curl compat order)
     for &prio_name in priority_order {
         for (i, (name, value)) in custom_headers.iter().enumerate() {
             if keep[i] && name.eq_ignore_ascii_case(prio_name) {
-                if value.is_empty() {
-                    let _ = write!(req, "{name}:\r\n");
+                // Rename internal marker to actual header name
+                let emit_name = if name.eq_ignore_ascii_case("_auto_authorization") {
+                    "Authorization"
                 } else {
-                    let _ = write!(req, "{name}: {value}\r\n");
+                    name
+                };
+                if value.is_empty() {
+                    let _ = write!(req, "{emit_name}:\r\n");
+                } else {
+                    let _ = write!(req, "{emit_name}: {value}\r\n");
                 }
             }
-        }
-    }
-    // Auto-generated Authorization headers (Basic/Digest/NTLM/Bearer) go in priority position.
-    // Custom -H "Authorization: custom" stays in normal position (curl compat: test 317).
-    for (i, (name, value)) in custom_headers.iter().enumerate() {
-        if keep[i]
-            && name.eq_ignore_ascii_case("authorization")
-            && auto_auth_prefixes.iter().any(|p| value.starts_with(p))
-        {
-            let _ = write!(req, "{name}: {value}\r\n");
         }
     }
 
@@ -236,14 +232,12 @@ where
     let mut deferred_content_type: Option<(String, String)> = None;
     let mut content_type_emitted = false;
     for (i, (name, value)) in custom_headers.iter().enumerate() {
-        // Skip priority headers, auto-auth, User-Agent, and Host (emitted elsewhere)
+        // Skip priority headers, User-Agent, Host, and Proxy-Connection (emitted elsewhere)
         let is_priority = priority_order.iter().any(|p| name.eq_ignore_ascii_case(p));
-        let is_auto_auth = name.eq_ignore_ascii_case("authorization")
-            && auto_auth_prefixes.iter().any(|p| value.starts_with(p));
         let is_ua = name.eq_ignore_ascii_case("user-agent");
         let is_host = name.eq_ignore_ascii_case("host");
         let is_proxy_conn = name.eq_ignore_ascii_case("proxy-connection");
-        if keep[i] && !is_priority && !is_auto_auth && !is_ua && !is_host && !is_proxy_conn {
+        if keep[i] && !is_priority && !is_ua && !is_host && !is_proxy_conn {
             // Defer form/multipart Content-Type to after Content-Length (curl compat)
             // Keep other Content-Types (like application/json) in place (test 383)
             if name.eq_ignore_ascii_case("content-type")
@@ -863,6 +857,12 @@ fn parse_headers(data: &[u8]) -> Result<ParsedHeaders, Error> {
         return Err(Error::Http("Weird server reply: binary zero in headers".to_string()));
     }
 
+    // Unfold HTTP header continuation lines (RFC 2616 §2.2, obsoleted but still supported
+    // for compat). A line starting with SP or HT is a continuation of the previous header.
+    // Replace "\r\n " / "\r\n\t" / "\n " / "\n\t" with a single space.
+    let data = unfold_headers(data);
+    let data = data.as_ref();
+
     let mut headers_buf = [httparse::EMPTY_HEADER; 64];
     let mut parsed = httparse::Response::new(&mut headers_buf);
 
@@ -1041,7 +1041,28 @@ fn parse_headers_large(data: &[u8]) -> Result<ParsedHeaders, Error> {
         let raw_value = raw_values.get(idx).cloned().unwrap_or_else(|| value.clone());
         headers_ordered.push((header.name.to_string(), raw_value));
         let _old = original_names.entry(name.clone()).or_insert_with(|| header.name.to_string());
-        let _old2 = headers.insert(name, value);
+        // For set-cookie, append with newline to preserve multiple values (same as parse_headers)
+        if name == "set-cookie" {
+            let _entry = headers
+                .entry(name)
+                .and_modify(|existing: &mut String| {
+                    existing.push('\n');
+                    existing.push_str(&value);
+                })
+                .or_insert(value);
+        } else if name == "content-length" {
+            let _entry = headers
+                .entry(name)
+                .and_modify(|existing: &mut String| {
+                    if existing.trim() != value.trim() {
+                        existing.push(',');
+                        existing.push_str(&value);
+                    }
+                })
+                .or_insert(value);
+        } else {
+            let _old2 = headers.insert(name, value);
+        }
     }
 
     Ok(ParsedHeaders {
@@ -1059,6 +1080,43 @@ fn parse_headers_large(data: &[u8]) -> Result<ParsedHeaders, Error> {
 ///
 /// `httparse` trims OWS from header values per RFC 7230, but curl preserves
 /// the raw whitespace in `-i` output. This function extracts the untrimmed
+/// Unfold HTTP header continuation lines (RFC 2616 §2.2, obsoleted by RFC 7230).
+///
+/// A continuation line starts with SP or HT. We replace `\r\n<SP|HT>` and `\n<SP|HT>`
+/// with a single space. Returns a `Cow::Borrowed` if no unfolding is needed.
+fn unfold_headers(data: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    // Quick check: is there any \n followed by SP or HT?
+    let needs_unfold = data.windows(2).any(|w| (w[0] == b'\n') && (w[1] == b' ' || w[1] == b'\t'));
+    if !needs_unfold {
+        return std::borrow::Cow::Borrowed(data);
+    }
+
+    let mut result = Vec::with_capacity(data.len());
+    let mut i = 0;
+    while i < data.len() {
+        if data[i] == b'\r'
+            && i + 2 < data.len()
+            && data[i + 1] == b'\n'
+            && (data[i + 2] == b' ' || data[i + 2] == b'\t')
+        {
+            // Replace \r\n<SP|HT> with a single space
+            result.push(b' ');
+            i += 3; // skip \r\n and the whitespace char
+        } else if data[i] == b'\n'
+            && i + 1 < data.len()
+            && (data[i + 1] == b' ' || data[i + 1] == b'\t')
+        {
+            // Replace \n<SP|HT> with a single space
+            result.push(b' ');
+            i += 2; // skip \n and the whitespace char
+        } else {
+            result.push(data[i]);
+            i += 1;
+        }
+    }
+    std::borrow::Cow::Owned(result)
+}
+
 /// values by parsing the raw header block.
 fn extract_raw_header_values(header_data: &[u8]) -> Vec<String> {
     let mut values = Vec::new();

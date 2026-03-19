@@ -11,7 +11,10 @@ use liburlx::CookieJar;
 #[test]
 fn very_long_cookie_name() {
     let mut jar = CookieJar::new();
-    let name = "x".repeat(4096);
+    // curl's MAX_COOKIE_LINE is 4096 (name + value combined).
+    // 4094 + 5 ("value") = 4099 > 4096 → rejected.
+    // 4090 + 5 = 4095 ≤ 4096 → accepted.
+    let name = "x".repeat(4090);
     jar.store_cookies(&[&format!("{name}=value")], "example.com", "/", true);
     assert_eq!(jar.len(), 1);
     let header = jar.cookie_header("example.com", "/", false).unwrap();
@@ -21,7 +24,8 @@ fn very_long_cookie_name() {
 #[test]
 fn very_long_cookie_value() {
     let mut jar = CookieJar::new();
-    let value = "y".repeat(4096);
+    // 3 ("key") + 4090 = 4093 ≤ 4096 → accepted
+    let value = "y".repeat(4090);
     jar.store_cookies(&[&format!("key={value}")], "example.com", "/", true);
     assert_eq!(jar.len(), 1);
     let header = jar.cookie_header("example.com", "/", false).unwrap();
@@ -36,15 +40,15 @@ fn one_thousand_cookies() {
     for i in 0..1000 {
         jar.store_cookies(&[&format!("key{i}=val{i}")], "example.com", "/", true);
     }
-    assert_eq!(jar.len(), 1000);
+    // curl caps at 50 cookies per domain (MAX_COOKIE_TOTAL_AMOUNT).
+    assert_eq!(jar.len(), 50);
 
     let header = jar.cookie_header("example.com", "/", false).unwrap();
-    // curl caps cookies per request at 150 (MAX_COOKIE_SEND_AMOUNT).
-    // First cookies by creation order are sent.
+    // First 50 cookies by creation order are kept; rest are rejected.
     assert!(header.contains("key0=val0"));
-    assert!(header.contains("key149=val149"));
-    // key150+ are truncated
-    assert!(!header.contains("key999=val999"));
+    assert!(header.contains("key49=val49"));
+    // key50+ were rejected
+    assert!(!header.contains("key50=val50"));
 }
 
 #[test]

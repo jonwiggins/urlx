@@ -61,19 +61,23 @@ impl HstsCache {
     }
 
     /// Check if a host should be upgraded to HTTPS.
+    ///
+    /// Trailing dots are stripped for matching (curl compat: tests 440/441).
     #[must_use]
     pub fn should_upgrade(&self, host: &str) -> bool {
         let host_lower = host.to_lowercase();
+        // Strip trailing dot for matching (curl compat: "example.com." matches "example.com")
+        let host_normalized = host_lower.strip_suffix('.').unwrap_or(&host_lower);
 
         // Direct match
-        if let Some(entry) = self.entries.get(&host_lower) {
+        if let Some(entry) = self.entries.get(host_normalized) {
             if entry.expires > Instant::now() {
                 return true;
             }
         }
 
         // Check parent domains with includeSubDomains
-        let mut domain = host_lower.as_str();
+        let mut domain = host_normalized;
         while let Some(dot_pos) = domain.find('.') {
             domain = &domain[dot_pos + 1..];
             if let Some(entry) = self.entries.get(domain) {
@@ -114,31 +118,54 @@ impl HstsCache {
                 continue;
             }
 
-            let parts: Vec<&str> = line.split('\t').collect();
-            if parts.len() < 2 {
-                continue;
+            // Try curl's native HSTS format: `host "YYYYMMDD HH:MM:SS"`
+            // Also supports tab-separated format: `host\ttimestamp\tinclude_subdomains`
+            if let Some((host_part, rest)) = line.split_once('"') {
+                // curl format: host "YYYYMMDD HH:MM:SS"
+                let trimmed = host_part.trim();
+                let host = trimmed.strip_suffix('.').unwrap_or(trimmed).to_lowercase();
+                let date_str = rest.trim_end_matches('"').trim();
+                if let Some(expire_ts) = parse_hsts_date(date_str) {
+                    if expire_ts > now_secs {
+                        let remaining_secs = expire_ts - now_secs;
+                        let _old = cache.entries.insert(
+                            host,
+                            HstsEntry {
+                                expires: Instant::now() + Duration::from_secs(remaining_secs),
+                                expire_timestamp: expire_ts,
+                                include_subdomains: false,
+                            },
+                        );
+                    }
+                }
+            } else {
+                // Tab-separated format: host\ttimestamp\tinclude_subdomains
+                let parts: Vec<&str> = line.split('\t').collect();
+                if parts.len() < 2 {
+                    continue;
+                }
+
+                let host = parts[0].strip_suffix('.').unwrap_or(parts[0]).to_lowercase();
+                let Ok(expire_ts) = parts[1].parse::<u64>() else {
+                    continue;
+                };
+                let include_subdomains = parts.get(2).is_some_and(|v| *v == "1");
+
+                // Skip already-expired entries
+                if expire_ts <= now_secs {
+                    continue;
+                }
+
+                let remaining_secs = expire_ts - now_secs;
+                let _old = cache.entries.insert(
+                    host,
+                    HstsEntry {
+                        expires: Instant::now() + Duration::from_secs(remaining_secs),
+                        expire_timestamp: expire_ts,
+                        include_subdomains,
+                    },
+                );
             }
-
-            let host = parts[0].to_lowercase();
-            let Ok(expire_ts) = parts[1].parse::<u64>() else {
-                continue;
-            };
-            let include_subdomains = parts.get(2).is_some_and(|v| *v == "1");
-
-            // Skip already-expired entries
-            if expire_ts <= now_secs {
-                continue;
-            }
-
-            let remaining_secs = expire_ts - now_secs;
-            let _old = cache.entries.insert(
-                host,
-                HstsEntry {
-                    expires: Instant::now() + Duration::from_secs(remaining_secs),
-                    expire_timestamp: expire_ts,
-                    include_subdomains,
-                },
-            );
         }
 
         Ok(cache)
@@ -196,6 +223,54 @@ impl Default for HstsCache {
 struct HstsDirectives {
     max_age: u64,
     include_subdomains: bool,
+}
+
+/// Parse a curl-format HSTS date string ("YYYYMMDD HH:MM:SS") into a Unix timestamp.
+fn parse_hsts_date(s: &str) -> Option<u64> {
+    // Format: "YYYYMMDD HH:MM:SS"
+    let parts: Vec<&str> = s.split_whitespace().collect();
+    if parts.is_empty() {
+        return None;
+    }
+
+    let date_part = parts[0];
+    if date_part.len() < 8 {
+        return None;
+    }
+
+    let year: u64 = date_part[..4].parse().ok()?;
+    let month: u32 = date_part[4..6].parse().ok()?;
+    let day: u32 = date_part[6..8].parse().ok()?;
+
+    let (hour, minute, second) = if parts.len() > 1 {
+        let time_parts: Vec<&str> = parts[1].split(':').collect();
+        let h: u64 = time_parts.first().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let m: u64 = time_parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+        let s: u64 = time_parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
+        (h, m, s)
+    } else {
+        (0, 0, 0)
+    };
+
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || year < 1970 {
+        return None;
+    }
+
+    // Convert to days since epoch (simplified)
+    let days_in_months: [u32; 13] = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let mut total_days: u64 = 0;
+    for y in 1970..year {
+        total_days += if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 { 366 } else { 365 };
+    }
+    for m in 1..month {
+        total_days += u64::from(days_in_months[m as usize]);
+        if m == 2 && ((year % 4 == 0 && year % 100 != 0) || year % 400 == 0) {
+            total_days += 1;
+        }
+    }
+    total_days += u64::from(day - 1);
+
+    Some(total_days * 86400 + hour * 3600 + minute * 60 + second)
 }
 
 /// Parse an HSTS header value into directives.

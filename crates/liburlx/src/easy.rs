@@ -67,6 +67,7 @@ pub struct Easy {
     cookie_jar: Option<CookieJar>,
     cookie_jar_path: Option<String>,
     hsts_cache: Option<HstsCache>,
+    hsts_file_path: Option<String>,
     multipart: Option<MultipartForm>,
     range: Option<String>,
     resolve_overrides: Vec<(String, String)>,
@@ -372,6 +373,7 @@ impl Clone for Easy {
             cookie_jar: self.cookie_jar.clone(),
             cookie_jar_path: self.cookie_jar_path.clone(),
             hsts_cache: self.hsts_cache.clone(),
+            hsts_file_path: self.hsts_file_path.clone(),
             multipart: self.multipart.clone(),
             range: self.range.clone(),
             resolve_overrides: self.resolve_overrides.clone(),
@@ -501,6 +503,7 @@ impl Easy {
             cookie_jar: None,
             cookie_jar_path: None,
             hsts_cache: None,
+            hsts_file_path: None,
             multipart: None,
             range: None,
             resolve_overrides: Vec::new(),
@@ -868,14 +871,16 @@ impl Easy {
         use base64::Engine;
         let credentials = format!("{user}:{password}");
         let encoded = base64::engine::general_purpose::STANDARD.encode(credentials.as_bytes());
-        self.header("Authorization", &format!("Basic {encoded}"));
+        // Use internal marker "_auto_Authorization" to distinguish auto-generated auth
+        // from custom -H headers. h1.rs emits these in priority position (before User-Agent).
+        self.header("_auto_Authorization", &format!("Basic {encoded}"));
     }
 
     /// Set Bearer token authentication.
     ///
     /// Adds an `Authorization: Bearer <token>` header to the request.
     pub fn bearer_token(&mut self, token: &str) {
-        self.header("Authorization", &format!("Bearer {token}"));
+        self.header("_auto_Authorization", &format!("Bearer {token}"));
         // Also store separately for SASL XOAUTH2 (IMAP/POP3/SMTP)
         self.oauth2_bearer = Some(token.to_string());
     }
@@ -904,15 +909,27 @@ impl Easy {
 
     /// Load cookies from a Netscape-format cookie file.
     ///
-    /// Enables the cookie engine and loads cookies from the given file path.
+    /// Enables the cookie engine and loads/merges cookies from the given file path.
+    /// If the file does not exist, the cookie engine is enabled but no cookies
+    /// are loaded (curl compat: `-b <nonexistent>` just enables cookies).
+    /// Multiple calls merge cookies from all files into the same jar.
     /// Equivalent to curl's `CURLOPT_COOKIEFILE` / `-b <file>`.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Io`] if the file cannot be read.
+    /// Returns [`Error::Io`] if the file exists but cannot be read.
     pub fn cookie_file<P: AsRef<Path>>(&mut self, path: P) -> Result<(), Error> {
-        let jar = CookieJar::load_from_file(path).map_err(Error::Io)?;
-        self.cookie_jar = Some(jar);
+        let jar = self.cookie_jar.get_or_insert_with(CookieJar::new);
+        match std::fs::File::open(path.as_ref()) {
+            Ok(file) => {
+                let reader = std::io::BufReader::new(file);
+                jar.load_from_reader(reader).map_err(Error::Io)?;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // File doesn't exist: just enable the cookie engine (curl compat)
+            }
+            Err(e) => return Err(Error::Io(e)),
+        }
         Ok(())
     }
 
@@ -1011,6 +1028,41 @@ impl Easy {
         } else {
             self.hsts_cache = None;
         }
+    }
+
+    /// Load HSTS entries from a file and enable HSTS enforcement.
+    ///
+    /// The file is also saved back after the transfer completes (call
+    /// [`save_hsts_cache`](Self::save_hsts_cache) after `perform()`).
+    /// Equivalent to curl's `--hsts <file>`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file exists but cannot be read.
+    pub fn hsts_file(&mut self, path: &str) -> Result<(), Error> {
+        let file_path = std::path::Path::new(path);
+        if file_path.exists() {
+            self.hsts_cache = Some(HstsCache::load_from_file(file_path)?);
+        } else {
+            // File doesn't exist yet: just enable HSTS (curl compat)
+            self.hsts(true);
+        }
+        self.hsts_file_path = Some(path.to_string());
+        Ok(())
+    }
+
+    /// Save the HSTS cache to the configured file path.
+    ///
+    /// Does nothing if no HSTS file path has been set.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be written.
+    pub fn save_hsts_cache(&self) -> Result<(), Error> {
+        if let (Some(ref path), Some(ref cache)) = (&self.hsts_file_path, &self.hsts_cache) {
+            cache.save_to_file(std::path::Path::new(path))?;
+        }
+        Ok(())
     }
 
     /// Add a DNS resolve override.
@@ -2736,16 +2788,18 @@ async fn perform_transfer(
             let cur_host = current_url.host_str().unwrap_or("");
             let orig_port = original_url.port_or_default().unwrap_or(0);
             let cur_port = current_url.port_or_default().unwrap_or(0);
+            // Strip on cross-host or cross-port redirect (curl compat: test 898)
             let is_cross_origin =
                 !orig_host.eq_ignore_ascii_case(cur_host) || orig_port != cur_port;
-            if is_cross_origin {
-                if !unrestricted_auth {
-                    // Strip auth and sensitive headers on cross-origin redirect
-                    request_headers.retain(|(k, _)| {
-                        !k.eq_ignore_ascii_case("authorization")
-                            && !k.eq_ignore_ascii_case("cookie")
-                    });
-                }
+            if is_cross_origin && !unrestricted_auth {
+                // Strip auth and sensitive headers on cross-origin redirect
+                request_headers.retain(|(k, _)| {
+                    !k.eq_ignore_ascii_case("authorization")
+                        && !k.eq_ignore_ascii_case("_auto_authorization")
+                        && !k.eq_ignore_ascii_case("cookie")
+                });
+            }
+            if !orig_host.eq_ignore_ascii_case(cur_host) {
                 // Drop custom Host header on cross-host redirect (curl compat: test 184)
                 request_headers.retain(|(k, _)| !k.eq_ignore_ascii_case("host"));
             }
@@ -2771,7 +2825,8 @@ async fn perform_transfer(
                     |(_, v)| v.split(':').next().unwrap_or(v.as_str()),
                 );
             let path = current_url.path();
-            let is_secure = current_url.scheme() == "https";
+            let is_secure =
+                current_url.scheme() == "https" || cookie_host.eq_ignore_ascii_case("localhost");
             if let Some(cookie_header) = jar.cookie_header(cookie_host, path, is_secure) {
                 // Merge with existing Cookie header if user set one (curl compat: -b file -b "k=v")
                 if let Some(existing) =
@@ -4264,7 +4319,8 @@ async fn perform_transfer(
                     |(_, v)| v.split(':').next().unwrap_or(v),
                 );
             let path = current_url.path();
-            let is_secure = current_url.scheme() == "https";
+            let is_secure =
+                current_url.scheme() == "https" || cookie_host.eq_ignore_ascii_case("localhost");
             jar.store_from_headers(response.headers(), cookie_host, path, is_secure);
         }
 
@@ -5583,23 +5639,11 @@ async fn do_single_request(
                 // Add proxy-specific headers for non-tunnel HTTP proxy requests
                 let mut proxy_effective_headers = effective_headers.clone();
                 if is_http_proxy {
-                    // Insert Proxy-Connection after Accept but before custom headers
-                    // (curl compat: test 317, 318). The Accept header is one of the
-                    // last "standard" headers before custom ones.
-                    let accept_pos = proxy_effective_headers
-                        .iter()
-                        .position(|(k, _)| k.eq_ignore_ascii_case("accept"));
-                    let cookie_pos = proxy_effective_headers
-                        .iter()
-                        .position(|(k, _)| k.eq_ignore_ascii_case("cookie"));
-                    // Prefer: after Accept (test 317/318), before Cookie (test 179)
-                    let insert_pos = cookie_pos
-                        .or_else(|| accept_pos.map(|p| p + 1))
-                        .unwrap_or(proxy_effective_headers.len());
-                    proxy_effective_headers.insert(
-                        insert_pos,
-                        ("Proxy-Connection".to_string(), "Keep-Alive".to_string()),
-                    );
+                    // Proxy-Connection is emitted by h1::request() in its fixed position
+                    // (after Accept, before custom headers — curl compat: test 179, 898).
+                    // Just add it to custom_headers so h1.rs picks it up.
+                    proxy_effective_headers
+                        .push(("Proxy-Connection".to_string(), "Keep-Alive".to_string()));
                     proxy_effective_headers.extend_from_slice(proxy_headers);
                 }
 
@@ -6420,7 +6464,9 @@ fn extract_login_options_from_url(url: &Url) -> Option<String> {
 
 fn extract_basic_auth_from_headers(headers: &[(String, String)]) -> Option<(String, String)> {
     use base64::Engine;
-    let auth_val = find_header(headers, "authorization")?;
+    // Check both "Authorization" and "_auto_Authorization" (internal marker for -u/--basic)
+    let auth_val = find_header(headers, "authorization")
+        .or_else(|| find_header(headers, "_auto_authorization"))?;
     let encoded = auth_val.strip_prefix("Basic ")?;
     let decoded = base64::engine::general_purpose::STANDARD.decode(encoded.trim()).ok()?;
     let decoded_str = String::from_utf8(decoded).ok()?;
@@ -7068,7 +7114,8 @@ mod tests {
         let mut easy = Easy::new();
         easy.basic_auth("user", "pass");
         assert_eq!(easy.headers.len(), 1);
-        assert_eq!(easy.headers[0].0, "Authorization");
+        // Internal marker for priority-position auth (h1.rs emits as "Authorization")
+        assert_eq!(easy.headers[0].0, "_auto_Authorization");
         // base64("user:pass") = "dXNlcjpwYXNz"
         assert_eq!(easy.headers[0].1, "Basic dXNlcjpwYXNz");
     }
@@ -7078,7 +7125,7 @@ mod tests {
         let mut easy = Easy::new();
         easy.bearer_token("my-token-123");
         assert_eq!(easy.headers.len(), 1);
-        assert_eq!(easy.headers[0].0, "Authorization");
+        assert_eq!(easy.headers[0].0, "_auto_Authorization");
         assert_eq!(easy.headers[0].1, "Bearer my-token-123");
     }
 
@@ -7475,9 +7522,11 @@ mod tests {
     }
 
     #[test]
-    fn easy_cookie_jar_file_not_found() {
+    fn easy_cookie_jar_file_not_found_enables_cookies() {
         let mut easy = Easy::new();
-        assert!(easy.cookie_file("/nonexistent/path.txt").is_err());
+        // Non-existent file should succeed and enable cookie engine (curl compat)
+        assert!(easy.cookie_file("/tmp/urlx_nonexistent_cookie_file.txt").is_ok());
+        assert!(easy.cookie_jar.is_some());
     }
 
     #[test]
