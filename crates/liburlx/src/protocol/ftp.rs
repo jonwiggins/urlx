@@ -281,6 +281,10 @@ pub struct FtpSession {
     features: Option<FtpFeatures>,
     /// Server hostname for TLS SNI.
     hostname: String,
+    /// Port used for this control connection.
+    port: u16,
+    /// Username used for login.
+    user: String,
     /// Local address of the control connection (for active mode PORT commands).
     local_addr: SocketAddr,
     /// Whether data connections should use TLS (set after PROT P).
@@ -294,6 +298,11 @@ pub struct FtpSession {
     config: FtpConfig,
     /// Accumulated raw FTP response bytes for dump-header support.
     header_bytes: Vec<u8>,
+    /// Current working directory components (for connection reuse).
+    /// Empty means "initial state after login" (home directory).
+    current_dir: Vec<String>,
+    /// Current TYPE setting (for skipping redundant TYPE commands on reuse).
+    current_type: Option<TransferType>,
 }
 
 impl FtpSession {
@@ -340,6 +349,8 @@ impl FtpSession {
             writer,
             features: None,
             hostname: host.to_string(),
+            port,
+            user: user.to_string(),
             local_addr,
             use_tls_data: false,
             active_port,
@@ -347,6 +358,8 @@ impl FtpSession {
             tls_connector: None,
             config,
             header_bytes,
+            current_dir: Vec::new(),
+            current_type: None,
         };
 
         // Login
@@ -431,12 +444,16 @@ impl FtpSession {
             writer,
             features: None,
             hostname: host.to_string(),
+            port,
+            user: user.to_string(),
             local_addr,
             use_tls_data: false,
             active_port,
             tls_connector: Some(tls_connector),
             config,
             header_bytes,
+            current_dir: Vec::new(),
+            current_type: None,
         };
 
         // For explicit FTPS, upgrade the control connection to TLS
@@ -548,12 +565,16 @@ impl FtpSession {
             writer,
             features: self.features,
             hostname: self.hostname,
+            port: self.port,
+            user: self.user,
             local_addr: self.local_addr,
             use_tls_data: false,
             active_port: self.active_port,
             tls_connector: self.tls_connector,
             config: self.config,
             header_bytes: self.header_bytes,
+            current_dir: self.current_dir,
+            current_type: self.current_type,
         })
     }
 
@@ -757,7 +778,8 @@ impl FtpSession {
                     .map_err(|e| Error::Http(format!("FTP data connection failed: {e}")))?;
                 return self.maybe_wrap_data_tls(tcp).await;
             }
-            // EPSV failed (e.g. 500/502), fall through to PASV
+            // EPSV failed (e.g. 500/502), remember and fall through to PASV
+            self.config.use_epsv = false;
         }
 
         send_command(&mut self.writer, "PASV").await?;
@@ -840,7 +862,10 @@ impl FtpSession {
                     message: format!("FTP EPRT failed: {} {}", resp.code, resp.message),
                 });
             }
-            // IPv4 EPRT failed, fall through to PORT
+            // IPv4 EPRT failed, remember and fall through to PORT
+            if !port_ok {
+                self.config.use_eprt = false;
+            }
         }
 
         if !port_ok && local_ip.is_ipv4() {
@@ -1343,7 +1368,7 @@ impl FtpSession {
     /// # Errors
     ///
     /// Returns an error if sending the QUIT command fails.
-    pub async fn quit(mut self) -> Result<(), Error> {
+    pub async fn quit(&mut self) -> Result<(), Error> {
         let _ = send_command(&mut self.writer, "QUIT").await;
         // Read the QUIT response with a short timeout (server may close
         // connection or exit before responding). Ignore all errors.
@@ -1353,6 +1378,12 @@ impl FtpSession {
         )
         .await;
         Ok(())
+    }
+
+    /// Check if this session can be reused for the given host, port, and user.
+    #[must_use]
+    pub fn can_reuse(&self, host: &str, port: u16, user: &str) -> bool {
+        self.hostname == host && self.port == port && self.user == user
     }
 }
 
@@ -1650,6 +1681,7 @@ pub async fn perform(
     resume_from: Option<u64>,
     config: &FtpConfig,
     credentials: Option<(&str, &str)>,
+    ftp_session: &mut Option<FtpSession>,
 ) -> Result<Response, Error> {
     let range_end = config.range_end;
     let (host, port) = url.host_and_port()?;
@@ -1681,77 +1713,208 @@ pub async fn perform(
     // Parse ;type=A or ;type=I from path (RFC 1738 FTP URL type)
     let (effective_path, type_override) = parse_ftp_type(path);
 
-    let mut session =
-        connect_session(&host, port, user, pass, ssl_mode, use_ssl, tls_config, config.clone())
-            .await?;
+    // Reuse existing session if compatible, otherwise create a new one.
+    let is_reuse = if let Some(existing) = ftp_session.take() {
+        if existing.can_reuse(&host, port, user) {
+            *ftp_session = Some(existing);
+            true
+        } else {
+            // Different host/port/user — quit old session
+            let mut old = existing;
+            let _ = old.quit().await;
+            drop(old);
+            false
+        }
+    } else {
+        false
+    };
 
-    // PWD after login (curl always sends this)
-    let _pwd = session.pwd_safe().await;
+    if !is_reuse {
+        let new_session =
+            connect_session(&host, port, user, pass, ssl_mode, use_ssl, tls_config, config.clone())
+                .await?;
+        *ftp_session = Some(new_session);
+    }
+
+    // At this point ftp_session is always Some (set in the block above).
+    let Some(session) = ftp_session.as_mut() else {
+        return Err(Error::Http("internal: FTP session missing".to_string()));
+    };
+    let result = perform_inner(
+        session,
+        url,
+        upload_data,
+        resume_from,
+        config,
+        is_reuse,
+        effective_path,
+        type_override,
+        is_dir_list,
+        range_end,
+    )
+    .await;
+
+    // On fatal I/O errors (connection lost), discard the session.
+    if let Err(ref e) = result {
+        if is_connection_error(e) {
+            let _ = ftp_session.take();
+        }
+    }
+
+    result
+}
+
+/// Check if an error indicates the FTP control connection is dead.
+const fn is_connection_error(e: &Error) -> bool {
+    matches!(e, Error::Connect(_) | Error::Io(_))
+}
+
+/// Send TYPE command only if the session's current type differs from the requested type.
+///
+/// Avoids redundant TYPE commands when reusing a session (curl compat: tests 210, 215, 216).
+async fn send_type_if_needed(
+    session: &mut FtpSession,
+    transfer_type: TransferType,
+) -> Result<(), Error> {
+    if session.current_type == Some(transfer_type) {
+        return Ok(());
+    }
+    let cmd = match transfer_type {
+        TransferType::Ascii => "TYPE A",
+        TransferType::Binary => "TYPE I",
+    };
+    send_command(&mut session.writer, cmd).await?;
+    let resp = session.read_and_record().await?;
+    if !resp.is_complete() {
+        return Err(Error::Transfer {
+            code: 17,
+            message: format!("FTP TYPE failed: {} {}", resp.code, resp.message),
+        });
+    }
+    session.current_type = Some(transfer_type);
+    Ok(())
+}
+
+/// Inner FTP transfer logic, operating on a borrowed session.
+///
+/// The session is guaranteed to be logged in. On reuse, CWD navigation
+/// is optimized to avoid redundant commands.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+async fn perform_inner(
+    session: &mut FtpSession,
+    url: &crate::url::Url,
+    upload_data: Option<&[u8]>,
+    resume_from: Option<u64>,
+    config: &FtpConfig,
+    is_reuse: bool,
+    effective_path: &str,
+    type_override: Option<TransferType>,
+    is_dir_list: bool,
+    range_end: Option<u64>,
+) -> Result<Response, Error> {
+    if !is_reuse {
+        // PWD after login (curl always sends this)
+        let _pwd = session.pwd_safe().await;
+    }
 
     // Navigate to directory via CWD commands
     let (dir_components, filename) = if is_dir_list {
-        // For listings, the entire path is the directory
-        let trimmed = effective_path.trim_start_matches('/');
-        let trimmed = trimmed.trim_end_matches('/');
-        if trimmed.is_empty() {
-            // Root directory listing.
-            // ftp://host/ (single slash) = relative root, no CWD needed (test 101)
-            // ftp://host// (double slash) = absolute path to /, CWD / needed (tests 350, 352)
-            if config.method == FtpMethod::NoCwd || !effective_path.starts_with("//") {
-                (Vec::new(), String::new())
-            } else {
-                (vec!["/"], String::new())
-            }
+        if config.method == FtpMethod::NoCwd {
+            // NoCwd: no CWD at all, path goes into the LIST command
+            (Vec::new(), String::new())
         } else {
-            let components: Vec<&str> = trimmed.split('/').collect();
-            (components, String::new())
+            // For listings, the entire path is the directory
+            let trimmed = effective_path.trim_start_matches('/');
+            let trimmed = trimmed.trim_end_matches('/');
+            if trimmed.is_empty() {
+                // Root directory listing.
+                // ftp://host/ (single slash) = relative root, no CWD needed (test 101)
+                // ftp://host// (double slash) = absolute path to /, CWD / needed (tests 350, 352)
+                if effective_path.starts_with("//") {
+                    (vec!["/"], String::new())
+                } else {
+                    (Vec::new(), String::new())
+                }
+            } else {
+                let components: Vec<&str> = trimmed.split('/').collect();
+                (components, String::new())
+            }
         }
     } else {
         // For file operations, split directory from filename
         split_path_for_method(effective_path, config.method)
     };
 
-    // Perform CWD navigation
-    for component in &dir_components {
-        if component.is_empty() {
-            continue;
-        }
-        send_command(&mut session.writer, &format!("CWD {component}")).await?;
-        let cwd_resp = session.read_and_record().await?;
-        if !cwd_resp.is_complete() {
-            if config.create_dirs {
-                // --ftp-create-dirs: try MKD then retry CWD
-                send_command(&mut session.writer, &format!("MKD {component}")).await?;
-                let _mkd_resp = session.read_and_record().await?;
-                // Always retry CWD after MKD, even if MKD failed (curl compat)
-                send_command(&mut session.writer, &format!("CWD {component}")).await?;
-                let retry_resp = session.read_and_record().await?;
-                if !retry_resp.is_complete() {
-                    let _ = session.quit().await;
-                    return Err(Error::Transfer {
-                        code: 9,
-                        message: format!(
-                            "FTP CWD failed after MKD: {} {}",
-                            retry_resp.code, retry_resp.message
-                        ),
-                    });
-                }
-            } else if cwd_resp.code == 421 {
-                // 421 = Service not available / timeout. Don't send QUIT —
-                // the server is closing the connection (curl compat: test 1120).
-                return Err(Error::Transfer {
-                    code: 28,
-                    message: format!("FTP server timeout: {} {}", cwd_resp.code, cwd_resp.message),
-                });
-            } else {
-                // CWD failed - send QUIT and return error code 9
-                let _ = session.quit().await;
+    // For connection reuse: check if we need to change directories.
+    // If target dir matches current dir, skip all CWD commands.
+    // If different, CWD / to reset then navigate to target.
+    let target_dir: Vec<String> =
+        dir_components.iter().filter(|c| !c.is_empty()).map(ToString::to_string).collect();
+
+    let need_cwd = if is_reuse {
+        target_dir != session.current_dir
+    } else {
+        // Fresh connection: always navigate (unless dir is empty)
+        !target_dir.is_empty()
+    };
+
+    if need_cwd {
+        // On reuse: reset to root first, then navigate
+        if is_reuse && !session.current_dir.is_empty() {
+            send_command(&mut session.writer, "CWD /").await?;
+            let cwd_resp = session.read_and_record().await?;
+            if !cwd_resp.is_complete() {
                 return Err(Error::Transfer {
                     code: 9,
-                    message: format!("FTP CWD failed: {} {}", cwd_resp.code, cwd_resp.message),
+                    message: format!("FTP CWD / failed: {} {}", cwd_resp.code, cwd_resp.message),
                 });
             }
+            session.current_dir.clear();
         }
+
+        // Perform CWD navigation
+        for component in &dir_components {
+            if component.is_empty() {
+                continue;
+            }
+            send_command(&mut session.writer, &format!("CWD {component}")).await?;
+            let cwd_resp = session.read_and_record().await?;
+            if !cwd_resp.is_complete() {
+                if config.create_dirs {
+                    // --ftp-create-dirs: try MKD then retry CWD
+                    send_command(&mut session.writer, &format!("MKD {component}")).await?;
+                    let _mkd_resp = session.read_and_record().await?;
+                    // Always retry CWD after MKD, even if MKD failed (curl compat)
+                    send_command(&mut session.writer, &format!("CWD {component}")).await?;
+                    let retry_resp = session.read_and_record().await?;
+                    if !retry_resp.is_complete() {
+                        return Err(Error::Transfer {
+                            code: 9,
+                            message: format!(
+                                "FTP CWD failed after MKD: {} {}",
+                                retry_resp.code, retry_resp.message
+                            ),
+                        });
+                    }
+                } else if cwd_resp.code == 421 {
+                    // 421 = Service not available / timeout. Don't send QUIT —
+                    // the server is closing the connection (curl compat: test 1120).
+                    return Err(Error::Transfer {
+                        code: 28,
+                        message: format!(
+                            "FTP server timeout: {} {}",
+                            cwd_resp.code, cwd_resp.message
+                        ),
+                    });
+                } else {
+                    return Err(Error::Transfer {
+                        code: 9,
+                        message: format!("FTP CWD failed: {} {}", cwd_resp.code, cwd_resp.message),
+                    });
+                }
+            }
+        }
+        session.current_dir = target_dir;
     }
 
     // Pre-quote commands (sent after CWD, before data transfer)
@@ -1759,7 +1922,6 @@ pub async fn perform(
         send_command(&mut session.writer, cmd).await?;
         let resp = session.read_and_record().await?;
         if !resp.is_complete() && !resp.is_preliminary() {
-            let _ = session.quit().await;
             return Err(Error::Transfer {
                 code: 21,
                 message: format!(
@@ -1771,11 +1933,10 @@ pub async fn perform(
     }
 
     // HEAD/nobody mode: only get file metadata, no data transfer.
-    // For directory listings (-I on a directory), just QUIT after CWD (curl compat: test 1000).
+    // For directory listings (-I on a directory), just return after CWD (curl compat: test 1000).
     if config.nobody {
         if is_dir_list {
             let raw = std::mem::take(&mut session.header_bytes);
-            let _ = session.quit().await;
             let headers = std::collections::HashMap::new();
             let mut resp = Response::new(200, headers, Vec::new(), url.as_str().to_string());
             resp.set_raw_headers(raw);
@@ -1797,15 +1958,7 @@ pub async fn perform(
         }
 
         // TYPE I for SIZE
-        send_command(&mut session.writer, "TYPE I").await?;
-        let type_resp = session.read_and_record().await?;
-        if !type_resp.is_complete() {
-            let _ = session.quit().await;
-            return Err(Error::Transfer {
-                code: 17,
-                message: format!("FTP TYPE failed: {} {}", type_resp.code, type_resp.message),
-            });
-        }
+        send_type_if_needed(session, TransferType::Binary).await?;
 
         // SIZE
         if !filename.is_empty() {
@@ -1821,7 +1974,6 @@ pub async fn perform(
         let _rest_resp = session.read_and_record().await?;
 
         let raw = std::mem::take(&mut session.header_bytes);
-        let _ = session.quit().await;
 
         // Build FTP HEAD output as pseudo-HTTP headers (curl compat)
         let mut body_text = String::new();
@@ -1857,13 +2009,11 @@ pub async fn perform(
             #[allow(clippy::cast_possible_truncation)]
             let offset_usize = offset as usize;
             if offset_usize >= upload_bytes.len() {
-                // Upload resume beyond file size: send EPSV + TYPE I then QUIT
+                // Upload resume beyond file size: send EPSV + TYPE I then return
                 // (curl sends these commands even when nothing to upload)
                 let _ = session.open_data_connection().await;
-                send_command(&mut session.writer, "TYPE I").await?;
-                let _ = session.read_and_record().await;
+                send_type_if_needed(session, TransferType::Binary).await?;
                 let raw = std::mem::take(&mut session.header_bytes);
-                let _ = session.quit().await;
                 let headers = std::collections::HashMap::new();
                 let mut resp = Response::new(200, headers, Vec::new(), url.as_str().to_string());
                 resp.set_raw_headers(raw);
@@ -1881,25 +2031,16 @@ pub async fn perform(
         let mut data_stream = match data_stream_result {
             Ok(s) => s,
             Err(e) => {
-                let _ = session.quit().await;
                 return Err(e);
             }
         };
 
         // TYPE command for upload: respect ;type=a URL suffix (curl compat: tests 475, 476)
-        let upload_type_cmd = match type_override {
-            Some(TransferType::Ascii) => "TYPE A",
-            _ => "TYPE I",
+        let upload_type = match type_override {
+            Some(TransferType::Ascii) => TransferType::Ascii,
+            _ => TransferType::Binary,
         };
-        send_command(&mut session.writer, upload_type_cmd).await?;
-        let type_resp = session.read_and_record().await?;
-        if !type_resp.is_complete() {
-            let _ = session.quit().await;
-            return Err(Error::Transfer {
-                code: 17,
-                message: format!("FTP TYPE failed: {} {}", type_resp.code, type_resp.message),
-            });
-        }
+        send_type_if_needed(session, upload_type).await?;
 
         // SIZE before upload for resume offset detection (curl compat: test 362)
         // Only send SIZE for resume, not for plain --append (curl compat: test 109)
@@ -1922,7 +2063,6 @@ pub async fn perform(
         send_command(&mut session.writer, &stor_cmd).await?;
         let stor_resp = session.read_and_record().await?;
         if !stor_resp.is_preliminary() && !stor_resp.is_complete() {
-            let _ = session.quit().await;
             return Err(Error::Transfer {
                 code: 25,
                 message: format!("FTP STOR/APPE failed: {} {}", stor_resp.code, stor_resp.message),
@@ -1951,7 +2091,6 @@ pub async fn perform(
 
         let complete_resp = session.read_and_record().await?;
         if !complete_resp.is_complete() {
-            let _ = session.quit().await;
             // 452/552 = disk full (curl returns CURLE_REMOTE_DISK_FULL = 70)
             let code = if complete_resp.code == 452 || complete_resp.code == 552 { 70 } else { 25 };
             return Err(Error::Transfer {
@@ -1968,7 +2107,6 @@ pub async fn perform(
             send_command(&mut session.writer, cmd).await?;
             let resp = session.read_and_record().await?;
             if !resp.is_complete() && !resp.is_preliminary() {
-                let _ = session.quit().await;
                 return Err(Error::Transfer {
                     code: 21,
                     message: format!(
@@ -1980,7 +2118,6 @@ pub async fn perform(
         }
 
         let raw = std::mem::take(&mut session.header_bytes);
-        let _ = session.quit().await;
         let headers = std::collections::HashMap::new();
         let mut resp = Response::new(200, headers, Vec::new(), url.as_str().to_string());
         resp.set_raw_headers(raw);
@@ -1995,26 +2132,22 @@ pub async fn perform(
         let mut data_stream = match data_stream_result {
             Ok(s) => s,
             Err(e) => {
-                let _ = session.quit().await;
                 return Err(e);
             }
         };
 
-        // TYPE A for directory listings
-        send_command(&mut session.writer, "TYPE A").await?;
-        let type_resp = session.read_and_record().await?;
-        if !type_resp.is_complete() {
-            let _ = session.quit().await;
-            return Err(Error::Transfer {
-                code: 17,
-                message: format!("FTP TYPE failed: {} {}", type_resp.code, type_resp.message),
-            });
-        }
+        // TYPE A for directory listings (skip if already set)
+        send_type_if_needed(session, TransferType::Ascii).await?;
 
         // LIST or NLST — for NoCwd, include path in the command (test 351)
         let list_base = if config.list_only { "NLST" } else { "LIST" };
         let list_cmd = if config.method == FtpMethod::NoCwd {
             let path = effective_path.trim_end_matches('/');
+            // FTP URL path conventions:
+            //   /path → relative to home (strip leading /, curl compat: test 1149)
+            //   //path → absolute path (strip one /, keep one, curl compat: test 1010)
+            let path =
+                if path.starts_with("//") { &path[1..] } else { path.trim_start_matches('/') };
             if path.is_empty() {
                 format!("{list_base} /")
             } else {
@@ -2030,14 +2163,12 @@ pub async fn perform(
         if list_resp.is_negative_transient() {
             drop(data_stream);
             let raw = std::mem::take(&mut session.header_bytes);
-            let _ = session.quit().await;
             let headers = std::collections::HashMap::new();
             let mut resp = Response::new(200, headers, Vec::new(), url.as_str().to_string());
             resp.set_raw_headers(raw);
             return Ok(resp);
         }
         if !list_resp.is_preliminary() && !list_resp.is_complete() {
-            let _ = session.quit().await;
             return Err(Error::Transfer {
                 code: 19,
                 message: format!("FTP LIST failed: {} {}", list_resp.code, list_resp.message),
@@ -2055,7 +2186,6 @@ pub async fn perform(
         if list_resp.is_preliminary() {
             let complete_resp = session.read_and_record().await?;
             if !complete_resp.is_complete() {
-                let _ = session.quit().await;
                 return Err(Error::Http(format!(
                     "FTP transfer failed: {} {}",
                     complete_resp.code, complete_resp.message
@@ -2068,7 +2198,6 @@ pub async fn perform(
             send_command(&mut session.writer, cmd).await?;
             let resp = session.read_and_record().await?;
             if !resp.is_complete() && !resp.is_preliminary() {
-                let _ = session.quit().await;
                 return Err(Error::Transfer {
                     code: 21,
                     message: format!(
@@ -2080,7 +2209,6 @@ pub async fn perform(
         }
 
         let raw = std::mem::take(&mut session.header_bytes);
-        let _ = session.quit().await;
         let mut headers = std::collections::HashMap::new();
         let _old = headers.insert("content-length".to_string(), data.len().to_string());
         let mut resp = Response::new(200, headers, data, url.as_str().to_string());
@@ -2090,11 +2218,12 @@ pub async fn perform(
 
     // File download (RETR)
     // Determine transfer type
-    let use_ascii = type_override.unwrap_or(if config.use_ascii {
+    let transfer_type = type_override.unwrap_or(if config.use_ascii {
         TransferType::Ascii
     } else {
         TransferType::Binary
-    }) == TransferType::Ascii;
+    });
+    let use_ascii = transfer_type == TransferType::Ascii;
 
     // FTP -z: send MDTM before download to check file modification time
     if let Some((cond_ts, negate)) = config.time_condition {
@@ -2113,7 +2242,6 @@ pub async fn perform(
                 };
                 if should_skip {
                     let raw = std::mem::take(&mut session.header_bytes);
-                    let _ = session.quit().await;
                     let headers = std::collections::HashMap::new();
                     let mut resp =
                         Response::new(200, headers, Vec::new(), url.as_str().to_string());
@@ -2131,26 +2259,12 @@ pub async fn perform(
     let mut data_stream = match data_stream_result {
         Ok(s) => s,
         Err(e) => {
-            // Skip QUIT for PRET failure (84) — curl just disconnects (test 1108)
-            if !matches!(&e, Error::Transfer { code: 84, .. }) {
-                let _ = session.quit().await;
-            }
             return Err(e);
         }
     };
 
-    // TYPE
-    let type_cmd = if use_ascii { "TYPE A" } else { "TYPE I" };
-    send_command(&mut session.writer, type_cmd).await?;
-    let type_resp = session.read_and_record().await?;
-    if !type_resp.is_complete() {
-        drop(data_stream);
-        let _ = session.quit().await;
-        return Err(Error::Transfer {
-            code: 17,
-            message: format!("FTP TYPE failed: {} {}", type_resp.code, type_resp.message),
-        });
-    }
+    // TYPE (skip if already set on this session)
+    send_type_if_needed(session, transfer_type).await?;
 
     // SIZE (curl always tries SIZE before RETR for non-ASCII transfers)
     // Skip SIZE when --ignore-content-length is set (curl compat: test 1137)
@@ -2170,7 +2284,6 @@ pub async fn perform(
     if let (Some(max_size), Some(sz)) = (config.max_filesize, remote_size) {
         if sz > max_size {
             drop(data_stream);
-            let _ = session.quit().await;
             return Err(Error::Transfer {
                 code: 63,
                 message: format!("Maximum file size exceeded ({sz} > {max_size})"),
@@ -2183,7 +2296,6 @@ pub async fn perform(
         if let Some(sz) = remote_size {
             if offset > sz {
                 drop(data_stream);
-                let _ = session.quit().await;
                 return Err(Error::Transfer {
                     code: 36,
                     message: format!("Offset ({offset}) was beyond the end of the file ({sz})"),
@@ -2193,7 +2305,6 @@ pub async fn perform(
                 // File already fully downloaded
                 drop(data_stream);
                 let raw = std::mem::take(&mut session.header_bytes);
-                let _ = session.quit().await;
                 let headers = std::collections::HashMap::new();
                 let mut resp = Response::new(200, headers, Vec::new(), url.as_str().to_string());
                 resp.set_raw_headers(raw);
@@ -2206,7 +2317,6 @@ pub async fn perform(
         let rest_resp = session.read_and_record().await?;
         if !rest_resp.is_intermediate() {
             drop(data_stream);
-            let _ = session.quit().await;
             return Err(Error::Transfer {
                 code: 36,
                 message: format!("FTP REST failed: {} {}", rest_resp.code, rest_resp.message),
@@ -2219,9 +2329,11 @@ pub async fn perform(
     let retr_resp = session.read_and_record().await?;
     if !retr_resp.is_preliminary() && !retr_resp.is_complete() {
         drop(data_stream);
-        let _ = session.quit().await;
+        // 550 = file not found → CURLE_REMOTE_FILE_NOT_FOUND (78)
+        // Other 5xx → CURLE_FTP_COULDNT_RETR_FILE (19)
+        let code = if retr_resp.code == 550 { 78 } else { 19 };
         return Err(Error::Transfer {
-            code: 19,
+            code,
             message: format!("FTP RETR failed: {} {}", retr_resp.code, retr_resp.message),
         });
     }
@@ -2252,13 +2364,12 @@ pub async fn perform(
     }
 
     // Check for partial file: if we know the expected size and got less data,
-    // return CURLE_PARTIAL_FILE (18) without sending QUIT (curl compat: test 161).
+    // return CURLE_PARTIAL_FILE (18) (curl compat: test 161).
     // Return the partial data so the CLI can still output it.
     if range_end.is_none() {
         if let Some(expected) = remote_size {
             let actual = data.len() as u64 + resume_from.unwrap_or(0);
             if actual < expected {
-                // Don't send QUIT — just drop the session (curl compat)
                 let mut headers = std::collections::HashMap::new();
                 let _old = headers.insert("content-length".to_string(), data.len().to_string());
                 let mut resp = Response::new(200, headers, data, url.as_str().to_string());
@@ -2273,7 +2384,6 @@ pub async fn perform(
     if retr_resp.is_preliminary() && range_end.is_none() {
         let complete_resp = session.read_and_record().await?;
         if !complete_resp.is_complete() {
-            let _ = session.quit().await;
             return Err(Error::Http(format!(
                 "FTP transfer failed: {} {}",
                 complete_resp.code, complete_resp.message
@@ -2286,12 +2396,11 @@ pub async fn perform(
         send_command(&mut session.writer, cmd).await?;
         let resp = session.read_and_record().await?;
         if !resp.is_complete() && !resp.is_preliminary() {
-            // Post-quote failure is not fatal — continue with QUIT (curl compat)
+            // Post-quote failure is not fatal (curl compat)
         }
     }
 
     let raw = std::mem::take(&mut session.header_bytes);
-    let _ = session.quit().await;
 
     let mut headers = std::collections::HashMap::new();
     let _old = headers.insert("content-length".to_string(), data.len().to_string());
@@ -2489,7 +2598,8 @@ pub async fn download(
     resume_from: Option<u64>,
     config: &FtpConfig,
 ) -> Result<Response, Error> {
-    perform(url, None, ssl_mode, UseSsl::None, tls_config, resume_from, config, None).await
+    perform(url, None, ssl_mode, UseSsl::None, tls_config, resume_from, config, None, &mut None)
+        .await
 }
 
 /// Perform an FTP directory listing and return it as a Response.
@@ -2504,7 +2614,7 @@ pub async fn list(
     tls_config: &crate::tls::TlsConfig,
     config: &FtpConfig,
 ) -> Result<Response, Error> {
-    perform(url, None, ssl_mode, UseSsl::None, tls_config, None, config, None).await
+    perform(url, None, ssl_mode, UseSsl::None, tls_config, None, config, None, &mut None).await
 }
 
 /// Perform an FTP upload.
@@ -2519,7 +2629,8 @@ pub async fn upload(
     tls_config: &crate::tls::TlsConfig,
     config: &FtpConfig,
 ) -> Result<Response, Error> {
-    perform(url, Some(data), ssl_mode, UseSsl::None, tls_config, None, config, None).await
+    perform(url, Some(data), ssl_mode, UseSsl::None, tls_config, None, config, None, &mut None)
+        .await
 }
 
 #[cfg(test)]

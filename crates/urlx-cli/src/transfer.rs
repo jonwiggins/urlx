@@ -671,6 +671,8 @@ pub fn run(args: &[String]) -> ExitCode {
             opts.fail_with_body,
             opts.is_upload,
             opts.dump_header.as_deref(),
+            &opts.per_url_ftp_methods,
+            opts.upload_filename.as_deref(),
         );
     }
 
@@ -1937,6 +1939,8 @@ pub fn run_multi(
     fail_with_body: bool,
     is_upload: bool,
     dump_header: Option<&str>,
+    per_url_ftp_methods: &[liburlx::protocol::ftp::FtpMethod],
+    upload_filename: Option<&str>,
 ) -> ExitCode {
     if parallel {
         return run_multi_parallel(
@@ -1965,9 +1969,11 @@ pub fn run_multi(
     let mut last_exit = ExitCode::SUCCESS;
 
     for (i, url) in urls.iter().enumerate() {
-        // -T upload: only the first URL gets PUT with the upload body.
-        // Subsequent URLs revert to GET without body (curl compat: test 1065).
-        if is_upload && i > 0 && easy.has_body() {
+        // -T upload: for HTTP, only the first URL gets PUT with the upload body;
+        // subsequent URLs revert to GET without body (curl compat: test 1065).
+        // For FTP, all URLs keep the upload body (curl compat: tests 149, 216).
+        let is_ftp_url = url.starts_with("ftp://") || url.starts_with("ftps://");
+        if is_upload && i > 0 && easy.has_body() && !is_ftp_url {
             let _ = easy.take_body();
             easy.method("GET");
         }
@@ -1984,7 +1990,22 @@ pub fn run_multi(
             }
         }
 
-        if let Err(e) = easy.url(url) {
+        // -T filename: append filename to URL path if URL ends with /
+        let effective_url = if is_upload {
+            if let Some(fname) = upload_filename {
+                if url.ends_with('/') {
+                    format!("{url}{fname}")
+                } else {
+                    url.clone()
+                }
+            } else {
+                url.clone()
+            }
+        } else {
+            url.clone()
+        };
+
+        if let Err(e) = easy.url(&effective_url) {
             if !silent || show_error {
                 eprintln!("curl: ({}) URL rejected: {e}", 3);
             }
@@ -2014,6 +2035,11 @@ pub fn run_multi(
                     easy.remove_header("Authorization");
                 }
             }
+        }
+
+        // Update FTP config per-URL (for --next changing --ftp-method; test 1096)
+        if let Some(method) = per_url_ftp_methods.get(i).copied() {
+            easy.ftp_method(method);
         }
 
         match rt.block_on(easy.perform_async()) {
@@ -2090,8 +2116,11 @@ pub fn run_multi(
                 // When dump-header goes to stdout and include_headers is active,
                 // headers were already output as doubled lines above. Skip include
                 // in output_response to avoid triple output.
-                let effective_include =
-                    if dump_to_stdout && include_headers { false } else { include_headers };
+                // Also suppress headers for non-HTTP protocols (FTP, etc.) — curl
+                // doesn't output HTTP-like headers for FTP even with --include.
+                let is_non_http = response.http_version()
+                    == liburlx::protocol::http::response::ResponseHttpVersion::Unknown;
+                let effective_include = include_headers && !(dump_to_stdout || is_non_http);
                 let exit = output_response(
                     &response,
                     file_for_this,
@@ -2116,6 +2145,9 @@ pub fn run_multi(
             }
         }
     }
+
+    // Send FTP QUIT to cleanly close any reusable FTP session
+    rt.block_on(easy.ftp_quit());
 
     last_exit
 }
