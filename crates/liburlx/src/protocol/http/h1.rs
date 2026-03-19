@@ -227,17 +227,25 @@ where
         req.push_str("Transfer-Encoding: chunked\r\n");
     }
 
+    // Check for internal _tr_encoding_connection marker (from --tr-encoding).
+    // When set, TE must be appended to the Connection header value.
+    let tr_encoding_te =
+        custom_headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("_tr_encoding_connection"));
+
     // Emit remaining custom headers (non-priority, non-user-agent) in command-line order.
     // Multipart Content-Type is deferred to after Content-Length (curl header ordering).
     let mut deferred_content_type: Option<(String, String)> = None;
     let mut content_type_emitted = false;
+    let mut connection_emitted = false;
     for (i, (name, value)) in custom_headers.iter().enumerate() {
         // Skip priority headers, User-Agent, Host, and Proxy-Connection (emitted elsewhere)
         let is_priority = priority_order.iter().any(|p| name.eq_ignore_ascii_case(p));
         let is_ua = name.eq_ignore_ascii_case("user-agent");
         let is_host = name.eq_ignore_ascii_case("host");
         let is_proxy_conn = name.eq_ignore_ascii_case("proxy-connection");
-        if keep[i] && !is_priority && !is_ua && !is_host && !is_proxy_conn {
+        // Skip internal _tr_encoding_connection marker (handled below)
+        let is_tr_enc_marker = name.eq_ignore_ascii_case("_tr_encoding_connection");
+        if keep[i] && !is_priority && !is_ua && !is_host && !is_proxy_conn && !is_tr_enc_marker {
             // Defer form/multipart Content-Type to after Content-Length (curl compat)
             // Keep other Content-Types (like application/json) in place (test 383)
             if name.eq_ignore_ascii_case("content-type")
@@ -254,6 +262,20 @@ where
                     continue;
                 }
             }
+            // Connection header: merge TE value from --tr-encoding (curl compat: tests 1125, 1171)
+            if name.eq_ignore_ascii_case("connection") {
+                connection_emitted = true;
+                if tr_encoding_te {
+                    if value.is_empty() {
+                        // -H "Connection;" with --tr-encoding → "Connection: TE"
+                        let _ = write!(req, "{name}: TE\r\n");
+                    } else {
+                        // -H "Connection: close" with --tr-encoding → "Connection: close, TE"
+                        let _ = write!(req, "{name}: {value}, TE\r\n");
+                    }
+                    continue;
+                }
+            }
             if value.is_empty() {
                 // Empty value from -H "Name;" → send header with no value
                 let _ = write!(req, "{name}:\r\n");
@@ -261,6 +283,11 @@ where
                 let _ = write!(req, "{name}: {value}\r\n");
             }
         }
+    }
+
+    // If --tr-encoding was set but no user Connection header was provided, add one
+    if tr_encoding_te && !connection_emitted {
+        req.push_str("Connection: TE\r\n");
     }
 
     // Add auto Content-Length for bodies (after custom headers, before Content-Type).
@@ -1178,11 +1205,14 @@ where
 /// Read exactly `content_length` bytes of body, using any already-read prefix.
 ///
 /// When a rate limiter is active, reads in chunks with throttling.
+/// When a `deadline` is provided, respects it and returns partial body on timeout
+/// (curl compat: test 223 — broken deflate detected via partial body).
 async fn read_exact_body<S>(
     stream: &mut S,
     content_length: usize,
     prefix: Vec<u8>,
     limiter: &mut RateLimiter,
+    deadline: Option<tokio::time::Instant>,
 ) -> Result<Vec<u8>, Error>
 where
     S: AsyncRead + Unpin,
@@ -1198,10 +1228,25 @@ where
     }
 
     if !limiter.is_active() {
-        // Fast path: read all remaining bytes at once
+        // Fast path: read all remaining bytes at once (or in a single deadline-wrapped read)
         let remaining = content_length - body.len();
         let mut remaining_buf = vec![0u8; remaining];
-        match stream.read_exact(&mut remaining_buf).await {
+        let read_fut = stream.read_exact(&mut remaining_buf);
+        let result = if let Some(dl) = deadline {
+            match tokio::time::timeout_at(dl, read_fut).await {
+                Ok(inner) => inner,
+                Err(_) => {
+                    // Deadline exceeded — return partial body
+                    return Err(Error::PartialBody {
+                        message: "transfer closed with outstanding read data remaining".to_string(),
+                        partial_body: body,
+                    });
+                }
+            }
+        } else {
+            read_fut.await
+        };
+        match result {
             Ok(_) => {}
             Err(e) if is_close_notify_error(&e) => {
                 // Treat as truncated — return partial body error
@@ -1235,7 +1280,21 @@ where
         let remaining = content_length - body.len();
         let chunk_size = remaining.min(THROTTLE_CHUNK_SIZE);
         let mut chunk_buf = vec![0u8; chunk_size];
-        match stream.read_exact(&mut chunk_buf).await {
+        let read_fut = stream.read_exact(&mut chunk_buf);
+        let result = if let Some(dl) = deadline {
+            match tokio::time::timeout_at(dl, read_fut).await {
+                Ok(inner) => inner,
+                Err(_) => {
+                    return Err(Error::PartialBody {
+                        message: "transfer closed with outstanding read data remaining".to_string(),
+                        partial_body: body,
+                    });
+                }
+            }
+        } else {
+            read_fut.await
+        };
+        match result {
             Ok(_) => {}
             Err(e)
                 if is_close_notify_error(&e) || e.kind() == std::io::ErrorKind::UnexpectedEof =>
@@ -1293,7 +1352,8 @@ where
     } else if !ignore_content_length && headers.contains_key("content-length") {
         let cl = &headers["content-length"];
         if let Ok(content_length) = cl.parse::<usize>() {
-            let body = read_exact_body(stream, content_length, body_prefix, limiter).await?;
+            let body =
+                read_exact_body(stream, content_length, body_prefix, limiter, deadline).await?;
             Ok((body, false, HashMap::new(), Vec::new()))
         } else {
             // Content-Length overflows usize — read to EOF (curl compat: test 395)

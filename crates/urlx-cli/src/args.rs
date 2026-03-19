@@ -901,9 +901,11 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
                 opts.easy.accept_encoding(true);
             }
             "--tr-encoding" => {
-                // Add TE: gzip and Connection: TE headers for transfer-encoding request
+                // Add TE: gzip header and mark that Connection should include TE.
+                // The h1 request builder merges TE into Connection (curl compat: tests
+                // 1125, 1171, 1277).
                 opts.easy.header("TE", "gzip");
-                opts.easy.header("Connection", "TE");
+                opts.easy.header("_tr_encoding_connection", "TE");
             }
             "--connect-timeout" => {
                 i += 1;
@@ -2948,23 +2950,25 @@ fn apply_variable_function(value: &[u8], func: &str) -> Result<Vec<u8>, u8> {
             Ok(simple_base64_decode(value))
         }
         "json" => {
-            // JSON string escaping (no wrapping quotes — curl compat)
-            let mut s = String::with_capacity(value.len());
+            // JSON string escaping (no wrapping quotes — curl compat).
+            // Operates on raw bytes: non-ASCII bytes are passed through as-is
+            // to preserve UTF-8 multibyte sequences (curl compat: test 268).
+            let mut out = Vec::with_capacity(value.len());
             for &byte in value {
                 match byte {
-                    b'"' => s.push_str("\\\""),
-                    b'\\' => s.push_str("\\\\"),
-                    b'\n' => s.push_str("\\n"),
-                    b'\r' => s.push_str("\\r"),
-                    b'\t' => s.push_str("\\t"),
+                    b'"' => out.extend_from_slice(b"\\\""),
+                    b'\\' => out.extend_from_slice(b"\\\\"),
+                    b'\n' => out.extend_from_slice(b"\\n"),
+                    b'\r' => out.extend_from_slice(b"\\r"),
+                    b'\t' => out.extend_from_slice(b"\\t"),
                     b if b < 0x20 => {
-                        use std::fmt::Write;
-                        let _ = write!(s, "\\u{:04x}", b);
+                        let hex = format!("\\u{b:04x}");
+                        out.extend_from_slice(hex.as_bytes());
                     }
-                    b => s.push(b as char),
+                    b => out.push(b),
                 }
             }
-            Ok(s.into_bytes())
+            Ok(out)
         }
         _ => {
             eprintln!("curl: unknown variable function: {func}");
