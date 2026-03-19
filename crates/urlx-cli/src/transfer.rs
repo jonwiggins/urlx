@@ -1113,17 +1113,24 @@ pub fn run(args: &[String]) -> ExitCode {
 
     // Non-HTTP protocols: --include doesn't output HTTP headers (curl compat).
     // Suppress include_headers for FTP/IMAP/POP3/SMTP/MQTT URLs.
+    // Exception: when an HTTP proxy is set, FTP/FTPS requests are relayed
+    // as HTTP through the proxy, so headers should be shown (curl compat: test 79).
+    let has_http_proxy = opts.easy.has_proxy();
     if opts.urls.first().is_some_and(|u| {
         let lower = u.to_lowercase();
-        lower.starts_with("ftp://")
-            || lower.starts_with("ftps://")
-            || lower.starts_with("imap://")
-            || lower.starts_with("imaps://")
-            || lower.starts_with("pop3://")
-            || lower.starts_with("pop3s://")
-            || lower.starts_with("smtp://")
-            || lower.starts_with("smtps://")
-            || lower.starts_with("mqtt://")
+        // FTP/FTPS through HTTP proxy → response is HTTP, keep headers
+        let is_ftp_over_proxy =
+            has_http_proxy && (lower.starts_with("ftp://") || lower.starts_with("ftps://"));
+        !is_ftp_over_proxy
+            && (lower.starts_with("ftp://")
+                || lower.starts_with("ftps://")
+                || lower.starts_with("imap://")
+                || lower.starts_with("imaps://")
+                || lower.starts_with("pop3://")
+                || lower.starts_with("pop3s://")
+                || lower.starts_with("smtp://")
+                || lower.starts_with("smtps://")
+                || lower.starts_with("mqtt://"))
     }) {
         opts.include_headers = false;
     }
