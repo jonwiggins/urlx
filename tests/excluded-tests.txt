@@ -23,6 +23,9 @@ test:1014:curl-config not applicable — compares --version with --features
 test:1022:curl-config not applicable — compares --version with --version
 test:1023:curl-config not applicable — compares --version with --vernum
 
+# curl documentation sync tests — urlx does not have curl's docs directory
+test:971:curl source analysis — options-in-versions and docs/cmdline-opts sync check
+
 # curl documentation/help tests — urlx has its own help text and no embedded manual
 test:1026:urlx does not embed curl manual — --manual flag not applicable
 test:1027:urlx has different help text format — --help output differs
