@@ -247,6 +247,7 @@ fn transfer_info_all_timing_fields() {
         local_port: 0,
         remote_ip: String::new(),
         remote_port: 0,
+        certs_der: Vec::new(),
     };
 
     assert_eq!(info.time_namelookup, Duration::from_millis(5));
@@ -316,6 +317,7 @@ fn transfer_info_clone_preserves_all_fields() {
         local_port: 0,
         remote_ip: String::new(),
         remote_port: 0,
+        certs_der: Vec::new(),
     };
     let cloned = info.clone();
     assert_eq!(cloned.time_namelookup, info.time_namelookup);

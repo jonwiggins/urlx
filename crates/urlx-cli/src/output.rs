@@ -640,6 +640,15 @@ pub fn format_write_out_with_context(
         result = result.replace("%{local_port}", &info.local_port.to_string());
     }
 
+    // %{certs}: TLS certificate chain in PEM format (curl compat: test 417)
+    if result.contains("%{certs}") {
+        let certs_pem = format_certs_pem(&info.certs_der);
+        #[allow(clippy::literal_string_with_formatting_args)]
+        {
+            result = result.replace("%{certs}", &certs_pem);
+        }
+    }
+
     // %{header_json}: format all response headers as a JSON object (curl compat: test 421)
     if result.contains("%{header_json}") {
         let json = format_header_json(response);
@@ -899,4 +908,50 @@ fn parse_url_components(
         query.to_string(),
         fragment.to_string(),
     )
+}
+
+/// Convert DER-encoded certificates to PEM format for `%{certs}`.
+///
+/// Each certificate is output as a PEM block with `-----BEGIN CERTIFICATE-----`
+/// and `-----END CERTIFICATE-----` markers, base64-encoded with 64-char line wrapping.
+fn format_certs_pem(certs_der: &[Vec<u8>]) -> String {
+    let mut result = String::new();
+    for cert in certs_der {
+        result.push_str("-----BEGIN CERTIFICATE-----\n");
+        let b64 = simple_base64_encode(cert);
+        // Wrap at 64 characters per line (PEM standard)
+        for chunk in b64.as_bytes().chunks(64) {
+            if let Ok(s) = std::str::from_utf8(chunk) {
+                result.push_str(s);
+            }
+            result.push('\n');
+        }
+        result.push_str("-----END CERTIFICATE-----\n");
+    }
+    result
+}
+
+/// Simple base64 encoder (no external dependency needed).
+fn simple_base64_encode(data: &[u8]) -> String {
+    const CHARS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut result = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        result.push(CHARS[((n >> 18) & 63) as usize] as char);
+        result.push(CHARS[((n >> 12) & 63) as usize] as char);
+        if chunk.len() > 1 {
+            result.push(CHARS[((n >> 6) & 63) as usize] as char);
+        } else {
+            result.push('=');
+        }
+        if chunk.len() > 2 {
+            result.push(CHARS[(n & 63) as usize] as char);
+        } else {
+            result.push('=');
+        }
+    }
+    result
 }

@@ -37,6 +37,30 @@ pub enum PooledStream {
     Unix(tokio::net::UnixStream),
 }
 
+impl PooledStream {
+    /// Get the local socket address of the underlying connection.
+    pub fn local_addr(&self) -> Option<std::net::SocketAddr> {
+        match self {
+            Self::Tcp(s) => s.local_addr().ok(),
+            #[cfg(feature = "rustls")]
+            Self::Tls(s) => s.get_ref().0.local_addr().ok(),
+            #[cfg(unix)]
+            Self::Unix(_) => None,
+        }
+    }
+
+    /// Get the peer socket address of the underlying connection.
+    pub fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+        match self {
+            Self::Tcp(s) => s.peer_addr().ok(),
+            #[cfg(feature = "rustls")]
+            Self::Tls(s) => s.get_ref().0.peer_addr().ok(),
+            #[cfg(unix)]
+            Self::Unix(_) => None,
+        }
+    }
+}
+
 impl AsyncRead for PooledStream {
     fn poll_read(
         self: Pin<&mut Self>,
