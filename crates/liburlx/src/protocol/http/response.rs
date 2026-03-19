@@ -81,6 +81,8 @@ pub struct TransferInfo {
     pub remote_ip: String,
     /// Remote port of the connection.
     pub remote_port: u16,
+    /// TLS peer certificate chain in DER-encoded format.
+    pub certs_der: Vec<Vec<u8>>,
 }
 
 /// An HTTP response with status, headers, and body.

@@ -5284,7 +5284,21 @@ async fn do_single_request(
             .await;
 
             match result {
-                Ok((response, can_reuse)) => {
+                Ok((mut response, can_reuse)) => {
+                    // Populate connection address info from reused pooled stream
+                    // (curl compat: test 435 — local_ip/local_port on reused connections)
+                    {
+                        let mut info = response.transfer_info().clone();
+                        if let Some(local) = stream.local_addr() {
+                            info.local_ip = local.ip().to_string();
+                            info.local_port = local.port();
+                        }
+                        if let Some(peer) = stream.peer_addr() {
+                            info.remote_ip = peer.ip().to_string();
+                            info.remote_port = peer.port();
+                        }
+                        response.set_transfer_info(info);
+                    }
                     if can_reuse && !forbid_reuse {
                         pool.put(&host, port, is_tls, stream);
                     }
@@ -5778,6 +5792,17 @@ async fn do_single_request(
                 let (tls_stream, alpn) = tls.connect(tls_stream_inner, &host).await?;
                 let time_appconnect = request_start.elapsed();
 
+                // Capture TLS peer certificates for %{certs} write-out variable
+                #[cfg(feature = "rustls")]
+                let tls_certs_der: Vec<Vec<u8>> = tls_stream
+                    .get_ref()
+                    .1
+                    .peer_certificates()
+                    .map(|certs| certs.iter().map(|c| c.as_ref().to_vec()).collect())
+                    .unwrap_or_default();
+                #[cfg(not(feature = "rustls"))]
+                let tls_certs_der: Vec<Vec<u8>> = Vec::new();
+
                 let request_target = resolve_request_target(custom_request_target, url, path_as_is);
 
                 // Use HTTP/2 if ALPN negotiated it, unless user forced HTTP/1.x
@@ -5816,6 +5841,7 @@ async fn do_single_request(
                     info.time_appconnect = time_appconnect;
                     info.time_pretransfer = time_pretransfer;
                     info.time_starttransfer = time_starttransfer;
+                    info.certs_der.clone_from(&tls_certs_der);
                     resp.set_transfer_info(info);
                     return Ok(resp);
                 }
@@ -5856,6 +5882,7 @@ async fn do_single_request(
                 info.time_appconnect = time_appconnect;
                 info.time_pretransfer = time_pretransfer;
                 info.time_starttransfer = time_starttransfer;
+                info.certs_der = tls_certs_der;
                 resp.set_transfer_info(info);
                 resp
             }
