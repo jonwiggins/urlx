@@ -627,6 +627,17 @@ pub fn run(args: &[String]) -> ExitCode {
         }
     }
 
+    // Refresh per_url_easy entries to pick up modifications made in run() after
+    // parse_args completed (e.g., -z/If-Modified-Since header, -T body).
+    // When there's no --next, clear per_url_easy so run_multi uses the template
+    // directly, preserving connection pool state across requests (curl compat: test 1074).
+    // When --next was used, per_url_easy entries hold per-group state and must be kept.
+    if !opts.had_next && opts.urls.len() > 1 {
+        for slot in opts.per_url_easy.iter_mut() {
+            *slot = None;
+        }
+    }
+
     // Multiple URLs: use Multi API for concurrent transfers
     if opts.urls.len() > 1 {
         // Build per-URL output filenames:
@@ -683,6 +694,7 @@ pub fn run(args: &[String]) -> ExitCode {
             &opts.per_url_ftp_methods,
             opts.upload_filename.as_deref(),
             &opts.per_url_easy,
+            &opts.per_url_upload_files,
         );
     }
 
@@ -2065,6 +2077,7 @@ pub fn run_multi(
     per_url_ftp_methods: &[liburlx::protocol::ftp::FtpMethod],
     upload_filename: Option<&str>,
     per_url_easy: &[Option<liburlx::Easy>],
+    per_url_upload_files: &[Option<String>],
 ) -> ExitCode {
     if parallel {
         return run_multi_parallel(
@@ -2091,6 +2104,9 @@ pub fn run_multi(
 
     let mut easy = template.clone();
     let mut last_exit = ExitCode::SUCCESS;
+    // Track HTTP version downgrade across requests (curl compat: test 1074).
+    // When server responds with HTTP/1.0, subsequent requests should also use HTTP/1.0.
+    let mut downgraded_http10 = false;
 
     // Pre-compute which URLs are part of an IMAP batch (consecutive IMAP URLs to
     // the same host:port, for connection reuse — curl compat: tests 804, 815, 816).
@@ -2141,16 +2157,35 @@ pub fn run_multi(
             easy = new_easy;
         }
 
-        // -T upload: for HTTP, only the first URL gets PUT with the upload body;
-        // subsequent URLs revert to GET without body (curl compat: test 1065).
+        // Apply HTTP/1.0 downgrade from previous response (curl compat: test 1074)
+        if downgraded_http10 {
+            easy.http_version(liburlx::HttpVersion::Http10);
+        }
+
+        // -T upload: per-URL upload tracking. Each URL with its own -T flag
+        // gets PUT with the upload body. URLs without their own -T revert to GET.
         // For FTP, all URLs keep the upload body (curl compat: tests 149, 216).
+        // Test 1064: `-T file URL1 -T file URL2` → both PUT
+        // Test 1065: `-T file URL1 URL2` → first PUT, second GET
         let is_ftp_url = url.starts_with("ftp://")
             || url.starts_with("ftps://")
             || url.starts_with("sftp://")
             || url.starts_with("scp://");
-        if is_upload && i > 0 && easy.has_body() && !is_ftp_url {
-            let _ = easy.take_body();
-            easy.method("GET");
+        if is_upload && i > 0 && !is_ftp_url {
+            let has_own_upload = per_url_upload_files.get(i).is_some_and(|f| f.is_some());
+            if has_own_upload {
+                // This URL has its own -T flag: re-read the file and PUT
+                if let Some(Some(ref path)) = per_url_upload_files.get(i) {
+                    if let Ok(data) = std::fs::read(path) {
+                        easy.body(&data);
+                        easy.method("PUT");
+                    }
+                }
+            } else if easy.has_body() {
+                // No -T for this URL: revert to GET (curl compat: test 1065)
+                let _ = easy.take_body();
+                easy.method("GET");
+            }
         }
 
         // --skip-existing: skip transfer if output file already exists
@@ -2316,6 +2351,14 @@ pub fn run_multi(
 
         match rt.block_on(easy.perform_async()) {
             Ok(response) => {
+                // Downgrade HTTP version if server responded with HTTP/1.0 (curl compat: test 1074).
+                // Subsequent requests on the same connection should use HTTP/1.0.
+                if response.http_version()
+                    == liburlx::protocol::http::response::ResponseHttpVersion::Http10
+                {
+                    easy.http_version(liburlx::HttpVersion::Http10);
+                    downgraded_http10 = true;
+                }
                 if fail_on_error && response.status() >= 400 {
                     let err_msg =
                         format!("The requested URL returned error: {}", response.status());

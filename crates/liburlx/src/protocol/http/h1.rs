@@ -383,7 +383,7 @@ where
                     resp.set_status_reason(ph.reason);
                     resp.set_uses_crlf(ph.uses_crlf);
                     resp.set_http_version(ph.version);
-                    resp.set_raw_headers(header_bytes);
+                    resp.set_raw_headers(normalize_raw_headers_for_output(&header_bytes));
                     if !trailers.is_empty() {
                         resp.set_trailers(trailers);
                     }
@@ -394,29 +394,40 @@ where
                 }
             }
             Err(_) => {
-                // Timeout waiting for 100 Continue — send body anyway (curl behavior)
+                // Timeout waiting for 100 Continue — send body anyway (curl behavior).
+                // If the write fails (server closed connection), ignore the error
+                // and try to read whatever response the server sent (test 1070).
                 if let Some(body_data) = body {
-                    if use_chunked {
-                        write_chunked_body(stream, body_data, &mut send_limiter).await?;
+                    let write_result = if use_chunked {
+                        write_chunked_body(stream, body_data, &mut send_limiter).await
                     } else {
-                        throttled_write(stream, body_data, &mut send_limiter).await?;
+                        throttled_write(stream, body_data, &mut send_limiter).await
+                    };
+                    if write_result.is_err() {
+                        // Body send failed (server closed connection) — fall through
+                        // to read whatever response the server sent.
                     }
                 }
             }
             Ok(Err(e)) => return Err(e),
         }
     } else {
-        // No 100-continue — send body immediately
+        // No 100-continue — send body immediately.
+        // If the write fails (server closed connection), ignore the error
+        // and try to read whatever response the server sent (curl compat: test 1070).
         if let Some(body_data) = body {
-            if use_chunked {
-                write_chunked_body(stream, body_data, &mut send_limiter).await?;
+            let write_result = if use_chunked {
+                write_chunked_body(stream, body_data, &mut send_limiter).await
             } else {
-                throttled_write(stream, body_data, &mut send_limiter).await?;
+                throttled_write(stream, body_data, &mut send_limiter).await
+            };
+            if write_result.is_err() {
+                // Body send failed — fall through to read response.
             }
         }
     }
 
-    stream.flush().await.map_err(|e| Error::Http(format!("flush failed: {e}")))?;
+    let _ = stream.flush().await;
 
     let is_head = method.eq_ignore_ascii_case("HEAD");
 
@@ -498,7 +509,7 @@ where
                 resp.set_status_reason(ph.reason);
                 resp.set_uses_crlf(ph.uses_crlf);
                 resp.set_http_version(ph.version);
-                resp.set_raw_headers(header_bytes.clone());
+                resp.set_raw_headers(normalize_raw_headers_for_output(&header_bytes));
                 resp.set_body_error(Some("invalid_content_length".to_string()));
                 return Ok((resp, true));
             }
@@ -511,7 +522,7 @@ where
                 resp.set_status_reason(ph.reason);
                 resp.set_uses_crlf(ph.uses_crlf);
                 resp.set_http_version(ph.version);
-                resp.set_raw_headers(header_bytes.clone());
+                resp.set_raw_headers(normalize_raw_headers_for_output(&header_bytes));
                 resp.set_body_error(Some("conflicting_content_length".to_string()));
                 return Ok((resp, true));
             }
@@ -570,7 +581,7 @@ where
             resp.set_status_reason(ph.reason);
             resp.set_uses_crlf(ph.uses_crlf);
             resp.set_http_version(ph.version);
-            resp.set_raw_headers(header_bytes.clone());
+            resp.set_raw_headers(normalize_raw_headers_for_output(&header_bytes));
             resp.set_body_error(Some("duplicate_location".to_string()));
             return Ok((resp, true));
         }
@@ -646,13 +657,14 @@ where
     resp.set_status_reason(ph.reason);
     resp.set_uses_crlf(ph.uses_crlf);
     resp.set_http_version(ph.version);
-    // Prepend 1xx informational response headers so --include shows them
+    // Prepend 1xx informational response headers so --include shows them.
+    // Normalize raw headers for output (unfold continuation lines, collapse whitespace).
     if informational_prefix.is_empty() {
-        resp.set_raw_headers(header_bytes);
+        resp.set_raw_headers(normalize_raw_headers_for_output(&header_bytes));
     } else {
         let mut combined = informational_prefix;
         combined.extend_from_slice(&header_bytes);
-        resp.set_raw_headers(combined);
+        resp.set_raw_headers(normalize_raw_headers_for_output(&combined));
     }
     if !trailers.is_empty() {
         resp.set_trailers(trailers);
@@ -1159,6 +1171,100 @@ fn unfold_headers(data: &[u8]) -> std::borrow::Cow<'_, [u8]> {
         }
     }
     std::borrow::Cow::Owned(result)
+}
+
+/// Normalize raw header bytes for output display (e.g., `-D`, `-i`).
+///
+/// Performs three transformations on header values:
+/// 1. Unfold continuation lines (`\r\n<SP|HT>` → single space)
+/// 2. Replace tabs with spaces in header values
+/// 3. Collapse consecutive spaces in header values into a single space
+///
+/// This matches curl's header output behavior (test 1274).
+fn normalize_raw_headers_for_output(data: &[u8]) -> Vec<u8> {
+    // Quick check: does this data contain any folds or tabs?
+    let has_fold = data.windows(2).any(|w| (w[0] == b'\n') && (w[1] == b' ' || w[1] == b'\t'));
+    let has_tab = data.contains(&b'\t');
+    if !has_fold && !has_tab {
+        return data.to_vec();
+    }
+
+    // First, unfold continuation lines
+    let unfolded = unfold_headers(data);
+    let unfolded = unfolded.as_ref();
+
+    // Now process each line: replace tabs and collapse whitespace in header values
+    let mut result = Vec::with_capacity(unfolded.len());
+    let mut i = 0;
+    while i < unfolded.len() {
+        // Find end of current line
+        let line_end = unfolded[i..]
+            .windows(2)
+            .position(|w| w == b"\r\n")
+            .map(|p| i + p + 2)
+            .or_else(|| unfolded[i..].iter().position(|&b| b == b'\n').map(|p| i + p + 1))
+            .unwrap_or(unfolded.len());
+
+        let line = &unfolded[i..line_end];
+
+        // Check if this is a header line (contains ':')
+        if let Some(colon_pos) = line.iter().position(|&b| b == b':') {
+            // Emit header name and colon as-is
+            result.extend_from_slice(&line[..=colon_pos]);
+            // Process value part: replace tabs with spaces, collapse consecutive spaces
+            let value_start = colon_pos + 1;
+            let line_content_end = if line.ends_with(b"\r\n") {
+                line.len() - 2
+            } else if line.ends_with(b"\n") {
+                line.len() - 1
+            } else {
+                line.len()
+            };
+            let value = &line[value_start..line_content_end];
+            // Replace tabs with spaces and collapse
+            let mut prev_space = false;
+            let mut value_started = false;
+            for &b in value {
+                let ch = if b == b'\t' { b' ' } else { b };
+                if ch == b' ' {
+                    if !value_started {
+                        // Leading space after colon: emit one space
+                        result.push(b' ');
+                        value_started = true;
+                        prev_space = true;
+                    } else if !prev_space {
+                        result.push(b' ');
+                        prev_space = true;
+                    }
+                    // else: collapse consecutive spaces
+                } else {
+                    if !value_started {
+                        // First non-space char without leading space
+                        value_started = true;
+                    }
+                    result.push(ch);
+                    prev_space = false;
+                }
+            }
+            // Trim trailing space from value
+            if result.last() == Some(&b' ') {
+                let _ = result.pop();
+            }
+            // Add line ending
+            if line.ends_with(b"\r\n") {
+                result.extend_from_slice(b"\r\n");
+            } else if line.ends_with(b"\n") {
+                result.push(b'\n');
+            }
+        } else {
+            // Status line or empty line: copy as-is
+            result.extend_from_slice(line);
+        }
+
+        i = line_end;
+    }
+
+    result
 }
 
 /// values by parsing the raw header block.
