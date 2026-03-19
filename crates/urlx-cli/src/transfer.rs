@@ -786,6 +786,26 @@ pub fn run(args: &[String]) -> ExitCode {
                                         .or_else(|| url_user.clone())
                                         .unwrap_or_default();
                                     let pass = entry.password.unwrap_or_default();
+
+                                    // For protocols that cannot handle control codes
+                                    // in credentials (everything except HTTP/HTTPS/WS/WSS),
+                                    // reject credentials containing control chars (curl compat: test 480).
+                                    let allows_ctrl = url.starts_with("http://")
+                                        || url.starts_with("https://")
+                                        || url.starts_with("ws://")
+                                        || url.starts_with("wss://");
+                                    if !allows_ctrl
+                                        && (liburlx::netrc::has_control_chars(&user)
+                                            || liburlx::netrc::has_control_chars(&pass))
+                                    {
+                                        if !opts.silent || opts.show_error {
+                                            eprintln!(
+                                                "curl: control code detected in .netrc credentials"
+                                            );
+                                        }
+                                        return ExitCode::from(26);
+                                    }
+
                                     if url.starts_with("ftp://")
                                         || url.starts_with("ftps://")
                                         || url.starts_with("sftp://")
