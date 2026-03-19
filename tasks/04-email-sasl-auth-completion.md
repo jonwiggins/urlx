@@ -1,5 +1,9 @@
 # Task 04: Complete Email SASL Authentication (IMAP, POP3, SMTP)
 
+## Status: COMPLETE
+
+All 37 tests pass as of 2026-03-19. This work was completed in PR #5 (`feat/email-sasl-auth-completion`, commit 29045c7).
+
 ## Summary
 While basic SASL mechanisms (PLAIN, LOGIN, CRAM-MD5, NTLM, EXTERNAL, XOAUTH2, OAUTHBEARER) are implemented, many SASL-related tests still fail due to edge cases: cancellation flows, --login-options forcing, --sasl-authzid, graceful downgrades, and specific mechanism ordering issues.
 
