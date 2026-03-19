@@ -7273,12 +7273,26 @@ fn find_header_end(data: &[u8]) -> Option<usize> {
 /// Checks `http_proxy`/`HTTP_PROXY` for HTTP, `https_proxy`/`HTTPS_PROXY` for HTTPS.
 /// curl convention: lowercase takes priority for `http_proxy`.
 fn proxy_from_env(scheme: &str) -> Option<Url> {
-    let var_names = match scheme {
-        "https" => &["https_proxy", "HTTPS_PROXY"][..],
-        _ => &["http_proxy", "HTTP_PROXY"][..],
+    // Check protocol-specific proxy env vars first, then fallback to all_proxy
+    // (curl compat: test 1106 — ftp_proxy for FTP URLs)
+    let var_names: &[&str] = match scheme {
+        "https" => &["https_proxy", "HTTPS_PROXY"],
+        "ftp" | "ftps" => &["ftp_proxy", "FTP_PROXY"],
+        _ => &["http_proxy", "HTTP_PROXY"],
     };
 
     for var in var_names {
+        if let Ok(val) = std::env::var(var) {
+            if !val.is_empty() {
+                if let Ok(url) = Url::parse(&val) {
+                    return Some(url);
+                }
+            }
+        }
+    }
+
+    // Fallback: check all_proxy / ALL_PROXY
+    for var in &["all_proxy", "ALL_PROXY"] {
         if let Ok(val) = std::env::var(var) {
             if !val.is_empty() {
                 if let Ok(url) = Url::parse(&val) {
