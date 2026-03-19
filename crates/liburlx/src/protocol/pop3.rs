@@ -166,6 +166,57 @@ async fn read_continuation<S: AsyncRead + Unpin>(
     Ok(line.trim().to_string())
 }
 
+/// Perform the POP3 greeting and CAPA exchange.
+///
+/// Returns `(apop_timestamp, sasl_mechanisms, has_apop, has_stls, capa_ok)`.
+///
+/// # Errors
+///
+/// Returns an error if the greeting is rejected.
+async fn pop3_greeting_and_capa<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    reader: &mut BufReader<R>,
+    writer: &mut W,
+) -> Result<(Option<String>, Vec<String>, bool, bool, bool), Error> {
+    let greeting = read_greeting(reader).await?;
+    if !greeting.ok {
+        return Err(Error::Http(format!("POP3 server rejected: {}", greeting.message)));
+    }
+
+    let apop_timestamp = extract_apop_timestamp(&greeting.message);
+
+    send_command(writer, "CAPA").await?;
+    let capa_resp = read_response(reader).await?;
+
+    if !capa_resp.ok {
+        return Ok((apop_timestamp, Vec::new(), false, false, false));
+    }
+
+    let capa_lines = read_multiline(reader).await?;
+    let (sasl_mechs, has_apop) = parse_pop3_capabilities(&capa_lines);
+    let has_stls = capa_lines
+        .iter()
+        .any(|l| l.to_uppercase() == "STLS" || l.to_uppercase().starts_with("STLS "));
+    Ok((apop_timestamp, sasl_mechs, has_apop, has_stls, true))
+}
+
+/// Parse POP3 CAPA response lines into SASL mechanisms and APOP flag.
+fn parse_pop3_capabilities(lines: &[String]) -> (Vec<String>, bool) {
+    let mut sasl_mechs = Vec::new();
+    let mut has_apop = false;
+    for line in lines {
+        let upper = line.to_uppercase();
+        if upper.starts_with("SASL") {
+            for mech in upper.split_whitespace().skip(1) {
+                sasl_mechs.push(mech.to_string());
+            }
+        }
+        if upper == "APOP" || upper.starts_with("APOP ") {
+            has_apop = true;
+        }
+    }
+    (sasl_mechs, has_apop)
+}
+
 /// Retrieve email from a POP3 server.
 ///
 /// URL format: `pop3://user:pass@host:port/N`
@@ -223,83 +274,81 @@ pub async fn retrieve(
     let addr = format!("{host}:{port}");
     let tcp = tokio::net::TcpStream::connect(&addr).await.map_err(Error::Connect)?;
 
-    let (reader, mut writer): (
-        Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+    // Establish connection with appropriate TLS mode.
+    // For STLS (POP3's STARTTLS), we use concrete types for the initial
+    // negotiation (greeting, CAPA, STLS command), then unsplit → TLS handshake
+    // → re-split into type-erased boxed streams for the rest of the protocol.
+    #[allow(clippy::type_complexity)]
+    let (mut reader, mut writer, apop_timestamp, server_sasl_mechs, server_has_apop): (
+        BufReader<Box<dyn tokio::io::AsyncRead + Unpin + Send>>,
         Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
+        Option<String>,
+        Vec<String>,
+        bool,
     ) = if use_implicit_tls {
         let connector = crate::tls::TlsConnector::new(tls_config)?;
         let (tls_stream, _alpn) = connector.connect(tcp, &host).await?;
         let (r, w) = tokio::io::split(tls_stream);
-        (Box::new(r), Box::new(w))
+        let mut rd = BufReader::new(Box::new(r) as Box<dyn tokio::io::AsyncRead + Unpin + Send>);
+        let mut wr: Box<dyn tokio::io::AsyncWrite + Unpin + Send> = Box::new(w);
+        let (apop_ts, sasl_mechs, has_apop, _has_stls, _capa_ok) =
+            pop3_greeting_and_capa(&mut rd, &mut wr).await?;
+        (rd, wr, apop_ts, sasl_mechs, has_apop)
     } else {
+        // Plain connection — use concrete types so we can unsplit for STLS
         let (r, w) = tokio::io::split(tcp);
-        (Box::new(r), Box::new(w))
-    };
-    let mut reader = BufReader::new(reader);
+        let mut plain_reader = BufReader::new(r);
+        let mut plain_writer = w;
+        let (apop_ts, sasl_mechs, has_apop, has_stls, capa_ok) =
+            pop3_greeting_and_capa(&mut plain_reader, &mut plain_writer).await?;
 
-    // Read greeting — skip banner lines until we find +OK or -ERR
-    let greeting = read_greeting(&mut reader).await?;
-    if !greeting.ok {
-        return Err(Error::Http(format!("POP3 server rejected: {}", greeting.message)));
-    }
-
-    // Extract APOP timestamp from greeting if present (e.g. "<1972.987654321@curl>")
-    let apop_timestamp = extract_apop_timestamp(&greeting.message);
-
-    // CAPA (curl always sends this before auth)
-    send_command(&mut writer, "CAPA").await?;
-    let capa_resp = read_response(&mut reader).await?;
-    let mut server_sasl_mechs = Vec::new();
-    let mut server_has_apop = false;
-    let mut server_has_stls = false;
-
-    // If CAPA failed and STARTTLS is required, error out immediately
-    if !capa_resp.ok && use_starttls && (use_ssl == UseSsl::All) {
-        return Err(Error::Transfer {
-            code: 64,
-            message: "POP3 STLS required but CAPA failed".to_string(),
-        });
-    }
-
-    if capa_resp.ok {
-        let capa_lines = read_multiline(&mut reader).await?;
-        for line in &capa_lines {
-            let upper = line.to_uppercase();
-            if upper.starts_with("SASL") {
-                for mech in upper.split_whitespace().skip(1) {
-                    server_sasl_mechs.push(mech.to_string());
-                }
-            }
-            if upper == "APOP" || upper.starts_with("APOP ") {
-                server_has_apop = true;
-            }
-            if upper == "STLS" || upper.starts_with("STLS ") {
-                server_has_stls = true;
-            }
+        // CAPA failed and STLS required → error immediately (no QUIT)
+        if !capa_ok && use_starttls && use_ssl == UseSsl::All {
+            return Err(Error::Transfer {
+                code: 64,
+                message: "POP3 STLS required but CAPA failed".to_string(),
+            });
         }
-    }
 
-    // STLS: upgrade plain connection to TLS if requested
-    if use_starttls {
-        if server_has_stls {
-            // Server advertises STLS — send the command
-            send_command(&mut writer, "STLS").await?;
-            let stls_resp = read_response(&mut reader).await?;
+        if use_starttls && has_stls {
+            send_command(&mut plain_writer, "STLS").await?;
+            let stls_resp = read_response(&mut plain_reader).await?;
             if !stls_resp.ok {
-                // Server rejected STLS — return CURLE_WEIRD_SERVER_REPLY (8)
                 return Err(Error::Protocol(8));
             }
-            // TLS handshake would happen here for full implementation
-        } else if use_ssl == UseSsl::All {
-            // STLS not advertised but required
-            let _ = send_command(&mut writer, "QUIT").await;
+            // Reassemble TCP stream and upgrade to TLS
+            let tcp_restored = plain_reader.into_inner().unsplit(plain_writer);
+            let connector = crate::tls::TlsConnector::new_no_alpn(tls_config)?;
+            let (tls_stream, _) = connector.connect(tcp_restored, &host).await?;
+            let (r, w) = tokio::io::split(tls_stream);
+            let mut rd =
+                BufReader::new(Box::new(r) as Box<dyn tokio::io::AsyncRead + Unpin + Send>);
+            let mut wr: Box<dyn tokio::io::AsyncWrite + Unpin + Send> = Box::new(w);
+            // Re-CAPA over TLS (RFC 2595)
+            send_command(&mut wr, "CAPA").await?;
+            let capa2 = read_response(&mut rd).await?;
+            let (sasl2, apop2) = if capa2.ok {
+                let lines = read_multiline(&mut rd).await?;
+                parse_pop3_capabilities(&lines)
+            } else {
+                (Vec::new(), false)
+            };
+            (rd, wr, apop_ts, sasl2, apop2)
+        } else if use_starttls && use_ssl == UseSsl::All && !has_stls {
+            let _ = send_command(&mut plain_writer, "QUIT").await;
             return Err(Error::Transfer {
                 code: 64,
                 message: "POP3 STLS required but not advertised".to_string(),
             });
+        } else {
+            // No TLS upgrade — box the plain streams
+            let rd =
+                BufReader::new(Box::new(plain_reader.into_inner())
+                    as Box<dyn tokio::io::AsyncRead + Unpin + Send>);
+            let wr: Box<dyn tokio::io::AsyncWrite + Unpin + Send> = Box::new(plain_writer);
+            (rd, wr, apop_ts, sasl_mechs, has_apop)
         }
-        // UseSsl::Try with no STLS: continue without TLS
-    }
+    };
 
     let forced =
         login_options.and_then(|lo| lo.strip_prefix("AUTH=").or_else(|| lo.strip_prefix("auth=")));
