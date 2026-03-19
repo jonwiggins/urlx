@@ -2596,22 +2596,24 @@ impl Easy {
 
         // Apply removed_headers: for built-in default headers (User-Agent, Accept),
         // add a sentinel empty-value entry so the h1 emitter suppresses the default.
-        // Only apply to known built-in defaults — other removal markers just prevent
-        // previously-set custom headers from being emitted.
-        // (curl compat: -H "User-Agent:" suppresses User-Agent, test 1147)
+        // If the header was already explicitly set (e.g. via -A), remove it first
+        // and replace with the sentinel.
+        // Non-built-in headers: no-op (there's no default to suppress).
+        // (curl compat: -H "User-Agent:" suppresses User-Agent, tests 4, 1147)
         for removed in &self.removed_headers {
-            let already_set = headers.iter().any(|(k, _)| k.eq_ignore_ascii_case(removed));
-            if !already_set {
-                let name = match removed.as_str() {
-                    "user-agent" => Some("User-Agent"),
-                    "accept" => Some("Accept"),
-                    "host" => Some("Host"),
-                    _ => None,
-                };
-                if let Some(name) = name {
-                    headers.push((name.to_string(), String::new()));
-                }
+            let name = match removed.as_str() {
+                "user-agent" => Some("User-Agent"),
+                "accept" => Some("Accept"),
+                "host" => Some("Host"),
+                _ => None,
+            };
+            if let Some(name) = name {
+                // Remove any existing header with this name (e.g. from -A)
+                headers.retain(|(k, _)| !k.eq_ignore_ascii_case(removed));
+                // Add sentinel to suppress the built-in default
+                headers.push((name.to_string(), String::new()));
             }
+            // Non-built-in headers: no-op (curl compat: test 4, -H "X-Test:")
         }
 
         let (effective_method, effective_body);
@@ -4827,13 +4829,10 @@ async fn perform_transfer(
             }
         }
 
-        // Check for failed resume: 416 Range Not Satisfiable means server rejected our range
-        if response.status() == 416 {
-            let has_range = headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("range"));
-            if has_range {
-                return Err(Error::Http("range not satisfiable".to_string()));
-            }
-        }
+        // 416 Range Not Satisfiable: let the CLI handle it via resume_check.
+        // Don't error here — the response should be returned normally so that
+        // multi-URL transfers can output the 416 response and continue
+        // (curl compat: test 1117).
 
         // Store cookies from response.
         // Use custom Host header for cookie domain matching if present (curl compat).

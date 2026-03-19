@@ -63,6 +63,15 @@ pub fn read_file(
                 });
             }
         }
+        (None, Some(last_n)) => {
+            // "-N" means last N bytes (curl compat: test 1020)
+            let n = last_n as usize;
+            if n >= data.len() {
+                data
+            } else {
+                data[data.len() - n..].to_vec()
+            }
+        }
         _ => data,
     };
 

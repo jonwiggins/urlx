@@ -13,6 +13,25 @@ use crate::output::{
     output_response, output_response_with_context, write_trace_file, WriteOutContext,
 };
 
+/// Redirect stderr (fd 2) to a file via `dup2`.
+///
+/// This is needed for `--stderr <file>` to redirect all stderr output
+/// (including progress bar) to the specified file (curl compat: test 1148).
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn redirect_stderr_to_file(path: &str) {
+    if let Ok(file) = std::fs::File::create(path) {
+        use std::os::unix::io::IntoRawFd;
+        let fd = file.into_raw_fd();
+        // SAFETY: dup2 redirects stderr (fd 2) to the opened file fd.
+        // Both fds are valid: fd comes from File::create, and 2 is stderr.
+        unsafe {
+            let _ = libc::dup2(fd, 2);
+            let _ = libc::close(fd);
+        }
+    }
+}
+
 /// Substitute `#1`, `#2`, etc. in an output filename template with glob match values.
 ///
 /// `#N` references the Nth glob group (1-indexed). If N is out of range, the `#N`
@@ -550,6 +569,15 @@ pub fn run(args: &[String]) -> ExitCode {
             return ExitCode::from(code);
         }
     };
+
+    // --stderr: redirect stderr to a file (curl compat: test 1148)
+    // Spawn a thread that copies stderr pipe to the file, then replace
+    // the global stderr fd via CommandExt in a child process is not feasible
+    // for in-process use. Instead, redirect by reopening stderr.
+    #[cfg(unix)]
+    if let Some(ref stderr_path) = opts.stderr_file {
+        redirect_stderr_to_file(stderr_path);
+    }
 
     // --fail-with-body + --fail: --fail wins (curl compat: test 360)
     if opts.fail_with_body && opts.fail_on_error && !opts.has_post_data {
@@ -1431,18 +1459,19 @@ pub fn run(args: &[String]) -> ExitCode {
 
     if opts.show_progress && !opts.silent {
         opts.easy.progress_callback(liburlx::make_progress_callback(|info| {
-            let pct = if info.dl_total > 0 { (info.dl_now * 100) / info.dl_total } else { 0 };
-            let bar_width: usize = 40;
-            #[allow(clippy::cast_possible_truncation)]
-            let filled = ((pct as usize) * bar_width) / 100;
-            let empty = bar_width.saturating_sub(filled);
-            eprint!(
-                "\r[{}{}] {}% ({} bytes)",
-                "#".repeat(filled),
-                " ".repeat(empty),
-                pct,
-                info.dl_now,
-            );
+            // curl's progress bar format: 72 hash characters followed by " 100.0%"
+            // Uses \r to update in-place (curl compat: test 1148)
+            let bar_width: usize = 72;
+            if info.dl_total > 0 {
+                #[allow(clippy::cast_precision_loss)]
+                let pct = (info.dl_now as f64 / info.dl_total as f64) * 100.0;
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let filled = ((pct as usize) * bar_width) / 100;
+                let empty = bar_width.saturating_sub(filled);
+                eprint!("\r{}{} {:5.1}%", "#".repeat(filled), " ".repeat(empty), pct);
+            } else {
+                eprint!("\r{} {:5.1}%", " ".repeat(bar_width), 0.0);
+            }
             true
         }));
     }
