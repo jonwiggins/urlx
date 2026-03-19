@@ -20,6 +20,7 @@ CURL_SRC="$PROJECT_ROOT/vendor/curl"
 TESTS_DIR="$CURL_BUILD/tests"
 WRAPPER="$SCRIPT_DIR/urlx-as-curl"
 URLX="$PROJECT_ROOT/target/release/urlx"
+EXCLUDE_FILE="$PROJECT_ROOT/tests/excluded-tests.txt"
 export URLX_BIN="$URLX"
 
 # Verify prerequisites
@@ -65,10 +66,19 @@ echo "urlx binary: $URLX"
 echo "Tests: ${*:-ALL}"
 echo ""
 
+# Build exclusion args: use -E file if the exclude file exists
+EXCLUDE_ARGS=()
+if [ -f "$EXCLUDE_FILE" ]; then
+    EXCLUDE_ARGS+=(-E "$EXCLUDE_FILE")
+    echo "Excluding tests listed in: $EXCLUDE_FILE"
+    echo ""
+fi
+
 perl runtests.pl \
     -a \
     -c "$WRAPPER" \
     -vc /usr/bin/curl \
+    "${EXCLUDE_ARGS[@]}" \
     "$@" 2>&1
 
 exit_code=$?

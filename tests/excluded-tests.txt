@@ -1,0 +1,30 @@
+# Permanently excluded curl tests for urlx
+#
+# Format: type:patterns:reason
+# Types: test (by number), keyword (by keyword), tool (by tool name)
+#
+# These tests verify curl's own source code structure, build system,
+# man pages, and symbol consistency. They are not applicable to urlx
+# since it is a completely different codebase written in Rust.
+
+# curl source code analysis tests — verify internal curl source structure
+test:745:curl source analysis — typecheck-gcc and curl.h sync check
+test:1119:curl source analysis — symbols-in-versions and headers sync
+test:1135:curl source analysis — CURL_EXTERN function order
+test:1165:curl source analysis — CURL_DISABLE values in configure.ac
+test:1167:curl source analysis — curl prefix of public symbols
+test:1177:curl source analysis — CURL_VERSION_* constants sync
+test:1185:curl source analysis — checksrc source code style validation
+test:1222:curl source analysis — deprecation statuses across codebase
+
+# curl-config tests — urlx does not ship curl-config
+test:1013:curl-config not applicable — compares --version with --protocols
+test:1014:curl-config not applicable — compares --version with --features
+test:1022:curl-config not applicable — compares --version with --version
+test:1023:curl-config not applicable — compares --version with --vernum
+
+# curl documentation/help tests — urlx has its own help text and no embedded manual
+test:1026:urlx does not embed curl manual — --manual flag not applicable
+test:1027:urlx has different help text format — --help output differs
+test:1139:curl documentation — verifies all libcurl options have man pages
+test:1173:curl documentation — man page syntax checks
