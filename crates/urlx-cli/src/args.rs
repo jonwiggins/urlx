@@ -149,6 +149,12 @@ pub struct CliOptions {
     /// Per-URL Easy handles for `--next` groups (indexed by URL position).
     /// Each entry records the Easy handle state for that URL's group.
     pub(crate) per_url_easy: Vec<Option<liburlx::Easy>>,
+    /// Per-URL group ID (indexed by URL position).
+    /// URLs in the same --next group share the same group ID.
+    /// Used to detect group transitions in `run_multi` for connection reuse.
+    pub(crate) per_url_group: Vec<usize>,
+    /// Current group ID counter (incremented on --next).
+    group_id: usize,
     /// URL index where the current --next group starts (for per-URL Easy handles).
     pub(crate) group_easy_start: usize,
 }
@@ -686,6 +692,8 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
         json_mode: false,
         per_url_ftp_methods: Vec::new(),
         per_url_easy: Vec::new(),
+        per_url_group: Vec::new(),
+        group_id: 0,
         group_easy_start: 0,
     };
 
@@ -694,7 +702,12 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
     let mut current_ftp_method = liburlx::protocol::ftp::FtpMethod::default();
     // Track pending -T upload file: set when -T is encountered, consumed when the next URL is added
     let mut pending_upload_file: Option<String> = None;
+    // Track whether any per-request option was set in the current --next group.
+    // Used to distinguish "no-op --next" from "badly used --next" (curl compat: tests 422, 430).
+    let mut group_has_options = false;
     while i < args.len() {
+        // No per-iteration tracking needed here — group_has_options is set
+        // by specific URL-consuming options (-O, -I, -d, -T, etc.) below.
         match args[i].as_str() {
             "-X" | "--request" => {
                 i += 1;
@@ -711,6 +724,9 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
             "-H" | "--header" => {
                 i += 1;
                 let val = require_arg(args, i, "-H")?;
+                // Warn about Unicode quote characters at start of value
+                // (curl compat: tests 469, 470)
+                warn_unicode_quote(val);
                 // -H @filename: read headers from file, one per line (curl compat: test 1147)
                 if let Some(path) = val.strip_prefix('@') {
                     if let Ok(contents) = std::fs::read_to_string(path) {
@@ -769,11 +785,14 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
                 if let Some(path) = val.strip_prefix('@') {
                     match read_data_source(path) {
                         Ok(data) => {
-                            // curl's -d @file strips ALL \r and \n from the data
-                            // (unlike --data-binary which keeps them).
-                            let data: Vec<u8> =
-                                data.into_iter().filter(|&b| b != b'\r' && b != b'\n').collect();
-                            opts.easy.body(&data);
+                            // curl's -d @file strips \r, \n, and \0 bytes
+                            // (unlike --data-binary which preserves them)
+                            // (curl compat: test 463)
+                            let stripped: Vec<u8> = data
+                                .into_iter()
+                                .filter(|&b| b != b'\r' && b != b'\n' && b != 0)
+                                .collect();
+                            opts.easy.body(&stripped);
                         }
                         Err(e) => {
                             eprintln!("curl: error reading data: {e}");
@@ -845,6 +864,7 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
                 i += 1;
                 let val = require_arg(args, i, "-o")?;
                 opts.output_files.push(val.to_string());
+                group_has_options = true;
             }
             "--out-null" => {
                 // Discard output for this URL (curl compat: test 756).
@@ -856,6 +876,7 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
             }
             "-O" | "--remote-name" | "--remote-name-all" => {
                 opts.remote_name = true;
+                group_has_options = true;
             }
             "--no-remote-name" => {
                 opts.remote_name = false;
@@ -1140,6 +1161,7 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
             "--unix-socket" => {
                 i += 1;
                 let val = require_arg(args, i, "--unix-socket")?;
+                warn_filename_like_flag(val);
                 opts.easy.unix_socket(val);
             }
             "--interface" => {
@@ -1896,11 +1918,39 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
             "--url" => {
                 i += 1;
                 let val = require_arg(args, i, "--url")?;
-                opts.urls.push(val.to_string());
-                opts.per_url_credentials.push(opts.user_credentials.clone());
-                opts.per_url_ftp_methods.push(current_ftp_method);
-                opts.per_url_easy.push(None);
-                opts.per_url_upload_files.push(pending_upload_file.take());
+                // --url @- reads URLs from stdin, --url @file reads from file
+                // (curl compat: tests 488, 489)
+                if let Some(source) = val.strip_prefix('@') {
+                    let content = if source == "-" {
+                        use std::io::Read as _;
+                        let mut buf = String::new();
+                        if std::io::stdin().read_to_string(&mut buf).is_ok() {
+                            buf
+                        } else {
+                            String::new()
+                        }
+                    } else {
+                        std::fs::read_to_string(source).unwrap_or_default()
+                    };
+                    for line in content.lines() {
+                        let line = line.trim();
+                        if !line.is_empty() {
+                            opts.urls.push(line.to_string());
+                            opts.per_url_credentials.push(opts.user_credentials.clone());
+                            opts.per_url_ftp_methods.push(current_ftp_method);
+                            opts.per_url_easy.push(None);
+                            opts.per_url_upload_files.push(pending_upload_file.take());
+                            opts.per_url_group.push(opts.group_id);
+                        }
+                    }
+                } else {
+                    opts.urls.push(val.to_string());
+                    opts.per_url_credentials.push(opts.user_credentials.clone());
+                    opts.per_url_ftp_methods.push(current_ftp_method);
+                    opts.per_url_easy.push(None);
+                    opts.per_url_upload_files.push(pending_upload_file.take());
+                    opts.per_url_group.push(opts.group_id);
+                }
                 opts.next_needs_url = false;
             }
             "--output-dir" => {
@@ -1967,6 +2017,7 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
                 opts.per_url_credentials.push(opts.user_credentials.clone());
                 opts.per_url_easy.push(None);
                 opts.per_url_upload_files.push(pending_upload_file.take());
+                opts.per_url_group.push(opts.group_id);
                 opts.next_needs_url = false;
             }
             "--expand-output" => {
@@ -2111,6 +2162,23 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
                 // Accepted for compatibility; not implemented
             }
             "-:" | "--next" => {
+                // --next without a preceding URL is an error (curl compat: test 422).
+                // But --next at the start of a config file is fine (curl compat: tests 430-432).
+                // In config files (config_depth > 0), --next without a URL is silently ignored.
+                let has_urls_in_group = opts.urls.len() > opts.group_easy_start;
+                if !has_urls_in_group && config_depth == 0 && group_has_options {
+                    eprintln!("curl: missing URL before --next");
+                    eprintln!("curl: option --next: is badly used here");
+                    eprintln!("curl: try 'curl --help' or 'curl --manual' for more information");
+                    return Err(2);
+                }
+                // If no URLs in current group (e.g., --next at start of config file),
+                // skip the group separator logic (curl compat: tests 430-432)
+                if !has_urls_in_group {
+                    i += 1;
+                    continue;
+                }
+
                 // --next separates URL groups; assign current group's -u credentials
                 // to URLs in the current group (from group_start_idx onwards), then reset.
                 let group_creds = opts.user_credentials.clone();
@@ -2122,6 +2190,18 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
                 // Assign current ftp_method to all URLs in the current group
                 for slot in opts.per_url_ftp_methods[group_start_idx..].iter_mut() {
                     *slot = current_ftp_method;
+                }
+                // Apply deferred --json headers to the current group before saving
+                // (curl compat: test 386 — json headers must not leak to next group)
+                if opts.json_mode {
+                    let has_ct = opts.easy.has_header("content-type");
+                    let has_accept = opts.easy.has_header("accept");
+                    if !has_ct {
+                        opts.easy.header("Content-Type", "application/json");
+                    }
+                    if !has_accept {
+                        opts.easy.header("Accept", "application/json");
+                    }
                 }
                 // Save per-URL Easy handles for the current group
                 let current_easy = opts.easy.clone();
@@ -2140,8 +2220,11 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
                 opts.has_post_data = false;
                 opts.easy.reset_method();
                 opts.easy.set_form_data(false);
+                opts.json_mode = false;
                 opts.next_needs_url = true;
                 opts.had_next = true;
+                opts.group_id += 1;
+                group_has_options = false;
             }
             arg if arg.starts_with("--no-") => {
                 // --no- prefix used on a non-boolean option (curl returns exit code 2)
@@ -2166,6 +2249,7 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
                 opts.per_url_easy.push(None); // Will be filled on --next or at end
                                               // Associate pending -T upload file with this URL (if any)
                 opts.per_url_upload_files.push(pending_upload_file.take());
+                opts.per_url_group.push(opts.group_id);
                 opts.next_needs_url = false;
             }
         }
@@ -2924,10 +3008,89 @@ fn unescape_form_filename(s: &str) -> String {
 
 pub fn require_arg<'a>(args: &'a [String], i: usize, flag: &str) -> Result<&'a str, u8> {
     if i >= args.len() {
-        eprintln!("curl: option {flag} requires an argument");
-        Err(1)
+        eprintln!("curl: option {flag}: requires parameter");
+        eprintln!("curl: try 'curl --help' or 'curl --manual' for more information");
+        Err(2)
     } else {
         Ok(&args[i])
+    }
+}
+
+/// Check if a string starts with a leading Unicode character (UTF-8 E2 80 xx).
+///
+/// curl warns about these to help users who accidentally paste text with
+/// "smart quotes" (curly quotes) or other Unicode punctuation from word processors.
+/// Matches curl's `has_leading_unicode()`: checks for E2 80 + high-bit byte.
+/// (curl compat: tests 469, 470)
+fn has_leading_unicode(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    bytes.len() >= 3 && bytes[0] == 0xE2 && bytes[1] == 0x80 && (bytes[2] & 0x80) != 0
+}
+
+/// Emit a warning about a leading Unicode character in an argument value.
+///
+/// Uses curl's `voutf` wrapping logic: `"Warning: "` prefix on each line,
+/// line break at terminal width (79 in tests). The format string is:
+/// `"The argument '%s' starts with a Unicode character. Maybe ASCII was intended?"`
+fn warn_unicode_quote(s: &str) {
+    if has_leading_unicode(s) {
+        let msg = format!(
+            "The argument '{}' starts with a Unicode character. Maybe ASCII was intended?",
+            s
+        );
+        warnf_wrapped(&msg);
+    }
+}
+
+/// Emit a warning message with curl-compatible line wrapping.
+///
+/// Matches curl's `voutf()` behavior: wraps at terminal width (79) minus
+/// prefix length (9 for "Warning: "), breaking at the last blank character
+/// before the wrap point. Each continuation line gets the same prefix.
+fn warnf_wrapped(msg: &str) {
+    let prefix = "Warning: ";
+    let term_width: usize = 79;
+    let prefw = prefix.len();
+    let width = if term_width > prefw { term_width - prefw } else { usize::MAX };
+
+    let bytes = msg.as_bytes();
+    let mut pos: usize = 0;
+    let len = bytes.len();
+
+    while pos < len {
+        let remaining = len - pos;
+        if remaining > width {
+            // Find last blank before width-1
+            let mut cut = width - 1;
+            while cut > 0 && bytes[pos + cut] != b' ' && bytes[pos + cut] != b'\t' {
+                cut -= 1;
+            }
+            if cut == 0 {
+                // No blank found, hard break at width-1
+                cut = width - 1;
+            }
+            // Write prefix + content up to and including the blank
+            eprint!("{prefix}");
+            let slice = &msg[pos..=pos + cut];
+            eprintln!("{slice}");
+            pos += cut + 1;
+        } else {
+            // Last segment: write prefix + remaining
+            eprint!("{prefix}");
+            eprintln!("{}", &msg[pos..]);
+            pos = len;
+        }
+    }
+}
+
+/// Warn if a filename argument looks like a flag (starts with `-`).
+///
+/// curl emits this warning when a file-type option receives a value
+/// that looks like a command-line flag.
+/// (curl compat: test 1268)
+fn warn_filename_like_flag(val: &str) {
+    if val.starts_with('-') && val.len() > 1 {
+        warnf_wrapped(&format!("The filename argument '{}' looks like a flag.", val));
     }
 }
 
