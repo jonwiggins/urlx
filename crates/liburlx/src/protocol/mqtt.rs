@@ -9,6 +9,39 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use crate::error::Error;
 use crate::protocol::http::response::Response;
 
+/// Percent-decode a URL path component for use as an MQTT topic.
+///
+/// MQTT topics are raw UTF-8 strings, not URL-encoded. A space in the
+/// topic must be sent as a literal space byte (0x20), not as `%20`.
+fn percent_decode_topic(encoded: &str) -> String {
+    let mut decoded = Vec::with_capacity(encoded.len());
+    let bytes = encoded.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (hex_nibble(bytes[i + 1]), hex_nibble(bytes[i + 2])) {
+                decoded.push(hi << 4 | lo);
+                i += 3;
+                continue;
+            }
+        }
+        decoded.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(decoded)
+        .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
+}
+
+/// Convert an ASCII hex digit to its numeric value.
+const fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
 /// MQTT Quality of Service levels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(u8)]
@@ -212,6 +245,8 @@ fn build_disconnect_packet() -> Vec<u8> {
 /// # Errors
 ///
 /// Returns an error if the packet is malformed or connection drops.
+/// IO errors during payload read are mapped to "partial" errors for
+/// proper exit code mapping (`CURLE_PARTIAL_FILE` = 18).
 async fn read_packet<S: AsyncRead + Unpin>(stream: &mut S) -> Result<(u8, u8, Vec<u8>), Error> {
     // Read fixed header byte
     let mut header = [0u8; 1];
@@ -242,13 +277,45 @@ async fn read_packet<S: AsyncRead + Unpin>(stream: &mut S) -> Result<(u8, u8, Ve
     // Read payload
     let mut payload = vec![0u8; remaining_len];
     if remaining_len > 0 {
-        let _n = stream
-            .read_exact(&mut payload)
-            .await
-            .map_err(|e| Error::Http(format!("MQTT read payload error: {e}")))?;
+        let _ = stream.read_exact(&mut payload).await.map_err(|_| {
+            // Truncated packet — maps to CURLE_PARTIAL_FILE (18)
+            Error::Http("partial MQTT data received".to_string())
+        })?;
     }
 
     Ok((packet_type, flags, payload))
+}
+
+/// Read and validate a CONNACK packet.
+///
+/// CONNACK is always exactly 4 bytes: type(0x20) + `remaining_length`(0x02) + 2 payload bytes.
+/// If the remaining length is not 2, returns `CURLE_WEIRD_SERVER_REPLY` (exit code 8).
+/// If the return code (second payload byte) is non-zero, also returns that error.
+///
+/// # Errors
+///
+/// Returns an error if the packet is malformed or connection drops.
+async fn read_connack<S: AsyncRead + Unpin>(stream: &mut S) -> Result<(), Error> {
+    // Read the fixed 4-byte CONNACK: type + remaining_length + 2 bytes payload
+    let mut buf = [0u8; 4];
+    let _ = stream
+        .read_exact(&mut buf)
+        .await
+        .map_err(|e| Error::Http(format!("MQTT read CONNACK error: {e}")))?;
+
+    let ptype = buf[0] >> 4;
+    if ptype != PacketType::Connack as u8 {
+        return Err(Error::Http("Weird server reply".to_string()));
+    }
+    // Check remaining length — must be exactly 2 for valid CONNACK
+    if buf[1] != 2 {
+        return Err(Error::Http("Weird server reply".to_string()));
+    }
+    // Check return code (second payload byte)
+    if buf[3] != 0 {
+        return Err(Error::Http("Weird server reply".to_string()));
+    }
+    Ok(())
 }
 
 /// Publish a message to an MQTT broker.
@@ -281,11 +348,8 @@ pub async fn publish_qos(
     qos: QoS,
 ) -> Result<Response, Error> {
     let (host, port) = url.host_and_port()?;
-    let topic = url.path().trim_start_matches('/');
-
-    if topic.is_empty() {
-        return Err(Error::Http("MQTT topic is required in URL path".to_string()));
-    }
+    let raw_topic = url.path().trim_start_matches('/');
+    let topic = percent_decode_topic(raw_topic);
 
     let addr = format!("{host}:{port}");
     let mut tcp = tokio::net::TcpStream::connect(&addr).await.map_err(Error::Connect)?;
@@ -296,18 +360,17 @@ pub async fn publish_qos(
         .await
         .map_err(|e| Error::Http(format!("MQTT connect write error: {e}")))?;
 
-    // Read CONNACK
-    let (ptype, _, connack_payload) = read_packet(&mut tcp).await?;
-    if ptype != PacketType::Connack as u8 {
-        return Err(Error::Http(format!("MQTT expected CONNACK, got type {ptype}")));
-    }
-    if connack_payload.len() >= 2 && connack_payload[1] != 0 {
-        return Err(Error::Http(format!("MQTT connection refused: code {}", connack_payload[1])));
+    // Read CONNACK (validates remaining length == 2 and return code == 0)
+    read_connack(&mut tcp).await?;
+
+    // Check topic after CONNECT/CONNACK (curl compat: test 1199)
+    if topic.is_empty() {
+        return Err(Error::UrlParse("No MQTT topic found. Forgot to URL encode it?".to_string()));
     }
 
     // PUBLISH
     let packet_id: u16 = 1;
-    let publish_pkt = build_publish_packet(topic, payload, qos, packet_id);
+    let publish_pkt = build_publish_packet(&topic, payload, qos, packet_id);
     tcp.write_all(&publish_pkt)
         .await
         .map_err(|e| Error::Http(format!("MQTT publish write error: {e}")))?;
@@ -399,13 +462,11 @@ pub async fn subscribe(url: &crate::url::Url) -> Result<Response, Error> {
 /// # Errors
 ///
 /// Returns an error if connection, subscription, or the `QoS` handshake fails.
+#[allow(clippy::too_many_lines)] // MQTT subscribe flow requires many protocol steps
 pub async fn subscribe_qos(url: &crate::url::Url, qos: QoS) -> Result<Response, Error> {
     let (host, port) = url.host_and_port()?;
-    let topic = url.path().trim_start_matches('/');
-
-    if topic.is_empty() {
-        return Err(Error::Http("MQTT topic is required in URL path".to_string()));
-    }
+    let raw_topic = url.path().trim_start_matches('/');
+    let topic = percent_decode_topic(raw_topic);
 
     let addr = format!("{host}:{port}");
     let mut tcp = tokio::net::TcpStream::connect(&addr).await.map_err(Error::Connect)?;
@@ -416,39 +477,68 @@ pub async fn subscribe_qos(url: &crate::url::Url, qos: QoS) -> Result<Response, 
         .await
         .map_err(|e| Error::Http(format!("MQTT connect write error: {e}")))?;
 
-    // Read CONNACK
-    let (ptype, _, connack_payload) = read_packet(&mut tcp).await?;
-    if ptype != PacketType::Connack as u8 {
-        return Err(Error::Http(format!("MQTT expected CONNACK, got type {ptype}")));
-    }
-    if connack_payload.len() >= 2 && connack_payload[1] != 0 {
-        return Err(Error::Http(format!("MQTT connection refused: code {}", connack_payload[1])));
+    // Read CONNACK (validates remaining length == 2 and return code == 0)
+    read_connack(&mut tcp).await?;
+
+    // Check topic after CONNECT/CONNACK (curl compat: test 1199)
+    if topic.is_empty() {
+        return Err(Error::UrlParse("No MQTT topic found. Forgot to URL encode it?".to_string()));
     }
 
     // SUBSCRIBE
-    let subscribe_pkt = build_subscribe_packet(topic, 1, qos);
+    let subscribe_pkt = build_subscribe_packet(&topic, 1, qos);
     tcp.write_all(&subscribe_pkt)
         .await
         .map_err(|e| Error::Http(format!("MQTT subscribe write error: {e}")))?;
 
-    // Read SUBACK
-    let (ptype, _, _) = read_packet(&mut tcp).await?;
-    if ptype != PacketType::Suback as u8 {
-        return Err(Error::Http(format!("MQTT expected SUBACK, got type {ptype}")));
+    // Read packets after SUBSCRIBE — the server may send PUBLISH before SUBACK
+    // (curl compat: test 1194). We need to handle both orderings.
+    let mut got_suback = false;
+    let mut publish_data: Option<(u8, Vec<u8>)> = None; // (flags, payload)
+
+    // Read up to 2 packets to find both SUBACK and PUBLISH (in any order)
+    for _ in 0..2 {
+        let (ptype, flags, pkt_payload) = read_packet(&mut tcp).await.map_err(|e| {
+            // Map read errors during subscribe to partial file (truncated response)
+            let msg = e.to_string();
+            if msg.contains("read")
+                || msg.contains("eof")
+                || msg.contains("Eof")
+                || msg.contains("unexpected end")
+            {
+                Error::Http("partial MQTT data received".to_string())
+            } else {
+                e
+            }
+        })?;
+
+        if ptype == PacketType::Suback as u8 {
+            got_suback = true;
+            if publish_data.is_some() {
+                break; // Have both
+            }
+        } else if ptype == PacketType::Publish as u8 {
+            publish_data = Some((flags, pkt_payload));
+            if got_suback {
+                break; // Have both
+            }
+        } else {
+            return Err(Error::Http(format!(
+                "MQTT unexpected packet type {ptype} during subscribe"
+            )));
+        }
     }
 
-    // Read one PUBLISH message
-    let (ptype, flags, payload) = read_packet(&mut tcp).await?;
-    if ptype != PacketType::Publish as u8 {
-        return Err(Error::Http(format!("MQTT expected PUBLISH, got type {ptype}")));
-    }
+    let (flags, payload) = publish_data
+        .ok_or_else(|| Error::Http("MQTT did not receive PUBLISH message".to_string()))?;
 
     // Parse QoS from PUBLISH flags
     let recv_qos = (flags >> 1) & 0x03;
 
     // Parse PUBLISH: 2 bytes topic length + topic + [2 bytes packet ID if QoS>0] + payload
     if payload.len() < 2 {
-        return Err(Error::Http("MQTT PUBLISH packet too short".to_string()));
+        // Truncated PUBLISH — exit code 18 = CURLE_PARTIAL_FILE
+        return Err(Error::Http("partial MQTT data received".to_string()));
     }
     let topic_len = u16::from_be_bytes([payload[0], payload[1]]) as usize;
 
@@ -456,7 +546,7 @@ pub async fn subscribe_qos(url: &crate::url::Url, qos: QoS) -> Result<Response, 
         // QoS 1 or 2: packet ID follows topic
         let id_offset = 2 + topic_len;
         if payload.len() < id_offset + 2 {
-            return Err(Error::Http("MQTT PUBLISH packet too short for QoS ID".to_string()));
+            return Err(Error::Http("partial MQTT data received".to_string()));
         }
         let pid = u16::from_be_bytes([payload[id_offset], payload[id_offset + 1]]);
         (id_offset + 2, Some(pid))
@@ -494,10 +584,9 @@ pub async fn subscribe_qos(url: &crate::url::Url, qos: QoS) -> Result<Response, 
         }
     }
 
-    // DISCONNECT
-    tcp.write_all(&build_disconnect_packet())
-        .await
-        .map_err(|e| Error::Http(format!("MQTT disconnect write error: {e}")))?;
+    // DISCONNECT — best-effort; server may have already closed the connection
+    // (curl compat: test 1194, server sends DISCONNECT first)
+    let _ = tcp.write_all(&build_disconnect_packet()).await;
 
     let mut headers = std::collections::HashMap::new();
     let _old = headers.insert("content-length".to_string(), message.len().to_string());
