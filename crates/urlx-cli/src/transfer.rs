@@ -1812,6 +1812,11 @@ pub fn error_to_curl_code(err: &liburlx::Error) -> u8 {
                 67 // CURLE_LOGIN_DENIED
             }
         }
+        liburlx::Error::SshHostKeyMismatch(_) => 60, // CURLE_PEER_FAILED_VERIFICATION
+        liburlx::Error::SshQuoteError(_) => 21,      // CURLE_QUOTE_ERROR
+        liburlx::Error::SshQuoteErrorWithData { .. } => 21, // CURLE_QUOTE_ERROR
+        liburlx::Error::SshUploadFailed(_) => 25,    // CURLE_UPLOAD_FAILED
+        liburlx::Error::SshRangeError(_) => 33,      // CURLE_RANGE_ERROR
         liburlx::Error::Transfer { code, .. } => u8::try_from(*code).unwrap_or(1),
         liburlx::Error::PartialBody { message, .. } => {
             if message.contains("transfer closed") || message.contains("outstanding read data") {
@@ -1845,6 +1850,11 @@ pub fn curl_error_message(err: &liburlx::Error) -> String {
         liburlx::Error::Timeout(d) => format!("Operation timed out after {d:?}"),
         liburlx::Error::UrlParse(msg) => msg.clone(),
         liburlx::Error::Ssh(msg) => msg.clone(),
+        liburlx::Error::SshHostKeyMismatch(msg) => msg.clone(),
+        liburlx::Error::SshQuoteError(msg) => msg.clone(),
+        liburlx::Error::SshUploadFailed(msg) => msg.clone(),
+        liburlx::Error::SshRangeError(msg) => msg.clone(),
+        liburlx::Error::SshQuoteErrorWithData { message, .. } => message.clone(),
         liburlx::Error::Connect(e) => format!("Failed to connect: {e}"),
         liburlx::Error::Tls(e) => e.to_string(),
         liburlx::Error::FileError(msg) => msg.clone(),
@@ -2070,7 +2080,10 @@ pub fn run_multi(
         // -T upload: for HTTP, only the first URL gets PUT with the upload body;
         // subsequent URLs revert to GET without body (curl compat: test 1065).
         // For FTP, all URLs keep the upload body (curl compat: tests 149, 216).
-        let is_ftp_url = url.starts_with("ftp://") || url.starts_with("ftps://");
+        let is_ftp_url = url.starts_with("ftp://")
+            || url.starts_with("ftps://")
+            || url.starts_with("sftp://")
+            || url.starts_with("scp://");
         if is_upload && i > 0 && easy.has_body() && !is_ftp_url {
             let _ = easy.take_body();
             easy.method("GET");
@@ -2137,6 +2150,34 @@ pub fn run_multi(
         }
 
         // Apply per-URL credentials: -u flag takes priority, then URL userinfo.
+        // For FTP/SSH/SMTP/IMAP/POP3, embed credentials in URL (these protocols
+        // read credentials from the URL, not from Authorization headers).
+        // (curl compat: tests 618, 619, 620, 621 — multi-URL SSH transfers)
+        if let Some(Some((ref user, ref pass))) = per_url_credentials.get(i) {
+            if effective_url.starts_with("ftp://")
+                || effective_url.starts_with("ftps://")
+                || effective_url.starts_with("sftp://")
+                || effective_url.starts_with("scp://")
+                || effective_url.starts_with("smtp://")
+                || effective_url.starts_with("smtps://")
+                || effective_url.starts_with("imap://")
+                || effective_url.starts_with("imaps://")
+                || effective_url.starts_with("pop3://")
+                || effective_url.starts_with("pop3s://")
+            {
+                let base_url = strip_url_credentials(&effective_url);
+                if let Some(scheme_end) = base_url.find("://").map(|p| p + 3) {
+                    let new_url = format!(
+                        "{}{}:{}@{}",
+                        &base_url[..scheme_end],
+                        user,
+                        pass,
+                        &base_url[scheme_end..]
+                    );
+                    let _ = easy.url(&new_url);
+                }
+            }
+        }
         // Remove old Authorization header before setting new credentials (curl compat: test 1134).
         // Skip when Digest/NTLM/AnyAuth is configured — those use challenge-response
         // and the auth_credentials handle the credentials (curl compat: test 388).
@@ -2310,6 +2351,19 @@ pub fn run_multi(
                 last_exit = exit;
             }
             Err(e) => {
+                // SFTP post-quote errors: output the downloaded data before
+                // reporting the error (curl compat: test 609)
+                if let liburlx::Error::SshQuoteErrorWithData { ref response, .. } = e {
+                    let file_for_this = output_files.get(i).map(String::as_str);
+                    let _ = output_response(
+                        response.as_ref(),
+                        file_for_this,
+                        write_out,
+                        false, // no include headers for SFTP
+                        silent,
+                        false,
+                    );
+                }
                 if !silent || show_error {
                     eprintln!("curl: transfer {} ({}): {e}", i + 1, url);
                 }

@@ -203,7 +203,7 @@ pub fn print_usage() {
     eprintln!("      --key <file>          Client private key (PEM/SSH format)");
     eprintln!("      --hostpubsha256 <hash>  SSH host key SHA-256 fingerprint (base64)");
     eprintln!("      --known-hosts <file>  SSH known_hosts file for host key verification");
-    eprintln!("      --hostpubmd5 <hash>   SSH host key MD5 fingerprint (ignored, deprecated)");
+    eprintln!("      --hostpubmd5 <hash>   SSH host key MD5 fingerprint (32 hex chars)");
     eprintln!("      --digest              Use HTTP Digest authentication");
     eprintln!("      --ntlm                Use HTTP NTLM authentication");
     eprintln!("      --proxy-user <u:p>    Proxy authentication (user:password)");
@@ -1062,9 +1062,16 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
                 opts.easy.ssh_known_hosts_path(val);
             }
             "--hostpubmd5" => {
-                // Recognized but not implemented — MD5 fingerprints are deprecated
                 i += 1;
-                let _val = require_arg(args, i, "--hostpubmd5")?;
+                let val = require_arg(args, i, "--hostpubmd5")?;
+                // Validate MD5 fingerprint: must be exactly 32 hex characters
+                if val.len() != 32 || !val.chars().all(|c| c.is_ascii_hexdigit()) {
+                    eprintln!(
+                        "curl: (2) Argument to --hostpubmd5 must be a 32 character hex string"
+                    );
+                    return Err(2);
+                }
+                opts.easy.ssh_host_key_md5(val);
             }
             "--digest" => {
                 opts.use_digest = true;
@@ -4613,14 +4620,26 @@ mod tests {
     }
 
     #[test]
-    fn parse_hostpubmd5_noop() {
+    fn parse_hostpubmd5_valid() {
         let args = vec![
             "urlx".into(),
             "--hostpubmd5".into(),
-            "00:11:22:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff".into(),
+            "00112233445566778899aabbccddeeff".into(),
             "sftp://example.com/file".into(),
         ];
         assert!(matches!(parse_args(&args), ParseResult::Options(_)));
+    }
+
+    #[test]
+    fn parse_hostpubmd5_invalid() {
+        // Too short: 2 hex chars instead of 32
+        let args = vec![
+            "urlx".into(),
+            "--hostpubmd5".into(),
+            "00".into(),
+            "sftp://example.com/file".into(),
+        ];
+        assert!(matches!(parse_args(&args), ParseResult::Error(2)));
     }
 
     #[test]

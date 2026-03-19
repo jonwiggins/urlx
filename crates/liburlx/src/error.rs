@@ -58,6 +58,32 @@ pub enum Error {
     #[error("SSH error: {0}")]
     Ssh(String),
 
+    /// SSH host key verification failed (maps to `CURLE_PEER_FAILED_VERIFICATION` = 60).
+    #[error("SSH host key verification failed: {0}")]
+    SshHostKeyMismatch(String),
+
+    /// SFTP/SCP quote command failed (maps to `CURLE_QUOTE_ERROR` = 21).
+    #[error("SFTP quote error: {0}")]
+    SshQuoteError(String),
+
+    /// SCP/SFTP upload failed (maps to `CURLE_UPLOAD_FAILED` = 25).
+    #[error("SSH upload failed: {0}")]
+    SshUploadFailed(String),
+
+    /// SFTP range request not satisfiable (maps to `CURLE_RANGE_ERROR` = 33).
+    #[error("SFTP range error: {0}")]
+    SshRangeError(String),
+
+    /// SFTP/SCP post-quote command failed, but download data is available.
+    /// The response is boxed to keep the error type small.
+    #[error("SFTP post-quote error: {message}")]
+    SshQuoteErrorWithData {
+        /// Error description.
+        message: String,
+        /// The response data from the successful download.
+        response: Box<crate::protocol::http::response::Response>,
+    },
+
     /// An authentication error occurred.
     #[error("authentication error: {0}")]
     Auth(String),

@@ -151,6 +151,8 @@ pub struct Easy {
     ssh_public_keyfile: Option<String>,
     /// SSH host key SHA-256 fingerprint for verification (base64, no prefix).
     ssh_host_key_sha256: Option<String>,
+    /// SSH host key MD5 fingerprint for verification (hex, 32 chars, no colons).
+    ssh_host_key_md5: Option<String>,
     /// Path to SSH `known_hosts` file for host key verification.
     ssh_known_hosts_path: Option<String>,
     /// Allowed SSH auth types bitmask (1=publickey, 2=password, 4=keyboard-interactive, 8=host).
@@ -317,6 +319,7 @@ impl std::fmt::Debug for Easy {
             .field("ssh_key_path", &self.ssh_key_path)
             .field("ssh_public_keyfile", &self.ssh_public_keyfile)
             .field("ssh_host_key_sha256", &self.ssh_host_key_sha256)
+            .field("ssh_host_key_md5", &self.ssh_host_key_md5)
             .field("ssh_known_hosts_path", &self.ssh_known_hosts_path)
             .field("ssh_auth_types", &self.ssh_auth_types)
             .field("path_as_is", &self.path_as_is)
@@ -435,6 +438,7 @@ impl Clone for Easy {
             ssh_key_path: self.ssh_key_path.clone(),
             ssh_public_keyfile: self.ssh_public_keyfile.clone(),
             ssh_host_key_sha256: self.ssh_host_key_sha256.clone(),
+            ssh_host_key_md5: self.ssh_host_key_md5.clone(),
             ssh_known_hosts_path: self.ssh_known_hosts_path.clone(),
             ssh_auth_types: self.ssh_auth_types,
             path_as_is: self.path_as_is,
@@ -565,6 +569,7 @@ impl Easy {
             ssh_key_path: None,
             ssh_public_keyfile: None,
             ssh_host_key_sha256: None,
+            ssh_host_key_md5: None,
             ssh_known_hosts_path: None,
             ssh_auth_types: None,
             path_as_is: false,
@@ -1900,6 +1905,16 @@ impl Easy {
         self.ssh_host_key_sha256 = Some(fingerprint.to_string());
     }
 
+    /// Set the expected SSH host key MD5 fingerprint for verification.
+    ///
+    /// The fingerprint should be a 32-character hex string without colons.
+    /// If the server's host key does not match, the connection is rejected.
+    ///
+    /// Equivalent to curl's `--hostpubmd5`.
+    pub fn ssh_host_key_md5(&mut self, fingerprint: &str) {
+        self.ssh_host_key_md5 = Some(fingerprint.to_string());
+    }
+
     /// Set the path to an SSH `known_hosts` file for host key verification.
     ///
     /// When set, the server's host key is verified against entries in the file.
@@ -2082,6 +2097,7 @@ impl Easy {
     ///
     /// Commands prefixed with `-` are sent after the transfer (post-quote).
     /// Commands without prefix are sent before the transfer (pre-quote).
+    /// The `*` prefix on the command itself means "accept failure" (ignore errors).
     pub fn ftp_quote(&mut self, cmd: &str) {
         if let Some(stripped) = cmd.strip_prefix('-') {
             self.ftp_post_quote.push(stripped.to_string());
@@ -2580,6 +2596,7 @@ impl Easy {
         #[cfg(feature = "ssh")]
         let ssh_host_key_policy = build_ssh_host_key_policy(
             self.ssh_host_key_sha256.as_deref(),
+            self.ssh_host_key_md5.as_deref(),
             self.ssh_known_hosts_path.as_deref(),
         )?;
         #[cfg(not(feature = "ssh"))]
@@ -6722,6 +6739,7 @@ fn extract_path_and_query(url_str: &str) -> String {
 #[cfg(feature = "ssh")]
 fn build_ssh_host_key_policy(
     sha256_fingerprint: Option<&str>,
+    md5_fingerprint: Option<&str>,
     known_hosts_path: Option<&str>,
 ) -> Result<crate::protocol::ssh::SshHostKeyPolicy, Error> {
     use crate::protocol::ssh::SshHostKeyPolicy;
@@ -6729,6 +6747,10 @@ fn build_ssh_host_key_policy(
     // SHA-256 fingerprint takes priority (most specific)
     if let Some(fp) = sha256_fingerprint {
         return Ok(SshHostKeyPolicy::Sha256Fingerprint(fp.to_string()));
+    }
+    // MD5 fingerprint (curl compat: tests 630, 631)
+    if let Some(fp) = md5_fingerprint {
+        return Ok(SshHostKeyPolicy::Md5Fingerprint(fp.to_string()));
     }
     // Then known_hosts file
     if let Some(path) = known_hosts_path {
