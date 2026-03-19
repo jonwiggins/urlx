@@ -2920,9 +2920,12 @@ async fn perform_transfer(
                     .unwrap_or("")
                     .eq_ignore_ascii_case(current_url.host_str().unwrap_or(""));
                 if (same_host || unrestricted_auth)
-                    && !request_headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+                    && !request_headers.iter().any(|(k, _)| {
+                        k.eq_ignore_ascii_case("authorization")
+                            || k.eq_ignore_ascii_case("_auto_authorization")
+                    })
                 {
-                    request_headers.push(("Authorization".to_string(), basic_hdr.clone()));
+                    request_headers.push(("_auto_Authorization".to_string(), basic_hdr.clone()));
                 }
             }
         }
@@ -2968,7 +2971,7 @@ async fn perform_transfer(
                     *nc,
                     cnonce,
                 );
-                request_headers.push(("Authorization".to_string(), auth_header));
+                request_headers.push(("_auto_Authorization".to_string(), auth_header));
             }
         }
 
@@ -2999,7 +3002,7 @@ async fn perform_transfer(
         if let Some(auth) = auth_credentials {
             if auth.method == AuthMethod::Ntlm {
                 let type1 = crate::auth::ntlm::create_type1_message();
-                request_headers.push(("Authorization".to_string(), format!("NTLM {type1}")));
+                request_headers.push(("_auto_Authorization".to_string(), format!("NTLM {type1}")));
             }
         }
 
@@ -3138,7 +3141,10 @@ async fn perform_transfer(
                     // Re-send without auth headers (server didn't ask for any)
                     let mut retry_headers = request_headers.clone();
                     // Remove any auth headers added by the probe
-                    retry_headers.retain(|(k, _)| !k.eq_ignore_ascii_case("authorization"));
+                    retry_headers.retain(|(k, _)| {
+                        !k.eq_ignore_ascii_case("authorization")
+                            && !k.eq_ignore_ascii_case("_auto_authorization")
+                    });
                     response = Box::pin(do_single_request(
                         &current_url,
                         &current_method,
@@ -3294,7 +3300,7 @@ async fn perform_transfer(
                             digest_state = Some((challenge, cnonce.clone(), 1));
 
                             let mut auth_headers = request_headers.clone();
-                            auth_headers.push(("Authorization".to_string(), auth_header));
+                            auth_headers.push(("_auto_Authorization".to_string(), auth_header));
 
                             response = Box::pin(do_single_request(
                                 &current_url,
@@ -3403,7 +3409,8 @@ async fn perform_transfer(
                                     // Update Digest state with new nonce
                                     digest_state = Some((new_challenge, cnonce.clone(), 1));
                                     let mut stale_headers = request_headers.clone();
-                                    stale_headers.push(("Authorization".to_string(), auth_header));
+                                    stale_headers
+                                        .push(("_auto_Authorization".to_string(), auth_header));
                                     response = Box::pin(do_single_request(
                                         &current_url,
                                         &current_method,
@@ -3492,13 +3499,19 @@ async fn perform_transfer(
                             let type1 = crate::auth::ntlm::create_type1_message();
                             let mut type1_headers = request_headers.clone();
                             type1_headers
-                                .push(("Authorization".to_string(), format!("NTLM {type1}")));
+                                .push(("_auto_Authorization".to_string(), format!("NTLM {type1}")));
+                            // Suppress body during NTLM Type 1 probe (Content-Length: 0)
+                            // curl compat: test 155
+                            type1_headers
+                                .retain(|(k, _)| !k.eq_ignore_ascii_case("content-length"));
+                            let type1_body =
+                                if current_body.is_some() { Some(&[] as &[u8]) } else { None };
 
                             response = Box::pin(do_single_request(
                                 &current_url,
                                 &current_method,
                                 &type1_headers,
-                                current_body.as_deref(),
+                                type1_body,
                                 verbose,
                                 accept_encoding,
                                 connect_timeout,
@@ -3587,7 +3600,7 @@ async fn perform_transfer(
 
                                     let mut type3_headers = request_headers.clone();
                                     type3_headers.push((
-                                        "Authorization".to_string(),
+                                        "_auto_Authorization".to_string(),
                                         format!("NTLM {type3}"),
                                     ));
 
@@ -3680,7 +3693,7 @@ async fn perform_transfer(
                         basic_resp.set_body(Vec::new());
                         redirect_chain.push(basic_resp);
                         let mut auth_headers = request_headers.clone();
-                        auth_headers.push(("Authorization".to_string(), basic_val));
+                        auth_headers.push(("_auto_Authorization".to_string(), basic_val));
                         response = Box::pin(do_single_request(
                             &current_url,
                             &current_method,
@@ -4323,6 +4336,7 @@ async fn perform_transfer(
                                 auth_headers.retain(|(k, _)| {
                                     !k.eq_ignore_ascii_case("proxy-authorization")
                                         && !k.eq_ignore_ascii_case("authorization")
+                                        && !k.eq_ignore_ascii_case("_auto_authorization")
                                 });
                                 if let Some(ref pa) = saved_proxy_auth {
                                     // Only re-send Proxy-Authorization for Digest (not NTLM)
@@ -4330,7 +4344,7 @@ async fn perform_transfer(
                                         auth_headers.push(pa.clone());
                                     }
                                 }
-                                auth_headers.push(("Authorization".to_string(), auth_value));
+                                auth_headers.push(("_auto_Authorization".to_string(), auth_value));
                                 response = Box::pin(do_single_request(
                                     &current_url,
                                     &current_method,
