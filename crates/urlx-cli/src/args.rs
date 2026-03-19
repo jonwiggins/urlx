@@ -695,6 +695,10 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
                 // Store original case value for non-HTTP protocols
                 // (IMAP/POP3/SMTP use -X as custom protocol command)
                 opts.custom_request_original = Some(val.to_string());
+                // Also set custom_request_target to preserve case for email
+                // protocols (IMAP/POP3/SMTP).  This ensures per-URL Easy
+                // handles cloned at --next time carry the original-case value.
+                opts.easy.custom_request_target(val);
             }
             "-H" | "--header" => {
                 i += 1;

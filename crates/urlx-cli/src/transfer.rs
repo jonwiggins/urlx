@@ -854,6 +854,15 @@ pub fn run(args: &[String]) -> ExitCode {
                 || url.starts_with("pop3://")
                 || url.starts_with("pop3s://")
             {
+                // Reject credentials with characters that break URL parsing
+                // (curl compat: test 896 — `"` and `{` in credentials)
+                let has_bad_char = |s: &str| s.contains('"') || s.contains('{') || s.contains('}');
+                if has_bad_char(user) || has_bad_char(pass) {
+                    if !opts.silent || opts.show_error {
+                        eprintln!("curl: (3) URL using bad/illegal format or missing URL");
+                    }
+                    return ExitCode::from(3);
+                }
                 let base_url = strip_url_credentials(&url);
                 let scheme_end = base_url.find("://").map_or(0, |p| p + 3);
                 let new_url = format!(
@@ -2016,6 +2025,42 @@ pub fn run_multi(
     let mut easy = template.clone();
     let mut last_exit = ExitCode::SUCCESS;
 
+    // Pre-compute which URLs are part of an IMAP batch (consecutive IMAP URLs to
+    // the same host:port, for connection reuse — curl compat: tests 804, 815, 816).
+    let mut imap_batch_processed: Vec<bool> = vec![false; urls.len()];
+    let mut imap_batches: Vec<(usize, usize)> = Vec::new(); // (start, end) inclusive
+    {
+        let mut i = 0;
+        while i < urls.len() {
+            let lower = urls[i].to_lowercase();
+            if lower.starts_with("imap://") || lower.starts_with("imaps://") {
+                let batch_start = i;
+                let host_port = extract_imap_host_port(&urls[i]);
+                let mut j = i + 1;
+                while j < urls.len() {
+                    let lower_j = urls[j].to_lowercase();
+                    if (lower_j.starts_with("imap://") || lower_j.starts_with("imaps://"))
+                        && extract_imap_host_port(&urls[j]) == host_port
+                    {
+                        j += 1;
+                    } else {
+                        break;
+                    }
+                }
+                if j > batch_start + 1 {
+                    // Multi-URL batch found
+                    imap_batches.push((batch_start, j - 1));
+                    for slot in &mut imap_batch_processed[batch_start..j] {
+                        *slot = true;
+                    }
+                }
+                i = j;
+            } else {
+                i += 1;
+            }
+        }
+    }
+
     for (i, url) in urls.iter().enumerate() {
         // Use per-URL Easy handle if available (from --next groups, curl compat: tests 430-432)
         if let Some(Some(per_easy)) = per_url_easy.get(i) {
@@ -2121,6 +2166,47 @@ pub fn run_multi(
         // Update FTP config per-URL (for --next changing --ftp-method; test 1096)
         if let Some(method) = per_url_ftp_methods.get(i).copied() {
             easy.ftp_method(method);
+        }
+
+        // IMAP batch: if this URL is the start of a multi-URL IMAP batch,
+        // process the entire batch on one connection (curl compat: tests 804, 815, 816).
+        if let Some(&(batch_start, batch_end)) = imap_batches.iter().find(|&&(s, _)| s == i) {
+            let batch_result = rt.block_on(run_imap_batch(
+                &urls[batch_start..=batch_end],
+                &easy,
+                per_url_easy,
+                per_url_credentials,
+                batch_start,
+            ));
+            match batch_result {
+                Ok(responses) => {
+                    for (idx, response) in responses.into_iter().enumerate() {
+                        let url_idx = batch_start + idx;
+                        let file_for_this = output_files.get(url_idx).map(String::as_str);
+                        let exit = output_response(
+                            &response,
+                            file_for_this,
+                            write_out,
+                            false, // include_headers
+                            silent,
+                            false, // suppress_body
+                        );
+                        last_exit = exit;
+                    }
+                }
+                Err(e) => {
+                    if !silent || show_error {
+                        eprintln!("curl: IMAP batch error: {e}");
+                    }
+                    last_exit = ExitCode::from(error_to_curl_code(&e));
+                }
+            }
+            // Skip remaining URLs in this batch (they were already processed)
+            continue;
+        }
+        // Skip individual URLs that are part of a batch (non-start elements)
+        if imap_batch_processed[i] {
+            continue;
         }
 
         match rt.block_on(easy.perform_async()) {
@@ -2279,6 +2365,116 @@ pub fn run_multi(
     }
 
     last_exit
+}
+
+/// Extract `host:port` from an IMAP URL for batch grouping.
+fn extract_imap_host_port(url: &str) -> String {
+    // Parse "imap://user:pass@host:port/path" to "host:port"
+    if let Some(rest) = url.strip_prefix("imap://").or_else(|| url.strip_prefix("imaps://")) {
+        // Skip userinfo@ if present
+        let after_at = rest.rfind('@').map_or(rest, |pos| &rest[pos + 1..]);
+        // Take host:port (before first /)
+        let host_port = after_at.split('/').next().unwrap_or(after_at);
+        host_port.to_lowercase()
+    } else {
+        String::new()
+    }
+}
+
+/// Run a batch of IMAP URLs on a single connection (curl compat: tests 804, 815, 816).
+async fn run_imap_batch(
+    urls: &[String],
+    template_easy: &liburlx::Easy,
+    per_url_easy: &[Option<liburlx::Easy>],
+    per_url_credentials: &[Option<(String, String)>],
+    batch_start: usize,
+) -> Result<Vec<liburlx::Response>, liburlx::Error> {
+    let mut ops = Vec::new();
+    let mut parsed_urls = Vec::new();
+
+    for (idx, url_str) in urls.iter().enumerate() {
+        let global_idx = batch_start + idx;
+        // Get the Easy handle for this URL (may have per-URL overrides from --next)
+        let url_easy =
+            per_url_easy.get(global_idx).and_then(|o| o.as_ref()).unwrap_or(template_easy);
+
+        let mut easy_clone = url_easy.clone();
+
+        // Embed per-URL credentials into the URL (same as the main transfer loop)
+        let effective_url =
+            if let Some(Some((ref user, ref pass))) = per_url_credentials.get(global_idx) {
+                let base_url = strip_url_credentials(url_str);
+                let scheme_end = base_url.find("://").map_or(0, |p| p + 3);
+                format!("{}{}:{}@{}", &base_url[..scheme_end], user, pass, &base_url[scheme_end..])
+            } else {
+                url_str.clone()
+            };
+
+        easy_clone.url(&effective_url)?;
+        // Get custom request and method from the Easy handle
+        parsed_urls.push(easy_clone);
+    }
+
+    // Build operation descriptors from the parsed Easy handles.
+    // For IMAP custom requests: -X sets the method (uppercased) and optionally
+    // custom_request_target (original case). When the method is not a standard
+    // HTTP method, it IS the custom command for IMAP.
+    let mut custom_requests: Vec<Option<String>> = Vec::new();
+    for easy_clone in &parsed_urls {
+        let method = easy_clone.effective_method();
+        let custom_request = easy_clone.custom_request();
+        // If custom_request_target is set, use it; otherwise if the method
+        // is not a standard HTTP method, use it as the custom request (preserving case).
+        let effective_custom = if custom_request.is_some() {
+            custom_request.map(ToString::to_string)
+        } else {
+            match method {
+                "GET" | "POST" | "PUT" | "HEAD" | "DELETE" | "PATCH" | "OPTIONS" => None,
+                _ => Some(method.to_string()),
+            }
+        };
+        custom_requests.push(effective_custom);
+    }
+
+    for (idx, easy_clone) in parsed_urls.iter().enumerate() {
+        let url = easy_clone
+            .url_ref()
+            .ok_or_else(|| liburlx::Error::Http("IMAP batch: missing URL".to_string()))?;
+        let method = easy_clone.effective_method();
+        let body = easy_clone.body_ref();
+
+        ops.push(liburlx::protocol::imap::ImapOperation {
+            url,
+            method,
+            body,
+            custom_request: custom_requests[idx].as_deref(),
+        });
+    }
+
+    // Get auth settings from the first URL's Easy handle
+    let first_easy =
+        per_url_easy.get(batch_start).and_then(|o| o.as_ref()).unwrap_or(template_easy);
+
+    let sasl_ir = first_easy.get_sasl_ir();
+    let oauth2_bearer = first_easy.get_oauth2_bearer().map(ToString::to_string);
+    let login_options = first_easy.get_login_options().map(ToString::to_string);
+    let sasl_authzid = first_easy.get_sasl_authzid().map(ToString::to_string);
+    let resolve_overrides = first_easy.get_resolve_overrides().to_vec();
+    let tls_config = first_easy.get_tls_config().clone();
+    let use_ssl = first_easy.get_use_ssl();
+
+    liburlx::protocol::imap::fetch_multi(
+        &ops,
+        sasl_ir,
+        oauth2_bearer.as_deref(),
+        login_options.as_deref(),
+        sasl_authzid.as_deref(),
+        &resolve_overrides,
+        'A',
+        use_ssl,
+        &tls_config,
+    )
+    .await
 }
 
 /// Run multiple URLs concurrently using the Multi API.
