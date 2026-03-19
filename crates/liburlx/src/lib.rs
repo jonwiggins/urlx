@@ -39,7 +39,9 @@ pub use error::Error;
 pub use hsts::HstsCache;
 pub use multi::{Multi, PipeliningMode};
 pub use progress::{make_progress_callback, ProgressCallback, ProgressInfo};
-pub use protocol::http::multipart::{guess_content_type as guess_form_content_type, MultipartForm};
+pub use protocol::http::multipart::{
+    guess_content_type as guess_form_content_type, FilenameEscapeMode, MultipartForm,
+};
 pub use protocol::http::response::{PushedResponse, Response, ResponseHttpVersion, TransferInfo};
 pub use share::{Share, ShareType};
 pub use throttle::SpeedLimits;

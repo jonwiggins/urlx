@@ -1141,6 +1141,36 @@ impl Easy {
         );
     }
 
+    /// Add file data with filename but no content type to the multipart form.
+    pub fn form_file_no_type(&mut self, name: &str, filename: &str, data: &[u8]) {
+        self.multipart
+            .get_or_insert_with(MultipartForm::new)
+            .file_data_no_type(name, filename, data);
+    }
+
+    /// Add a multi-file part to the multipart form.
+    ///
+    /// Creates a `multipart/mixed` sub-boundary with multiple files.
+    /// Each tuple is `(filename, content_type, data)`.
+    pub fn form_multi_file(&mut self, name: &str, files: Vec<(String, String, Vec<u8>)>) {
+        self.multipart.get_or_insert_with(MultipartForm::new).multi_file(name, files);
+    }
+
+    /// Set the multipart filename escape mode.
+    pub fn set_form_escape_mode(&mut self, mode: crate::FilenameEscapeMode) {
+        self.multipart.get_or_insert_with(MultipartForm::new).set_escape_mode(mode);
+    }
+
+    /// Set whether multipart should use "attachment" disposition.
+    pub fn set_form_use_attachment(&mut self, val: bool) {
+        self.multipart.get_or_insert_with(MultipartForm::new).set_use_attachment(val);
+    }
+
+    /// Set whether multipart should use SMTP MIME mode.
+    pub fn set_form_smtp_mode(&mut self, val: bool) {
+        self.multipart.get_or_insert_with(MultipartForm::new).set_smtp_mode(val);
+    }
+
     /// Set a byte range for the request.
     ///
     /// Sends a `Range: bytes=<range>` header. Format examples:
@@ -2453,21 +2483,32 @@ impl Easy {
 
         let (effective_method, effective_body);
 
-        if let Some(ref multipart) = self.multipart {
-            // Multipart form: encode body and set content-type header
-            effective_body = Some(multipart.encode());
+        if let Some(ref mut multipart) = self.multipart {
+            let is_smtp = url.scheme() == "smtp" || url.scheme() == "smtps";
+
+            // For SMTP, enable smtp_mode so the MIME headers are in the body
+            if is_smtp {
+                multipart.set_smtp_mode(true);
+            }
+
+            // Check if user provided a custom Content-Type (use "attachment" disposition)
             let ct_idx = headers.iter().position(|(k, _)| k.eq_ignore_ascii_case("content-type"));
             if let Some(idx) = ct_idx {
-                // User provided Content-Type: extract value, remove it, and re-add
-                // with proper casing and boundary appended (curl compat: test 669)
+                // User provided Content-Type — use "attachment" disposition (curl compat: test 277)
+                if !is_smtp {
+                    multipart.set_use_attachment(true);
+                }
                 let mut ct_value = headers.remove(idx).1;
                 if !ct_value.contains("boundary=") {
                     ct_value = format!("{ct_value}; boundary={}", multipart.boundary());
                 }
                 headers.push(("Content-Type".to_string(), ct_value));
-            } else {
+            } else if !is_smtp {
                 headers.push(("Content-Type".to_string(), multipart.content_type()));
             }
+
+            // Multipart form: encode body and set content-type header
+            effective_body = Some(multipart.encode());
             // Default to POST for multipart
             effective_method = self.method.clone().unwrap_or_else(|| "POST".to_string());
         } else {

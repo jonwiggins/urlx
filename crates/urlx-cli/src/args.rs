@@ -1815,6 +1815,9 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
                     return Err(1);
                 }
             }
+            "--form-escape" => {
+                opts.easy.set_form_escape_mode(liburlx::FilenameEscapeMode::BackslashEscape);
+            }
             "--request-target" => {
                 i += 1;
                 let val = require_arg(args, i, "--request-target")?;
@@ -2498,54 +2501,82 @@ fn parse_form_field(easy: &mut liburlx::Easy, val: &str) -> Result<(), String> {
 
     if let Some(rest) = value.strip_prefix('@') {
         // File upload — parse filepath and optional ;type= ;filename= modifiers
-        let (filepath, modifiers) = parse_form_file_spec(rest);
+        // Check for comma-separated multi-file syntax (commas outside quotes split files)
+        let file_specs = split_comma_file_specs(rest);
 
-        let mut custom_type: Option<String> = None;
-        let mut custom_filename: Option<String> = None;
+        if file_specs.len() > 1 {
+            // Multi-file: create a multipart/mixed sub-part
+            let mut files: Vec<(String, String, Vec<u8>)> = Vec::new();
+            for spec in file_specs {
+                let (filepath, modifiers) = parse_form_file_spec(spec);
+                let mut custom_type: Option<String> = None;
+                for modifier in modifiers {
+                    if let Some(t) = modifier.strip_prefix("type=") {
+                        custom_type = Some(t.to_string());
+                    }
+                }
+                let data = std::fs::read(&filepath)
+                    .map_err(|e| format!("error reading form file: {e}"))?;
+                let original_filename = std::path::Path::new(&filepath)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let ct = custom_type
+                    .unwrap_or_else(|| liburlx::guess_form_content_type(&original_filename));
+                files.push((original_filename, ct, data));
+            }
+            easy.form_multi_file(name, files);
+        } else {
+            // Single file
+            let (filepath, modifiers) = parse_form_file_spec(rest);
 
-        // Parse semicolon-separated modifiers
-        for modifier in modifiers {
-            if let Some(t) = modifier.strip_prefix("type=") {
-                custom_type = Some(t.to_string());
-            } else if let Some(f) = modifier.strip_prefix("filename=") {
-                custom_filename = Some(unescape_form_filename(f));
-            } else if let Some(f) = modifier.strip_prefix("format=") {
-                // format= appends to type: e.g., type=text/x-null;format=x-curl
-                if let Some(ref mut ct) = custom_type {
-                    ct.push_str(";format=");
-                    ct.push_str(f);
+            let mut custom_type: Option<String> = None;
+            let mut custom_filename: Option<String> = None;
+
+            // Parse semicolon-separated modifiers
+            for modifier in modifiers {
+                if let Some(t) = modifier.strip_prefix("type=") {
+                    custom_type = Some(t.to_string());
+                } else if let Some(f) = modifier.strip_prefix("filename=") {
+                    custom_filename = Some(unescape_form_filename(f));
+                } else if let Some(f) = modifier.strip_prefix("format=") {
+                    // format= appends to type: e.g., type=text/x-null;format=x-curl
+                    if let Some(ref mut ct) = custom_type {
+                        ct.push_str(";format=");
+                        ct.push_str(f);
+                    }
                 }
             }
-        }
 
-        // Read the file (or stdin for @-)
-        let data = if filepath == "-" {
-            use std::io::Read as _;
-            let mut buf = Vec::new();
-            let _bytes = std::io::stdin()
-                .read_to_end(&mut buf)
-                .map_err(|e| format!("error reading stdin: {e}"))?;
-            buf
-        } else {
-            std::fs::read(&filepath).map_err(|e| format!("error reading form file: {e}"))?
-        };
+            // Read the file (or stdin for @-)
+            let data = if filepath == "-" {
+                use std::io::Read as _;
+                let mut buf = Vec::new();
+                let _bytes = std::io::stdin()
+                    .read_to_end(&mut buf)
+                    .map_err(|e| format!("error reading stdin: {e}"))?;
+                buf
+            } else {
+                std::fs::read(&filepath).map_err(|e| format!("error reading form file: {e}"))?
+            };
 
-        let original_filename = std::path::Path::new(&filepath)
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default();
-        let display_filename = custom_filename.unwrap_or_else(|| original_filename.clone());
+            let original_filename = std::path::Path::new(&filepath)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let display_filename = custom_filename.unwrap_or_else(|| original_filename.clone());
 
-        if let Some(ref ct) = custom_type {
-            easy.form_file_with_type(name, &display_filename, ct, &data);
-        } else {
-            // Guess content type from the original filepath, not the custom filename
-            easy.form_file_with_type(
-                name,
-                &display_filename,
-                &liburlx::guess_form_content_type(&original_filename),
-                &data,
-            );
+            if let Some(ref ct) = custom_type {
+                easy.form_file_with_type(name, &display_filename, ct, &data);
+            } else {
+                // Guess content type from the original filepath, not the custom filename
+                easy.form_file_with_type(
+                    name,
+                    &display_filename,
+                    &liburlx::guess_form_content_type(&original_filename),
+                    &data,
+                );
+            }
         }
     } else if let Some(rest) = value.strip_prefix('<') {
         // Read field value from file: name=<filepath or name=<filepath;type=mime
@@ -2567,34 +2598,207 @@ fn parse_form_field(easy: &mut liburlx::Easy, val: &str) -> Result<(), String> {
             easy.form_field(name, &data);
         }
     } else {
-        // Text field — may have ;type= modifier (curl compat: -F "name=val;type=mime")
-        // Split on ;type= to extract the Content-Type. Everything after ;type= is the type
-        // (including sub-parameters like ;charset=X).
-        if let Some(type_pos) = find_type_modifier(value) {
-            let field_value = value[..type_pos].trim_start();
-            let content_type = &value[type_pos + 6..]; // skip ";type="
-            easy.form_field_with_type(name, field_value, content_type);
+        // Text field — parse value and optional modifiers (;type=, ;filename=)
+        // The value can be quoted: "..." — in which case the closing quote ends the value
+        // and modifiers follow after a `;`.
+        let (field_value, modifiers) = parse_text_value_and_modifiers(value);
+
+        let mut custom_type: Option<String> = None;
+        let mut custom_filename: Option<String> = None;
+
+        for modifier in &modifiers {
+            let trimmed = modifier.trim();
+            if let Some(t) = trimmed.strip_prefix("type=") {
+                custom_type = Some(t.to_string());
+            } else if let Some(f) = trimmed.strip_prefix("filename=") {
+                custom_filename = Some(unescape_form_filename(f));
+            }
+        }
+
+        // Merge type sub-parameters: e.g., "type=text/foo; charset=utf-8" where
+        // charset= is a Content-Type parameter, not a form modifier.
+        // curl treats unknown modifiers after type= as Content-Type sub-params.
+        if let Some(ref mut ct) = custom_type {
+            for modifier in &modifiers {
+                let trimmed = modifier.trim();
+                if !trimmed.starts_with("type=")
+                    && !trimmed.starts_with("filename=")
+                    && !trimmed.starts_with("format=")
+                    && !trimmed.is_empty()
+                {
+                    // Unknown modifier after type — append as Content-Type sub-param
+                    ct.push_str("; ");
+                    ct.push_str(trimmed);
+                }
+            }
+        }
+
+        if let Some(ref filename) = custom_filename {
+            // Text value with filename → file-like part
+            if let Some(ref ct) = custom_type {
+                easy.form_file_with_type(name, filename, ct, field_value.as_bytes());
+            } else {
+                // No explicit type → don't set Content-Type (curl compat: SMTP test 1187)
+                easy.form_file_no_type(name, filename, field_value.as_bytes());
+            }
+        } else if let Some(ref ct) = custom_type {
+            easy.form_field_with_type(name, &field_value, ct);
         } else {
-            easy.form_field(name, value);
+            easy.form_field(name, &field_value);
         }
     }
 
     Ok(())
 }
 
-/// Find the position of `;type=` in a form field value, respecting quotes.
+/// Split comma-separated file specs, respecting quoted paths.
 ///
-/// Returns the byte offset of the `;` before `type=`, or `None` if not found.
-fn find_type_modifier(value: &str) -> Option<usize> {
-    let bytes = value.as_bytes();
+/// E.g., `"file1.txt",file2.txt;type=foo,"file3.txt"` →
+/// `["\"file1.txt\"", "file2.txt;type=foo", "\"file3.txt\""]`
+fn split_comma_file_specs(s: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut in_quote = false;
+    let bytes = s.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b';' && value[i + 1..].starts_with("type=") {
-            return Some(i);
+        if bytes[i] == b'\\' && in_quote && i + 1 < bytes.len() {
+            i += 2;
+        } else if bytes[i] == b'"' {
+            in_quote = !in_quote;
+            i += 1;
+        } else if bytes[i] == b',' && !in_quote {
+            parts.push(&s[start..i]);
+            start = i + 1;
+            i += 1;
+        } else {
+            i += 1;
+        }
+    }
+    parts.push(&s[start..]);
+    parts
+}
+
+/// Parse a text value and its modifiers from a form field value string.
+///
+/// The value can be:
+/// - A quoted string: `"value with ;special chars"` followed by `;type=...`
+/// - An unquoted string: `value;type=...`
+///
+/// Returns `(value, modifiers)` where modifiers are the `;`-separated parts.
+fn parse_text_value_and_modifiers(s: &str) -> (String, Vec<String>) {
+    if let Some(inner) = s.strip_prefix('"') {
+        // Quoted value — find closing quote (respecting backslash escapes)
+        let mut end = 0;
+        let mut chars = inner.chars();
+        while let Some(c) = chars.next() {
+            if c == '\\' {
+                end += c.len_utf8();
+                if let Some(next) = chars.next() {
+                    end += next.len_utf8();
+                }
+            } else if c == '"' {
+                break;
+            } else {
+                end += c.len_utf8();
+            }
+        }
+        let raw_value = &inner[..end];
+        // Unescape the value
+        let value = unescape_form_value(raw_value);
+        let rest = &inner[end..];
+        let rest = rest.strip_prefix('"').unwrap_or(rest);
+        // Parse modifiers from the rest (;-separated)
+        let modifiers = if rest.is_empty() { vec![] } else { split_modifiers_owned(rest) };
+        (value, modifiers)
+    } else {
+        // Unquoted value — find first unquoted `;` followed by a known modifier
+        // (type=, filename=, format=)
+        if let Some(pos) = find_first_modifier_semicolon(s) {
+            let value = s[..pos].to_string();
+            let rest = &s[pos..]; // includes the leading `;`
+            let modifiers = split_modifiers_owned(rest);
+            (value, modifiers)
+        } else {
+            (s.to_string(), vec![])
+        }
+    }
+}
+
+/// Find the position of the first `;` that starts a known modifier (type=, filename=, format=).
+fn find_first_modifier_semicolon(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b';' {
+            let rest = s[i + 1..].trim_start();
+            if rest.starts_with("type=")
+                || rest.starts_with("filename=")
+                || rest.starts_with("format=")
+            {
+                return Some(i);
+            }
         }
         i += 1;
     }
     None
+}
+
+/// Split modifiers on `;`, returning owned strings. Handles quoted values.
+fn split_modifiers_owned(s: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut in_quote = false;
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && in_quote && i + 1 < bytes.len() {
+            i += 2;
+        } else if bytes[i] == b'"' {
+            in_quote = !in_quote;
+            i += 1;
+        } else if bytes[i] == b';' && !in_quote {
+            let part = s[start..i].trim().to_string();
+            if !part.is_empty() {
+                parts.push(part);
+            }
+            start = i + 1;
+            i += 1;
+        } else {
+            i += 1;
+        }
+    }
+    let part = s[start..].trim().to_string();
+    if !part.is_empty() {
+        parts.push(part);
+    }
+    parts
+}
+
+/// Unescape a form value string (from inside quotes).
+fn unescape_form_value(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(&next) = chars.peek() {
+                match next {
+                    '\\' | '"' => {
+                        result.push(next);
+                        let _ = chars.next();
+                    }
+                    _ => {
+                        result.push('\\');
+                    }
+                }
+            } else {
+                result.push('\\');
+            }
+        } else {
+            result.push(c);
+        }
+    }
+    result
 }
 
 /// Split a modifier string on `;` while respecting quoted values.
