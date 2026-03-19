@@ -95,6 +95,13 @@ pub struct TlsConfig {
     /// Alternative to `client_key` (file path). Must correspond to the
     /// client certificate. Equivalent to `CURLOPT_SSLKEY_BLOB`.
     pub client_key_blob: Option<Vec<u8>>,
+
+    /// Path to a CRL (Certificate Revocation List) file in PEM format.
+    ///
+    /// When set, the server's certificate chain is checked against this CRL.
+    /// If any certificate in the chain has been revoked, the connection fails
+    /// with error 60. Equivalent to curl's `--crlfile`.
+    pub crl_file: Option<PathBuf>,
 }
 
 impl Default for TlsConfig {
@@ -113,6 +120,7 @@ impl Default for TlsConfig {
             ca_cert_blob: None,
             client_cert_blob: None,
             client_key_blob: None,
+            crl_file: None,
         }
     }
 }
@@ -190,13 +198,37 @@ mod rustls_impl {
                 // Custom CA bundle from file
                 let root_store = load_ca_certs(ca_path)?;
 
-                let builder = Self::config_builder(&versions).with_root_certificates(root_store);
+                // When a CRL file is specified, build a custom verifier with
+                // CRL checking (curl compat: test 313 — --crlfile)
+                if let Some(ref crl_path) = tls_config.crl_file {
+                    let crls = load_crls(crl_path)?;
+                    let verifier =
+                        rustls::client::WebPkiServerVerifier::builder(Arc::new(root_store))
+                            .with_crls(crls)
+                            .build()
+                            .map_err(|e| {
+                                Error::Tls(format!("CRL verifier build failed: {e}").into())
+                            })?;
 
-                let mut config = Self::with_client_auth(builder, tls_config)?;
-                if use_http_alpn {
-                    Self::configure_alpn(&mut config);
+                    let builder = Self::config_builder(&versions)
+                        .dangerous()
+                        .with_custom_certificate_verifier(verifier);
+
+                    let mut config = builder.with_no_client_auth();
+                    if use_http_alpn {
+                        Self::configure_alpn(&mut config);
+                    }
+                    config
+                } else {
+                    let builder =
+                        Self::config_builder(&versions).with_root_certificates(root_store);
+
+                    let mut config = Self::with_client_auth(builder, tls_config)?;
+                    if use_http_alpn {
+                        Self::configure_alpn(&mut config);
+                    }
+                    config
                 }
-                config
             } else if let Some(ref ca_blob) = tls_config.ca_cert_blob {
                 // Custom CA bundle from in-memory blob
                 let root_store = load_ca_certs_from_blob(ca_blob)?;
@@ -478,6 +510,25 @@ mod rustls_impl {
         }
 
         Ok(root_store)
+    }
+
+    /// Load CRLs (Certificate Revocation Lists) from a PEM file.
+    fn load_crls(
+        path: &std::path::Path,
+    ) -> Result<Vec<rustls::pki_types::CertificateRevocationListDer<'static>>, Error> {
+        use rustls::pki_types::pem::PemObject;
+        use rustls::pki_types::CertificateRevocationListDer;
+
+        let crls = CertificateRevocationListDer::pem_file_iter(path)
+            .map_err(|e| Error::Tls(Box::new(e)))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| Error::Tls(Box::new(e)))?;
+
+        if crls.is_empty() {
+            return Err(Error::Tls("no valid CRLs found in file".into()));
+        }
+
+        Ok(crls)
     }
 
     /// Load client certificates from a PEM file.

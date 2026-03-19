@@ -1080,6 +1080,26 @@ pub fn run(args: &[String]) -> ExitCode {
         }
     }
 
+    // --no-clobber: if output file exists, rename to .1, .2, etc. (curl compat: test 379)
+    if opts.no_clobber {
+        if let Some(ref path) = opts.output_file {
+            if std::path::Path::new(path).exists() {
+                let mut n = 1u32;
+                loop {
+                    let candidate = format!("{path}.{n}");
+                    if !std::path::Path::new(&candidate).exists() {
+                        opts.output_file = Some(candidate);
+                        break;
+                    }
+                    n += 1;
+                    if n > 100 {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
     // -C - auto-resume: determine offset from existing output file size
     if opts.auto_resume {
         if opts.is_upload {

@@ -88,6 +88,8 @@ pub struct CliOptions {
     pub(crate) proto_default: Option<String>,
     pub(crate) output_dir: Option<String>,
     pub(crate) remove_on_error: bool,
+    /// `--no-clobber`: don't overwrite existing output files, append `.1`, `.2`, etc.
+    pub(crate) no_clobber: bool,
     pub(crate) fail_with_body: bool,
     pub(crate) fail_early: bool,
     pub(crate) retry_all_errors: bool,
@@ -662,6 +664,7 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
         proto_default: None,
         output_dir: None,
         remove_on_error: false,
+        no_clobber: false,
         fail_with_body: false,
         fail_early: false,
         retry_all_errors: false,
@@ -1066,6 +1069,11 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
                 i += 1;
                 let val = require_arg(args, i, "--cacert")?;
                 opts.easy.ssl_ca_cert(std::path::Path::new(val));
+            }
+            "--crlfile" => {
+                i += 1;
+                let val = require_arg(args, i, "--crlfile")?;
+                opts.easy.ssl_crl_file(std::path::Path::new(val));
             }
             "--cert" => {
                 i += 1;
@@ -1962,6 +1970,9 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
             "--remove-on-error" => {
                 opts.remove_on_error = true;
             }
+            "--no-clobber" => {
+                opts.no_clobber = true;
+            }
             "--skip-existing" => {
                 opts.skip_existing = true;
             }
@@ -2049,7 +2060,6 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
             | "--basic"
             | "--proxy-basic"
             | "--tcp-fastopen"
-            | "--no-clobber"
             | "--ca-native"
             | "--no-ca-native"
             | "--disallow-username-in-url"
@@ -2136,7 +2146,6 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
             | "--pass"
             | "--proxy-cert-type"
             | "--proxy-key-type"
-            | "--crlfile"
             | "--proxy-crlfile"
             | "--proxy-pinnedpubkey"
             | "--proxy-pass"

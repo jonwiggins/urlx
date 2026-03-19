@@ -599,6 +599,36 @@ where
         }
     }
 
+    // If parse_headers detected a control-character body error (e.g., CR in
+    // Content-Length value), return the raw header bytes before the bad line
+    // as response body (curl outputs raw data on weird server reply — test 415).
+    if let Some(body_err) = ph.body_error {
+        // Build raw header bytes from the truncated (valid) parsed headers
+        let line_ending: &[u8] = if ph.uses_crlf { b"\r\n" } else { b"\n" };
+        let mut raw_body = Vec::new();
+        // Status line
+        if let Some(first_line_end) =
+            header_bytes.windows(line_ending.len()).position(|w| w == line_ending)
+        {
+            raw_body.extend_from_slice(&header_bytes[..first_line_end]);
+            raw_body.extend_from_slice(line_ending);
+        }
+        // Valid header lines (before the bad one)
+        for (k, v) in &ph.headers_ordered {
+            raw_body.extend_from_slice(k.as_bytes());
+            raw_body.extend_from_slice(v.as_bytes());
+            raw_body.extend_from_slice(line_ending);
+        }
+        let mut resp = Response::new(ph.status, ph.headers.clone(), raw_body, url.to_string());
+        resp.set_headers_ordered(ph.headers_ordered);
+        resp.set_status_reason(ph.reason);
+        resp.set_uses_crlf(ph.uses_crlf);
+        resp.set_http_version(ph.version);
+        resp.set_raw_headers(Vec::new());
+        resp.set_body_error(Some(body_err));
+        return Ok((resp, true));
+    }
+
     // 204 and 304 responses have no body per HTTP spec.
     // Also skip body when a Range request got a non-206/416 response
     // (server doesn't support ranges — curl returns CURLE_RANGE_ERROR
@@ -830,12 +860,17 @@ where
 
         buf.extend_from_slice(&tmp[..n]);
 
-        // Check for end of headers (supports both \r\n\r\n and \n\n)
-        if let Some((pos, len)) = find_header_end(&buf) {
-            let header_end = pos + len;
-            let body_prefix = buf[header_end..].to_vec();
-            buf.truncate(header_end);
-            return Ok((buf, body_prefix));
+        // Only look for header end if the response starts with "HTTP/"
+        // (an HTTP status line). Otherwise this is HTTP/0.9 — raw body
+        // without headers. Keep reading until EOF (curl compat: test 306).
+        if buf.starts_with(b"HTTP/") {
+            // Check for end of headers (supports both \r\n\r\n and \n\n)
+            if let Some((pos, len)) = find_header_end(&buf) {
+                let header_end = pos + len;
+                let body_prefix = buf[header_end..].to_vec();
+                buf.truncate(header_end);
+                return Ok((buf, body_prefix));
+            }
         }
 
         if buf.len() > MAX_HEADER_SIZE {
@@ -910,6 +945,8 @@ struct ParsedHeaders {
     headers: HashMap<String, String>,
     original_names: HashMap<String, String>,
     headers_ordered: Vec<(String, String)>,
+    /// If set, indicates a header-level error that should be returned as `body_error`.
+    body_error: Option<String>,
 }
 
 /// Parse raw header bytes into structured response headers.
@@ -928,6 +965,59 @@ fn parse_headers(data: &[u8]) -> Result<ParsedHeaders, Error> {
         return Err(Error::Http("Weird server reply: binary zero in headers".to_string()));
     }
 
+    // Check for control characters (bare CR not followed by LF) in header values
+    // that would cause httparse to fail. Truncate headers at the offending line
+    // and flag as body_error (curl compat: test 415 — Content-Length: \r-6).
+    let mut trunc_body_error: Option<String> = None;
+    let data_slice = &data[..header_end];
+    let truncated_data = {
+        let mut truncated: Option<Vec<u8>> = None;
+        // Scan header lines (skip status line)
+        let lines_start = data_slice
+            .windows(2)
+            .position(|w| w == b"\r\n")
+            .map(|p| p + 2)
+            .or_else(|| data_slice.iter().position(|&b| b == b'\n').map(|p| p + 1))
+            .unwrap_or(0);
+        let mut pos = lines_start;
+        while pos < data_slice.len() {
+            // Find end of this line
+            let line_end = data_slice[pos..]
+                .windows(2)
+                .position(|w| w == b"\r\n")
+                .map(|p| pos + p + 2)
+                .or_else(|| data_slice[pos..].iter().position(|&b| b == b'\n').map(|p| pos + p + 1))
+                .unwrap_or(data_slice.len());
+            let line = &data_slice[pos..line_end];
+            // Check if this header line has a bare CR in the value area
+            // (after the colon). A bare CR is \r NOT followed by \n.
+            if let Some(colon_pos) = line.iter().position(|&b| b == b':') {
+                let value_area = &line[colon_pos + 1..];
+                let has_bare_cr = value_area.windows(2).any(|w| w[0] == b'\r' && w[1] != b'\n')
+                    || (value_area.last() == Some(&b'\r') && !value_area.ends_with(b"\r\n"));
+                if has_bare_cr {
+                    // Truncate headers at this line
+                    let line_ending = if data_slice[..pos].ends_with(b"\r\n") {
+                        b"\r\n" as &[u8]
+                    } else {
+                        b"\n" as &[u8]
+                    };
+                    let mut trunc = data_slice[..pos].to_vec();
+                    trunc.extend_from_slice(line_ending);
+                    truncated = Some(trunc);
+                    trunc_body_error = Some("negative_content_length".to_string());
+                    break;
+                }
+            }
+            if line == b"\r\n" || line == b"\n" {
+                break; // End of headers
+            }
+            pos = line_end;
+        }
+        truncated
+    };
+    let data = truncated_data.as_ref().map_or(data_slice, |trunc| trunc.as_slice());
+
     // Unfold HTTP header continuation lines (RFC 2616 §2.2, obsoleted but still supported
     // for compat). A line starting with SP or HT is a continuation of the previous header.
     // Replace "\r\n " / "\r\n\t" / "\n " / "\n\t" with a single space.
@@ -940,7 +1030,14 @@ fn parse_headers(data: &[u8]) -> Result<ParsedHeaders, Error> {
     let header_len = match parsed.parse(data) {
         Ok(httparse::Status::Complete(len)) => len,
         Ok(httparse::Status::Partial) => {
-            return Err(Error::Http("incomplete response headers".to_string()));
+            // If we truncated headers, this is expected — the truncated block
+            // doesn't have a final \r\n\r\n after the last header line.
+            // Fall through to use what we have.
+            if trunc_body_error.is_some() {
+                data.len()
+            } else {
+                return Err(Error::Http("incomplete response headers".to_string()));
+            }
         }
         Err(e) => {
             let emsg = e.to_string();
@@ -948,6 +1045,11 @@ fn parse_headers(data: &[u8]) -> Result<ParsedHeaders, Error> {
             // curl returns CURLE_UNSUPPORTED_PROTOCOL (1) for these.
             // Only treat as version error if the response actually started with "HTTP/".
             if emsg.contains("invalid HTTP version") && data.starts_with(b"HTTP/") {
+                // HTTP/2 or HTTP/3 status line on HTTP/1.x connection = version
+                // mismatch → CURLE_WEIRD_SERVER_REPLY (8) (curl compat: test 471)
+                if data.starts_with(b"HTTP/2") || data.starts_with(b"HTTP/3") {
+                    return Err(Error::Http("Weird server reply: version mismatch".to_string()));
+                }
                 return Err(Error::UnsupportedProtocol(
                     "unsupported HTTP version in response".to_string(),
                 ));
@@ -1051,6 +1153,7 @@ fn parse_headers(data: &[u8]) -> Result<ParsedHeaders, Error> {
         headers,
         original_names,
         headers_ordered,
+        body_error: trunc_body_error,
     })
 }
 
@@ -1171,6 +1274,7 @@ fn parse_headers_large(data: &[u8]) -> Result<ParsedHeaders, Error> {
         headers,
         original_names,
         headers_ordered,
+        body_error: None,
     })
 }
 
