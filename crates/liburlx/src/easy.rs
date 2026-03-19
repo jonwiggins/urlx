@@ -1465,6 +1465,14 @@ impl Easy {
         self.tls_config.ca_cert = Some(path.to_path_buf());
     }
 
+    /// Set the path to a CRL (Certificate Revocation List) file in PEM format.
+    ///
+    /// When set, the server's certificate chain is checked against this CRL.
+    /// Equivalent to curl's `--crlfile` flag or `CURLOPT_CRLFILE`.
+    pub fn ssl_crl_file(&mut self, path: &Path) {
+        self.tls_config.crl_file = Some(path.to_path_buf());
+    }
+
     /// Set the path to a client certificate in PEM format.
     ///
     /// Used for mutual TLS (mTLS) authentication.
@@ -5542,7 +5550,16 @@ async fn do_single_request(
                     }
                     return Ok(maybe_decompress_inner(response, accept_encoding, raw));
                 }
-                Err(_) => {
+                Err(e) => {
+                    // Only retry on a fresh connection for I/O-level errors
+                    // (stale/reset connections). For protocol-level errors like
+                    // version mismatch or weird server reply, propagate immediately
+                    // (curl compat: test 471 — HTTP/1.1 to HTTP/2 switch).
+                    match &e {
+                        Error::Http(msg) if msg.contains("Weird server reply") => return Err(e),
+                        Error::UnsupportedProtocol(_) => return Err(e),
+                        _ => {}
+                    }
                     // Pooled connection was stale — fall through to create new one
                     if verbose {
                         #[allow(clippy::print_stderr)]

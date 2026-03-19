@@ -502,12 +502,16 @@ impl CookieJar {
                             path = p.to_string();
                         }
                     } else if attr_name.eq_ignore_ascii_case("expires") {
+                        // Reject date strings >= MAX_DATE_LENGTH (curl compat: test 483)
+                        const MAX_DATE_LENGTH: usize = 80;
                         // Parse date in various formats (RFC 2616, Netscape, etc.)
-                        if let Some(t) = parse_cookie_date(attr_value) {
-                            // Only set if max-age hasn't already been set
-                            // (max-age takes precedence per RFC 6265 §5.3)
-                            if expires.is_none() {
-                                expires = Some(cap_cookie_expiry(t));
+                        if attr_value.len() < MAX_DATE_LENGTH {
+                            if let Some(t) = parse_cookie_date(attr_value) {
+                                // Only set if max-age hasn't already been set
+                                // (max-age takes precedence per RFC 6265 §5.3)
+                                if expires.is_none() {
+                                    expires = Some(cap_cookie_expiry(t));
+                                }
                             }
                         }
                     } else if attr_name.eq_ignore_ascii_case("max-age") {
