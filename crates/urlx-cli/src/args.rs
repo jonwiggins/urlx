@@ -135,6 +135,9 @@ pub struct CliOptions {
     pub(crate) skip_existing: bool,
     /// `--json` was used — defer Content-Type/Accept headers until after arg parsing.
     pub(crate) json_mode: bool,
+    /// Per-URL FTP method (indexed by URL position).
+    /// Supports `--next` changing `--ftp-method` between URL groups (test 1096).
+    pub(crate) per_url_ftp_methods: Vec<liburlx::protocol::ftp::FtpMethod>,
 }
 
 /// Print version information to stdout.
@@ -595,10 +598,12 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
         variables: Vec::new(),
         skip_existing: false,
         json_mode: false,
+        per_url_ftp_methods: Vec::new(),
     };
 
     let mut i = 1;
     let mut group_start_idx: usize = 0;
+    let mut current_ftp_method = liburlx::protocol::ftp::FtpMethod::default();
     while i < args.len() {
         match args[i].as_str() {
             "-X" | "--request" => {
@@ -1610,22 +1615,18 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
             "--ftp-method" => {
                 i += 1;
                 let val = require_arg(args, i, "--ftp-method")?;
-                match val.to_lowercase().as_str() {
-                    "multicwd" => {
-                        opts.easy.ftp_method(liburlx::protocol::ftp::FtpMethod::MultiCwd);
-                    }
-                    "singlecwd" => {
-                        opts.easy.ftp_method(liburlx::protocol::ftp::FtpMethod::SingleCwd);
-                    }
-                    "nocwd" => {
-                        opts.easy.ftp_method(liburlx::protocol::ftp::FtpMethod::NoCwd);
-                    }
+                let method = match val.to_lowercase().as_str() {
+                    "multicwd" => liburlx::protocol::ftp::FtpMethod::MultiCwd,
+                    "singlecwd" => liburlx::protocol::ftp::FtpMethod::SingleCwd,
+                    "nocwd" => liburlx::protocol::ftp::FtpMethod::NoCwd,
                     _ => {
                         eprintln!("curl: invalid FTP method: {val}");
                         eprintln!("  Valid values: multicwd, singlecwd, nocwd");
                         return Err(1);
                     }
-                }
+                };
+                opts.easy.ftp_method(method);
+                current_ftp_method = method;
             }
             "--connect-to" => {
                 i += 1;
@@ -1764,6 +1765,7 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
                 let val = require_arg(args, i, "--url")?;
                 opts.urls.push(val.to_string());
                 opts.per_url_credentials.push(opts.user_credentials.clone());
+                opts.per_url_ftp_methods.push(current_ftp_method);
                 opts.next_needs_url = false;
             }
             "--output-dir" => {
@@ -1963,8 +1965,13 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
                         *cred_slot = group_creds.clone();
                     }
                 }
+                // Assign current ftp_method to all URLs in the current group
+                for slot in opts.per_url_ftp_methods[group_start_idx..].iter_mut() {
+                    *slot = current_ftp_method;
+                }
                 group_start_idx = opts.per_url_credentials.len();
                 opts.user_credentials = None;
+                current_ftp_method = liburlx::protocol::ftp::FtpMethod::default();
                 opts.next_needs_url = true;
                 opts.had_next = true;
             }
@@ -1987,6 +1994,7 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
             url => {
                 opts.urls.push(url.to_string());
                 opts.per_url_credentials.push(opts.user_credentials.clone());
+                opts.per_url_ftp_methods.push(current_ftp_method);
                 opts.next_needs_url = false;
             }
         }
@@ -2001,6 +2009,11 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
                 *cred_slot = group_creds.clone();
             }
         }
+    }
+
+    // Assign last group's ftp_method to all URLs in the last group
+    for slot in opts.per_url_ftp_methods[group_start_idx..].iter_mut() {
+        *slot = current_ftp_method;
     }
 
     // --next at the end with no URL is a parse error (curl returns exit code 2)

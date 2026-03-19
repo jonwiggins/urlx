@@ -228,6 +228,9 @@ pub struct Easy {
     tftp_blksize: Option<u16>,
     /// Disable TFTP options negotiation (curl `--tftp-no-options`).
     tftp_no_options: bool,
+    /// Reusable FTP control connection for multi-URL transfers.
+    /// Persists across `perform_async()` calls on the same Easy handle.
+    ftp_session: Option<crate::protocol::ftp::FtpSession>,
     /// Last response received, even if the transfer ultimately failed.
     /// This allows callers to output partial response data on error (curl compat).
     last_response: Option<Response>,
@@ -465,6 +468,7 @@ impl Clone for Easy {
             pre_proxy: self.pre_proxy.clone(),
             tftp_blksize: self.tftp_blksize,
             tftp_no_options: self.tftp_no_options,
+            ftp_session: None,   // ephemeral — not cloned (connection state)
             last_response: None, // ephemeral — not cloned
         }
     }
@@ -592,8 +596,20 @@ impl Easy {
             pre_proxy: None,
             tftp_blksize: None,
             tftp_no_options: false,
+            ftp_session: None,
             last_response: None,
         }
+    }
+
+    /// Send FTP QUIT and close any reusable FTP session.
+    ///
+    /// Call this after all URLs are processed to cleanly close the
+    /// FTP control connection (curl compat: QUIT at end of multi-URL).
+    pub async fn ftp_quit(&mut self) {
+        if let Some(ref mut session) = self.ftp_session {
+            let _ = session.quit().await;
+        }
+        self.ftp_session = None;
     }
 
     /// Set the URL to transfer.
@@ -2147,7 +2163,11 @@ impl Easy {
             .build()
             .map_err(|e| Error::Http(format!("failed to create runtime: {e}")))?;
 
-        rt.block_on(self.perform_async())
+        let result = rt.block_on(self.perform_async());
+        // Send FTP QUIT after each sync perform() call.
+        // For multi-URL async usage, the caller is responsible for calling ftp_quit().
+        rt.block_on(self.ftp_quit());
+        result
     }
 
     /// Perform the transfer and return the response (async).
@@ -2453,6 +2473,7 @@ impl Easy {
             self.raw,
             self.form_data,
             self.allowed_protocols.as_deref(),
+            &mut self.ftp_session,
         );
 
         // Apply total transfer timeout if set.
@@ -2603,6 +2624,7 @@ async fn perform_transfer(
     raw: bool,
     form_data: bool,
     allowed_protocols: Option<&[String]>,
+    ftp_session: &mut Option<crate::protocol::ftp::FtpSession>,
 ) -> Result<Response, Error> {
     let transfer_start = Instant::now();
     let original_url = url.clone();
@@ -2841,6 +2863,7 @@ async fn perform_transfer(
             http_proxy_tunnel,
             proxy_http_10,
             raw,
+            ftp_session,
         ))
         .await?;
 
@@ -2933,6 +2956,7 @@ async fn perform_transfer(
                         http_proxy_tunnel,
                         proxy_http_10,
                         raw,
+                        ftp_session,
                     ))
                     .await?;
                 }
@@ -3087,6 +3111,7 @@ async fn perform_transfer(
                                 http_proxy_tunnel,
                                 proxy_http_10,
                                 raw,
+                                ftp_session,
                             ))
                             .await?;
 
@@ -3192,6 +3217,7 @@ async fn perform_transfer(
                                         http_proxy_tunnel,
                                         proxy_http_10,
                                         raw,
+                                        ftp_session,
                                     ))
                                     .await?;
                                 }
@@ -3279,6 +3305,7 @@ async fn perform_transfer(
                                 http_proxy_tunnel,
                                 proxy_http_10,
                                 raw,
+                                ftp_session,
                             ))
                             .await?;
                         }
@@ -3373,6 +3400,7 @@ async fn perform_transfer(
                                         http_proxy_tunnel,
                                         proxy_http_10,
                                         raw,
+                                        ftp_session,
                                     ))
                                     .await?;
                                 }
@@ -3420,6 +3448,7 @@ async fn perform_transfer(
                             ignore_content_length,
                             speed_limits,
                             ftp_ssl_mode,
+                            use_ssl,
                             ssh_key_path,
                             proxy_tls_config,
                             alt_svc_cache,
@@ -3459,6 +3488,7 @@ async fn perform_transfer(
                             http_proxy_tunnel,
                             proxy_http_10,
                             raw,
+                            ftp_session,
                         ))
                         .await?;
                     }
@@ -3565,6 +3595,7 @@ async fn perform_transfer(
                                     http_proxy_tunnel,
                                     proxy_http_10,
                                     raw,
+                                    ftp_session,
                                 ))
                                 .await?;
                             }
@@ -3675,6 +3706,7 @@ async fn perform_transfer(
                                     http_proxy_tunnel,
                                     proxy_http_10,
                                     raw,
+                                    ftp_session,
                                 ))
                                 .await?;
                             }
@@ -3943,6 +3975,7 @@ async fn do_single_request(
     http_proxy_tunnel: bool,
     proxy_http_10: bool,
     raw: bool,
+    ftp_session: &mut Option<crate::protocol::ftp::FtpSession>,
 ) -> Result<Response, Error> {
     // Handle non-HTTP schemes directly
     match url.scheme() {
@@ -4096,6 +4129,7 @@ async fn do_single_request(
                 resume_offset,
                 &ftp_config_with_range,
                 None,
+                ftp_session,
             )
             .await;
         }
