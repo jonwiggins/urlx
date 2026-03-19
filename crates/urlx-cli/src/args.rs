@@ -708,6 +708,8 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
     // Track whether any per-request option was set in the current --next group.
     // Used to distinguish "no-op --next" from "badly used --next" (curl compat: tests 422, 430).
     let mut group_has_options = false;
+    // Stack for nested multipart containers (`-F "=(;type=..."` / `-F "=)"`)
+    let mut mime_container_stack: Vec<usize> = Vec::new();
     while i < args.len() {
         // No per-iteration tracking needed here — group_has_options is set
         // by specific URL-consuming options (-O, -I, -d, -T, etc.) below.
@@ -1027,7 +1029,9 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
             "-F" | "--form" => {
                 i += 1;
                 let val = require_arg(args, i, "-F")?;
-                if let Err(msg) = parse_form_field(&mut opts.easy, val) {
+                if let Err(msg) =
+                    parse_form_field_ext(&mut opts.easy, val, &mut mime_container_stack, false)
+                {
                     eprintln!("curl: {msg}");
                     // Exit code 26 = CURLE_READ_ERROR (file not found / read error)
                     return Err(26);
@@ -2674,8 +2678,14 @@ fn unescape(s: &str) -> String {
     result
 }
 
-/// Helper to require an argument value for an option flag.
-/// Parse a `-F name=value` form field with full curl syntax.
+/// Parse a `-F name=value` form field (simple wrapper for backward compatibility).
+#[allow(dead_code)]
+fn parse_form_field(easy: &mut liburlx::Easy, val: &str) -> Result<(), String> {
+    let mut stack = Vec::new();
+    parse_form_field_ext(easy, val, &mut stack, false)
+}
+
+/// Parse a `-F name=value` form field with full curl MIME API syntax.
 ///
 /// Supports:
 /// - `name=value` — text field
@@ -2683,14 +2693,50 @@ fn unescape(s: &str) -> String {
 /// - `name=@filepath;type=mime` — file with custom Content-Type
 /// - `name=@filepath;filename=custom` — file with custom filename
 /// - `name=@"filepath"` — quoted file path
-/// - Complex backslash escaping in filenames
-fn parse_form_field(easy: &mut liburlx::Easy, val: &str) -> Result<(), String> {
+/// - `=(;type=multipart/alternative` — open nested multipart container
+/// - `=)` — close nested multipart container
+/// - `;encoder=base64` — Content-Transfer-Encoding
+/// - `;headers=Header: value` — custom part header
+/// - `;headers=@file` or `;headers=<file` — headers from file
+#[allow(clippy::too_many_lines)]
+fn parse_form_field_ext(
+    easy: &mut liburlx::Easy,
+    val: &str,
+    container_stack: &mut Vec<usize>,
+    _form_string: bool,
+) -> Result<(), String> {
     let (name, value) =
         val.split_once('=').ok_or_else(|| format!("invalid form field format: {val}"))?;
 
+    // Handle multipart container open: "=(;type=multipart/alternative"
+    if let Some(rest) = value.strip_prefix('(') {
+        let mut content_type = "multipart/mixed".to_string();
+        // Parse modifiers after '('
+        if let Some(mods) = rest.strip_prefix(';') {
+            let parts: Vec<&str> = mods.split(';').collect();
+            for part in parts {
+                let trimmed = part.trim();
+                if let Some(t) = trimmed.strip_prefix("type=") {
+                    content_type = t.to_string();
+                }
+            }
+        }
+        let idx = easy.form_open_container(&content_type);
+        container_stack.push(idx);
+        return Ok(());
+    }
+
+    // Handle multipart container close: "=)"
+    if value == ")" {
+        if container_stack.is_empty() {
+            return Err("unmatched =) — no open multipart container".to_string());
+        }
+        let _ = container_stack.pop();
+        return Ok(());
+    }
+
     if let Some(rest) = value.strip_prefix('@') {
-        // File upload — parse filepath and optional ;type= ;filename= modifiers
-        // Check for comma-separated multi-file syntax (commas outside quotes split files)
+        // File upload — parse filepath and optional modifiers
         let file_specs = split_comma_file_specs(rest);
 
         if file_specs.len() > 1 {
@@ -2721,19 +2767,23 @@ fn parse_form_field(easy: &mut liburlx::Easy, val: &str) -> Result<(), String> {
 
             let mut custom_type: Option<String> = None;
             let mut custom_filename: Option<String> = None;
+            let mut custom_headers: Vec<String> = Vec::new();
+            let mut encoder: Option<String> = None;
 
-            // Parse semicolon-separated modifiers
             for modifier in modifiers {
                 if let Some(t) = modifier.strip_prefix("type=") {
                     custom_type = Some(t.to_string());
                 } else if let Some(f) = modifier.strip_prefix("filename=") {
                     custom_filename = Some(unescape_form_filename(f));
                 } else if let Some(f) = modifier.strip_prefix("format=") {
-                    // format= appends to type: e.g., type=text/x-null;format=x-curl
                     if let Some(ref mut ct) = custom_type {
                         ct.push_str(";format=");
                         ct.push_str(f);
                     }
+                } else if let Some(h) = modifier.strip_prefix("headers=") {
+                    parse_headers_modifier(h, &mut custom_headers)?;
+                } else if let Some(e) = modifier.strip_prefix("encoder=") {
+                    encoder = Some(e.to_string());
                 }
             }
 
@@ -2755,15 +2805,36 @@ fn parse_form_field(easy: &mut liburlx::Easy, val: &str) -> Result<(), String> {
                 .unwrap_or_default();
             let display_filename = custom_filename.unwrap_or_else(|| original_filename.clone());
 
-            if let Some(ref ct) = custom_type {
-                easy.form_file_with_type(name, &display_filename, ct, &data);
-            } else {
-                // Guess content type from the original filepath, not the custom filename
-                easy.form_file_with_type(
-                    name,
-                    &display_filename,
-                    &liburlx::guess_form_content_type(&original_filename),
+            if custom_headers.is_empty() && encoder.is_none() && container_stack.is_empty() {
+                // Simple path — use existing API
+                if let Some(ref ct) = custom_type {
+                    easy.form_file_with_type(name, &display_filename, ct, &data);
+                } else {
+                    // No explicit type — use form_file_data which sets explicit_type=false.
+                    // In SMTP/IMAP mode, Content-Type is only output for explicit types.
+                    // For HTTP, Content-Type is always output (explicit_type=false still
+                    // outputs a guessed type in the non-SMTP encode path).
+                    easy.form_file_data(name, &display_filename, &data);
+                }
+            } else if let Some(&container_idx) = container_stack.last() {
+                // Inside a nested container
+                easy.form_add_to_container(
+                    container_idx,
                     &data,
+                    custom_type.as_deref(),
+                    Some(&display_filename),
+                    custom_headers,
+                    encoder.as_deref(),
+                );
+            } else {
+                // Top-level part with custom headers/encoder
+                easy.form_add_with_options(
+                    name,
+                    &data,
+                    custom_type.as_deref(),
+                    Some(&display_filename),
+                    custom_headers,
+                    encoder.as_deref(),
                 );
             }
         }
@@ -2791,12 +2862,14 @@ fn parse_form_field(easy: &mut liburlx::Easy, val: &str) -> Result<(), String> {
         // The value can be quoted: "..." — in which case the closing quote ends the value
         // and modifiers follow after a `;`.
         let (raw_value, modifiers) = parse_text_value_and_modifiers(value);
-        // curl strips leading whitespace from unquoted text field values (curl compat: test 186)
+        // curl strips leading whitespace from unquoted text field values (curl compat: tests 186, 646)
         let field_value =
             if value.starts_with('"') { raw_value } else { raw_value.trim_start().to_string() };
 
         let mut custom_type: Option<String> = None;
         let mut custom_filename: Option<String> = None;
+        let mut custom_headers: Vec<String> = Vec::new();
+        let mut encoder: Option<String> = None;
 
         for modifier in &modifiers {
             let trimmed = modifier.trim();
@@ -2804,6 +2877,10 @@ fn parse_form_field(easy: &mut liburlx::Easy, val: &str) -> Result<(), String> {
                 custom_type = Some(t.to_string());
             } else if let Some(f) = trimmed.strip_prefix("filename=") {
                 custom_filename = Some(unescape_form_filename(f));
+            } else if let Some(h) = trimmed.strip_prefix("headers=") {
+                parse_headers_modifier(h, &mut custom_headers)?;
+            } else if let Some(e) = trimmed.strip_prefix("encoder=") {
+                encoder = Some(e.to_string());
             }
         }
 
@@ -2817,6 +2894,8 @@ fn parse_form_field(easy: &mut liburlx::Easy, val: &str) -> Result<(), String> {
                 if !trimmed.starts_with("type=")
                     && !trimmed.starts_with("filename=")
                     && !trimmed.starts_with("format=")
+                    && !trimmed.starts_with("headers=")
+                    && !trimmed.starts_with("encoder=")
                     && !trimmed.is_empty()
                 {
                     // Unknown modifier after type — append as Content-Type sub-param
@@ -2826,12 +2905,31 @@ fn parse_form_field(easy: &mut liburlx::Easy, val: &str) -> Result<(), String> {
             }
         }
 
-        if let Some(ref filename) = custom_filename {
-            // Text value with filename → file-like part
+        if !container_stack.is_empty() {
+            // Inside a nested container — add as subpart
+            let container_idx = *container_stack.last().unwrap_or(&0);
+            easy.form_add_to_container(
+                container_idx,
+                field_value.as_bytes(),
+                custom_type.as_deref(),
+                custom_filename.as_deref(),
+                custom_headers,
+                encoder.as_deref(),
+            );
+        } else if !custom_headers.is_empty() || encoder.is_some() {
+            // Top-level with custom headers/encoder
+            easy.form_add_with_options(
+                name,
+                field_value.as_bytes(),
+                custom_type.as_deref(),
+                custom_filename.as_deref(),
+                custom_headers,
+                encoder.as_deref(),
+            );
+        } else if let Some(ref filename) = custom_filename {
             if let Some(ref ct) = custom_type {
                 easy.form_file_with_type(name, filename, ct, field_value.as_bytes());
             } else {
-                // No explicit type → don't set Content-Type (curl compat: SMTP test 1187)
                 easy.form_file_no_type(name, filename, field_value.as_bytes());
             }
         } else if let Some(ref ct) = custom_type {
@@ -2842,6 +2940,67 @@ fn parse_form_field(easy: &mut liburlx::Easy, val: &str) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+/// Parse a `headers=` modifier value.
+///
+/// Supports:
+/// - `headers=Header-Name: value` — inline header
+/// - `headers=@filename` or `headers=<filename` — headers from file
+fn parse_headers_modifier(value: &str, headers: &mut Vec<String>) -> Result<(), String> {
+    if let Some(path) = value.strip_prefix('@').or_else(|| value.strip_prefix('<')) {
+        // Headers from file
+        let contents = std::fs::read_to_string(path)
+            .map_err(|e| format!("error reading headers file: {e}"))?;
+        read_header_file_contents(&contents, headers);
+    } else {
+        // Inline header
+        headers.push(value.to_string());
+    }
+    Ok(())
+}
+
+/// Read headers from file contents (curl format).
+///
+/// Lines starting with `#` are comments. Header folding (continuation with space/tab)
+/// is supported. Blank lines are ignored.
+fn read_header_file_contents(contents: &str, headers: &mut Vec<String>) {
+    let mut current_header: Option<String> = None;
+
+    for line in contents.lines() {
+        // Skip comment lines (starting with #)
+        if line.starts_with('#') {
+            continue;
+        }
+        // Skip empty lines
+        if line.trim().is_empty() {
+            // Flush current header
+            if let Some(h) = current_header.take() {
+                headers.push(h);
+            }
+            continue;
+        }
+        // Folded header (continuation line starts with space or tab)
+        if line.starts_with(' ') || line.starts_with('\t') {
+            if let Some(ref mut h) = current_header {
+                // Fold: join with single space, trim the leading whitespace from continuation
+                h.push(' ');
+                h.push_str(line.trim());
+                continue;
+            }
+        }
+        // New header — flush previous
+        if let Some(h) = current_header.take() {
+            headers.push(h);
+        }
+        // Strip trailing whitespace and \r
+        let trimmed = line.trim_end().trim_end_matches('\r');
+        current_header = Some(trimmed.to_string());
+    }
+    // Flush last header
+    if let Some(h) = current_header {
+        headers.push(h);
+    }
 }
 
 /// Split comma-separated file specs, respecting quoted paths.
@@ -2918,7 +3077,7 @@ fn parse_text_value_and_modifiers(s: &str) -> (String, Vec<String>) {
     }
 }
 
-/// Find the position of the first `;` that starts a known modifier (type=, filename=, format=).
+/// Find the position of the first `;` that starts a known modifier.
 fn find_first_modifier_semicolon(s: &str) -> Option<usize> {
     let bytes = s.as_bytes();
     let mut i = 0;
@@ -2928,6 +3087,8 @@ fn find_first_modifier_semicolon(s: &str) -> Option<usize> {
             if rest.starts_with("type=")
                 || rest.starts_with("filename=")
                 || rest.starts_with("format=")
+                || rest.starts_with("headers=")
+                || rest.starts_with("encoder=")
             {
                 return Some(i);
             }

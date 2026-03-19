@@ -261,6 +261,7 @@ pub async fn send_mail(
     config: &SmtpConfig<'_>,
     use_ssl: UseSsl,
     tls_config: &crate::tls::TlsConfig,
+    pre_connected: Option<tokio::net::TcpStream>,
 ) -> Result<crate::protocol::http::response::Response, Error> {
     let (host, port) = url.host_and_port()?;
 
@@ -298,8 +299,12 @@ pub async fn send_mail(
     let use_starttls = !use_implicit_tls && use_ssl != UseSsl::None;
 
     // Connect to SMTP server (with optional TLS for smtps://)
-    let addr = format!("{host}:{port}");
-    let tcp = tokio::net::TcpStream::connect(&addr).await.map_err(Error::Connect)?;
+    let tcp = if let Some(stream) = pre_connected {
+        stream
+    } else {
+        let addr = format!("{host}:{port}");
+        tokio::net::TcpStream::connect(&addr).await.map_err(Error::Connect)?
+    };
 
     // Establish connection with appropriate TLS mode.
     // For STARTTLS, we use concrete types for the initial negotiation (greeting,
@@ -799,6 +804,15 @@ async fn do_send_mail<S: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         )));
     }
 
+    // Check for 7-bit encoding violations in the body (curl compat: test 649).
+    // This check happens after DATA so the SMTP protocol commands are captured.
+    if check_7bit_violation(mail_data) {
+        return Err(Error::Transfer {
+            code: 26,
+            message: "7-bit encoding applied to 8-bit data".to_string(),
+        });
+    }
+
     // Send message body with proper line handling
     write_smtp_data(writer, mail_data, config.crlf).await?;
 
@@ -813,6 +827,47 @@ async fn do_send_mail<S: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     }
 
     Ok(())
+}
+
+/// Check if a MIME body has `Content-Transfer-Encoding: 7bit` followed by 8-bit data.
+///
+/// Scans the body for `Content-Transfer-Encoding: 7bit` headers and validates
+/// that the corresponding part data contains only 7-bit ASCII bytes.
+fn check_7bit_violation(data: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(data);
+    // Split on boundary delimiters (lines starting with --)
+    let mut in_7bit_part = false;
+    let mut past_headers = false;
+
+    for line in text.split('\n') {
+        let trimmed = line.trim_end_matches('\r');
+
+        // Boundary delimiter resets state
+        if trimmed.starts_with("--") {
+            in_7bit_part = false;
+            past_headers = false;
+            continue;
+        }
+
+        // Empty line = end of headers
+        if trimmed.is_empty() && !past_headers {
+            past_headers = true;
+            continue;
+        }
+
+        // Check for CTE: 7bit header
+        if !past_headers && trimmed.eq_ignore_ascii_case("Content-Transfer-Encoding: 7bit") {
+            in_7bit_part = true;
+            continue;
+        }
+
+        // If we're in a 7bit part body, check for 8-bit bytes
+        if in_7bit_part && past_headers && line.as_bytes().iter().any(|&b| b > 127) {
+            return true;
+        }
+    }
+
+    false
 }
 
 /// Write SMTP DATA body, handling dot-stuffing and optional CRLF conversion.

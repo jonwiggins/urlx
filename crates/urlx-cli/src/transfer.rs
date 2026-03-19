@@ -1951,6 +1951,19 @@ pub fn run(args: &[String]) -> ExitCode {
                 eprintln!();
             }
 
+            // SFTP post-quote errors: output the downloaded data before
+            // reporting the error (curl compat: test 609)
+            if let liburlx::Error::SshQuoteErrorWithData { ref response, .. } = e {
+                let _ = output_response(
+                    response.as_ref(),
+                    opts.output_file.as_deref(),
+                    opts.write_out.as_deref(),
+                    false, // no include headers for SFTP
+                    opts.silent,
+                    false,
+                );
+            }
+
             // Output last response data on error (curl compat — headers/body before error)
             if let Some(resp) = opts.easy.last_response() {
                 // For redirect responses (max-redirects exceeded), only output headers

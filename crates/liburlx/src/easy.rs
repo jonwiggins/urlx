@@ -1204,6 +1204,63 @@ impl Easy {
         self.multipart.get_or_insert_with(MultipartForm::new).set_smtp_mode(val);
     }
 
+    /// Open a nested multipart container (for `=(;type=...` syntax).
+    pub fn form_open_container(&mut self, content_type: &str) -> usize {
+        self.multipart.get_or_insert_with(MultipartForm::new).open_multipart_container(content_type)
+    }
+
+    /// Add a part to a previously opened multipart container.
+    pub fn form_add_to_container(
+        &mut self,
+        container_idx: usize,
+        data: &[u8],
+        content_type: Option<&str>,
+        filename: Option<&str>,
+        custom_headers: Vec<String>,
+        encoder: Option<&str>,
+    ) {
+        self.multipart.get_or_insert_with(MultipartForm::new).add_part_to_container(
+            container_idx,
+            data,
+            content_type,
+            filename,
+            custom_headers,
+            encoder,
+        );
+    }
+
+    /// Add a part with custom headers and optional encoder.
+    pub fn form_add_with_options(
+        &mut self,
+        name: &str,
+        data: &[u8],
+        content_type: Option<&str>,
+        filename: Option<&str>,
+        custom_headers: Vec<String>,
+        encoder: Option<&str>,
+    ) {
+        self.multipart.get_or_insert_with(MultipartForm::new).add_part_with_options(
+            name,
+            data,
+            content_type,
+            filename,
+            custom_headers,
+            encoder,
+        );
+    }
+
+    /// Validate multipart encoders (check 7-bit constraint).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if 7-bit encoded content has 8-bit bytes.
+    pub fn validate_form_encoders(&self) -> Result<(), crate::error::Error> {
+        if let Some(ref multipart) = self.multipart {
+            multipart.validate_encoders()?;
+        }
+        Ok(())
+    }
+
     /// Set a byte range for the request.
     ///
     /// Sends a `Range: bytes=<range>` header. Format examples:
@@ -2554,17 +2611,38 @@ impl Easy {
 
         if let Some(ref mut multipart) = self.multipart {
             let is_smtp = url.scheme() == "smtp" || url.scheme() == "smtps";
+            let is_imap = url.scheme() == "imap" || url.scheme() == "imaps";
 
-            // For SMTP, enable smtp_mode so the MIME headers are in the body
-            if is_smtp {
+            // For SMTP and IMAP APPEND, enable smtp_mode so the MIME headers are in the body
+            if is_smtp || is_imap {
                 multipart.set_smtp_mode(true);
+                // Collect -H headers for inclusion in the MIME preamble (curl compat: tests 646, 648)
+                // These headers go into the MIME body, not the SMTP envelope.
+                // Exclude Content-Type (handled separately) and internal headers.
+                let mime_headers: Vec<(String, String)> = headers
+                    .iter()
+                    .filter(|(k, _)| {
+                        !k.eq_ignore_ascii_case("content-type")
+                            && !k.starts_with('_')
+                            && !k.eq_ignore_ascii_case("user-agent")
+                            && !k.eq_ignore_ascii_case("accept")
+                    })
+                    .cloned()
+                    .collect();
+                if !mime_headers.is_empty() {
+                    multipart.set_smtp_headers(mime_headers);
+                }
             }
 
             // Check if user provided a custom Content-Type (use "attachment" disposition)
             let ct_idx = headers.iter().position(|(k, _)| k.eq_ignore_ascii_case("content-type"));
             if let Some(idx) = ct_idx {
                 // User provided Content-Type — use "attachment" disposition (curl compat: test 277)
-                if !is_smtp {
+                // Exception: if the user-provided Content-Type is multipart/form-data (possibly
+                // with params like charset), keep "form-data" disposition (curl compat: test 669)
+                let ct_is_formdata =
+                    headers[idx].1.trim().to_lowercase().starts_with("multipart/form-data");
+                if !is_smtp && !ct_is_formdata {
                     multipart.set_use_attachment(true);
                 }
                 let mut ct_value = headers.remove(idx).1;
@@ -2576,7 +2654,15 @@ impl Easy {
                 headers.push(("Content-Type".to_string(), multipart.content_type()));
             }
 
-            // Multipart form: encode body and set content-type header
+            // Validate encoders (7-bit check — curl compat: test 649).
+            // For SMTP, defer validation to the DATA phase.
+            if !is_smtp {
+                multipart.validate_encoders()?;
+            }
+
+            // Multipart form: encode body and set content-type header.
+            // For SMTP, encode even if there's a 7-bit error — the SMTP handler
+            // will abort after DATA is sent (curl compat: test 649).
             effective_body = Some(multipart.encode());
             // Default to POST for multipart
             effective_method = self.method.clone().unwrap_or_else(|| "POST".to_string());
@@ -5340,18 +5426,27 @@ async fn do_single_request(
                 password: header_creds.as_ref().map(|(_, p)| p.as_str()),
                 login_options: effective_login_opts.as_deref(),
             };
-            let smtp_use_ssl = if url.scheme() == "smtps" {
-                // Implicit TLS: signal with a special value
-                crate::protocol::ftp::UseSsl::All
-            } else {
-                use_ssl
-            };
+            let smtp_use_ssl =
+                if url.scheme() == "smtps" { crate::protocol::ftp::UseSsl::All } else { use_ssl };
+            // HTTP CONNECT proxy tunnel for email protocols (curl compat: tests 1319-1321)
+            let tunnel_stream = establish_email_proxy_tunnel(
+                proxy,
+                http_proxy_tunnel,
+                proxy_credentials,
+                proxy_headers,
+                verbose,
+                proxy_http_10,
+                headers,
+                url,
+            )
+            .await?;
             return crate::protocol::smtp::send_mail(
                 url,
                 mail_data,
                 &smtp_config,
                 smtp_use_ssl,
                 tls_config,
+                tunnel_stream,
             )
             .await;
         }
@@ -5362,9 +5457,19 @@ async fn do_single_request(
                 .or_else(|| extract_login_options_from_url(url));
             let imap_use_ssl =
                 if url.scheme() == "imaps" { crate::protocol::ftp::UseSsl::All } else { use_ssl };
-            // curl uses 'A' + N for IMAP tags where N is the connection number.
-            // Direct IMAP = 'A' (first connection), redirect from HTTP = 'B' (second connection).
             let tag_prefix = if redirected_from_http { 'B' } else { 'A' };
+            // HTTP CONNECT proxy tunnel for email protocols (curl compat: tests 1319-1321)
+            let tunnel_stream = establish_email_proxy_tunnel(
+                proxy,
+                http_proxy_tunnel,
+                proxy_credentials,
+                proxy_headers,
+                verbose,
+                proxy_http_10,
+                headers,
+                url,
+            )
+            .await?;
             return crate::protocol::imap::fetch(
                 url,
                 method,
@@ -5378,6 +5483,7 @@ async fn do_single_request(
                 tag_prefix,
                 imap_use_ssl,
                 tls_config,
+                tunnel_stream,
             )
             .await;
         }
@@ -5396,6 +5502,18 @@ async fn do_single_request(
                 .or_else(|| extract_login_options_from_url(url));
             let pop3_use_ssl =
                 if url.scheme() == "pop3s" { crate::protocol::ftp::UseSsl::All } else { use_ssl };
+            // HTTP CONNECT proxy tunnel for email protocols (curl compat: tests 1319-1321)
+            let tunnel_stream = establish_email_proxy_tunnel(
+                proxy,
+                http_proxy_tunnel,
+                proxy_credentials,
+                proxy_headers,
+                verbose,
+                proxy_http_10,
+                headers,
+                url,
+            )
+            .await?;
             return crate::protocol::pop3::retrieve(
                 url,
                 creds_tuple,
@@ -5407,6 +5525,7 @@ async fn do_single_request(
                 sasl_authzid,
                 pop3_use_ssl,
                 tls_config,
+                tunnel_stream,
             )
             .await;
         }
@@ -6655,6 +6774,81 @@ enum ConnectTunnelResult<S> {
 ///
 /// Sends a CONNECT request to the proxy and validates the 200 response
 /// before returning the stream for TLS negotiation.
+/// Establish an HTTP CONNECT proxy tunnel for email protocols (SMTP, IMAP, POP3).
+///
+/// Returns `Some(TcpStream)` if a proxy is configured with tunnel mode,
+/// `None` if no proxy is needed (direct connection).
+#[allow(clippy::too_many_arguments)]
+async fn establish_email_proxy_tunnel(
+    proxy: Option<&crate::url::Url>,
+    http_proxy_tunnel: bool,
+    proxy_credentials: Option<&ProxyAuthCredentials>,
+    proxy_headers: &[(String, String)],
+    verbose: bool,
+    proxy_http_10: bool,
+    headers: &[(String, String)],
+    target_url: &crate::url::Url,
+) -> Result<Option<tokio::net::TcpStream>, Error> {
+    let proxy_url = match proxy {
+        Some(p) if http_proxy_tunnel => p,
+        _ => return Ok(None),
+    };
+
+    let proxy_scheme = proxy_url.scheme();
+    if proxy_scheme != "http" && proxy_scheme != "https" {
+        return Ok(None);
+    }
+
+    let (proxy_host, proxy_port) = proxy_url.host_and_port()?;
+    let (target_host, target_port) = target_url.host_and_port()?;
+
+    let proxy_addr = format!("{proxy_host}:{proxy_port}");
+    let tcp = tokio::net::TcpStream::connect(&proxy_addr).await.map_err(Error::Connect)?;
+
+    let result = establish_connect_tunnel(
+        tcp,
+        &target_host,
+        target_port,
+        headers,
+        proxy_credentials,
+        proxy_headers,
+        verbose,
+        proxy_http_10,
+    )
+    .await?;
+
+    match result {
+        ConnectTunnelResult::Connected { stream, .. } => Ok(Some(stream)),
+        ConnectTunnelResult::Failed { status, .. } => {
+            Err(Error::Http(format!("CONNECT tunnel failed: {status}")))
+        }
+        ConnectTunnelResult::NeedReconnect { .. } => {
+            // Reconnect and try again (proxy closed connection after 407)
+            let tcp2 = tokio::net::TcpStream::connect(&proxy_addr).await.map_err(Error::Connect)?;
+            let result2 = establish_connect_tunnel(
+                tcp2,
+                &target_host,
+                target_port,
+                headers,
+                proxy_credentials,
+                proxy_headers,
+                verbose,
+                proxy_http_10,
+            )
+            .await?;
+            match result2 {
+                ConnectTunnelResult::Connected { stream, .. } => Ok(Some(stream)),
+                ConnectTunnelResult::Failed { status, .. } => {
+                    Err(Error::Http(format!("CONNECT tunnel failed: {status}")))
+                }
+                ConnectTunnelResult::NeedReconnect { .. } => {
+                    Err(Error::Http("CONNECT tunnel: too many reconnects".to_string()))
+                }
+            }
+        }
+    }
+}
+
 /// Handles 407 Proxy Authentication Required for Digest and NTLM auth.
 ///
 /// The stream type is generic to support both plain TCP (HTTP proxy) and
