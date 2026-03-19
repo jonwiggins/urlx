@@ -203,6 +203,46 @@ enum SmtpMode {
     Help,
 }
 
+/// Perform the SMTP greeting and EHLO/HELO exchange.
+///
+/// Reads the server greeting, sends EHLO (with HELO fallback), and returns
+/// whether EHLO succeeded along with parsed capabilities.
+///
+/// # Errors
+///
+/// Returns an error if the greeting is rejected or HELO fails.
+async fn smtp_greeting_and_ehlo<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    reader: &mut BufReader<R>,
+    writer: &mut W,
+    ehlo_name: &str,
+) -> Result<(bool, EhloCapabilities), Error> {
+    let greeting = read_response(reader).await?;
+    if !greeting.is_ok() {
+        return Err(Error::Http(format!(
+            "SMTP server rejected connection: {} {}",
+            greeting.code, greeting.message
+        )));
+    }
+
+    send_command(writer, &format!("EHLO {ehlo_name}")).await?;
+    let ehlo_resp = read_response(reader).await?;
+
+    if ehlo_resp.is_ok() {
+        Ok((true, parse_ehlo_capabilities(&ehlo_resp.message)))
+    } else {
+        // Fall back to HELO
+        send_command(writer, &format!("HELO {ehlo_name}")).await?;
+        let helo_resp = read_response(reader).await?;
+        if !helo_resp.is_ok() {
+            return Err(Error::Http(format!(
+                "SMTP HELO failed: {} {}",
+                helo_resp.code, helo_resp.message
+            )));
+        }
+        Ok((false, EhloCapabilities::default()))
+    }
+}
+
 /// Send an email or execute an SMTP command.
 ///
 /// Connects to the SMTP server specified in the URL, performs EHLO/HELO,
@@ -261,81 +301,75 @@ pub async fn send_mail(
     let addr = format!("{host}:{port}");
     let tcp = tokio::net::TcpStream::connect(&addr).await.map_err(Error::Connect)?;
 
-    // Type-erased reader/writer so we can use either plain or TLS streams
-    let (reader, mut writer): (
-        Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+    // Establish connection with appropriate TLS mode.
+    // For STARTTLS, we use concrete types for the initial negotiation (greeting,
+    // EHLO, STARTTLS command), then unsplit → TLS handshake → re-split into
+    // type-erased boxed streams for the rest of the protocol.
+    #[allow(clippy::type_complexity)]
+    let (mut reader, mut writer, caps, ehlo_ok): (
+        BufReader<Box<dyn tokio::io::AsyncRead + Unpin + Send>>,
         Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
+        EhloCapabilities,
+        bool,
     ) = if use_implicit_tls {
         let connector = crate::tls::TlsConnector::new(tls_config)?;
         let (tls_stream, _alpn) = connector.connect(tcp, &host).await?;
         let (r, w) = tokio::io::split(tls_stream);
-        (Box::new(r), Box::new(w))
+        let mut rd = BufReader::new(Box::new(r) as Box<dyn tokio::io::AsyncRead + Unpin + Send>);
+        let mut wr: Box<dyn tokio::io::AsyncWrite + Unpin + Send> = Box::new(w);
+        let (ehlo_ok, caps) = smtp_greeting_and_ehlo(&mut rd, &mut wr, ehlo_name).await?;
+        (rd, wr, caps, ehlo_ok)
     } else {
+        // Plain connection — use concrete types so we can unsplit for STARTTLS
         let (r, w) = tokio::io::split(tcp);
-        (Box::new(r), Box::new(w))
-    };
-    let mut reader = BufReader::new(reader);
+        let mut plain_reader = BufReader::new(r);
+        let mut plain_writer = w;
+        let (ehlo_ok, caps) =
+            smtp_greeting_and_ehlo(&mut plain_reader, &mut plain_writer, ehlo_name).await?;
 
-    // Read server greeting
-    let greeting = read_response(&mut reader).await?;
-    if !greeting.is_ok() {
-        return Err(Error::Http(format!(
-            "SMTP server rejected connection: {} {}",
-            greeting.code, greeting.message
-        )));
-    }
-
-    // Send EHLO
-    send_command(&mut writer, &format!("EHLO {ehlo_name}")).await?;
-    let ehlo_resp = read_response(&mut reader).await?;
-
-    let (ehlo_ok, caps) = if ehlo_resp.is_ok() {
-        let caps = parse_ehlo_capabilities(&ehlo_resp.message);
-        (true, caps)
-    } else {
-        // Fall back to HELO
-        send_command(&mut writer, &format!("HELO {ehlo_name}")).await?;
-        let helo_resp = read_response(&mut reader).await?;
-        if !helo_resp.is_ok() {
-            return Err(Error::Http(format!(
-                "SMTP HELO failed: {} {}",
-                helo_resp.code, helo_resp.message
-            )));
-        }
-        // HELO = no capabilities
-        (false, EhloCapabilities::default())
-    };
-
-    // STARTTLS: upgrade plain connection to TLS if requested
-    if use_starttls && ehlo_ok {
-        if caps.starttls {
+        if use_starttls && ehlo_ok && caps.starttls {
             // Server advertises STARTTLS — send the command
-            send_command(&mut writer, "STARTTLS").await?;
-            let starttls_resp = read_response(&mut reader).await?;
+            send_command(&mut plain_writer, "STARTTLS").await?;
+            let starttls_resp = read_response(&mut plain_reader).await?;
             if !starttls_resp.is_ok() {
                 // Server rejected STARTTLS — return CURLE_WEIRD_SERVER_REPLY (8)
                 return Err(Error::Protocol(8));
             }
-            // TLS handshake would happen here (not needed for current tests)
-            // For now, this code path means STARTTLS succeeded — would need
-            // stream reassembly and TLS wrapping for full implementation.
-        } else if use_ssl == UseSsl::All {
-            // STARTTLS not advertised but required → CURLE_USE_SSL_FAILED (64)
-            let _ = send_command(&mut writer, "QUIT").await;
+
+            // Reassemble TCP stream from split halves and upgrade to TLS
+            let tcp_restored = plain_reader.into_inner().unsplit(plain_writer);
+            let connector = crate::tls::TlsConnector::new_no_alpn(tls_config)?;
+            let (tls_stream, _) = connector.connect(tcp_restored, &host).await?;
+            let (r, w) = tokio::io::split(tls_stream);
+            let mut rd =
+                BufReader::new(Box::new(r) as Box<dyn tokio::io::AsyncRead + Unpin + Send>);
+            let mut wr: Box<dyn tokio::io::AsyncWrite + Unpin + Send> = Box::new(w);
+
+            // Re-EHLO over the TLS connection (RFC 3207 Section 4.2)
+            send_command(&mut wr, &format!("EHLO {ehlo_name}")).await?;
+            let ehlo2 = read_response(&mut rd).await?;
+            let (ehlo_ok2, caps2) = if ehlo2.is_ok() {
+                (true, parse_ehlo_capabilities(&ehlo2.message))
+            } else {
+                (false, EhloCapabilities::default())
+            };
+            (rd, wr, caps2, ehlo_ok2)
+        } else if use_starttls && use_ssl == UseSsl::All && (!ehlo_ok || !caps.starttls) {
+            // STARTTLS required but not available or EHLO failed
+            let _ = send_command(&mut plain_writer, "QUIT").await;
             return Err(Error::Transfer {
                 code: 64,
-                message: "SMTP STARTTLS required but not advertised".to_string(),
+                message: "SMTP STARTTLS required but not available".to_string(),
             });
+        } else {
+            // No TLS upgrade — box the plain streams
+            let rd =
+                BufReader::new(Box::new(plain_reader.into_inner())
+                    as Box<dyn tokio::io::AsyncRead + Unpin + Send>);
+            let wr: Box<dyn tokio::io::AsyncWrite + Unpin + Send> = Box::new(plain_writer);
+            (rd, wr, caps, ehlo_ok)
         }
-        // UseSsl::Try with no STARTTLS advertised: continue without TLS
-    } else if use_starttls && !ehlo_ok && use_ssl == UseSsl::All {
-        // EHLO failed (HELO fallback), can't check STARTTLS, but it's required
-        let _ = send_command(&mut writer, "QUIT").await;
-        return Err(Error::Transfer {
-            code: 64,
-            message: "SMTP STARTTLS required but EHLO failed".to_string(),
-        });
-    }
+    };
 
     // Authenticate if credentials provided AND server advertises AUTH
     // When EHLO failed (HELO fallback), skip auth (no capability).

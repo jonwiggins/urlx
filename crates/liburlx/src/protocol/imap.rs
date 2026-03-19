@@ -279,6 +279,59 @@ fn parse_imap_url(path: &str, query: Option<&str>) -> ImapParams {
     params
 }
 
+/// Perform the IMAP greeting and CAPABILITY exchange.
+///
+/// Returns `(is_preauth, auth_mechanisms, server_sasl_ir, has_starttls, cap_ok)`.
+///
+/// # Errors
+///
+/// Returns an error if the greeting is rejected.
+async fn imap_greeting_and_capability<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    reader: &mut BufReader<R>,
+    writer: &mut W,
+    tags: &mut TagCounter,
+) -> Result<(bool, Vec<String>, bool, bool, bool), Error> {
+    let greeting = read_greeting(reader).await?;
+    let is_preauth = greeting.contains("PREAUTH");
+    if !greeting.contains("OK") && !is_preauth {
+        return Err(Error::Http(format!("IMAP server rejected: {greeting}")));
+    }
+
+    let tag = tags.next_tag();
+    send_command(writer, &tag, "CAPABILITY").await?;
+    let cap_resp = read_response(reader, &tag).await?;
+
+    if !cap_resp.is_ok() {
+        // Return empty capabilities — caller checks cap_ok for error
+        return Ok((is_preauth, Vec::new(), false, false, false));
+    }
+
+    let (auth_mechs, sasl_ir) = parse_imap_capabilities(&cap_resp.data);
+    let has_starttls = cap_resp
+        .data
+        .iter()
+        .any(|line| line.split_whitespace().any(|t| t.eq_ignore_ascii_case("STARTTLS")));
+    Ok((is_preauth, auth_mechs, sasl_ir, has_starttls, true))
+}
+
+/// Parse AUTH mechanisms and SASL-IR from CAPABILITY response data.
+fn parse_imap_capabilities(data: &[String]) -> (Vec<String>, bool) {
+    let mut auth_mechs = Vec::new();
+    let mut sasl_ir = false;
+    for line in data {
+        for token in line.split_whitespace() {
+            if let Some(mech) = token.strip_prefix("AUTH=").or_else(|| token.strip_prefix("auth="))
+            {
+                auth_mechs.push(mech.to_uppercase());
+            }
+            if token.eq_ignore_ascii_case("SASL-IR") {
+                sasl_ir = true;
+            }
+        }
+    }
+    (auth_mechs, sasl_ir)
+}
+
 /// Execute an IMAP operation based on URL and options.
 ///
 /// URL format: `imap://user:pass@host:port/mailbox/;UID=N`
@@ -352,84 +405,79 @@ pub async fn fetch(
             .unwrap_or(&host);
     let addr = format!("{resolved_host}:{port}");
     let tcp = tokio::net::TcpStream::connect(&addr).await.map_err(Error::Connect)?;
+    let mut tags = TagCounter::new(tag_prefix);
 
-    let (reader, mut writer): (
-        Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+    // Establish connection with appropriate TLS mode.
+    // For STARTTLS, we use concrete types for the initial negotiation
+    // (greeting, CAPABILITY, STARTTLS command), then unsplit → TLS handshake
+    // → re-split into type-erased boxed streams for the rest of the protocol.
+    #[allow(clippy::type_complexity)]
+    let (mut reader, mut writer, server_auth_mechs, server_sasl_ir, is_preauth): (
+        BufReader<Box<dyn tokio::io::AsyncRead + Unpin + Send>>,
         Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
+        Vec<String>,
+        bool,
+        bool,
     ) = if use_implicit_tls {
         let connector = crate::tls::TlsConnector::new(tls_config)?;
         let (tls_stream, _alpn) = connector.connect(tcp, &host).await?;
         let (r, w) = tokio::io::split(tls_stream);
-        (Box::new(r), Box::new(w))
+        let mut rd = BufReader::new(Box::new(r) as Box<dyn tokio::io::AsyncRead + Unpin + Send>);
+        let mut wr: Box<dyn tokio::io::AsyncWrite + Unpin + Send> = Box::new(w);
+        let (is_preauth, auth_mechs, sasl_ir, _has_starttls, _cap_ok) =
+            imap_greeting_and_capability(&mut rd, &mut wr, &mut tags).await?;
+        (rd, wr, auth_mechs, sasl_ir, is_preauth)
     } else {
         let (r, w) = tokio::io::split(tcp);
-        (Box::new(r), Box::new(w))
-    };
-    let mut reader = BufReader::new(reader);
-    let mut tags = TagCounter::new(tag_prefix);
+        let mut plain_reader = BufReader::new(r);
+        let mut plain_writer = w;
+        let (is_preauth, auth_mechs, sasl_ir, has_starttls, cap_ok) =
+            imap_greeting_and_capability(&mut plain_reader, &mut plain_writer, &mut tags).await?;
 
-    // Read greeting
-    let greeting = read_greeting(&mut reader).await?;
-    let is_preauth = greeting.contains("PREAUTH");
-    if !greeting.contains("OK") && !is_preauth {
-        return Err(Error::Http(format!("IMAP server rejected: {greeting}")));
-    }
-
-    // CAPABILITY
-    let tag = tags.next_tag();
-    send_command(&mut writer, &tag, "CAPABILITY").await?;
-    let cap_resp = read_response(&mut reader, &tag).await?;
-
-    // If CAPABILITY itself failed and STARTTLS is required, error out
-    if !cap_resp.is_ok() && use_starttls && (use_ssl == UseSsl::All) {
-        return Err(Error::Transfer {
-            code: 64,
-            message: "IMAP STARTTLS required but CAPABILITY failed".to_string(),
-        });
-    }
-
-    // Parse AUTH mechanisms and STARTTLS from CAPABILITY
-    let mut server_auth_mechs = Vec::new();
-    let mut server_sasl_ir = false;
-    let mut has_starttls = false;
-    for line in &cap_resp.data {
-        for token in line.split_whitespace() {
-            if let Some(mech) = token.strip_prefix("AUTH=").or_else(|| token.strip_prefix("auth="))
-            {
-                server_auth_mechs.push(mech.to_uppercase());
-            }
-            if token.eq_ignore_ascii_case("SASL-IR") {
-                server_sasl_ir = true;
-            }
-            if token.eq_ignore_ascii_case("STARTTLS") {
-                has_starttls = true;
-            }
+        // CAPABILITY failed and STARTTLS required → error immediately (no LOGOUT)
+        if !cap_ok && use_starttls && use_ssl == UseSsl::All {
+            return Err(Error::Transfer {
+                code: 64,
+                message: "IMAP STARTTLS required but CAPABILITY failed".to_string(),
+            });
         }
-    }
 
-    // STARTTLS: upgrade plain connection to TLS if requested
-    if use_starttls && cap_resp.is_ok() {
-        if has_starttls {
-            // Server advertises STARTTLS — send the command
+        if use_starttls && has_starttls {
             let tag = tags.next_tag();
-            send_command(&mut writer, &tag, "STARTTLS").await?;
-            let starttls_resp = read_response(&mut reader, &tag).await?;
+            send_command(&mut plain_writer, &tag, "STARTTLS").await?;
+            let starttls_resp = read_response(&mut plain_reader, &tag).await?;
             if !starttls_resp.is_ok() {
-                // Server rejected STARTTLS — return CURLE_WEIRD_SERVER_REPLY (8)
                 return Err(Error::Protocol(8));
             }
-            // TLS handshake would happen here for full implementation
-        } else if use_ssl == UseSsl::All {
-            // STARTTLS not advertised but required
+            // Reassemble TCP stream and upgrade to TLS
+            let tcp_restored = plain_reader.into_inner().unsplit(plain_writer);
+            let connector = crate::tls::TlsConnector::new_no_alpn(tls_config)?;
+            let (tls_stream, _) = connector.connect(tcp_restored, &host).await?;
+            let (r, w) = tokio::io::split(tls_stream);
+            let mut rd =
+                BufReader::new(Box::new(r) as Box<dyn tokio::io::AsyncRead + Unpin + Send>);
+            let mut wr: Box<dyn tokio::io::AsyncWrite + Unpin + Send> = Box::new(w);
+            // Re-CAPABILITY over TLS (RFC 2595 Section 3.1)
+            let tag = tags.next_tag();
+            send_command(&mut wr, &tag, "CAPABILITY").await?;
+            let cap2 = read_response(&mut rd, &tag).await?;
+            let (auth_mechs2, sasl_ir2) = parse_imap_capabilities(&cap2.data);
+            (rd, wr, auth_mechs2, sasl_ir2, is_preauth)
+        } else if use_starttls && use_ssl == UseSsl::All && !has_starttls {
             let ltag = tags.next_tag();
-            let _ = send_command(&mut writer, &ltag, "LOGOUT").await;
+            let _ = send_command(&mut plain_writer, &ltag, "LOGOUT").await;
             return Err(Error::Transfer {
                 code: 64,
                 message: "IMAP STARTTLS required but not advertised".to_string(),
             });
+        } else {
+            let rd =
+                BufReader::new(Box::new(plain_reader.into_inner())
+                    as Box<dyn tokio::io::AsyncRead + Unpin + Send>);
+            let wr: Box<dyn tokio::io::AsyncWrite + Unpin + Send> = Box::new(plain_writer);
+            (rd, wr, auth_mechs, sasl_ir, is_preauth)
         }
-        // UseSsl::Try with no STARTTLS: continue without TLS
-    }
+    };
 
     // Skip authentication if PREAUTH was received (curl compat: test 846).
     // The server already authenticated the connection (e.g. via TLS client cert).
@@ -567,58 +615,73 @@ pub async fn fetch_multi(
             .unwrap_or(&host);
     let addr = format!("{resolved_host}:{port}");
     let tcp = tokio::net::TcpStream::connect(&addr).await.map_err(Error::Connect)?;
+    let mut tags = TagCounter::new(tag_prefix);
 
-    let (reader, mut writer): (
-        Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+    // Same STARTTLS setup as fetch()
+    #[allow(clippy::type_complexity)]
+    let (mut reader, mut writer, server_auth_mechs, server_sasl_ir, is_preauth): (
+        BufReader<Box<dyn tokio::io::AsyncRead + Unpin + Send>>,
         Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
+        Vec<String>,
+        bool,
+        bool,
     ) = if use_implicit_tls {
         let connector = crate::tls::TlsConnector::new(tls_config)?;
         let (tls_stream, _alpn) = connector.connect(tcp, &host).await?;
         let (r, w) = tokio::io::split(tls_stream);
-        (Box::new(r), Box::new(w))
+        let mut rd = BufReader::new(Box::new(r) as Box<dyn tokio::io::AsyncRead + Unpin + Send>);
+        let mut wr: Box<dyn tokio::io::AsyncWrite + Unpin + Send> = Box::new(w);
+        let (is_preauth, auth_mechs, sasl_ir, _has_starttls, _cap_ok) =
+            imap_greeting_and_capability(&mut rd, &mut wr, &mut tags).await?;
+        (rd, wr, auth_mechs, sasl_ir, is_preauth)
     } else {
         let (r, w) = tokio::io::split(tcp);
-        (Box::new(r), Box::new(w))
-    };
-    let mut reader = BufReader::new(reader);
-    let mut tags = TagCounter::new(tag_prefix);
+        let mut plain_reader = BufReader::new(r);
+        let mut plain_writer = w;
+        let (is_preauth, auth_mechs, sasl_ir, has_starttls, cap_ok) =
+            imap_greeting_and_capability(&mut plain_reader, &mut plain_writer, &mut tags).await?;
 
-    // Read greeting
-    let greeting = read_greeting(&mut reader).await?;
-    let is_preauth = greeting.contains("PREAUTH");
-    if !greeting.contains("OK") && !is_preauth {
-        return Err(Error::Http(format!("IMAP server rejected: {greeting}")));
-    }
-
-    // CAPABILITY
-    let tag = tags.next_tag();
-    send_command(&mut writer, &tag, "CAPABILITY").await?;
-    let cap_resp = read_response(&mut reader, &tag).await?;
-
-    if !cap_resp.is_ok() && use_starttls && (use_ssl == UseSsl::All) {
-        return Err(Error::Transfer {
-            code: 64,
-            message: "IMAP STARTTLS required but CAPABILITY failed".to_string(),
-        });
-    }
-
-    let mut server_auth_mechs = Vec::new();
-    let mut server_sasl_ir = false;
-    let mut _has_starttls = false;
-    for line in &cap_resp.data {
-        for token in line.split_whitespace() {
-            if let Some(mech) = token.strip_prefix("AUTH=").or_else(|| token.strip_prefix("auth="))
-            {
-                server_auth_mechs.push(mech.to_uppercase());
-            }
-            if token.eq_ignore_ascii_case("SASL-IR") {
-                server_sasl_ir = true;
-            }
-            if token.eq_ignore_ascii_case("STARTTLS") {
-                _has_starttls = true;
-            }
+        if !cap_ok && use_starttls && use_ssl == UseSsl::All {
+            return Err(Error::Transfer {
+                code: 64,
+                message: "IMAP STARTTLS required but CAPABILITY failed".to_string(),
+            });
         }
-    }
+
+        if use_starttls && has_starttls {
+            let tag = tags.next_tag();
+            send_command(&mut plain_writer, &tag, "STARTTLS").await?;
+            let starttls_resp = read_response(&mut plain_reader, &tag).await?;
+            if !starttls_resp.is_ok() {
+                return Err(Error::Protocol(8));
+            }
+            let tcp_restored = plain_reader.into_inner().unsplit(plain_writer);
+            let connector = crate::tls::TlsConnector::new_no_alpn(tls_config)?;
+            let (tls_stream, _) = connector.connect(tcp_restored, &host).await?;
+            let (r, w) = tokio::io::split(tls_stream);
+            let mut rd =
+                BufReader::new(Box::new(r) as Box<dyn tokio::io::AsyncRead + Unpin + Send>);
+            let mut wr: Box<dyn tokio::io::AsyncWrite + Unpin + Send> = Box::new(w);
+            let tag = tags.next_tag();
+            send_command(&mut wr, &tag, "CAPABILITY").await?;
+            let cap2 = read_response(&mut rd, &tag).await?;
+            let (auth_mechs2, sasl_ir2) = parse_imap_capabilities(&cap2.data);
+            (rd, wr, auth_mechs2, sasl_ir2, is_preauth)
+        } else if use_starttls && use_ssl == UseSsl::All && !has_starttls {
+            let ltag = tags.next_tag();
+            let _ = send_command(&mut plain_writer, &ltag, "LOGOUT").await;
+            return Err(Error::Transfer {
+                code: 64,
+                message: "IMAP STARTTLS required but not advertised".to_string(),
+            });
+        } else {
+            let rd =
+                BufReader::new(Box::new(plain_reader.into_inner())
+                    as Box<dyn tokio::io::AsyncRead + Unpin + Send>);
+            let wr: Box<dyn tokio::io::AsyncWrite + Unpin + Send> = Box::new(plain_writer);
+            (rd, wr, auth_mechs, sasl_ir, is_preauth)
+        }
+    };
 
     // Authenticate (skip if PREAUTH)
     if !is_preauth {
