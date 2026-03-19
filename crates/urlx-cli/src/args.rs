@@ -760,11 +760,10 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
                 // Support @filename to read from file, @- for stdin
                 if let Some(path) = val.strip_prefix('@') {
                     match read_data_source(path) {
-                        Ok(mut data) => {
-                            // curl's -d @file strips trailing \r\n (unlike --data-binary)
-                            while data.last() == Some(&b'\n') || data.last() == Some(&b'\r') {
-                                let _ = data.pop();
-                            }
+                        Ok(data) => {
+                            // curl's -d @file strips ALL \r and \n (unlike --data-binary)
+                            let data: Vec<u8> =
+                                data.into_iter().filter(|&b| b != b'\r' && b != b'\n').collect();
                             opts.easy.body(&data);
                         }
                         Err(e) => {
