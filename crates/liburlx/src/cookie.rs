@@ -1440,4 +1440,42 @@ mod tests {
         // But not over HTTP
         assert!(jar.cookie_header("example.com", "/", false).is_none());
     }
+
+    #[test]
+    fn test_329_max_age_zero_deletes() {
+        // Simulate test 329
+        let mut jar = CookieJar::new();
+
+        // Load cookies from files
+        let data1 = b".host.foo.com\tTRUE\t/we/want/\tFALSE\t22147483647\ttest\tno\n";
+        let data2 = b".host.foo.com\tTRUE\t/we/want/\tFALSE\t22147483647\ttester\tyes\n";
+        jar.load_from_reader(std::io::Cursor::new(data1)).unwrap();
+        jar.load_from_reader(std::io::Cursor::new(data2)).unwrap();
+        assert_eq!(jar.len(), 2);
+
+        // First request: should send both
+        let header = jar.cookie_header("host.foo.com", "/we/want/329", false);
+        assert!(header.is_some());
+        let h = header.unwrap();
+        assert!(h.contains("tester=yes"), "should have tester=yes, got: {h}");
+        assert!(h.contains("test=no"), "should have test=no, got: {h}");
+
+        // Server responds with Max-Age=0 for test cookie and Max-Age=-1 for testn1
+        jar.parse_set_cookie(
+            "testn1=yes; path=/we/want/; domain=.host.foo.com; Max-Age=-1;",
+            "host.foo.com",
+            "/we/want/329",
+            false,
+        );
+        jar.parse_set_cookie(
+            "test=yes; path=/we/want/; domain=.host.foo.com; Max-Age=0;",
+            "host.foo.com",
+            "/we/want/329",
+            false,
+        );
+
+        // Second request should only send tester=yes
+        let header = jar.cookie_header("host.foo.com", "/we/want/3290002", false);
+        assert_eq!(header, Some("tester=yes".to_string()), "Only tester=yes should be sent");
+    }
 }

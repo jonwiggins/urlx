@@ -2127,6 +2127,10 @@ pub fn run_multi(
             let mut new_easy = per_easy.clone();
             // Preserve FTP session for connection reuse across URLs (curl compat: tests 146, 210, 698)
             new_easy.take_ftp_session_from(&mut easy);
+            // Transfer accumulated cookie jar and HSTS cache from the previous
+            // Easy handle so cookies persist across sequential URLs (curl compat:
+            // tests 327, 329, 331, 392, 1218, 1228, 1258).
+            new_easy.transfer_state_from(&mut easy);
             easy = new_easy;
         }
 

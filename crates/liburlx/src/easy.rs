@@ -981,6 +981,26 @@ impl Easy {
         Ok(())
     }
 
+    /// Returns the number of cookies in the cookie jar (0 if no jar).
+    #[must_use]
+    pub fn cookie_count(&self) -> usize {
+        self.cookie_jar.as_ref().map_or(0, CookieJar::len)
+    }
+
+    /// Transfer the cookie jar and HSTS cache from another Easy handle.
+    ///
+    /// This preserves accumulated cookies and HSTS entries when switching
+    /// Easy handles in multi-URL sequential mode (curl compat: cookies
+    /// must persist across URLs in the same invocation).
+    pub fn transfer_state_from(&mut self, other: &mut Self) {
+        if other.cookie_jar.is_some() {
+            self.cookie_jar = other.cookie_jar.take();
+        }
+        if other.hsts_cache.is_some() {
+            self.hsts_cache = other.hsts_cache.take();
+        }
+    }
+
     /// Set the proxy URL.
     ///
     /// HTTP URLs are forwarded through the proxy. HTTPS URLs use
