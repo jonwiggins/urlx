@@ -246,6 +246,8 @@ pub struct FtpConfig {
     pub ssl_control: bool,
     /// Send CCC (Clear Command Channel) after PROT (curl `--ftp-ssl-ccc`).
     pub ssl_ccc: bool,
+    /// Alternative USER command when initial USER fails (curl `--ftp-alternative-to-user`).
+    pub alternative_to_user: Option<String>,
 }
 
 impl Default for FtpConfig {
@@ -274,6 +276,7 @@ impl Default for FtpConfig {
             use_pret: false,
             ssl_control: false,
             ssl_ccc: false,
+            alternative_to_user: None,
         }
     }
 }
@@ -399,8 +402,11 @@ impl FtpSession {
                 greeting.code, greeting.message
             )));
         }
+        // 230 greeting means already authenticated (curl compat: test 1219)
+        let skip_login = greeting.code == 230;
 
         let active_port = config.active_port.clone();
+        let alt_to_user = config.alternative_to_user.clone();
         let mut header_bytes = Vec::new();
         header_bytes.extend_from_slice(&greeting.raw_bytes);
         let mut session = Self {
@@ -421,8 +427,8 @@ impl FtpSession {
             current_type: None,
         };
 
-        // Login
-        session.login(user, pass).await?;
+        // Login (skip if server sent 230 in greeting)
+        session.login(user, pass, skip_login, alt_to_user.as_deref()).await?;
 
         // Send ACCT command if configured
         if let Some(ref account) = session.config.account {
@@ -494,8 +500,10 @@ impl FtpSession {
                 greeting.code, greeting.message
             )));
         }
+        let skip_login = greeting.code == 230;
 
         let active_port = config.active_port.clone();
+        let alt_to_user = config.alternative_to_user.clone();
         let mut header_bytes = Vec::new();
         header_bytes.extend_from_slice(&greeting.raw_bytes);
         let mut session = Self {
@@ -524,11 +532,9 @@ impl FtpSession {
                 // AUTH succeeded: PBSZ/PROT before login
                 session.setup_data_protection().await?;
             }
-            // Login (either over TLS or plain if Try mode fell through)
-            session.login(user, pass).await?;
+            session.login(user, pass, skip_login, alt_to_user.as_deref()).await?;
         } else {
-            // For implicit FTPS: login first, then PBSZ/PROT
-            session.login(user, pass).await?;
+            session.login(user, pass, skip_login, alt_to_user.as_deref()).await?;
             session.setup_data_protection().await?;
         }
 
@@ -683,8 +689,22 @@ impl FtpSession {
 
     /// Login with USER/PASS sequence.
     ///
+    /// When the server sends a 230 in the greeting, `skip_login` should be true
+    /// to avoid sending USER/PASS. When USER fails and `alternative_to_user` is
+    /// set, sends that command before continuing with PASS.
+    ///
     /// Returns `Error::Transfer { code: 67, .. }` on login failure (`CURLE_LOGIN_DENIED`).
-    async fn login(&mut self, user: &str, pass: &str) -> Result<(), Error> {
+    async fn login(
+        &mut self,
+        user: &str,
+        pass: &str,
+        skip_login: bool,
+        alternative_to_user: Option<&str>,
+    ) -> Result<(), Error> {
+        if skip_login {
+            return Ok(());
+        }
+
         send_command(&mut self.writer, &format!("USER {user}")).await?;
         let user_resp = self.read_and_record().await?;
 
@@ -692,8 +712,16 @@ impl FtpSession {
             // 331 = User name OK, need password
             send_command(&mut self.writer, &format!("PASS {pass}")).await?;
             let pass_resp = self.read_and_record().await?;
-            // 332 = Need account for login (ACCT will be sent separately)
-            if !pass_resp.is_complete() && pass_resp.code != 332 {
+            if pass_resp.code == 332 {
+                // 332 = Need account for login — ACCT will be sent by caller if configured.
+                // If no account is configured, fail immediately (curl compat: test 295).
+                if self.config.account.is_none() {
+                    return Err(Error::Transfer {
+                        code: 67,
+                        message: format!("Access denied: {} {}", pass_resp.code, pass_resp.message),
+                    });
+                }
+            } else if !pass_resp.is_complete() {
                 return Err(Error::Transfer {
                     code: 67,
                     message: format!("Access denied: {} {}", pass_resp.code, pass_resp.message),
@@ -701,6 +729,27 @@ impl FtpSession {
             }
         } else if user_resp.is_complete() {
             // 230 = Logged in without needing password
+        } else if alternative_to_user.is_some() {
+            // USER failed — try the alternative command (curl compat: test 280)
+            let alt = alternative_to_user.unwrap_or_default();
+            send_command(&mut self.writer, alt).await?;
+            let alt_resp = self.read_and_record().await?;
+            if alt_resp.code == 331 {
+                // Alt USER accepted, now send PASS
+                send_command(&mut self.writer, &format!("PASS {pass}")).await?;
+                let pass_resp = self.read_and_record().await?;
+                if !pass_resp.is_complete() && pass_resp.code != 332 {
+                    return Err(Error::Transfer {
+                        code: 67,
+                        message: format!("Access denied: {} {}", pass_resp.code, pass_resp.message),
+                    });
+                }
+            } else if !alt_resp.is_complete() {
+                return Err(Error::Transfer {
+                    code: 67,
+                    message: format!("Access denied: {} {}", alt_resp.code, alt_resp.message),
+                });
+            }
         } else {
             return Err(Error::Transfer {
                 code: 67,
@@ -1885,12 +1934,15 @@ pub async fn perform(
             let _ = ftp_session.take();
         }
     }
+    // On URL parse errors (e.g., null byte), discard session without QUIT (curl compat: test 340)
+    if matches!(&result, Err(Error::UrlParse(_))) {
+        let _ = ftp_session.take();
+    }
     // On certain transfer errors, discard without QUIT (curl compat):
     // - 14 (CURLE_FTP_WEIRD_227_FORMAT): bad PASV response (test 237)
     // - 28 (CURLE_OPERATION_TIMEDOUT): server timeout (test 1120)
-    // - 10 (CURLE_FTP_ACCEPT_FAILED): active mode accept failed (tests 1206, 1207)
     if let Err(Error::Transfer { code, .. }) = &result {
-        if matches!(code, 14 | 28 | 10 | 84) {
+        if matches!(code, 14 | 28 | 84) {
             let _ = ftp_session.take();
         }
     }
@@ -1987,7 +2039,28 @@ async fn perform_inner(
 ) -> Result<Response, Error> {
     if !is_reuse {
         // PWD after login (curl always sends this)
-        let _pwd = session.pwd_safe().await;
+        let pwd_path = session.pwd_safe().await;
+
+        // SYST: detect OS/400 and send SITE NAMEFMT 1.
+        // curl only sends SYST when PWD succeeds AND the path does NOT start with '/'
+        // (curl compat: tests 1102, 1103; no SYST on PWD failure: test 124).
+        let pwd_not_slash = pwd_path.as_ref().is_some_and(|p| !p.starts_with('/'));
+        if pwd_not_slash {
+            send_command(&mut session.writer, "SYST").await?;
+            let syst_resp = session.read_and_record().await?;
+            if syst_resp.is_complete() && syst_resp.message.contains("OS/400") {
+                // OS/400: switch to Unix-style naming format
+                send_command(&mut session.writer, "SITE NAMEFMT 1").await?;
+                let _site_resp = session.read_and_record().await?;
+                // Re-issue PWD after format change
+                let _pwd2 = session.pwd_safe().await;
+            }
+        }
+    }
+
+    // Reject null bytes in decoded FTP path (curl compat: test 340)
+    if effective_path.contains('\0') {
+        return Err(Error::UrlParse("FTP path contains null byte".to_string()));
     }
 
     // Navigate to directory via CWD commands
@@ -2017,6 +2090,9 @@ async fn perform_inner(
         // For file operations, split directory from filename
         split_path_for_method(effective_path, config.method)
     };
+
+    // Pre-quote commands (sent before CWD; curl compat: test 754)
+    execute_quote_commands(session, &config.pre_quote).await?;
 
     // For connection reuse: check if we need to change directories.
     // If target dir matches current dir, skip all CWD commands.
@@ -2090,9 +2166,6 @@ async fn perform_inner(
         session.current_dir = target_dir;
     }
 
-    // Pre-quote commands (sent after CWD, before PASV)
-    execute_quote_commands(session, &config.pre_quote).await?;
-
     // HEAD/nobody mode: only get file metadata, no data transfer.
     // For directory listings (-I on a directory), just return after CWD (curl compat: test 1000).
     if config.nobody {
@@ -2165,6 +2238,25 @@ async fn perform_inner(
 
     // For uploads
     if let Some(upload_bytes) = upload_data {
+        // FTP upload time condition (-z): check MDTM before uploading (curl compat: tests 247, 248)
+        if let Some((cond_ts, negate)) = config.time_condition {
+            send_command(&mut session.writer, &format!("MDTM {filename}")).await?;
+            let mdtm_resp = session.read_and_record().await?;
+            if mdtm_resp.is_complete() {
+                let mdtm_str = mdtm_resp.message.trim();
+                if let Some(file_ts) = parse_mdtm_timestamp(mdtm_str) {
+                    let should_skip = if negate { file_ts >= cond_ts } else { file_ts <= cond_ts };
+                    if should_skip {
+                        let raw = std::mem::take(&mut session.header_bytes);
+                        let headers = std::collections::HashMap::new();
+                        let mut resp =
+                            Response::new(200, headers, Vec::new(), url.as_str().to_string());
+                        resp.set_raw_headers(raw);
+                        return Ok(resp);
+                    }
+                }
+            }
+        }
         // Determine upload resume behavior:
         // - resume_from == Some(0): auto-resume (-C -), need SIZE to discover offset
         // - resume_from == Some(N), N > 0: explicit offset (-C N), skip N bytes, APPE
@@ -2311,6 +2403,9 @@ async fn perform_inner(
 
         // TYPE A for directory listings (skip if already set)
         send_type_if_needed(session, TransferType::Ascii).await?;
+
+        // Post-PASV quote commands (after TYPE, before LIST; curl compat: test 754)
+        execute_quote_commands(session, &config.post_pasv_quote).await?;
 
         // LIST or NLST — for NoCwd, include path in the command (test 351)
         let list_base = if config.list_only { "NLST" } else { "LIST" };
@@ -2525,9 +2620,40 @@ async fn perform_inner(
     }
 
     // Now accept the data connection for active mode (passive mode already connected)
-    // Use a timeout for active mode accept (curl compat: test 1208 — NODATACONN150)
-    let accept_timeout = Some(std::time::Duration::from_secs(30));
-    let mut data_stream = data_conn.into_stream(session, accept_timeout).await?;
+    // For active mode, race accept against control channel (server may send 425/421
+    // instead of connecting — curl compat: tests 1206, 1207).
+    let mut data_stream = match data_conn {
+        DataConnection::Connected(stream) => stream,
+        DataConnection::PendingActive { listener, use_tls } => {
+            let accept_fut = listener.accept();
+            // Race: accept data connection vs read control channel error
+            tokio::select! {
+                accept_result = accept_fut => {
+                    let (tcp, _) = accept_result
+                        .map_err(|e| Error::Http(format!("FTP active mode accept failed: {e}")))?;
+                    if use_tls {
+                        session.maybe_wrap_data_tls(tcp).await?
+                    } else {
+                        FtpStream::Plain(tcp)
+                    }
+                }
+                ctrl_result = read_response(&mut session.reader) => {
+                    // Server sent a response instead of connecting — likely 425/421
+                    let ctrl_resp = ctrl_result?;
+                    session.header_bytes.extend_from_slice(&ctrl_resp.raw_bytes);
+                    let code = if ctrl_resp.code == 425 || ctrl_resp.code == 421 {
+                        10
+                    } else {
+                        19
+                    };
+                    return Err(Error::Transfer {
+                        code,
+                        message: format!("FTP RETR failed: {} {}", ctrl_resp.code, ctrl_resp.message),
+                    });
+                }
+            }
+        }
+    };
 
     let mut data = Vec::new();
 
