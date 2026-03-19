@@ -218,8 +218,10 @@ pub struct FtpConfig {
     pub list_only: bool,
     /// HEAD request — only get file info, no data transfer (`-I` / `--head`).
     pub nobody: bool,
-    /// Pre-transfer FTP quote commands (from `-Q "CMD"`).
+    /// Pre-transfer FTP quote commands (from `-Q "CMD"`), sent after CWD, before PASV.
     pub pre_quote: Vec<String>,
+    /// Post-PASV / pre-RETR quote commands (from `-Q "+CMD"`), sent after TYPE, before SIZE/RETR.
+    pub post_pasv_quote: Vec<String>,
     /// Post-transfer FTP quote commands (from `-Q "-CMD"`).
     pub post_quote: Vec<String>,
     /// Time condition for conditional download (-z).
@@ -229,6 +231,9 @@ pub struct FtpConfig {
     /// End byte for range download (e.g., `-r 4-16` → `range_end = Some(16)`).
     /// When set, ABOR is sent after reading `range_end - start + 1` bytes.
     pub range_end: Option<u64>,
+    /// Negative range: last N bytes of the file (e.g., `-r -12` → `range_from_end = Some(12)`).
+    /// Resolved to a REST offset after SIZE response.
+    pub range_from_end: Option<u64>,
     /// Skip SIZE command (`--ignore-content-length`).
     pub ignore_content_length: bool,
     /// Maximum file size allowed for download (`--max-filesize`).
@@ -259,14 +264,68 @@ impl Default for FtpConfig {
             list_only: false,
             nobody: false,
             pre_quote: Vec::new(),
+            post_pasv_quote: Vec::new(),
             post_quote: Vec::new(),
             time_condition: None,
             range_end: None,
+            range_from_end: None,
             ignore_content_length: false,
             max_filesize: None,
             use_pret: false,
             ssl_control: false,
             ssl_ccc: false,
+        }
+    }
+}
+
+/// A data connection that may be fully connected (passive) or pending accept (active).
+///
+/// In passive mode, the connection is established immediately.
+/// In active mode, the listener is ready but the server hasn't connected yet —
+/// `accept()` must be called after sending RETR/LIST/STOR to complete the connection.
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum DataConnection {
+    /// Fully established data connection (passive mode).
+    Connected(FtpStream),
+    /// Pending active mode: listener waiting for server to connect.
+    PendingActive {
+        /// TCP listener waiting for the server's data connection.
+        listener: tokio::net::TcpListener,
+        /// Whether to wrap the accepted connection with TLS.
+        use_tls: bool,
+    },
+}
+
+impl DataConnection {
+    /// Get the connected stream, accepting the active mode connection if needed.
+    ///
+    /// For passive mode, returns the stream immediately.
+    /// For active mode, waits for the server to connect (with optional timeout).
+    async fn into_stream(
+        self,
+        session: &FtpSession,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<FtpStream, Error> {
+        match self {
+            Self::Connected(stream) => Ok(stream),
+            Self::PendingActive { listener, use_tls } => {
+                let accept_fut = listener.accept();
+                let (tcp, _) = if let Some(dur) = timeout {
+                    tokio::time::timeout(dur, accept_fut).await.map_err(|_| Error::Transfer {
+                        code: 10,
+                        message: "FTP active mode accept timed out".to_string(),
+                    })?
+                } else {
+                    accept_fut.await
+                }
+                .map_err(|e| Error::Http(format!("FTP active mode accept failed: {e}")))?;
+
+                if use_tls {
+                    session.maybe_wrap_data_tls(tcp).await
+                } else {
+                    Ok(FtpStream::Plain(tcp))
+                }
+            }
         }
     }
 }
@@ -715,12 +774,13 @@ impl FtpSession {
     ///
     /// If `active_port` is set, uses PORT/EPRT (active mode).
     /// Otherwise, uses PASV (passive mode).
-    async fn open_data_connection(&mut self) -> Result<FtpStream, Error> {
+    async fn open_data_connection(&mut self) -> Result<DataConnection, Error> {
         if let Some(ref addr) = self.active_port {
             let addr = addr.clone();
             self.open_active_data_connection(&addr).await
         } else {
-            self.open_passive_data_connection(None).await
+            let stream = self.open_passive_data_connection(None).await?;
+            Ok(DataConnection::Connected(stream))
         }
     }
 
@@ -728,13 +788,17 @@ impl FtpSession {
     ///
     /// If `pret_cmd` is provided and `config.use_pret` is true, sends
     /// `PRET <pret_cmd>` before entering passive mode (curl compat: test 1107).
-    async fn open_data_connection_with_pret(&mut self, pret_cmd: &str) -> Result<FtpStream, Error> {
+    async fn open_data_connection_with_pret(
+        &mut self,
+        pret_cmd: &str,
+    ) -> Result<DataConnection, Error> {
         if let Some(ref addr) = self.active_port {
             let addr = addr.clone();
             self.open_active_data_connection(&addr).await
         } else {
             let pret = if self.config.use_pret { Some(pret_cmd) } else { None };
-            self.open_passive_data_connection(pret).await
+            let stream = self.open_passive_data_connection(pret).await?;
+            Ok(DataConnection::Connected(stream))
         }
     }
 
@@ -771,15 +835,30 @@ impl FtpSession {
             send_command(&mut self.writer, "EPSV").await?;
             let epsv_resp = self.read_and_record().await?;
             if epsv_resp.code == 229 {
-                let data_port = parse_epsv_response(&epsv_resp.message)?;
-                let data_addr = format!("{}:{data_port}", self.hostname);
-                let tcp = TcpStream::connect(&data_addr)
-                    .await
-                    .map_err(|e| Error::Http(format!("FTP data connection failed: {e}")))?;
-                return self.maybe_wrap_data_tls(tcp).await;
+                match parse_epsv_response(&epsv_resp.message) {
+                    Ok(data_port) => {
+                        let data_addr = format!("{}:{data_port}", self.hostname);
+                        match TcpStream::connect(&data_addr).await {
+                            Ok(tcp) => {
+                                return self.maybe_wrap_data_tls(tcp).await;
+                            }
+                            Err(_e) => {
+                                // Data connection failed — fall through to PASV
+                                // (curl compat: test 1233)
+                                self.config.use_epsv = false;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        // Bad EPSV response (e.g. port > 65535) — return error
+                        // (curl compat: test 238)
+                        return Err(e);
+                    }
+                }
+            } else {
+                // EPSV failed (e.g. 500/502), remember and fall through to PASV
+                self.config.use_epsv = false;
             }
-            // EPSV failed (e.g. 500/502), remember and fall through to PASV
-            self.config.use_epsv = false;
         }
 
         send_command(&mut self.writer, "PASV").await?;
@@ -814,7 +893,10 @@ impl FtpSession {
     /// and falls back to PORT on failure (curl behavior for IPv6-capable builds).
     ///
     /// Returns `Error::Transfer { code: 30, .. }` if both EPRT and PORT fail.
-    async fn open_active_data_connection(&mut self, bind_addr: &str) -> Result<FtpStream, Error> {
+    async fn open_active_data_connection(
+        &mut self,
+        bind_addr: &str,
+    ) -> Result<DataConnection, Error> {
         // Determine the IP to advertise in PORT/EPRT.
         // `-` means use the control connection's local address.
         // An explicit IP means advertise that IP (but bind locally).
@@ -880,13 +962,10 @@ impl FtpSession {
             }
         }
 
-        // Accept the incoming data connection from the server
-        let (tcp, _) = listener
-            .accept()
-            .await
-            .map_err(|e| Error::Http(format!("FTP active mode accept failed: {e}")))?;
-
-        self.maybe_wrap_data_tls(tcp).await
+        // Return the listener for deferred accept (after RETR/STOR/LIST is sent)
+        // This allows detecting server error responses (425/421) before blocking on accept
+        // (curl compat: tests 1206, 1207, 1208)
+        Ok(DataConnection::PendingActive { listener, use_tls: self.use_tls_data })
     }
 
     /// Optionally wrap a data connection TCP stream with TLS.
@@ -912,7 +991,8 @@ impl FtpSession {
     /// Returns an error if the transfer fails.
     pub async fn download(&mut self, path: &str) -> Result<Vec<u8>, Error> {
         self.set_type(TransferType::Binary).await?;
-        let mut data_stream = self.open_data_connection().await?;
+        let data_conn = self.open_data_connection().await?;
+        let mut data_stream = data_conn.into_stream(self, None).await?;
 
         send_command(&mut self.writer, &format!("RETR {path}")).await?;
         let retr_resp = self.read_and_record().await?;
@@ -948,7 +1028,8 @@ impl FtpSession {
     /// Returns an error if the server doesn't support REST or the transfer fails.
     pub async fn download_resume(&mut self, path: &str, offset: u64) -> Result<Vec<u8>, Error> {
         self.set_type(TransferType::Binary).await?;
-        let mut data_stream = self.open_data_connection().await?;
+        let data_conn = self.open_data_connection().await?;
+        let mut data_stream = data_conn.into_stream(self, None).await?;
 
         // Send REST to set the starting offset
         send_command(&mut self.writer, &format!("REST {offset}")).await?;
@@ -994,7 +1075,8 @@ impl FtpSession {
     /// Returns an error if the transfer fails.
     pub async fn upload(&mut self, path: &str, data: &[u8]) -> Result<(), Error> {
         self.set_type(TransferType::Binary).await?;
-        let mut data_stream = self.open_data_connection().await?;
+        let data_conn = self.open_data_connection().await?;
+        let mut data_stream = data_conn.into_stream(self, None).await?;
 
         send_command(&mut self.writer, &format!("STOR {path}")).await?;
         let stor_resp = self.read_and_record().await?;
@@ -1033,7 +1115,8 @@ impl FtpSession {
     /// Returns an error if the transfer fails.
     pub async fn append(&mut self, path: &str, data: &[u8]) -> Result<(), Error> {
         self.set_type(TransferType::Binary).await?;
-        let mut data_stream = self.open_data_connection().await?;
+        let data_conn = self.open_data_connection().await?;
+        let mut data_stream = data_conn.into_stream(self, None).await?;
 
         send_command(&mut self.writer, &format!("APPE {path}")).await?;
         let appe_resp = self.read_and_record().await?;
@@ -1084,7 +1167,8 @@ impl FtpSession {
             }
         }
 
-        let mut data_stream = self.open_data_connection().await?;
+        let data_conn = self.open_data_connection().await?;
+        let mut data_stream = data_conn.into_stream(self, None).await?;
 
         send_command(&mut self.writer, "LIST").await?;
         let list_resp = self.read_and_record().await?;
@@ -1119,7 +1203,8 @@ impl FtpSession {
     ///
     /// Returns an error if MLSD is not supported or fails.
     pub async fn mlsd(&mut self, path: Option<&str>) -> Result<Vec<u8>, Error> {
-        let mut data_stream = self.open_data_connection().await?;
+        let data_conn = self.open_data_connection().await?;
+        let mut data_stream = data_conn.into_stream(self, None).await?;
 
         let cmd = path.map_or_else(|| "MLSD".to_string(), |p| format!("MLSD {p}"));
         send_command(&mut self.writer, &cmd).await?;
@@ -1499,18 +1584,42 @@ pub async fn send_command<S: AsyncWrite + Unpin>(
 /// Returns an error if the response cannot be parsed.
 pub fn parse_pasv_response(message: &str) -> Result<(String, u16), Error> {
     // Find the parenthesized address
-    let start = message
-        .find('(')
-        .ok_or_else(|| Error::Http("PASV response missing address".to_string()))?;
-    let end = message
-        .find(')')
-        .ok_or_else(|| Error::Http("PASV response missing closing paren".to_string()))?;
+    let start = message.find('(').ok_or_else(|| Error::Transfer {
+        code: 14,
+        message: "PASV response missing address".to_string(),
+    })?;
+    let end = message.find(')').ok_or_else(|| Error::Transfer {
+        code: 14,
+        message: "PASV response missing closing paren".to_string(),
+    })?;
 
     let nums: Vec<u16> =
         message[start + 1..end].split(',').filter_map(|s| s.trim().parse().ok()).collect();
 
     if nums.len() != 6 {
-        return Err(Error::Http(format!("PASV response has {} numbers, expected 6", nums.len())));
+        return Err(Error::Transfer {
+            code: 14,
+            message: format!("PASV response has {} numbers, expected 6", nums.len()),
+        });
+    }
+
+    // Validate IP octets are in range 0-255 (curl compat: test 237)
+    if nums[0] > 255 || nums[1] > 255 || nums[2] > 255 || nums[3] > 255 {
+        return Err(Error::Transfer {
+            code: 14,
+            message: format!(
+                "PASV response has invalid IP: {}.{}.{}.{}",
+                nums[0], nums[1], nums[2], nums[3]
+            ),
+        });
+    }
+
+    // Validate port octets are in range 0-255
+    if nums[4] > 255 || nums[5] > 255 {
+        return Err(Error::Transfer {
+            code: 14,
+            message: format!("PASV response has invalid port values: {},{}", nums[4], nums[5]),
+        });
     }
 
     let host = format!("{}.{}.{}.{}", nums[0], nums[1], nums[2], nums[3]);
@@ -1528,15 +1637,31 @@ pub fn parse_pasv_response(message: &str) -> Result<(String, u16), Error> {
 /// Returns an error if the response cannot be parsed.
 pub fn parse_epsv_response(message: &str) -> Result<u16, Error> {
     // Find the port between ||| and |
-    let start = message
-        .find("|||")
-        .ok_or_else(|| Error::Http("EPSV response missing port delimiter".to_string()))?;
+    let start = message.find("|||").ok_or_else(|| Error::Transfer {
+        code: 13,
+        message: "EPSV response missing port delimiter".to_string(),
+    })?;
     let rest = &message[start + 3..];
-    let end = rest
-        .find('|')
-        .ok_or_else(|| Error::Http("EPSV response missing closing delimiter".to_string()))?;
+    let end = rest.find('|').ok_or_else(|| Error::Transfer {
+        code: 13,
+        message: "EPSV response missing closing delimiter".to_string(),
+    })?;
 
-    rest[..end].parse::<u16>().map_err(|e| Error::Http(format!("EPSV port parse error: {e}")))
+    // Parse as u32 first to detect out-of-range ports (curl compat: test 238)
+    let port_num: u32 = rest[..end].parse().map_err(|e| Error::Transfer {
+        code: 13,
+        message: format!("EPSV port parse error: {e}"),
+    })?;
+
+    if port_num == 0 || port_num > 65535 {
+        return Err(Error::Transfer {
+            code: 13,
+            message: format!("EPSV port out of range: {port_num}"),
+        });
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    Ok(port_num as u16)
 }
 
 /// Parse FEAT response into feature list.
@@ -1760,6 +1885,23 @@ pub async fn perform(
             let _ = ftp_session.take();
         }
     }
+    // On certain transfer errors, discard without QUIT (curl compat):
+    // - 14 (CURLE_FTP_WEIRD_227_FORMAT): bad PASV response (test 237)
+    // - 28 (CURLE_OPERATION_TIMEDOUT): server timeout (test 1120)
+    // - 10 (CURLE_FTP_ACCEPT_FAILED): active mode accept failed (tests 1206, 1207)
+    if let Err(Error::Transfer { code, .. }) = &result {
+        if matches!(code, 14 | 28 | 10 | 84) {
+            let _ = ftp_session.take();
+        }
+    }
+    // On partial file (body_error set), discard the session without QUIT
+    // because the control connection may be in an indeterminate state
+    // (curl compat: test 161 — no QUIT after premature data end).
+    if let Ok(ref resp) = result {
+        if resp.body_error().is_some() {
+            let _ = ftp_session.take();
+        }
+    }
 
     result
 }
@@ -1792,6 +1934,37 @@ async fn send_type_if_needed(
         });
     }
     session.current_type = Some(transfer_type);
+    Ok(())
+}
+
+/// Execute a list of FTP quote commands on the session.
+///
+/// Commands prefixed with `*` have their failure ignored ("best effort").
+/// Other commands fail the transfer with `CURLE_QUOTE_ERROR` (21) on non-2xx response.
+async fn execute_quote_commands(
+    session: &mut FtpSession,
+    commands: &[String],
+) -> Result<(), Error> {
+    for raw_cmd in commands {
+        // Strip `*` prefix: means "ignore failure" (curl compat: test 227)
+        #[allow(clippy::option_if_let_else)]
+        let (ignore_fail, actual_cmd) = if let Some(stripped) = raw_cmd.strip_prefix('*') {
+            (true, stripped)
+        } else {
+            (false, raw_cmd.as_str())
+        };
+        send_command(&mut session.writer, actual_cmd).await?;
+        let resp = session.read_and_record().await?;
+        if !ignore_fail && !resp.is_complete() && !resp.is_preliminary() {
+            return Err(Error::Transfer {
+                code: 21,
+                message: format!(
+                    "FTP quote command '{}' failed: {} {}",
+                    actual_cmd, resp.code, resp.message
+                ),
+            });
+        }
+    }
     Ok(())
 }
 
@@ -1917,20 +2090,8 @@ async fn perform_inner(
         session.current_dir = target_dir;
     }
 
-    // Pre-quote commands (sent after CWD, before data transfer)
-    for cmd in &config.pre_quote {
-        send_command(&mut session.writer, cmd).await?;
-        let resp = session.read_and_record().await?;
-        if !resp.is_complete() && !resp.is_preliminary() {
-            return Err(Error::Transfer {
-                code: 21,
-                message: format!(
-                    "FTP quote command '{cmd}' failed: {} {}",
-                    resp.code, resp.message
-                ),
-            });
-        }
-    }
+    // Pre-quote commands (sent after CWD, before PASV)
+    execute_quote_commands(session, &config.pre_quote).await?;
 
     // HEAD/nobody mode: only get file metadata, no data transfer.
     // For directory listings (-I on a directory), just return after CWD (curl compat: test 1000).
@@ -2004,8 +2165,16 @@ async fn perform_inner(
 
     // For uploads
     if let Some(upload_bytes) = upload_data {
-        // Handle upload resume: skip bytes and use APPE
-        let (effective_upload_data, use_appe) = if let Some(offset) = resume_from {
+        // Determine upload resume behavior:
+        // - resume_from == Some(0): auto-resume (-C -), need SIZE to discover offset
+        // - resume_from == Some(N), N > 0: explicit offset (-C N), skip N bytes, APPE
+        // - resume_from == None: no resume, plain STOR (or APPE if --append)
+        let is_auto_resume = resume_from == Some(0);
+        let explicit_offset = resume_from.filter(|&o| o > 0);
+
+        // For explicit offset: compute upload data and APPE flag immediately (no SIZE needed)
+        // For auto-resume: defer until after SIZE
+        let (mut effective_upload_data, mut use_appe) = if let Some(offset) = explicit_offset {
             #[allow(clippy::cast_possible_truncation)]
             let offset_usize = offset as usize;
             if offset_usize >= upload_bytes.len() {
@@ -2027,13 +2196,14 @@ async fn perform_inner(
         // Open data connection (with PRET for --ftp-pret)
         let pret_cmd =
             if config.append { format!("APPE {filename}") } else { format!("STOR {filename}") };
-        let data_stream_result = session.open_data_connection_with_pret(&pret_cmd).await;
-        let mut data_stream = match data_stream_result {
+        let data_conn_result = session.open_data_connection_with_pret(&pret_cmd).await;
+        let data_conn = match data_conn_result {
             Ok(s) => s,
             Err(e) => {
                 return Err(e);
             }
         };
+        let mut data_stream = data_conn.into_stream(session, None).await?;
 
         // TYPE command for upload: respect ;type=a URL suffix (curl compat: tests 475, 476)
         let upload_type = match type_override {
@@ -2042,24 +2212,38 @@ async fn perform_inner(
         };
         send_type_if_needed(session, upload_type).await?;
 
-        // SIZE before upload for resume offset detection (curl compat: test 362)
-        // Only send SIZE for resume, not for plain --append (curl compat: test 109)
-        let mut use_appe_effective = use_appe;
-        if resume_from.is_some() {
+        // SIZE for auto-resume (-C -): determine remote file size to compute offset
+        // (curl compat: tests 1038, 1039). Skip SIZE for explicit offset (test 112).
+        if is_auto_resume {
             send_command(&mut session.writer, &format!("SIZE {filename}")).await?;
             let size_resp = session.read_and_record().await?;
-            if !size_resp.is_complete() {
-                // File doesn't exist — use STOR instead of APPE
-                use_appe_effective = false;
+            if size_resp.is_complete() {
+                if let Ok(remote_size) = size_resp.message.trim().parse::<u64>() {
+                    if remote_size > 0 {
+                        #[allow(clippy::cast_possible_truncation)]
+                        let skip = remote_size as usize;
+                        if skip >= upload_bytes.len() {
+                            // Remote file is same size or larger — nothing to upload
+                            drop(data_stream);
+                            let raw = std::mem::take(&mut session.header_bytes);
+                            let headers = std::collections::HashMap::new();
+                            let mut resp =
+                                Response::new(200, headers, Vec::new(), url.as_str().to_string());
+                            resp.set_raw_headers(raw);
+                            return Ok(resp);
+                        }
+                        effective_upload_data = &upload_bytes[skip..];
+                        use_appe = true;
+                    }
+                    // remote_size == 0: use STOR with full data (use_appe stays false)
+                }
             }
+            // SIZE failed: file doesn't exist, use STOR with full data
         }
 
         // STOR or APPE
-        let stor_cmd = if use_appe_effective {
-            format!("APPE {filename}")
-        } else {
-            format!("STOR {filename}")
-        };
+        let stor_cmd =
+            if use_appe { format!("APPE {filename}") } else { format!("STOR {filename}") };
         send_command(&mut session.writer, &stor_cmd).await?;
         let stor_resp = session.read_and_record().await?;
         if !stor_resp.is_preliminary() && !stor_resp.is_complete() {
@@ -2103,19 +2287,7 @@ async fn perform_inner(
         }
 
         // Post-quote commands
-        for cmd in &config.post_quote {
-            send_command(&mut session.writer, cmd).await?;
-            let resp = session.read_and_record().await?;
-            if !resp.is_complete() && !resp.is_preliminary() {
-                return Err(Error::Transfer {
-                    code: 21,
-                    message: format!(
-                        "FTP quote command '{cmd}' failed: {} {}",
-                        resp.code, resp.message
-                    ),
-                });
-            }
-        }
+        execute_quote_commands(session, &config.post_quote).await?;
 
         let raw = std::mem::take(&mut session.header_bytes);
         let headers = std::collections::HashMap::new();
@@ -2128,13 +2300,14 @@ async fn perform_inner(
     if is_dir_list {
         // Open data connection (with PRET for --ftp-pret; curl compat: test 1107)
         let list_base = if config.list_only { "NLST" } else { "LIST" };
-        let data_stream_result = session.open_data_connection_with_pret(list_base).await;
-        let mut data_stream = match data_stream_result {
+        let data_conn_result = session.open_data_connection_with_pret(list_base).await;
+        let data_conn = match data_conn_result {
             Ok(s) => s,
             Err(e) => {
                 return Err(e);
             }
         };
+        let mut data_stream = data_conn.into_stream(session, None).await?;
 
         // TYPE A for directory listings (skip if already set)
         send_type_if_needed(session, TransferType::Ascii).await?;
@@ -2194,19 +2367,7 @@ async fn perform_inner(
         }
 
         // Post-quote commands
-        for cmd in &config.post_quote {
-            send_command(&mut session.writer, cmd).await?;
-            let resp = session.read_and_record().await?;
-            if !resp.is_complete() && !resp.is_preliminary() {
-                return Err(Error::Transfer {
-                    code: 21,
-                    message: format!(
-                        "FTP quote command '{cmd}' failed: {} {}",
-                        resp.code, resp.message
-                    ),
-                });
-            }
-        }
+        execute_quote_commands(session, &config.post_quote).await?;
 
         let raw = std::mem::take(&mut session.header_bytes);
         let mut headers = std::collections::HashMap::new();
@@ -2254,9 +2415,12 @@ async fn perform_inner(
 
     // Open data connection BEFORE TYPE/SIZE (curl sends EPSV/PASV before TYPE)
     // Send PRET before EPSV if --ftp-pret is enabled (curl compat: test 1107)
-    let data_stream_result =
+    // For active mode, this returns a PendingActive with a listener that hasn't
+    // accepted yet — accept is deferred until after RETR to detect server errors
+    // like 425/421 (curl compat: tests 1206, 1207, 1208).
+    let data_conn_result =
         session.open_data_connection_with_pret(&format!("RETR {filename}")).await;
-    let mut data_stream = match data_stream_result {
+    let data_conn = match data_conn_result {
         Ok(s) => s,
         Err(e) => {
             return Err(e);
@@ -2265,6 +2429,9 @@ async fn perform_inner(
 
     // TYPE (skip if already set on this session)
     send_type_if_needed(session, transfer_type).await?;
+
+    // Post-PASV quote commands (sent after TYPE, before SIZE/RETR; curl compat: test 227)
+    execute_quote_commands(session, &config.post_pasv_quote).await?;
 
     // SIZE (curl always tries SIZE before RETR for non-ASCII transfers)
     // Skip SIZE when --ignore-content-length is set (curl compat: test 1137)
@@ -2280,10 +2447,22 @@ async fn perform_inner(
         // SIZE failure is not fatal for download (may fail with 500)
     }
 
+    // Resolve negative range (-N = last N bytes) against SIZE (curl compat: test 1057)
+    let mut resume_from = resume_from;
+    let mut range_end = range_end;
+    if let Some(from_end) = config.range_from_end {
+        if let Some(sz) = remote_size {
+            let offset = sz.saturating_sub(from_end);
+            resume_from = Some(offset);
+            // Set range_end so ABOR is sent after reading the last N bytes
+            range_end = Some(sz.saturating_sub(1));
+        }
+    }
+
     // --max-filesize: check SIZE response before RETR (curl compat: test 290)
     if let (Some(max_size), Some(sz)) = (config.max_filesize, remote_size) {
         if sz > max_size {
-            drop(data_stream);
+            drop(data_conn);
             return Err(Error::Transfer {
                 code: 63,
                 message: format!("Maximum file size exceeded ({sz} > {max_size})"),
@@ -2295,7 +2474,7 @@ async fn perform_inner(
     if let Some(offset) = resume_from {
         if let Some(sz) = remote_size {
             if offset > sz {
-                drop(data_stream);
+                drop(data_conn);
                 return Err(Error::Transfer {
                     code: 36,
                     message: format!("Offset ({offset}) was beyond the end of the file ({sz})"),
@@ -2303,7 +2482,7 @@ async fn perform_inner(
             }
             if offset == sz {
                 // File already fully downloaded
-                drop(data_stream);
+                drop(data_conn);
                 let raw = std::mem::take(&mut session.header_bytes);
                 let headers = std::collections::HashMap::new();
                 let mut resp = Response::new(200, headers, Vec::new(), url.as_str().to_string());
@@ -2316,7 +2495,7 @@ async fn perform_inner(
         send_command(&mut session.writer, &format!("REST {offset}")).await?;
         let rest_resp = session.read_and_record().await?;
         if !rest_resp.is_intermediate() {
-            drop(data_stream);
+            drop(data_conn);
             return Err(Error::Transfer {
                 code: 36,
                 message: format!("FTP REST failed: {} {}", rest_resp.code, rest_resp.message),
@@ -2328,15 +2507,27 @@ async fn perform_inner(
     send_command(&mut session.writer, &format!("RETR {filename}")).await?;
     let retr_resp = session.read_and_record().await?;
     if !retr_resp.is_preliminary() && !retr_resp.is_complete() {
-        drop(data_stream);
+        drop(data_conn);
+        // 425 = Can't open data connection (active mode) → CURLE_FTP_ACCEPT_FAILED (10)
         // 550 = file not found → CURLE_REMOTE_FILE_NOT_FOUND (78)
         // Other 5xx → CURLE_FTP_COULDNT_RETR_FILE (19)
-        let code = if retr_resp.code == 550 { 78 } else { 19 };
+        let code = if retr_resp.code == 425 || retr_resp.code == 421 {
+            10
+        } else if retr_resp.code == 550 {
+            78
+        } else {
+            19
+        };
         return Err(Error::Transfer {
             code,
             message: format!("FTP RETR failed: {} {}", retr_resp.code, retr_resp.message),
         });
     }
+
+    // Now accept the data connection for active mode (passive mode already connected)
+    // Use a timeout for active mode accept (curl compat: test 1208 — NODATACONN150)
+    let accept_timeout = Some(std::time::Duration::from_secs(30));
+    let mut data_stream = data_conn.into_stream(session, accept_timeout).await?;
 
     let mut data = Vec::new();
 
@@ -2392,13 +2583,7 @@ async fn perform_inner(
     }
 
     // Post-quote commands
-    for cmd in &config.post_quote {
-        send_command(&mut session.writer, cmd).await?;
-        let resp = session.read_and_record().await?;
-        if !resp.is_complete() && !resp.is_preliminary() {
-            // Post-quote failure is not fatal (curl compat)
-        }
-    }
+    execute_quote_commands(session, &config.post_quote).await?;
 
     let raw = std::mem::take(&mut session.header_bytes);
 
@@ -2537,7 +2722,13 @@ fn split_path_for_method(path: &str, method: FtpMethod) -> (Vec<&str>, String) {
     let trimmed = path.trim_start_matches('/');
 
     match method {
-        FtpMethod::NoCwd => (Vec::new(), trimmed.to_string()),
+        FtpMethod::NoCwd => {
+            // For NoCwd, preserve absolute paths:
+            //   ftp://host/file  → path="/file"  → filename="file" (relative)
+            //   ftp://host//file → path="//file"  → filename="/file" (absolute, curl compat: test 1227)
+            let filename = if path.starts_with("//") { &path[1..] } else { trimmed };
+            (Vec::new(), filename.to_string())
+        }
         FtpMethod::SingleCwd => {
             if let Some((dir, file)) = trimmed.rsplit_once('/') {
                 if dir.is_empty() {

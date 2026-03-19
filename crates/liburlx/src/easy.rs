@@ -183,6 +183,8 @@ pub struct Easy {
     ftp_list_only: bool,
     /// FTP pre-transfer quote commands (curl `-Q "CMD"`).
     ftp_pre_quote: Vec<String>,
+    /// FTP post-PASV / pre-RETR quote commands (curl `-Q "+CMD"`).
+    ftp_post_pasv_quote: Vec<String>,
     /// FTP post-transfer quote commands (curl `-Q "-CMD"`).
     ftp_post_quote: Vec<String>,
     /// FTP time condition for `-z` flag: `(unix_timestamp, negate)`.
@@ -454,6 +456,7 @@ impl Clone for Easy {
             ftp_crlf: self.ftp_crlf,
             ftp_list_only: self.ftp_list_only,
             ftp_pre_quote: self.ftp_pre_quote.clone(),
+            ftp_post_pasv_quote: self.ftp_post_pasv_quote.clone(),
             ftp_post_quote: self.ftp_post_quote.clone(),
             ftp_time_condition: self.ftp_time_condition,
             sasl_authzid: self.sasl_authzid.clone(),
@@ -585,6 +588,7 @@ impl Easy {
             ftp_crlf: false,
             ftp_list_only: false,
             ftp_pre_quote: Vec::new(),
+            ftp_post_pasv_quote: Vec::new(),
             ftp_post_quote: Vec::new(),
             ftp_time_condition: None,
             sasl_authzid: None,
@@ -2159,12 +2163,18 @@ impl Easy {
     /// Add an FTP quote command.
     ///
     /// Commands prefixed with `-` are sent after the transfer (post-quote).
+    /// Commands prefixed with `+` are sent after PASV/before RETR (post-PASV quote).
     /// Commands without prefix are sent before the transfer (pre-quote).
     /// The `*` prefix on the command itself means "accept failure" (ignore errors).
     pub fn ftp_quote(&mut self, cmd: &str) {
         if let Some(stripped) = cmd.strip_prefix('-') {
+            // Post-transfer: `-CMD` or `-*CMD`
             self.ftp_post_quote.push(stripped.to_string());
+        } else if let Some(stripped) = cmd.strip_prefix('+') {
+            // Post-PASV: `+CMD` or `+*CMD`
+            self.ftp_post_pasv_quote.push(stripped.to_string());
         } else {
+            // Pre-transfer: `CMD` or `*CMD`
             self.ftp_pre_quote.push(cmd.to_string());
         }
     }
@@ -2656,9 +2666,11 @@ impl Easy {
             list_only: self.ftp_list_only,
             nobody: effective_method == "HEAD",
             pre_quote: self.ftp_pre_quote.clone(),
+            post_pasv_quote: self.ftp_post_pasv_quote.clone(),
             post_quote: self.ftp_post_quote.clone(),
             time_condition: self.ftp_time_condition,
             range_end: None,
+            range_from_end: None,
             ignore_content_length: self.ignore_content_length,
             max_filesize: self.max_filesize,
             ssl_control: self.ftp_ssl_control,
@@ -2837,7 +2849,12 @@ impl Default for Easy {
 }
 
 /// Internal async transfer implementation.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines, clippy::fn_params_excessive_bools)]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::fn_params_excessive_bools,
+    clippy::large_stack_frames
+)]
 async fn perform_transfer(
     last_resp_store: std::sync::Arc<std::sync::Mutex<Option<Response>>>,
     deadline: Option<tokio::time::Instant>,
@@ -4728,6 +4745,44 @@ async fn perform_transfer(
                     redirect_url_auth = Some(format!("Basic {encoded}"));
                 }
 
+                // Cross-protocol redirect to FTP: perform FTP transfer
+                // (curl compat: tests 973, 1028, 1055)
+                if next_scheme == "ftp" || next_scheme == "ftps" {
+                    redirect_chain.push(response);
+
+                    let effective_ssl_mode = if next_scheme == "ftps" {
+                        crate::protocol::ftp::FtpSslMode::Implicit
+                    } else {
+                        ftp_ssl_mode
+                    };
+                    // For 307/308 redirects with upload data, this becomes an FTP upload
+                    let ftp_upload_data = current_body.as_deref();
+                    let ftp_resume_offset = None;
+                    let ftp_result = crate::protocol::ftp::perform(
+                        &next_url,
+                        ftp_upload_data,
+                        effective_ssl_mode,
+                        use_ssl,
+                        tls_config,
+                        ftp_resume_offset,
+                        ftp_config,
+                        None,
+                        ftp_session,
+                    )
+                    .await;
+
+                    match ftp_result {
+                        Ok(mut ftp_resp) => {
+                            // Clear FTP protocol headers — don't include them in output
+                            // when redirecting from HTTP to FTP (curl compat: tests 973, 1028)
+                            ftp_resp.set_raw_headers(Vec::new());
+                            ftp_resp.set_redirect_responses(redirect_chain);
+                            return Ok(ftp_resp);
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+
                 // Capture intermediate redirect response for -L --include output
                 redirect_chain.push(response);
 
@@ -4957,7 +5012,8 @@ async fn do_single_request(
                     ftp_ssl_mode
                 };
                 // Extract resume/range from Range header for FTP.
-                // Formats: "bytes=42-" (resume from offset) or "bytes=4-16" (range).
+                // Formats: "bytes=42-" (resume from offset), "bytes=4-16" (range),
+                //          "bytes=-12" (last 12 bytes).
                 let ftp_range = headers.iter().find_map(|(k, v)| {
                     if k.eq_ignore_ascii_case("range") {
                         v.strip_prefix("bytes=").map(ToString::to_string)
@@ -4965,8 +5021,20 @@ async fn do_single_request(
                         None
                     }
                 });
+                // Detect negative range: "-N" (last N bytes, curl compat: test 1057)
+                let ftp_range_from_end = ftp_range.as_deref().and_then(|r| {
+                    if r.starts_with('-') && !r[1..].contains('-') {
+                        // "-12" format: last 12 bytes
+                        r[1..].parse::<u64>().ok()
+                    } else {
+                        None
+                    }
+                });
                 let resume_offset = ftp_range.as_deref().and_then(|r| {
-                    if r.ends_with('-') {
+                    if ftp_range_from_end.is_some() {
+                        // Negative range: resolved later from SIZE
+                        None
+                    } else if r.ends_with('-') {
                         // "42-" format: resume from offset 42
                         r.strip_suffix('-').and_then(|n| n.parse::<u64>().ok())
                     } else if let Some((start, _end)) = r.split_once('-') {
@@ -4978,7 +5046,10 @@ async fn do_single_request(
                 });
                 // Extract end byte for range limit (for ABOR after partial read)
                 let ftp_range_end = ftp_range.as_deref().and_then(|r| {
-                    if r.ends_with('-') {
+                    if ftp_range_from_end.is_some() {
+                        // Negative range: no fixed end byte
+                        None
+                    } else if r.ends_with('-') {
                         None // open-ended range
                     } else if let Some((_start, end)) = r.split_once('-') {
                         end.parse::<u64>().ok()
@@ -4990,6 +5061,7 @@ async fn do_single_request(
                 // Set range_end on ftp_config if needed
                 let mut ftp_config_with_range = ftp_config.clone();
                 ftp_config_with_range.range_end = ftp_range_end;
+                ftp_config_with_range.range_from_end = ftp_range_from_end;
                 let ftp_use_ssl = use_ssl;
                 return crate::protocol::ftp::perform(
                     url,
