@@ -15,18 +15,18 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 ## Current Status
 
 **Version:** v0.1.0 published (crates.io + GitHub Releases + Homebrew)
-**curl test suite:** 878 pass / 385 fail / 130 skip out of 1393 tests (69.5% pass rate, tests 1-1400)
-**Rust test count:** ~2,600
+**curl test suite:** 1,171 pass / 102 fail / 54 skip out of 1,327 tests (92% pass rate, tests 1-1400)
+**Rust test count:** 2,655
 **Blockers:** None — infrastructure is live
 
 ### What Has Been Built
 
-A functional curl replacement covering HTTP/1.0-1.1, HTTP/2, HTTP/3 (QUIC via quinn), TLS (rustls + native-tls), FTP/FTPS, SSH/SFTP/SCP, WebSocket, MQTT, SMTP, IMAP, POP3, DICT, TFTP, file://, DNS (system + hickory + DoH + DoT + Happy Eyeballs), cookies (Netscape format, domain-indexed, PSL, SameSite), HSTS, proxies (HTTP/SOCKS4/SOCKS4a/SOCKS5/HTTPS tunnel), authentication (Basic, Digest, Bearer, AWS SigV4, NTLMv2, SCRAM-SHA-256), connection pooling, rate limiting, multipart form upload, decompression (gzip, deflate, br, zstd), and a C ABI compatibility layer (liburlx-ffi with 56 exported functions).
+A functional curl replacement covering HTTP/1.0-1.1, HTTP/2, HTTP/3 (QUIC via quinn), TLS (rustls + native-tls + STARTTLS), FTP/FTPS, SSH/SFTP/SCP, WebSocket, MQTT, SMTP, IMAP, POP3, DICT, TFTP, file://, DNS (system + hickory + DoH + DoT + Happy Eyeballs), cookies (Netscape format, domain-indexed, PSL, SameSite), HSTS, proxies (HTTP/SOCKS4/SOCKS4a/SOCKS5/HTTPS tunnel), authentication (Basic, Digest, Bearer, AWS SigV4, NTLMv2, SCRAM-SHA-256, SASL CRAM-MD5/OAUTHBEARER/XOAUTH2/EXTERNAL), connection pooling, rate limiting, multipart form upload, decompression (gzip, deflate, br, zstd), and a C ABI compatibility layer (liburlx-ffi with 57 exported functions).
 
 **Key stats:**
-- CLI flags: 238 long + 40 short (~89 no-ops); curl has ~250 long flags
-- FFI: 119 CURLOPT, 47 CURLINFO, 42 CURLcode, 56 exported functions (all with catch_unwind)
-- 141 Rust source files, ~59,000 lines of code
+- CLI flags: 261 long + 46 short; curl has ~250 long flags
+- FFI: 156 CURLOPT, 49 CURLINFO, 41 CURLcode, 57 exported functions (all with catch_unwind)
+- 141 Rust source files, ~72,000 lines of code
 - 4 fuzz harnesses, 9 benchmark groups, 20+ feature flags
 
 ### Known Issues
@@ -107,90 +107,79 @@ Document every skip with a reason. Skips without rationale are not allowed.
 
 ---
 
-## Remaining Work: Failure Analysis (as of 2026-03-17)
+## Remaining Work: Failure Analysis (as of 2026-03-19)
 
-Full test suite run: 878 pass / 385 fail / 130 skip (tests 1-1400, 30s timeout). (+164 from session start of 714).
+Full test suite run: 1,171 pass / 102 fail / 54 skip (tests 1-1400, 30s timeout). **92% pass rate.**
 
-**78% of failures are bugs in existing features. 22% need new/incomplete features.**
+### Failing Tests by Category (102 total)
 
-66% of failures are protocol mismatches (wrong commands/headers sent), 10% exit codes, 8% wrong body, 7% wrong stdout, 6% wrong stderr.
+| # | Category | Tests | Count | Details |
+|---|----------|-------|-------|---------|
+| 1 | **Source/build analysis** | 745, 1013, 1014, 1022, 1023, 1026, 1027, 1119, 1135, 1139, 1165, 1167, 1173, 1177, 1185, 1222 | 16 | curl-config, source symbol checks, man page sync, checksrc — N/A for urlx |
+| 2 | **IMAP edge cases** | 795, 800, 815, 816, 847, 897, 1221 | 7 | STORE/CLOSE/EXPUNGE custom commands, login options, IMAP via HTTP proxy |
+| 3 | **HTTP NTLM auth** | 547, 548, 555, 560, 694, 775, 895 | 7 | NTLM with POST callback, Negotiate, multi-interface |
+| 4 | **FTP over SOCKS/proxy** | 706, 707, 712, 713, 714, 715, 1050, 1059, 1069, 1105 | 10 | FTP via SOCKS4/5, HTTP CONNECT tunnel, IPv6 EPRT, proxy relay |
+| 5 | **HTTP PUT/POST edge cases** | 186, 357, 490, 491, 492, 493, 1015, 1077, 1106 | 9 | Expect 100, PUT methods, POST encoding, cookies with POST |
+| 6 | **HTTP headers/encoding** | 306, 313, 373, 379, 415, 471, 483 | 7 | HTTPS cert/CRL, chunked encoding, Content-Length edge cases, globbing |
+| 7 | **Email via HTTP tunnel** | 1319, 1320, 1321 | 3 | POP3/SMTP/IMAP through HTTP CONNECT proxy |
+| 8 | **SMTP/IMAP auth cancellation** | 932, 933, 971 | 3 | CRAM-MD5/NTLM graceful cancellation (hangs on --max-time + -T -) |
+| 9 | **HTTP etag/resume** | 338, 369, 481, 482, 484, 485, 487, 497 | 8 | Etag multi-URL, --no-clobber + resume, --remove-on-error |
+| 10 | **CLI/globbing/output** | 760, 761, 762, 776, 988, 1134, 1265, 1268, 1292, 1299, 1328, 1370, 1371, 1400 | 14 | Globbing edge cases, --remote-time, -J Content-Disposition, --libcurl, NO_PROXY IPv6 |
+| 11 | **FTP misc** | 203, 254, 590, 1217, 1224, 1225, 1226 | 7 | file:// edge case, IPv6 EPSV, FTP NLST, PASV RETR |
+| 12 | **SMTP MIME/misc** | 609, 646, 647, 648, 649, 669 | 6 | Multipart MIME, IMAP APPEND upload, SMTP edge cases |
+| 13 | **TLS/HTTPS** | 306, 313 | 2 | PEM cert validation, CRL checking |
+| 14 | **Misc** | 1020, 1105, 1106, 1117, 1147, 1148, 1152 | 7 | Various HTTP edge cases, proxy interactions |
 
-### Bug Fixes Needed (ordered by test impact)
+### Permanently Skippable (~16 tests)
 
-| # | Bug | ~Tests | Effort | Details |
-|---|-----|--------|--------|---------|
-| 1 | **HTTP proxy CONNECT + NTLM proxy auth** | ~40 | 3-4 days | NTLM Type 1 repeated instead of Type 3; body sent during auth negotiation; CONNECT tunnel not reused; Digest proxy auth broken |
-| 2 | **SMTP QUIT + advanced auth + MIME** | ~30 | 2 days | Missing QUIT after some auth paths; need CRAM-MD5/NTLM/XOAUTH2; VRFY/EXPN commands; multipart MIME upload; long lines truncated |
-| 3 | **Cookie/HSTS fixes** | ~20 | 1-2 days | -b file vs string detection; cookie count 151→150; 8KB header cap; Max-Age=0; secure cookies; HSTS trailing dots |
-| 4 | **--write-out variables** | ~14 | 1 day | Missing %{certs}, %{header_json}, %{url.*} variables |
-| 5 | **Auth credential stripping on redirect** | ~13 | 1 day | Authorization/Cookie header leaks cross-host; --oauth2-bearer not stripped |
-| 6 | **Content/chunked encoding** | ~15 | 1-2 days | --raw chunked passthrough; broken deflate; trailer headers; --max-filesize with chunked; JSON Unicode |
-| 7 | **Expect: 100-continue** | ~10 | 1 day | Body sent before 100 response; Content-Length wrong when body suppressed |
-| 8 | **FTP misc** | ~20 | 1-2 days | URL encoding in paths (%0a, %0d); NLST; active PORT quirks; --ftp-method nocwd; quote commands |
-| 9 | **--next + --expand-data + URL encoding** | ~16 | 1-2 days | Headers leak between --next requests; {{var:func}} not expanded; { } escaping |
-| 10 | **SOCKS proxy** | ~10 | 1 day | SOCKS5 auth; SOCKS4 long usernames; hostname-mode; --connect-to with SOCKS |
-| 11 | **HTTP resume (GET)** | ~5 | 0.5 day | Resume from end of file, beyond end, with --fail |
-| 12 | **Misc CLI** | ~30 | 2-3 days | Header line folding; TE header; -K config file bugs; flag-like filename warnings; --no-remote-name; various small fixes |
+Tests in category 1 (source/build analysis) are not applicable to urlx — they verify curl's own source code structure, man pages, and build system. These should be permanently skipped.
 
-### New Features Needed
+### Addressable Failures (~86 tests)
 
-| # | Feature | ~Tests | Effort | Details |
-|---|---------|--------|--------|---------|
-| 1 | **IMAP full protocol** | ~50 | 2-3 days | RFC 5092 URL parsing (UIDVALIDITY, SECTION); LIST/SEARCH/EXAMINE commands; APPEND uploads; custom -X commands; raw body output (not HTTP-wrapped); AUTH mechanisms |
-| 2 | **POP3 full protocol** | ~35 | 1-2 days | AUTH mechanisms (XOAUTH2, PLAIN); RETR body output (not HTTP-wrapped); LIST; DELE; custom -X commands |
-| 3 | **FTPS TLS pipeline** | ~11 | 3-4 days | After AUTH TLS + PBSZ 0, FTP command flow stops — TLS stream wrapping is broken. Need to rewrap reader/writer with TLS after STARTTLS |
+| Priority | Category | ~Tests | Effort |
+|----------|----------|--------|--------|
+| High | FTP over SOCKS/proxy | ~10 | 1-2 days |
+| High | HTTP PUT/POST/Expect | ~9 | 1 day |
+| High | IMAP edge cases | ~7 | 1 day |
+| Medium | HTTP NTLM (POST callback) | ~7 | 1-2 days |
+| Medium | CLI/globbing/output | ~14 | 2 days |
+| Medium | HTTP etag/resume | ~8 | 1 day |
+| Medium | Email via HTTP tunnel | ~3 | 0.5 day |
+| Medium | SMTP MIME/misc | ~6 | 1 day |
+| Low | HTTP headers/encoding | ~7 | 1 day |
+| Low | FTP misc | ~7 | 1 day |
+| Low | Auth cancellation (hangs) | ~3 | 1 day |
+| Low | Misc | ~7 | 1-2 days |
 
-### Estimated Path to 90%+
-
-Total addressable: ~330 of 520 failures (63%). Remaining ~190 are edge cases, complex interactions, and tests requiring deeper architectural changes (HTTP/2 multiplexing, multi-interface event loop, etc.).
+### Path to 95%+
 
 | Milestone | Pass Rate | Work |
 |-----------|-----------|------|
-| Current | 61.6% (708/1149) | — |
-| Quick bug fixes (cookies, auth, FTP) | ~62% (~710) | 1 week |
-| IMAP + POP3 protocols | ~69% (~795) | +1 week |
-| Proxy CONNECT + NTLM + FTPS | ~76% (~875) | +2 weeks |
-| Long tail (encoding, CLI, misc) | ~82% (~940) | +2 weeks |
+| Current | 92% (1,171/1,273 non-skipped) | — |
+| Skip source analysis tests | 93.5% (1,171/1,257) | 0 effort |
+| FTP proxy + HTTP PUT/POST | 95% (~1,190) | 1 week |
+| IMAP + CLI + etag fixes | 97% (~1,220) | +1 week |
+| Long tail (NTLM, MIME, misc) | 98%+ (~1,240) | +2 weeks |
 
 ---
 
-## Completed Batches
+## Test Suite Progress
 
-### HTTP-1 (tests 1-20) — COMPLETE
-All 20 tests pass.
+1,171 of 1,327 tests pass (92%). The test suite spans tests 1-1400 with 54 skipped (libtests, missing features, debug-only).
 
-### HTTP-2 (tests 21-40) — COMPLETE
-All 20 tests pass.
+### By Range
 
-### HTTP-3 (tests 41-60) — COMPLETE
-All 20 tests pass.
-
-### HTTP-4 (tests 61-99) — COMPLETE
-All 39 tests pass. Fixed: Digest auth, NTLM, --anyauth, HTTP/0.9, http_proxy env, CONNECT tunneling, globbing, cookies.
-
-### FTP-1 (tests 100-130) — COMPLETE
-All 31 tests pass. Complete FTP protocol rewrite: USER/PASS/PWD/CWD/EPSV/TYPE/LIST|RETR|STOR|APPE/QUIT, active mode, resume, quote commands, --crlf, .netrc.
-
-### HTTP-5 / FTP-2 (tests 131-199) — COMPLETE
-57/67 pass. Fixed: FTP credentials (URL > -u > netrc), --ftp-create-dirs, byte ranges, MDTM time conditions, -I head mode, --anyauth pre-auth suppression, Digest stale=true, -F type= parsing, --retry, inline cookies, negative Content-Length, Range across redirects.
-
-### FILE / HTTPS / PROXY (tests 200-500) — PARTIAL
-62/149 pass (additional tests beyond previously passing). Fixed: file:// read/write/resume, decompression preserving raw_headers, null byte detection, chunked premature close, bare-LF chunked, --json @file, --etag-save/compare, --dump-header validation, --max-filesize Content-Length, --fail-with-body interaction, URL credential extraction for HTTP.
-
-### HTTP-6 / NETRC / MISC (tests 550-700) — PARTIAL
-14/63 pass (tests 500-550 are all libtests/skipped). Fixed: chunked transfer with mixed \r\n/\n line endings, netrc quoted password parsing with escape sequences, --remote-name-all/--no-remote-name, --next exit code, -O trailing slash defaults to "curl_response", --output-dir with -O, --create-dirs for --etag-save, SOCKS4 proxy Connection header, redirect query string space encoding via proxy, multipart Content-Type boundary merging, FTP 332 ACCT response, URL credentials in multi-URL mode.
-
-### SFTP / SCP (tests 600-665) — PARTIAL
-20/45 pass. Enabled ssh feature, patched sshserver.pl for Ed25519 keys + russh-compatible KexAlgorithms. Fixed: SFTP/SCP download/upload, file creation, error code mapping (78 for file-not-found, 67 for login-denied). Remaining: SFTP quote commands (-Q), multi-URL SSH reuse, byte ranges, --ftp-create-dirs for SFTP, host key verification edge cases.
-
-### HTTP-7 / Content-Length / Redirect (tests 700-800) — PARTIAL
-22/48 pass. Fixed: Content-Length validation (trailing chars, comma-separated, conflicting duplicates), duplicate Location headers, --follow flag, 302/308 redirect method conversion, NETRC env var, -f header output, --variable flag with byte ranges.
-
-### FTP Connection Reuse (tests 146, 149, 210-212, 215-216, 407, 698, 1010, 1096, 1149) — COMPLETE
-All 12 tests pass. FTP control connection reused across multi-URL transfers: CWD / to reset between different directories, skip CWD when same directory, EPSV/PASV/PORT fallback persisted, TYPE command cached, QUIT only sent at end. Session stored in Easy handle and transferred across --next boundaries.
-
-### --variable (tests 784-791) — COMPLETE
-All 7 tests pass. Implemented --variable and --expand-data flags with file loading, stdin, byte ranges, and {{variable}} expansion.
+| Range | Description | Pass/Total | Notes |
+|-------|-------------|------------|-------|
+| 1-99 | HTTP basics | 97/97 | All pass |
+| 100-199 | FTP, HTTP auth/forms | 88/93 | 5 failures (186, 190 timeout edge cases) |
+| 200-399 | file://, HTTPS, proxy | 175/192 | Failures: HTTPS cert CRL, etag, chunked, proxy edge cases |
+| 400-599 | HTTP proxy, POST | 75/103 | ~16 are libtests/skipped; failures in NTLM POST callback, SOCKS |
+| 600-699 | SFTP/SCP, SMTP, IMAP | 63/82 | SMTP MIME, IMAP custom commands |
+| 700-799 | Cookies, HSTS, headers | 73/82 | Globbing, NTLM, etag edge cases |
+| 800-999 | SSH, SMTP, IMAP, POP3 | 268/282 | SASL auth cancellation hangs, login options |
+| 1000-1199 | HTTP/2, misc, analysis | 158/188 | ~16 source analysis tests (N/A), FTP proxy, NTLM |
+| 1200-1400 | Advanced features | 174/208 | CLI output, Content-Disposition, --libcurl |
 
 ---
 
