@@ -1764,6 +1764,11 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
                 let val = require_arg(args, i, "--ftp-account")?;
                 opts.easy.ftp_account(val);
             }
+            "--ftp-alternative-to-user" => {
+                i += 1;
+                let val = require_arg(args, i, "--ftp-alternative-to-user")?;
+                opts.easy.ftp_alternative_to_user(val);
+            }
             "--ftp-method" => {
                 i += 1;
                 let val = require_arg(args, i, "--ftp-method")?;
@@ -2141,7 +2146,6 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
             | "--proxy-pass"
             | "--curves"
             | "--engine"
-            | "--ftp-alternative-to-user"
             | "--krb"
             | "--random-file"
             | "--egd-file"

@@ -145,6 +145,8 @@ pub struct Easy {
     ftp_skip_pasv_ip: bool,
     /// FTP account string (sent via ACCT command).
     ftp_account: Option<String>,
+    /// Alternative USER command when initial USER fails (curl `--ftp-alternative-to-user`).
+    ftp_alternative_to_user: Option<String>,
     /// Path to SSH private key for SFTP/SCP authentication.
     ssh_key_path: Option<String>,
     /// Path to SSH public key file for SFTP/SCP authentication.
@@ -437,6 +439,7 @@ impl Clone for Easy {
             ftp_use_eprt: self.ftp_use_eprt,
             ftp_skip_pasv_ip: self.ftp_skip_pasv_ip,
             ftp_account: self.ftp_account.clone(),
+            ftp_alternative_to_user: self.ftp_alternative_to_user.clone(),
             ssh_key_path: self.ssh_key_path.clone(),
             ssh_public_keyfile: self.ssh_public_keyfile.clone(),
             ssh_host_key_sha256: self.ssh_host_key_sha256.clone(),
@@ -569,6 +572,7 @@ impl Easy {
             ftp_use_eprt: true,
             ftp_skip_pasv_ip: false,
             ftp_account: None,
+            ftp_alternative_to_user: None,
             ssh_key_path: None,
             ssh_public_keyfile: None,
             ssh_host_key_sha256: None,
@@ -1936,6 +1940,13 @@ impl Easy {
         self.ftp_account = Some(account.to_string());
     }
 
+    /// Set an alternative command to send when USER fails.
+    ///
+    /// Equivalent to `CURLOPT_FTP_ALTERNATIVE_TO_USER` / curl's `--ftp-alternative-to-user`.
+    pub fn ftp_alternative_to_user(&mut self, cmd: &str) {
+        self.ftp_alternative_to_user = Some(cmd.to_string());
+    }
+
     /// Set a time condition for FTP downloads (`-z` flag).
     ///
     /// When set, FTP downloads use MDTM to check file modification time.
@@ -2675,6 +2686,7 @@ impl Easy {
             max_filesize: self.max_filesize,
             ssl_control: self.ftp_ssl_control,
             ssl_ccc: self.ftp_ssl_ccc,
+            alternative_to_user: self.ftp_alternative_to_user.clone(),
         };
 
         let dns_resolver = self.build_dns_resolver();
@@ -2786,6 +2798,9 @@ impl Easy {
             } else {
                 // Timeout — grab whatever response was stored before cancellation
                 self.last_response = last_resp_store.lock().ok().and_then(|mut g| g.take());
+                // Discard FTP session without QUIT — connection is dead after timeout
+                // (curl compat: test 1208 — no QUIT after timeout)
+                let _ = self.ftp_session.take();
                 return Err(Error::Timeout(timeout));
             }
         } else {
