@@ -122,8 +122,11 @@ impl HstsCache {
             // Also supports tab-separated format: `host\ttimestamp\tinclude_subdomains`
             if let Some((host_part, rest)) = line.split_once('"') {
                 // curl format: host "YYYYMMDD HH:MM:SS"
+                // A leading dot means includeSubDomains (curl compat: test 493)
                 let trimmed = host_part.trim();
-                let host = trimmed.strip_suffix('.').unwrap_or(trimmed).to_lowercase();
+                let (include_subdomains, trimmed_host) =
+                    trimmed.strip_prefix('.').map_or((false, trimmed), |h| (true, h));
+                let host = trimmed_host.strip_suffix('.').unwrap_or(trimmed_host).to_lowercase();
                 let date_str = rest.trim_end_matches('"').trim();
                 if let Some(expire_ts) = parse_hsts_date(date_str) {
                     if expire_ts > now_secs {
@@ -133,7 +136,7 @@ impl HstsCache {
                             HstsEntry {
                                 expires: Instant::now() + Duration::from_secs(remaining_secs),
                                 expire_timestamp: expire_ts,
-                                include_subdomains: false,
+                                include_subdomains,
                             },
                         );
                     }

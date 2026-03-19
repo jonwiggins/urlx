@@ -522,14 +522,17 @@ pub fn run(args: &[String]) -> ExitCode {
         let mut expanded_urls = Vec::new();
         let mut expanded_values = Vec::new();
         let mut expanded_groups = Vec::new();
+        let mut expanded_upload_files = Vec::new();
         for (url_idx, url) in opts.urls.iter().enumerate() {
             let group = opts.per_url_group.get(url_idx).copied().unwrap_or(0);
+            let upload_file = opts.per_url_upload_files.get(url_idx).cloned().unwrap_or(None);
             match liburlx::glob::expand_glob_with_values(url) {
                 Ok(entries) => {
                     for (expanded_url, values) in entries {
                         expanded_urls.push(expanded_url);
                         expanded_values.push(values);
                         expanded_groups.push(group);
+                        expanded_upload_files.push(upload_file.clone());
                     }
                 }
                 Err(e) => {
@@ -543,6 +546,135 @@ pub fn run(args: &[String]) -> ExitCode {
         opts.urls = expanded_urls;
         opts.glob_values = expanded_values;
         opts.per_url_group = expanded_groups;
+        opts.per_url_upload_files = expanded_upload_files;
+    }
+
+    // Expand -T upload file globs: `-T '{file1,file2}' URL` expands to multiple uploads.
+    // For each upload file glob, iterate through all URLs (cartesian product).
+    // curl compat: tests 490, 491, 492
+    if opts.is_upload && !opts.globoff {
+        // Also handle the case where upload_file_path has globs but per_url_upload_files
+        // entries are None (e.g., `URL -T '{file1,file2}'` where URL comes before -T)
+        let upload_path_has_glob =
+            opts.upload_file_path.as_ref().is_some_and(|p| p.contains('{') || p.contains('['));
+        if upload_path_has_glob {
+            // Apply the glob upload_file_path to all URLs that don't have their own
+            let glob_path = opts.upload_file_path.clone().unwrap_or_default();
+            for entry in &mut opts.per_url_upload_files {
+                if entry.is_none() {
+                    *entry = Some(glob_path.clone());
+                }
+            }
+        }
+        // Check if any upload file path contains glob patterns
+        let has_upload_glob = opts
+            .per_url_upload_files
+            .iter()
+            .any(|f| f.as_ref().is_some_and(|path| path.contains('{') || path.contains('[')));
+        if has_upload_glob {
+            let mut new_urls = Vec::new();
+            let mut new_upload_files = Vec::new();
+            let mut new_groups = Vec::new();
+            let mut new_glob_values = Vec::new();
+            let mut new_per_url_easy = Vec::new();
+            let mut new_per_url_creds = Vec::new();
+            let mut new_per_url_ftp_methods = Vec::new();
+
+            // Gather all URLs that share the same upload file glob
+            let mut i = 0;
+            while i < opts.urls.len() {
+                let upload_file = opts.per_url_upload_files.get(i).cloned().unwrap_or(None);
+                if let Some(ref path) = upload_file {
+                    if path.contains('{') || path.contains('[') {
+                        // Expand the upload file glob
+                        let upload_paths = match liburlx::glob::expand_glob(path) {
+                            Ok(paths) => paths,
+                            Err(_) => {
+                                // Not a valid glob, treat as literal
+                                vec![path.clone()]
+                            }
+                        };
+                        // Find all consecutive URLs that share this upload glob
+                        // (from URL glob expansion, they all have the same upload_file)
+                        let mut url_group_end = i + 1;
+                        while url_group_end < opts.urls.len() {
+                            let next_upload = opts
+                                .per_url_upload_files
+                                .get(url_group_end)
+                                .and_then(|f| f.as_ref());
+                            if next_upload == Some(path) {
+                                url_group_end += 1;
+                            } else {
+                                break;
+                            }
+                        }
+                        let url_range = i..url_group_end;
+
+                        // Cartesian product: for each upload file, iterate all URLs
+                        for upload_path in &upload_paths {
+                            let fname = std::path::Path::new(upload_path)
+                                .file_name()
+                                .map(|n| n.to_string_lossy().to_string());
+                            for j in url_range.clone() {
+                                let mut url = opts.urls[j].clone();
+                                // Append filename to URL path if URL ends with /
+                                if let Some(ref f) = fname {
+                                    if url.ends_with('/') {
+                                        url.push_str(f);
+                                    }
+                                }
+                                new_urls.push(url);
+                                new_upload_files.push(Some(upload_path.clone()));
+                                new_groups.push(opts.per_url_group.get(j).copied().unwrap_or(0));
+                                new_glob_values
+                                    .push(opts.glob_values.get(j).cloned().unwrap_or_default());
+                                new_per_url_easy
+                                    .push(opts.per_url_easy.get(j).cloned().unwrap_or(None));
+                                new_per_url_creds
+                                    .push(opts.per_url_credentials.get(j).cloned().unwrap_or(None));
+                                new_per_url_ftp_methods.push(
+                                    opts.per_url_ftp_methods.get(j).copied().unwrap_or_default(),
+                                );
+                            }
+                        }
+                        i = url_group_end;
+                    } else {
+                        // Non-glob upload file — pass through as-is
+                        new_urls.push(opts.urls[i].clone());
+                        new_upload_files.push(upload_file);
+                        new_groups.push(opts.per_url_group.get(i).copied().unwrap_or(0));
+                        new_glob_values.push(opts.glob_values.get(i).cloned().unwrap_or_default());
+                        new_per_url_easy.push(opts.per_url_easy.get(i).cloned().unwrap_or(None));
+                        new_per_url_creds
+                            .push(opts.per_url_credentials.get(i).cloned().unwrap_or(None));
+                        new_per_url_ftp_methods
+                            .push(opts.per_url_ftp_methods.get(i).copied().unwrap_or_default());
+                        i += 1;
+                    }
+                } else {
+                    // No upload file for this URL — pass through
+                    new_urls.push(opts.urls[i].clone());
+                    new_upload_files.push(upload_file);
+                    new_groups.push(opts.per_url_group.get(i).copied().unwrap_or(0));
+                    new_glob_values.push(opts.glob_values.get(i).cloned().unwrap_or_default());
+                    new_per_url_easy.push(opts.per_url_easy.get(i).cloned().unwrap_or(None));
+                    new_per_url_creds
+                        .push(opts.per_url_credentials.get(i).cloned().unwrap_or(None));
+                    new_per_url_ftp_methods
+                        .push(opts.per_url_ftp_methods.get(i).copied().unwrap_or_default());
+                    i += 1;
+                }
+            }
+            opts.urls = new_urls;
+            opts.per_url_upload_files = new_upload_files;
+            opts.per_url_group = new_groups;
+            opts.glob_values = new_glob_values;
+            opts.per_url_easy = new_per_url_easy;
+            opts.per_url_credentials = new_per_url_creds;
+            opts.per_url_ftp_methods = new_per_url_ftp_methods;
+            // Clear single upload_filename since each URL now has its own
+            opts.upload_filename = None;
+        }
     }
 
     // -G/--get: move POST body data into URL query string
@@ -629,7 +761,10 @@ pub fn run(args: &[String]) -> ExitCode {
     // Deferred -T file read for multi-URL path: load upload file before run_multi
     // returns early (run_multi clones the easy handle, so body must be set now).
     // Single-URL path has its own deferred read further below (line ~892).
-    if opts.urls.len() > 1 {
+    // Skip if -T was glob-expanded — each URL has its own file in per_url_upload_files.
+    let upload_glob_expanded =
+        opts.is_upload && opts.per_url_upload_files.iter().filter(|f| f.is_some()).count() > 1;
+    if opts.urls.len() > 1 && !upload_glob_expanded {
         if let Some(ref path) = opts.upload_file_path {
             match std::fs::read(path) {
                 Ok(data) => {
@@ -2313,44 +2448,55 @@ pub fn run_multi(
             || url.starts_with("ftps://")
             || url.starts_with("sftp://")
             || url.starts_with("scp://");
-        if is_upload && i > 0 && !is_ftp_url {
+        if is_upload && !is_ftp_url {
             let has_own_upload = per_url_upload_files.get(i).is_some_and(|f| f.is_some());
             if has_own_upload {
-                // This URL has its own -T flag: re-read the file
+                // This URL has its own -T file: read the file
                 if let Some(Some(ref path)) = per_url_upload_files.get(i) {
-                    if let Ok(data) = std::fs::read(path) {
-                        // Apply resume offset if set (Content-Range + body slicing, curl compat: test 1002)
-                        if let Some(offset) = resume_offset {
-                            if offset > 0 {
-                                let total = data.len() as u64;
-                                let end = total.saturating_sub(1);
-                                if offset <= end {
-                                    #[allow(clippy::cast_possible_truncation)]
-                                    let start = offset as usize;
-                                    let sliced = &data[start..];
-                                    easy.remove_header("Content-Range");
-                                    easy.header(
-                                        "Content-Range",
-                                        &format!("bytes {offset}-{end}/{total}"),
-                                    );
-                                    easy.body(sliced);
+                    match std::fs::read(path) {
+                        Ok(data) => {
+                            // Apply resume offset if set (Content-Range + body slicing, curl compat: test 1002)
+                            if let Some(offset) = resume_offset {
+                                if offset > 0 {
+                                    let total = data.len() as u64;
+                                    let end = total.saturating_sub(1);
+                                    if offset <= end {
+                                        #[allow(clippy::cast_possible_truncation)]
+                                        let start = offset as usize;
+                                        let sliced = &data[start..];
+                                        easy.remove_header("Content-Range");
+                                        easy.header(
+                                            "Content-Range",
+                                            &format!("bytes {offset}-{end}/{total}"),
+                                        );
+                                        easy.body(sliced);
+                                    } else {
+                                        easy.body(&[]);
+                                    }
                                 } else {
-                                    easy.body(&[]);
+                                    easy.body(&data);
                                 }
                             } else {
                                 easy.body(&data);
                             }
-                        } else {
-                            easy.body(&data);
+                            // Only default to PUT if no explicit -X method was set
+                            // (curl compat: test 1002 — -X GET overrides -T's PUT)
+                            if easy.method_is_default() {
+                                easy.method("PUT");
+                            }
                         }
-                        // Only default to PUT if no explicit -X method was set
-                        // (curl compat: test 1002 — -X GET overrides -T's PUT)
-                        if easy.method_is_default() {
-                            easy.method("PUT");
+                        Err(e) => {
+                            // Missing file: report error but continue with remaining transfers
+                            // (curl compat: test 491 — error 26 for missing upload file)
+                            if !silent || show_error {
+                                eprintln!("curl: can't open '{path}' for reading: {e}");
+                            }
+                            last_exit = ExitCode::from(26); // CURLE_READ_ERROR
+                            continue;
                         }
                     }
                 }
-            } else if easy.has_body() {
+            } else if i > 0 && easy.has_body() {
                 // No -T for this URL: revert to GET (curl compat: test 1065)
                 let _ = easy.take_body();
                 easy.method("GET");
@@ -2525,12 +2671,16 @@ pub fn run_multi(
                 // Only downgrade when connection reuse is expected — if the server
                 // closes the connection, the next request creates a fresh connection
                 // which should use HTTP/1.1 (curl compat: test 1258).
+                // For FTP-over-proxy, check Proxy-Connection as well (curl compat: test 1077).
                 if response.http_version()
                     == liburlx::protocol::http::response::ResponseHttpVersion::Http10
                 {
                     let has_keepalive = response
                         .header("connection")
-                        .is_some_and(|v| v.eq_ignore_ascii_case("keep-alive"));
+                        .is_some_and(|v| v.eq_ignore_ascii_case("keep-alive"))
+                        || response
+                            .header("proxy-connection")
+                            .is_some_and(|v| v.eq_ignore_ascii_case("keep-alive"));
                     if has_keepalive {
                         easy.http_version(liburlx::HttpVersion::Http10);
                         downgraded_http10 = true;

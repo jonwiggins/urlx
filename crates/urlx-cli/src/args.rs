@@ -1303,8 +1303,14 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
             "--data-urlencode" => {
                 i += 1;
                 let val = require_arg(args, i, "--data-urlencode")?;
-                let encoded = urlencoded(val);
-                opts.easy.body(encoded.as_bytes());
+                let encoded = data_urlencode(val)?;
+                // Concatenate multiple --data-urlencode with & separator (curl compat: test 1015)
+                if opts.easy.has_body() {
+                    opts.easy.append_body(b"&");
+                    opts.easy.append_body(encoded.as_bytes());
+                } else {
+                    opts.easy.body(encoded.as_bytes());
+                }
                 opts.has_post_data = true;
                 if opts.easy.method_is_default() {
                     opts.easy.method("POST");
@@ -2389,13 +2395,84 @@ pub fn read_data_source(path: &str) -> Result<Vec<u8>, std::io::Error> {
 
 /// If the value contains `=`, only the part after the first `=` is encoded
 /// (the name is passed through as-is). Otherwise the entire value is encoded.
-pub fn urlencoded(input: &str) -> String {
+#[cfg(test)]
+fn urlencoded(input: &str) -> String {
     if let Some((name, value)) = input.split_once('=') {
         let encoded = percent_encode(value);
         format!("{name}={encoded}")
     } else {
         percent_encode(input)
     }
+}
+
+/// Handle `--data-urlencode` with full curl syntax (curl compat: test 1015).
+///
+/// Supported forms:
+/// - `content` — URL-encode the entire string
+/// - `=content` — URL-encode content (no name prefix)
+/// - `name=content` — name is literal, content is URL-encoded
+/// - `@filename` — read file, URL-encode entire contents
+/// - `name@filename` — name is literal, file contents are URL-encoded as value
+fn data_urlencode(input: &str) -> Result<String, u8> {
+    // Check for @filename form first (no name prefix)
+    if let Some(path) = input.strip_prefix('@') {
+        let data = std::fs::read(path).map_err(|e| {
+            eprintln!("curl: error reading data file '{path}': {e}");
+            1_u8
+        })?;
+        let s = String::from_utf8_lossy(&data);
+        return Ok(curl_urlencode(&s));
+    }
+
+    // Check for name@filename form: find @ before any =
+    if let Some(at_pos) = input.find('@') {
+        let eq_pos = input.find('=');
+        if eq_pos.is_none() || at_pos < eq_pos.unwrap_or(usize::MAX) {
+            let name = &input[..at_pos];
+            let path = &input[at_pos + 1..];
+            let data = std::fs::read(path).map_err(|e| {
+                eprintln!("curl: error reading data file '{path}': {e}");
+                1_u8
+            })?;
+            let s = String::from_utf8_lossy(&data);
+            return Ok(format!("{name}={}", curl_urlencode(&s)));
+        }
+    }
+
+    // =content form: encode entire content without name
+    if let Some(content) = input.strip_prefix('=') {
+        return Ok(curl_urlencode(content));
+    }
+
+    // name=content form: name is literal, content is URL-encoded
+    if let Some((name, content)) = input.split_once('=') {
+        return Ok(format!("{name}={}", curl_urlencode(content)));
+    }
+
+    // Plain content: URL-encode the entire string
+    Ok(curl_urlencode(input))
+}
+
+/// URL-encode using curl's convention: spaces become `+`, other special chars
+/// become `%XX`. This matches `application/x-www-form-urlencoded` encoding.
+pub fn curl_urlencode(input: &str) -> String {
+    let mut result = String::with_capacity(input.len());
+    for byte in input.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                result.push(byte as char);
+            }
+            b' ' => {
+                result.push('+');
+            }
+            _ => {
+                result.push('%');
+                result.push(char::from(HEX_CHARS[(byte >> 4) as usize]));
+                result.push(char::from(HEX_CHARS[(byte & 0x0F) as usize]));
+            }
+        }
+    }
+    result
 }
 
 /// Percent-encode a string per RFC 3986 (unreserved characters are not encoded).
@@ -2713,7 +2790,10 @@ fn parse_form_field(easy: &mut liburlx::Easy, val: &str) -> Result<(), String> {
         // Text field — parse value and optional modifiers (;type=, ;filename=)
         // The value can be quoted: "..." — in which case the closing quote ends the value
         // and modifiers follow after a `;`.
-        let (field_value, modifiers) = parse_text_value_and_modifiers(value);
+        let (raw_value, modifiers) = parse_text_value_and_modifiers(value);
+        // curl strips leading whitespace from unquoted text field values (curl compat: test 186)
+        let field_value =
+            if value.starts_with('"') { raw_value } else { raw_value.trim_start().to_string() };
 
         let mut custom_type: Option<String> = None;
         let mut custom_filename: Option<String> = None;
@@ -2727,9 +2807,10 @@ fn parse_form_field(easy: &mut liburlx::Easy, val: &str) -> Result<(), String> {
             }
         }
 
-        // Merge type sub-parameters: e.g., "type=text/foo; charset=utf-8" where
+        // Merge type sub-parameters: e.g., "type=text/html;charset=utf-8" where
         // charset= is a Content-Type parameter, not a form modifier.
-        // curl treats unknown modifiers after type= as Content-Type sub-params.
+        // curl treats unknown modifiers after type= as Content-Type sub-params
+        // and joins them with `;` (no space) matching the original input (curl compat: test 186).
         if let Some(ref mut ct) = custom_type {
             for modifier in &modifiers {
                 let trimmed = modifier.trim();
@@ -2739,7 +2820,7 @@ fn parse_form_field(easy: &mut liburlx::Easy, val: &str) -> Result<(), String> {
                     && !trimmed.is_empty()
                 {
                     // Unknown modifier after type — append as Content-Type sub-param
-                    ct.push_str("; ");
+                    ct.push(';');
                     ct.push_str(trimmed);
                 }
             }

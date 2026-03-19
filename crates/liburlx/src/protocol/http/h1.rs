@@ -357,6 +357,115 @@ where
                             throttled_write(stream, body_data, &mut send_limiter).await?;
                         }
                     }
+                } else if status == 417 && use_expect {
+                    // Server rejected our auto-emitted Expect header with 417 Expectation Failed.
+                    // Consume the 417 response body, then retry the request without Expect
+                    // (curl compat: test 357).
+                    let ph = parse_headers(&header_bytes)?;
+                    let is_head = method.eq_ignore_ascii_case("HEAD");
+                    let no_body_417 = is_head
+                        || ph.status == 204
+                        || ph.status == 304
+                        || (100..200).contains(&ph.status);
+                    let mut recv_limiter = RateLimiter::for_recv(speed_limits);
+                    if !no_body_417 {
+                        // Read and discard the 417 response body
+                        let _ = read_body_from_headers(
+                            stream,
+                            &ph.headers,
+                            body_prefix,
+                            keep_alive,
+                            ignore_content_length,
+                            &mut recv_limiter,
+                            deadline,
+                            raw,
+                        )
+                        .await?;
+                    }
+
+                    // Build the 417 response for output (curl includes it in the output)
+                    let mut resp_417 =
+                        Response::new(ph.status, ph.headers, Vec::new(), url.to_string());
+                    resp_417.set_raw_headers(normalize_raw_headers_for_output(&header_bytes));
+                    resp_417.set_header_original_names(ph.original_names);
+                    resp_417.set_headers_ordered(ph.headers_ordered);
+                    resp_417.set_status_reason(ph.reason);
+                    resp_417.set_uses_crlf(ph.uses_crlf);
+                    resp_417.set_http_version(ph.version);
+
+                    // Rebuild request without Expect header and resend
+                    let mut retry_req = req.replace("Expect: 100-continue\r\n", "");
+                    // Fix: if the retry_req was already built with the right content,
+                    // just make sure Expect header is removed
+                    if retry_req == req {
+                        // Expect header wasn't in the format we expected, try case-insensitive
+                        retry_req = req.clone();
+                    }
+                    stream
+                        .write_all(retry_req.as_bytes())
+                        .await
+                        .map_err(|e| Error::Http(format!("write failed: {e}")))?;
+
+                    // Send body with the retry request
+                    if let Some(body_data) = body {
+                        if use_chunked {
+                            write_chunked_body(stream, body_data, &mut send_limiter).await?;
+                        } else {
+                            throttled_write(stream, body_data, &mut send_limiter).await?;
+                        }
+                    }
+
+                    // Read the retry response
+                    let (retry_header_bytes, retry_body_prefix) =
+                        read_response_headers(stream).await?;
+                    let retry_ph = parse_headers(&retry_header_bytes)?;
+                    let retry_no_body = is_head
+                        || retry_ph.status == 204
+                        || retry_ph.status == 304
+                        || (100..200).contains(&retry_ph.status);
+                    let mut retry_recv_limiter = RateLimiter::for_recv(speed_limits);
+                    let (retry_body, retry_eof, retry_trailers, retry_raw_trailers) =
+                        if retry_no_body {
+                            (Vec::new(), false, HashMap::new(), Vec::new())
+                        } else {
+                            read_body_from_headers(
+                                stream,
+                                &retry_ph.headers,
+                                retry_body_prefix,
+                                keep_alive,
+                                ignore_content_length,
+                                &mut retry_recv_limiter,
+                                deadline,
+                                raw,
+                            )
+                            .await?
+                        };
+                    let retry_close = retry_ph
+                        .headers
+                        .get("connection")
+                        .is_some_and(|v| v.eq_ignore_ascii_case("close"));
+                    let can_reuse = keep_alive && !use_http10 && !retry_close && !retry_eof;
+                    let mut resp = Response::new(
+                        retry_ph.status,
+                        retry_ph.headers,
+                        retry_body,
+                        url.to_string(),
+                    );
+                    resp.set_header_original_names(retry_ph.original_names);
+                    resp.set_headers_ordered(retry_ph.headers_ordered);
+                    resp.set_status_reason(retry_ph.reason);
+                    resp.set_uses_crlf(retry_ph.uses_crlf);
+                    resp.set_http_version(retry_ph.version);
+                    resp.set_raw_headers(normalize_raw_headers_for_output(&retry_header_bytes));
+                    if !retry_trailers.is_empty() {
+                        resp.set_trailers(retry_trailers);
+                    }
+                    if !retry_raw_trailers.is_empty() {
+                        resp.set_raw_trailers(retry_raw_trailers);
+                    }
+                    // Prepend the 417 response in the redirect chain so it appears in output
+                    resp.push_redirect_response(resp_417);
+                    return Ok((resp, can_reuse));
                 } else {
                     // Server responded with final status — don't send body
                     // Re-parse the full response from what we already have
@@ -2603,15 +2712,43 @@ mod tests {
     async fn request_expect_100_server_rejects() {
         use tokio::io::duplex;
 
-        let (mut client, mut server) = duplex(4096);
+        let (mut client, mut server) = duplex(1_100_000);
 
         let server_task = tokio::spawn(async move {
             let mut buf = vec![0u8; 2048];
             let _n = server.read(&mut buf).await.unwrap();
 
             // Server rejects with 417 (Expectation Failed)
-            let response = b"HTTP/1.1 417 Expectation Failed\r\nContent-Length: 8\r\n\r\nrejected";
-            server.write_all(response).await.unwrap();
+            let response_417 = b"HTTP/1.1 417 Expectation Failed\r\nContent-Length: 0\r\n\r\n";
+            server.write_all(response_417).await.unwrap();
+
+            // Read the retry request (without Expect header) + body
+            let mut retry_buf = vec![0u8; 4096];
+            let mut total = 0;
+            loop {
+                let n = server.read(&mut retry_buf[total..]).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                total += n;
+                // Check if we've received headers + body
+                let data = &retry_buf[..total];
+                if let Some(header_end) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let header_str = String::from_utf8_lossy(&data[..header_end]);
+                    assert!(!header_str.contains("Expect:"), "retry should not have Expect header");
+                    // Read remaining body
+                    let body_start = header_end + 4;
+                    let remaining = total - body_start;
+                    if remaining >= 17 {
+                        // Got the full "should not be sent" body (17 bytes)
+                        break;
+                    }
+                }
+            }
+
+            // Send success response for the retry
+            let response_200 = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+            server.write_all(response_200).await.unwrap();
             server.shutdown().await.unwrap();
         });
 
@@ -2636,8 +2773,12 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(resp.status(), 417);
-        assert_eq!(resp.body_str().unwrap(), "rejected");
+        // After 417 retry, the final response should be 200
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.body_str().unwrap(), "ok");
+        // The 417 should be in the redirect chain
+        assert_eq!(resp.redirect_responses().len(), 1);
+        assert_eq!(resp.redirect_responses()[0].status(), 417);
 
         server_task.await.unwrap();
     }
