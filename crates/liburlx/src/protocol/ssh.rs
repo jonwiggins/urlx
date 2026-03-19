@@ -31,6 +31,8 @@ pub enum SshHostKeyPolicy {
     KnownHosts(Vec<KnownHostEntry>),
     /// Verify against a specific SHA-256 fingerprint (base64-encoded, no prefix).
     Sha256Fingerprint(String),
+    /// Verify against a specific MD5 fingerprint (hex-encoded, 32 chars, no colons).
+    Md5Fingerprint(String),
 }
 
 /// A parsed `known_hosts` entry for host key verification.
@@ -167,6 +169,140 @@ fn glob_match_recursive(text: &[u8], pattern: &[u8]) -> bool {
     false
 }
 
+/// Compute MD5 hash.
+///
+/// Used for `--hostpubmd5` host key verification.
+#[allow(clippy::many_single_char_names, clippy::too_many_lines)]
+fn md5_hash(data: &[u8]) -> [u8; 16] {
+    // MD5 constants
+    const S: [u32; 64] = [
+        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5,
+        9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10,
+        15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+    ];
+    const K: [u32; 64] = [
+        0xd76a_a478,
+        0xe8c7_b756,
+        0x2420_70db,
+        0xc1bd_ceee,
+        0xf57c_0faf,
+        0x4787_c62a,
+        0xa830_4613,
+        0xfd46_9501,
+        0x6980_98d8,
+        0x8b44_f7af,
+        0xffff_5bb1,
+        0x895c_d7be,
+        0x6b90_1122,
+        0xfd98_7193,
+        0xa679_438e,
+        0x49b4_0821,
+        0xf61e_2562,
+        0xc040_b340,
+        0x265e_5a51,
+        0xe9b6_c7aa,
+        0xd62f_105d,
+        0x0244_1453,
+        0xd8a1_e681,
+        0xe7d3_fbc8,
+        0x21e1_cde6,
+        0xc337_07d6,
+        0xf4d5_0d87,
+        0x455a_14ed,
+        0xa9e3_e905,
+        0xfcef_a3f8,
+        0x676f_02d9,
+        0x8d2a_4c8a,
+        0xfffa_3942,
+        0x8771_f681,
+        0x6d9d_6122,
+        0xfde5_380c,
+        0xa4be_ea44,
+        0x4bde_cfa9,
+        0xf6bb_4b60,
+        0xbebf_bc70,
+        0x289b_7ec6,
+        0xeaa1_27fa,
+        0xd4ef_3085,
+        0x0488_1d05,
+        0xd9d4_d039,
+        0xe6db_99e5,
+        0x1fa2_7cf8,
+        0xc4ac_5665,
+        0xf429_2244,
+        0x432a_ff97,
+        0xab94_23a7,
+        0xfc93_a039,
+        0x655b_59c3,
+        0x8f0c_cc92,
+        0xffef_f47d,
+        0x8584_5dd1,
+        0x6fa8_7e4f,
+        0xfe2c_e6e0,
+        0xa301_4314,
+        0x4e08_11a1,
+        0xf753_7e82,
+        0xbd3a_f235,
+        0x2ad7_d2bb,
+        0xeb86_d391,
+    ];
+
+    let mut a0: u32 = 0x6745_2301;
+    let mut b0: u32 = 0xefcd_ab89;
+    let mut c0: u32 = 0x98ba_dcfe;
+    let mut d0: u32 = 0x1032_5476;
+
+    let bit_len = (data.len() as u64) * 8;
+    let mut padded = data.to_vec();
+    padded.push(0x80);
+    while padded.len() % 64 != 56 {
+        padded.push(0);
+    }
+    padded.extend_from_slice(&bit_len.to_le_bytes());
+
+    for chunk in padded.chunks_exact(64) {
+        let mut m = [0u32; 16];
+        for i in 0..16 {
+            m[i] = u32::from_le_bytes([
+                chunk[4 * i],
+                chunk[4 * i + 1],
+                chunk[4 * i + 2],
+                chunk[4 * i + 3],
+            ]);
+        }
+
+        let (mut a, mut b, mut c, mut d) = (a0, b0, c0, d0);
+
+        #[allow(clippy::needless_range_loop)]
+        for i in 0..64 {
+            let (f, g) = match i {
+                0..=15 => ((b & c) | ((!b) & d), i),
+                16..=31 => ((d & b) | ((!d) & c), (5 * i + 1) % 16),
+                32..=47 => (b ^ c ^ d, (3 * i + 5) % 16),
+                _ => (c ^ (b | !d), (7 * i) % 16),
+            };
+
+            let f = f.wrapping_add(a).wrapping_add(K[i]).wrapping_add(m[g]);
+            a = d;
+            d = c;
+            c = b;
+            b = b.wrapping_add(f.rotate_left(S[i]));
+        }
+
+        a0 = a0.wrapping_add(a);
+        b0 = b0.wrapping_add(b);
+        c0 = c0.wrapping_add(c);
+        d0 = d0.wrapping_add(d);
+    }
+
+    let mut result = [0u8; 16];
+    result[0..4].copy_from_slice(&a0.to_le_bytes());
+    result[4..8].copy_from_slice(&b0.to_le_bytes());
+    result[8..12].copy_from_slice(&c0.to_le_bytes());
+    result[12..16].copy_from_slice(&d0.to_le_bytes());
+    result
+}
+
 /// Compute HMAC-SHA1(key, message).
 ///
 /// Used for hashed `known_hosts` hostname verification.
@@ -296,8 +432,27 @@ impl russh::client::Handler for SshHandler {
                 if actual == *expected {
                     Ok(true)
                 } else {
-                    Err(Error::Ssh(format!(
+                    Err(Error::SshHostKeyMismatch(format!(
                         "SSH host key fingerprint mismatch: expected SHA256:{expected}, got SHA256:{actual}"
+                    )))
+                }
+            }
+            SshHostKeyPolicy::Md5Fingerprint(expected) => {
+                // Compute MD5 of the public key bytes
+                let key_bytes = server_public_key
+                    .to_bytes()
+                    .map_err(|e| Error::Ssh(format!("failed to encode server key: {e}")))?;
+                let digest = md5_hash(&key_bytes);
+                let actual = digest.iter().fold(String::new(), |mut s, b| {
+                    use std::fmt::Write;
+                    let _ = write!(s, "{b:02x}");
+                    s
+                });
+                if actual == expected.to_lowercase() {
+                    Ok(true)
+                } else {
+                    Err(Error::SshHostKeyMismatch(format!(
+                        "SSH host key MD5 mismatch: expected {expected}, got {actual}"
                     )))
                 }
             }
@@ -309,7 +464,7 @@ impl russh::client::Handler for SshHandler {
                 for entry in entries {
                     if host_matches_entry(&self.hostname, entry) {
                         if entry.revoked {
-                            return Err(Error::Ssh(format!(
+                            return Err(Error::SshHostKeyMismatch(format!(
                                 "SSH host key for '{}' is revoked in known_hosts",
                                 self.hostname
                             )));
@@ -318,14 +473,14 @@ impl russh::client::Handler for SshHandler {
                             return Ok(true);
                         }
                         // Key mismatch — potential MITM
-                        return Err(Error::Ssh(format!(
+                        return Err(Error::SshHostKeyMismatch(format!(
                             "SSH host key for '{}' does not match known_hosts (possible MITM attack)",
                             self.hostname
                         )));
                     }
                 }
                 // Host not found in known_hosts — reject
-                Err(Error::Ssh(format!(
+                Err(Error::SshHostKeyMismatch(format!(
                     "SSH host '{}' not found in known_hosts file",
                     self.hostname
                 )))
@@ -577,11 +732,13 @@ impl SshSession {
 
     /// List a directory via SFTP.
     ///
-    /// Returns the listing as UTF-8 text with one entry per line.
+    /// Returns the listing in long format (`ls -l` style) with one entry per line.
+    /// This matches curl's SFTP directory listing output.
     ///
     /// # Errors
     ///
     /// Returns [`Error::Ssh`] if the SFTP session or directory read fails.
+    #[allow(clippy::items_after_statements)]
     pub async fn sftp_list(&self, path: &str) -> Result<Vec<u8>, Error> {
         let channel = self
             .handle
@@ -602,10 +759,21 @@ impl SshSession {
             .await
             .map_err(|e| Error::Ssh(format!("SFTP readdir '{path}' failed: {e}")))?;
 
+        use std::fmt::Write;
         let mut listing = String::new();
         for entry in entries {
-            listing.push_str(&entry.file_name());
-            listing.push('\n');
+            let meta = entry.metadata();
+            let perms = format_permissions(&meta);
+            let nlinks: u32 = if meta.file_type().is_dir() { 3 } else { 1 };
+            let uid = meta.uid.unwrap_or(0);
+            let gid = meta.gid.unwrap_or(0);
+            let size = meta.size.unwrap_or(0);
+            let mtime_str = format_mtime(meta.mtime);
+            let name = entry.file_name();
+            let _ = writeln!(
+                listing,
+                "{perms} {nlinks:4} {uid:<8} {gid:<8} {size:>12} {mtime_str} {name}"
+            );
         }
 
         Ok(listing.into_bytes())
@@ -703,16 +871,16 @@ impl SshSession {
             .handle
             .channel_open_session()
             .await
-            .map_err(|e| Error::Ssh(format!("failed to open SSH channel: {e}")))?;
+            .map_err(|e| Error::SshUploadFailed(format!("failed to open SSH channel: {e}")))?;
 
         // Execute scp in sink (upload) mode
         channel
             .exec(true, format!("scp -t {path}"))
             .await
-            .map_err(|e| Error::Ssh(format!("failed to exec scp: {e}")))?;
+            .map_err(|e| Error::SshUploadFailed(format!("failed to exec scp: {e}")))?;
 
         // Wait for initial \0 acknowledgement from server
-        wait_for_scp_ack(&mut channel).await?;
+        wait_for_scp_ack(&mut channel).await.map_err(|e| Error::SshUploadFailed(format!("{e}")))?;
 
         // Extract filename from path
         let filename = path.rsplit('/').next().unwrap_or(path);
@@ -722,22 +890,25 @@ impl SshSession {
         channel
             .data(header.as_bytes())
             .await
-            .map_err(|e| Error::Ssh(format!("scp header write failed: {e}")))?;
+            .map_err(|e| Error::SshUploadFailed(format!("scp header write failed: {e}")))?;
 
         // Wait for acknowledgement
-        wait_for_scp_ack(&mut channel).await?;
+        wait_for_scp_ack(&mut channel).await.map_err(|e| Error::SshUploadFailed(format!("{e}")))?;
 
         // Send file data
-        channel.data(data).await.map_err(|e| Error::Ssh(format!("scp data write failed: {e}")))?;
+        channel
+            .data(data)
+            .await
+            .map_err(|e| Error::SshUploadFailed(format!("scp data write failed: {e}")))?;
 
         // Send trailing null byte
         channel
             .data(&b"\0"[..])
             .await
-            .map_err(|e| Error::Ssh(format!("scp trailing null write failed: {e}")))?;
+            .map_err(|e| Error::SshUploadFailed(format!("scp trailing null write failed: {e}")))?;
 
         // Wait for final acknowledgement
-        wait_for_scp_ack(&mut channel).await?;
+        wait_for_scp_ack(&mut channel).await.map_err(|e| Error::SshUploadFailed(format!("{e}")))?;
 
         // Signal EOF
         let _ = channel.eof().await;
@@ -887,21 +1058,43 @@ pub async fn download(
 
     let mut data = if url.scheme() == "scp" {
         session.scp_download(path).await?
+    } else if path.ends_with('/') {
+        // Directory listing (curl compat: tests 613, 614)
+        session.sftp_list(path).await?
     } else {
         session.sftp_download(path).await?
     };
 
     // Apply byte range if specified (SFTP only)
     if let Some(range_str) = range {
-        data = apply_byte_range(&data, range_str);
+        data = apply_byte_range(&data, range_str)?;
     }
 
     // Execute post-quote commands
-    if !post_quote.is_empty() && url.scheme() == "sftp" {
-        execute_sftp_quotes(&session, post_quote).await?;
-    }
+    // Post-quote errors still produce the downloaded data (curl compat: test 609)
+    let post_quote_err = if !post_quote.is_empty() && url.scheme() == "sftp" {
+        execute_sftp_quotes(&session, post_quote).await.err()
+    } else {
+        None
+    };
 
     let _ = session.close().await;
+
+    // If post-quote failed, return error with downloaded data embedded
+    if let Some(err) = post_quote_err {
+        // Return the error; the caller (CLI) will already have written body data
+        // from a previous successful response in the same transfer sequence.
+        // For now, we still need to return the data so it can be output.
+        // Use a special error that includes the response data.
+        let headers = HashMap::new();
+        let mut resp = Response::new(200, headers, data, url.as_str().to_string());
+        resp.set_raw_headers(Vec::new());
+        // Store the post-quote error in the response as a header-like marker
+        return Err(Error::SshQuoteErrorWithData {
+            message: err.to_string(),
+            response: Box::new(resp),
+        });
+    }
 
     let headers = HashMap::new();
     let mut resp = Response::new(200, headers, data, url.as_str().to_string());
@@ -1019,7 +1212,117 @@ pub async fn head(
     Ok(resp)
 }
 
-/// Execute SFTP quote commands (rename, rm, mkdir, rmdir).
+/// Format Unix-style file permissions string (e.g., "-rw-r--r--" or "drwxr-xr-x").
+fn format_permissions(meta: &russh_sftp::protocol::FileAttributes) -> String {
+    let raw = meta.permissions.unwrap_or(0);
+    let file_type_char = if meta.is_dir() {
+        'd'
+    } else if meta.is_symlink() {
+        'l'
+    } else {
+        '-'
+    };
+    let perms = meta.permissions();
+    let mut s = String::with_capacity(10);
+    s.push(file_type_char);
+    s.push(if perms.owner_read { 'r' } else { '-' });
+    s.push(if perms.owner_write { 'w' } else { '-' });
+    s.push(if raw & 0o4000 != 0 {
+        if perms.owner_exec {
+            's'
+        } else {
+            'S'
+        }
+    } else if perms.owner_exec {
+        'x'
+    } else {
+        '-'
+    });
+    s.push(if perms.group_read { 'r' } else { '-' });
+    s.push(if perms.group_write { 'w' } else { '-' });
+    s.push(if raw & 0o2000 != 0 {
+        if perms.group_exec {
+            's'
+        } else {
+            'S'
+        }
+    } else if perms.group_exec {
+        'x'
+    } else {
+        '-'
+    });
+    s.push(if perms.other_read { 'r' } else { '-' });
+    s.push(if perms.other_write { 'w' } else { '-' });
+    s.push(if raw & 0o1000 != 0 {
+        if perms.other_exec {
+            't'
+        } else {
+            'T'
+        }
+    } else if perms.other_exec {
+        'x'
+    } else {
+        '-'
+    });
+    s
+}
+
+/// Format mtime as a human-readable date string (e.g., "Jan  1  2000" or "Jan  1 12:00").
+#[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+fn format_mtime(mtime: Option<u32>) -> String {
+    let Some(ts) = mtime else {
+        return "Jan  1  1970".to_string();
+    };
+
+    // Convert Unix timestamp to date components
+    let secs = i64::from(ts);
+    let days = secs / 86400;
+    let time_of_day = secs % 86400;
+    let hours = time_of_day / 3600;
+    let minutes = (time_of_day % 3600) / 60;
+
+    // Simple date calculation from epoch days
+    let (year, month, day) = days_to_ymd(days);
+
+    let month_names =
+        ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    let mon_str = month_names[((month - 1) as usize).min(11)];
+
+    // If the file is older than ~6 months, show year; otherwise show time
+    let now_days = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let now_days = now_days / 86400;
+    let six_months_days = 182;
+
+    if (now_days - days).abs() > six_months_days {
+        format!("{mon_str} {day:2}  {year}")
+    } else {
+        format!("{mon_str} {day:2} {hours:02}:{minutes:02}")
+    }
+}
+
+/// Convert days since Unix epoch to (year, month, day).
+#[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
+const fn days_to_ymd(days: i64) -> (i64, i64, i64) {
+    // Algorithm from http://howardhinnant.github.io/date_algorithms.html
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64; // day of era [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365; // year of era [0, 399]
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // day of year [0, 365]
+    let mp = (5 * doy + 2) / 153; // month [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // day [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // month [1, 12]
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m as i64, d as i64)
+}
+
+/// Execute SFTP quote commands (rename, rm, mkdir, rmdir, chmod, chown, ln, symlink).
+///
+/// Commands prefixed with `*` are "accept-fail": errors are ignored.
 async fn execute_sftp_quotes(session: &SshSession, commands: &[String]) -> Result<(), Error> {
     let channel = session
         .handle
@@ -1035,58 +1338,204 @@ async fn execute_sftp_quotes(session: &SshSession, commands: &[String]) -> Resul
         .map_err(|e| Error::Ssh(format!("SFTP session init failed: {e}")))?;
 
     for cmd in commands {
-        let parts: Vec<&str> = cmd.splitn(2, ' ').collect();
-        let op = parts[0].to_lowercase();
-        let args = parts.get(1).copied().unwrap_or("");
-        match op.as_str() {
-            "rename" => {
-                let rename_parts: Vec<&str> = args.splitn(2, ' ').collect();
-                if rename_parts.len() < 2 {
-                    return Err(Error::Ssh("SFTP quote rename: need old and new path".to_string()));
-                }
-                sftp.rename(rename_parts[0], rename_parts[1])
-                    .await
-                    .map_err(|e| Error::Ssh(format!("SFTP quote rename failed: {e}")))?;
+        // Check for `*` prefix (accept-fail: ignore errors)
+        let (accept_fail, cmd) =
+            cmd.strip_prefix('*').map_or((false, cmd.as_str()), |stripped| (true, stripped));
+
+        let result = execute_single_sftp_quote(&sftp, cmd).await;
+        if let Err(e) = result {
+            if accept_fail {
+                // Silently ignore the error
+                continue;
             }
-            "rm" | "remove" => {
-                sftp.remove_file(args)
-                    .await
-                    .map_err(|e| Error::Ssh(format!("SFTP quote rm failed: {e}")))?;
-            }
-            "mkdir" => {
-                sftp.create_dir(args)
-                    .await
-                    .map_err(|e| Error::Ssh(format!("SFTP quote mkdir failed: {e}")))?;
-            }
-            "rmdir" => {
-                sftp.remove_dir(args)
-                    .await
-                    .map_err(|e| Error::Ssh(format!("SFTP quote rmdir failed: {e}")))?;
-            }
-            _ => {
-                return Err(Error::Ssh(format!("SFTP quote: unsupported command '{op}'")));
-            }
+            return Err(e);
         }
     }
     Ok(())
 }
 
-/// Apply a byte range (e.g., "5-9") to downloaded data.
-fn apply_byte_range(data: &[u8], range: &str) -> Vec<u8> {
+/// Execute a single SFTP quote command.
+#[allow(clippy::too_many_lines)]
+async fn execute_single_sftp_quote(
+    sftp: &russh_sftp::client::SftpSession,
+    cmd: &str,
+) -> Result<(), Error> {
+    let parts: Vec<&str> = cmd.splitn(2, ' ').collect();
+    let op = parts[0].to_lowercase();
+    let args = parts.get(1).copied().unwrap_or("");
+    match op.as_str() {
+        "rename" => {
+            let rename_parts: Vec<&str> = args.splitn(2, ' ').collect();
+            if rename_parts.len() < 2 {
+                return Err(Error::SshQuoteError(
+                    "SFTP quote rename: need old and new path".to_string(),
+                ));
+            }
+            sftp.rename(rename_parts[0], rename_parts[1])
+                .await
+                .map_err(|e| Error::SshQuoteError(format!("SFTP quote rename failed: {e}")))?;
+        }
+        "rm" | "remove" => {
+            sftp.remove_file(args)
+                .await
+                .map_err(|e| Error::SshQuoteError(format!("SFTP quote rm failed: {e}")))?;
+        }
+        "mkdir" => {
+            sftp.create_dir(args)
+                .await
+                .map_err(|e| Error::SshQuoteError(format!("SFTP quote mkdir failed: {e}")))?;
+        }
+        "rmdir" => {
+            sftp.remove_dir(args)
+                .await
+                .map_err(|e| Error::SshQuoteError(format!("SFTP quote rmdir failed: {e}")))?;
+        }
+        "chmod" => {
+            // chmod <mode> <path>
+            let chmod_parts: Vec<&str> = args.splitn(2, ' ').collect();
+            if chmod_parts.len() < 2 {
+                return Err(Error::SshQuoteError(
+                    "SFTP quote chmod: need mode and path".to_string(),
+                ));
+            }
+            let mode = u32::from_str_radix(chmod_parts[0], 8).map_err(|e| {
+                Error::SshQuoteError(format!(
+                    "SFTP quote chmod: invalid mode '{}': {e}",
+                    chmod_parts[0]
+                ))
+            })?;
+            // Read existing metadata to preserve file type bits, then set new permissions
+            let meta = sftp
+                .metadata(chmod_parts[1])
+                .await
+                .map_err(|e| Error::SshQuoteError(format!("SFTP quote chmod stat failed: {e}")))?;
+            let file_type_bits = meta.permissions.unwrap_or(0) & 0o170_000;
+            let attrs = russh_sftp::protocol::FileAttributes {
+                size: None,
+                uid: None,
+                user: None,
+                gid: None,
+                group: None,
+                permissions: Some(file_type_bits | mode),
+                atime: None,
+                mtime: None,
+            };
+            sftp.set_metadata(chmod_parts[1], attrs)
+                .await
+                .map_err(|e| Error::SshQuoteError(format!("SFTP quote chmod failed: {e}")))?;
+        }
+        "chown" => {
+            // chown <uid> <path>
+            let chown_parts: Vec<&str> = args.splitn(2, ' ').collect();
+            if chown_parts.len() < 2 {
+                return Err(Error::SshQuoteError(
+                    "SFTP quote chown: need uid and path".to_string(),
+                ));
+            }
+            let uid = chown_parts[0].parse::<u32>().map_err(|e| {
+                Error::SshQuoteError(format!(
+                    "SFTP quote chown: invalid uid '{}': {e}",
+                    chown_parts[0]
+                ))
+            })?;
+            let attrs = russh_sftp::protocol::FileAttributes {
+                size: None,
+                uid: Some(uid),
+                user: None,
+                gid: None,
+                group: None,
+                permissions: None,
+                atime: None,
+                mtime: None,
+            };
+            sftp.set_metadata(chown_parts[1], attrs)
+                .await
+                .map_err(|e| Error::SshQuoteError(format!("SFTP quote chown failed: {e}")))?;
+        }
+        "chgrp" => {
+            // chgrp <gid> <path>
+            let chgrp_parts: Vec<&str> = args.splitn(2, ' ').collect();
+            if chgrp_parts.len() < 2 {
+                return Err(Error::SshQuoteError(
+                    "SFTP quote chgrp: need gid and path".to_string(),
+                ));
+            }
+            let gid = chgrp_parts[0].parse::<u32>().map_err(|e| {
+                Error::SshQuoteError(format!(
+                    "SFTP quote chgrp: invalid gid '{}': {e}",
+                    chgrp_parts[0]
+                ))
+            })?;
+            let attrs = russh_sftp::protocol::FileAttributes {
+                size: None,
+                uid: None,
+                user: None,
+                gid: Some(gid),
+                group: None,
+                permissions: None,
+                atime: None,
+                mtime: None,
+            };
+            sftp.set_metadata(chgrp_parts[1], attrs)
+                .await
+                .map_err(|e| Error::SshQuoteError(format!("SFTP quote chgrp failed: {e}")))?;
+        }
+        "ln" | "symlink" => {
+            let ln_parts: Vec<&str> = args.splitn(2, ' ').collect();
+            if ln_parts.len() < 2 {
+                return Err(Error::SshQuoteError(
+                    "SFTP quote ln/symlink: need source and target path".to_string(),
+                ));
+            }
+            sftp.symlink(ln_parts[0], ln_parts[1])
+                .await
+                .map_err(|e| Error::SshQuoteError(format!("SFTP quote symlink failed: {e}")))?;
+        }
+        _ => {
+            return Err(Error::SshQuoteError(format!("SFTP quote: unsupported command '{op}'")));
+        }
+    }
+    Ok(())
+}
+
+/// Apply a byte range (e.g., "5-9" or "-9") to downloaded data.
+///
+/// Returns `Ok(data)` on success, or `Err(SshRangeError)` if the range is not satisfiable.
+fn apply_byte_range(data: &[u8], range: &str) -> Result<Vec<u8>, Error> {
+    // Negative range: "-N" means last N bytes
+    if let Some(suffix) = range.strip_prefix('-') {
+        let n = suffix.parse::<usize>().unwrap_or(0);
+        if n == 0 {
+            return Err(Error::SshRangeError("invalid range".to_string()));
+        }
+        let start = data.len().saturating_sub(n);
+        return Ok(data[start..].to_vec());
+    }
+
     if let Some((start_str, end_str)) = range.split_once('-') {
         let start = start_str.parse::<usize>().unwrap_or(0);
-        let end = if end_str.is_empty() {
-            data.len().saturating_sub(1)
-        } else {
-            end_str.parse::<usize>().unwrap_or_else(|_| data.len().saturating_sub(1))
-        };
+        // "N-" means from offset N to end of file
+        if end_str.is_empty() {
+            // Range beyond file size: return error (curl compat: test 637)
+            if start >= data.len() {
+                return Err(Error::SshRangeError(format!(
+                    "Requested range was not satisfiable (start {start} >= size {})",
+                    data.len()
+                )));
+            }
+            return Ok(data[start..].to_vec());
+        }
+        let end = end_str.parse::<usize>().unwrap_or_else(|_| data.len().saturating_sub(1));
         if start >= data.len() {
-            return Vec::new();
+            return Err(Error::SshRangeError(format!(
+                "Requested range was not satisfiable (start {start} >= size {})",
+                data.len()
+            )));
         }
         let end = end.min(data.len().saturating_sub(1));
-        data[start..=end].to_vec()
+        Ok(data[start..=end].to_vec())
     } else {
-        data.to_vec()
+        Ok(data.to_vec())
     }
 }
 
@@ -1125,6 +1574,12 @@ async fn connect_session(
 
     if allow_pubkey {
         if let Some(key_path) = ssh_key_path {
+            // Verify the key file exists before attempting connection (curl compat: test 656)
+            if !std::path::Path::new(key_path).exists() {
+                return Err(Error::Ssh(format!(
+                    "failed to load SSH key: unable to read '{key_path}'"
+                )));
+            }
             return SshSession::connect_with_key(
                 host,
                 port,
