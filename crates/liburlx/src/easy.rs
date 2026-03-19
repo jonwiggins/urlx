@@ -4874,68 +4874,78 @@ async fn do_single_request(
             };
         }
         "ftp" | "ftps" => {
-            // Reject FTP URLs with %0a or %0d (CR/LF injection — curl compat: tests 225, 226)
-            let raw_url = url.as_str();
-            if raw_url.contains("%0a")
-                || raw_url.contains("%0A")
-                || raw_url.contains("%0d")
-                || raw_url.contains("%0D")
-            {
-                return Err(Error::UrlParse("FTP URL contains CR/LF characters".to_string()));
-            }
-            // Determine effective SSL mode: ftps:// always uses implicit TLS
-            let effective_ssl_mode = if url.scheme() == "ftps" {
-                crate::protocol::ftp::FtpSslMode::Implicit
+            // FTP-over-HTTP-proxy: relay the FTP URL as a plain HTTP request
+            // through the proxy (curl compat: tests 79, 208, 299).
+            let is_http_proxy = proxy.is_some_and(|p| {
+                let s = p.scheme();
+                s == "http" || s == "https"
+            });
+            if is_http_proxy && !http_proxy_tunnel {
+                // Fall through to the HTTP proxy path below — handled after this match
             } else {
-                ftp_ssl_mode
-            };
-            // Extract resume/range from Range header for FTP.
-            // Formats: "bytes=42-" (resume from offset) or "bytes=4-16" (range).
-            let ftp_range = headers.iter().find_map(|(k, v)| {
-                if k.eq_ignore_ascii_case("range") {
-                    v.strip_prefix("bytes=").map(ToString::to_string)
-                } else {
-                    None
+                // Reject FTP URLs with %0a or %0d (CR/LF injection — curl compat: tests 225, 226)
+                let raw_url = url.as_str();
+                if raw_url.contains("%0a")
+                    || raw_url.contains("%0A")
+                    || raw_url.contains("%0d")
+                    || raw_url.contains("%0D")
+                {
+                    return Err(Error::UrlParse("FTP URL contains CR/LF characters".to_string()));
                 }
-            });
-            let resume_offset = ftp_range.as_deref().and_then(|r| {
-                if r.ends_with('-') {
-                    // "42-" format: resume from offset 42
-                    r.strip_suffix('-').and_then(|n| n.parse::<u64>().ok())
-                } else if let Some((start, _end)) = r.split_once('-') {
-                    // "4-16" format: REST at start offset
-                    start.parse::<u64>().ok()
+                // Determine effective SSL mode: ftps:// always uses implicit TLS
+                let effective_ssl_mode = if url.scheme() == "ftps" {
+                    crate::protocol::ftp::FtpSslMode::Implicit
                 } else {
-                    None
-                }
-            });
-            // Extract end byte for range limit (for ABOR after partial read)
-            let ftp_range_end = ftp_range.as_deref().and_then(|r| {
-                if r.ends_with('-') {
-                    None // open-ended range
-                } else if let Some((_start, end)) = r.split_once('-') {
-                    end.parse::<u64>().ok()
-                } else {
-                    None
-                }
-            });
-            let upload_data = if method == "PUT" { Some(body.unwrap_or(&[])) } else { None };
-            // Set range_end on ftp_config if needed
-            let mut ftp_config_with_range = ftp_config.clone();
-            ftp_config_with_range.range_end = ftp_range_end;
-            let ftp_use_ssl = use_ssl;
-            return crate::protocol::ftp::perform(
-                url,
-                upload_data,
-                effective_ssl_mode,
-                ftp_use_ssl,
-                tls_config,
-                resume_offset,
-                &ftp_config_with_range,
-                None,
-                ftp_session,
-            )
-            .await;
+                    ftp_ssl_mode
+                };
+                // Extract resume/range from Range header for FTP.
+                // Formats: "bytes=42-" (resume from offset) or "bytes=4-16" (range).
+                let ftp_range = headers.iter().find_map(|(k, v)| {
+                    if k.eq_ignore_ascii_case("range") {
+                        v.strip_prefix("bytes=").map(ToString::to_string)
+                    } else {
+                        None
+                    }
+                });
+                let resume_offset = ftp_range.as_deref().and_then(|r| {
+                    if r.ends_with('-') {
+                        // "42-" format: resume from offset 42
+                        r.strip_suffix('-').and_then(|n| n.parse::<u64>().ok())
+                    } else if let Some((start, _end)) = r.split_once('-') {
+                        // "4-16" format: REST at start offset
+                        start.parse::<u64>().ok()
+                    } else {
+                        None
+                    }
+                });
+                // Extract end byte for range limit (for ABOR after partial read)
+                let ftp_range_end = ftp_range.as_deref().and_then(|r| {
+                    if r.ends_with('-') {
+                        None // open-ended range
+                    } else if let Some((_start, end)) = r.split_once('-') {
+                        end.parse::<u64>().ok()
+                    } else {
+                        None
+                    }
+                });
+                let upload_data = if method == "PUT" { Some(body.unwrap_or(&[])) } else { None };
+                // Set range_end on ftp_config if needed
+                let mut ftp_config_with_range = ftp_config.clone();
+                ftp_config_with_range.range_end = ftp_range_end;
+                let ftp_use_ssl = use_ssl;
+                return crate::protocol::ftp::perform(
+                    url,
+                    upload_data,
+                    effective_ssl_mode,
+                    ftp_use_ssl,
+                    tls_config,
+                    resume_offset,
+                    &ftp_config_with_range,
+                    None,
+                    ftp_session,
+                )
+                .await;
+            }
         }
         "smtp" | "smtps" => {
             let mail_data = body.unwrap_or(&[]);
@@ -5724,7 +5734,8 @@ async fn do_single_request(
                 return Err(Error::Http("HTTPS support requires the 'rustls' feature".to_string()));
             }
         }
-        "http" => {
+        // FTP-over-HTTP-proxy also uses this path (curl compat: tests 79, 208, 299)
+        "http" | "ftp" | "ftps" => {
             let is_http_proxy = proxy.is_some() && !is_socks_proxy;
             // Use CONNECT tunnel for HTTP if --proxytunnel / -p is set
             let use_tunnel = is_http_proxy && http_proxy_tunnel;
@@ -5818,9 +5829,14 @@ async fn do_single_request(
             } else {
                 // Direct or non-tunnel proxy HTTP request
                 // Custom request target overrides; otherwise, for HTTP proxy use absolute URL
+                let is_ftp_over_proxy = is_http_proxy && matches!(url.scheme(), "ftp" | "ftps");
                 #[allow(clippy::option_if_let_else)]
                 let request_target = if let Some(target) = custom_request_target {
                     target.to_string()
+                } else if is_ftp_over_proxy {
+                    // FTP-over-HTTP-proxy: keep credentials in URL (curl compat: tests 208, 299)
+                    let full = url.to_full_string();
+                    full.split_once('#').map_or_else(|| full.clone(), |(base, _)| base.to_string())
                 } else if is_http_proxy {
                     // Strip fragment and credentials from proxy request URL
                     // Credentials go in Authorization header, not the Request-URI
@@ -5841,6 +5857,11 @@ async fn do_single_request(
                     url.request_target()
                 };
 
+                // For FTP-over-HTTP-proxy, override Host to include default port
+                // (curl compat: tests 208, 299 — Host: host.com:21)
+                let proxy_host_header =
+                    if is_ftp_over_proxy { format!("{host}:{port}") } else { host_header.clone() };
+
                 // Add proxy-specific headers for non-tunnel HTTP proxy requests
                 let mut proxy_effective_headers = effective_headers.clone();
                 if is_http_proxy {
@@ -5850,6 +5871,19 @@ async fn do_single_request(
                     proxy_effective_headers
                         .push(("Proxy-Connection".to_string(), "Keep-Alive".to_string()));
                     proxy_effective_headers.extend_from_slice(proxy_headers);
+                }
+                // FTP-over-proxy: add Authorization header for URL/CLI credentials
+                // (curl compat: tests 208, 299)
+                if is_ftp_over_proxy {
+                    let ftp_user = url.username();
+                    let ftp_pass = url.password().unwrap_or("");
+                    if !ftp_user.is_empty() {
+                        use base64::Engine;
+                        let encoded = base64::engine::general_purpose::STANDARD
+                            .encode(format!("{ftp_user}:{ftp_pass}").as_bytes());
+                        proxy_effective_headers
+                            .push(("_auto_Authorization".to_string(), format!("Basic {encoded}")));
+                    }
                 }
 
                 let use_http10 = http_version == HttpVersion::Http10;
@@ -5861,7 +5895,7 @@ async fn do_single_request(
                 let (resp, can_reuse) = crate::protocol::http::h1::request(
                     &mut stream,
                     method,
-                    &host_header,
+                    &proxy_host_header,
                     &request_target,
                     &proxy_effective_headers,
                     body,
@@ -6713,7 +6747,19 @@ fn extract_basic_auth_from_headers(headers: &[(String, String)]) -> Option<(Stri
 
 /// Find the end of HTTP headers (\r\n\r\n) in a buffer.
 fn find_header_end(data: &[u8]) -> Option<usize> {
-    data.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
+    // Standard CRLF: \r\n\r\n
+    if let Some(p) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+        return Some(p + 4);
+    }
+    // Bare LF: \n\n
+    if let Some(p) = data.windows(2).position(|w| w == b"\n\n") {
+        return Some(p + 2);
+    }
+    // Mixed: \n\r\n (bare LF header, then CRLF blank line — curl compat: test 206)
+    if let Some(p) = data.windows(3).position(|w| w == b"\n\r\n") {
+        return Some(p + 3);
+    }
+    None
 }
 
 /// Get proxy URL from environment variables.
@@ -7464,6 +7510,20 @@ mod tests {
     fn find_header_end_not_found() {
         let data = b"HTTP/1.1 200 OK\r\npartial";
         assert_eq!(find_header_end(data), None);
+    }
+
+    #[test]
+    fn find_header_end_bare_lf() {
+        let data = b"HTTP/1.1 200 OK\nServer: no\n\nbody";
+        assert_eq!(find_header_end(data), Some(28));
+    }
+
+    #[test]
+    fn find_header_end_mixed_lf_crlf() {
+        // Mixed: last header line ends with bare LF, blank line is CRLF
+        // (curl compat: test 206 CONNECT response)
+        let data = b"HTTP/1.1 200 OK\r\nServer: no\n\r\nbody";
+        assert_eq!(find_header_end(data), Some(30));
     }
 
     #[test]
