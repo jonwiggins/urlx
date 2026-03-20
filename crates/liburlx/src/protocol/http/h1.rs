@@ -564,6 +564,11 @@ where
         if !http09_allowed {
             return Err(Error::Http("unsupported HTTP version in response".to_string()));
         }
+        // HEAD + HTTP/0.9: no status line means we can't distinguish headers from body,
+        // which is a weird server reply for HEAD (curl compat: test 1144)
+        if is_head {
+            return Err(Error::Http("Weird server reply".to_string()));
+        }
         // Read remaining body to EOF
         let mut body = body_prefix;
         let mut tmp = [0u8; 8192];
