@@ -1046,8 +1046,12 @@ impl FtpSession {
                 });
             }
         }
-        // Try EPSV first if enabled
-        if self.config.use_epsv {
+        // For IPv6, EPSV is always required (PASV doesn't support IPv6 addresses).
+        // curl compat: --disable-epsv only disables EPSV for IPv4.
+        let force_epsv = self.local_addr.is_ipv6();
+
+        // Try EPSV first if enabled, or always for IPv6
+        if self.config.use_epsv || force_epsv {
             send_command(&mut self.writer, "EPSV").await?;
             let epsv_resp = self.read_and_record().await?;
             if epsv_resp.code == 229 {
@@ -1067,7 +1071,13 @@ impl FtpSession {
                                 }
                                 return self.maybe_wrap_data_tls(tcp).await;
                             }
-                            Err(_e) => {
+                            Err(e) => {
+                                if force_epsv {
+                                    // IPv6 has no PASV fallback
+                                    return Err(Error::Http(format!(
+                                        "FTP EPSV data connection failed: {e}"
+                                    )));
+                                }
                                 // Data connection failed — fall through to PASV
                                 // (curl compat: test 1233)
                                 self.config.use_epsv = false;
@@ -1080,6 +1090,15 @@ impl FtpSession {
                         return Err(e);
                     }
                 }
+            } else if force_epsv {
+                // IPv6 has no PASV fallback — EPSV is required
+                return Err(Error::Transfer {
+                    code: 13,
+                    message: format!(
+                        "FTP EPSV failed: {} {} (PASV not available for IPv6)",
+                        epsv_resp.code, epsv_resp.message
+                    ),
+                });
             } else {
                 // EPSV failed (e.g. 500/502), remember and fall through to PASV
                 self.config.use_epsv = false;
