@@ -15,7 +15,7 @@
 
 ---
 
-urlx is a from-scratch rewrite of [curl](https://curl.se/) in Rust. Zero `unsafe` outside the FFI boundary. Built on [tokio](https://tokio.rs/) and [rustls](https://github.com/rustls/rustls) — no OpenSSL. **92% of curl's own test suite passes against urlx** (1,171 / 1,273 tests).
+urlx is a from-scratch rewrite of [curl](https://curl.se/) in Rust. Zero `unsafe` outside the FFI boundary. Built on [tokio](https://tokio.rs/) and [rustls](https://github.com/rustls/rustls) — no OpenSSL. **93.4% of curl's own test suite passes against urlx** (1,173 / 1,327 tests, tests 1–1400).
 
 ## Highlights
 
@@ -25,7 +25,7 @@ urlx is a from-scratch rewrite of [curl](https://curl.se/) in Rust. Zero `unsafe
 - **Drop-in C library** — `liburlx-ffi` exposes the libcurl C ABI so existing C/C++ programs can link against it
 - **Idiomatic Rust API** — `liburlx` provides a clean async/sync API modeled on curl's Easy/Multi handles
 - **Broad protocol support** — HTTP/1.1, HTTP/2, HTTP/3 (QUIC), FTP/FTPS, SFTP/SCP, WebSocket, SMTP, IMAP, POP3, MQTT, DICT, TFTP
-- **2,600+ tests** — unit, integration (against real servers), property-based, and fuzz harnesses
+- **2,655 tests** — unit, integration (against real servers), property-based, and fuzz harnesses
 - **Async core** — tokio runtime with a blocking `Easy` wrapper and native async `Multi` API
 
 ## Quick Start
