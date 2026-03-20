@@ -1326,11 +1326,19 @@ pub fn run(args: &[String]) -> ExitCode {
                 || url.starts_with("pop3s://")
             {
                 // Reject credentials with special characters only when --login-options
-                // is used (curl compat: test 896). Without --login-options, percent-encode
+                // is used with a specific mechanism (curl compat: test 896).
+                // AUTH=* means "try any available" and should NOT reject special chars
+                // (curl compat: test 895). Without --login-options, percent-encode
                 // special chars so they survive URL embedding (curl compat: tests 800, 847, 988).
                 let has_bad_char = |s: &str| s.contains('"') || s.contains('{') || s.contains('}');
+                let is_wildcard_auth = opts
+                    .easy
+                    .get_login_options()
+                    .and_then(|lo| lo.strip_prefix("AUTH=").or_else(|| lo.strip_prefix("auth=")))
+                    .is_some_and(|m| m == "*");
                 if (has_bad_char(user) || has_bad_char(pass))
                     && opts.easy.get_login_options().is_some()
+                    && !is_wildcard_auth
                 {
                     if !opts.silent || opts.show_error {
                         eprintln!("curl: (3) URL using bad/illegal format or missing URL");
