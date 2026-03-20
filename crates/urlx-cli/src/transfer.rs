@@ -3030,6 +3030,31 @@ pub fn run_multi(
                 if !silent || show_error {
                     eprintln!("curl: (1) Protocol \"{scheme}\" not supported");
                 }
+                // Still produce write-out for unsupported protocols (curl compat: tests 423, 424)
+                if let Some(wo) = write_out {
+                    let dummy_response = liburlx::Response::new(
+                        0,
+                        std::collections::HashMap::new(),
+                        Vec::new(),
+                        url.clone(),
+                    );
+                    let ctx = WriteOutContext {
+                        urlnum: i,
+                        exitcode: 1,
+                        errormsg: format!("Protocol \"{scheme}\" not supported"),
+                        had_error: true,
+                        ..WriteOutContext::default()
+                    };
+                    let _ = output_response_with_context(
+                        &dummy_response,
+                        None,
+                        Some(wo),
+                        false,
+                        silent,
+                        true,
+                        &ctx,
+                    );
+                }
                 let exit_code = ExitCode::from(1_u8);
                 if fail_early {
                     return exit_code;
