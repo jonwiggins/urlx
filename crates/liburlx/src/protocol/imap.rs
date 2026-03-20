@@ -399,6 +399,7 @@ pub async fn fetch(
                 tag_prefix,
                 use_ssl,
                 tls_config,
+                pre_connected,
             )
             .await
         })
@@ -420,6 +421,7 @@ async fn fetch_inner(
     tag_prefix: char,
     use_ssl: UseSsl,
     tls_config: &crate::tls::TlsConfig,
+    pre_connected: Option<tokio::net::TcpStream>,
 ) -> Result<Response, Error> {
     // Reject URLs with CR or LF in the path (curl compat: test 829).
     // Check BEFORE credentials or connection setup.

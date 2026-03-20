@@ -768,10 +768,14 @@ impl FtpSession {
         match self.read_and_record().await {
             Ok(resp) if resp.is_complete() => {
                 // Parse path from 257 "/path"
+                // Only extract if both opening and closing quotes are found.
+                // Unmatched quotes → treat as "could not get path" (curl compat: test 1152).
                 if let Some(start) = resp.message.find('"') {
                     if let Some(end) = resp.message[start + 1..].find('"') {
                         return Some(resp.message[start + 1..start + 1 + end].to_string());
                     }
+                    // Unmatched quote: path extraction failed
+                    return None;
                 }
                 Some(resp.message)
             }
