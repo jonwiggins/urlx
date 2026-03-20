@@ -551,6 +551,10 @@ async fn fetch_inner(
         let forced = login_options
             .and_then(|lo| lo.strip_prefix("AUTH=").or_else(|| lo.strip_prefix("auth=")));
 
+        // AUTH=* means "try any available mechanism" — treat as no forced mechanism
+        // (curl compat: test 895).
+        let forced = forced.and_then(|f| if f == "*" { None } else { Some(f) });
+
         // Check if forced mechanism is +LOGIN (plain LOGIN command, not SASL AUTHENTICATE LOGIN)
         let force_login_cmd = forced
             .is_some_and(|f| f.eq_ignore_ascii_case("+LOGIN") || f.eq_ignore_ascii_case("LOGIN"));
@@ -766,6 +770,8 @@ pub async fn fetch_multi(
     if !is_preauth {
         let forced = login_options
             .and_then(|lo| lo.strip_prefix("AUTH=").or_else(|| lo.strip_prefix("auth=")));
+        // AUTH=* means "try any available mechanism" (curl compat: test 895).
+        let forced = forced.and_then(|f| if f == "*" { None } else { Some(f) });
         let force_login_cmd = forced
             .is_some_and(|f| f.eq_ignore_ascii_case("+LOGIN") || f.eq_ignore_ascii_case("LOGIN"));
 
