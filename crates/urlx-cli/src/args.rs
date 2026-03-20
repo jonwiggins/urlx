@@ -142,6 +142,8 @@ pub struct CliOptions {
     pub(crate) per_url_credentials: Vec<Option<(String, String)>>,
     /// Original -X value preserving case (for non-HTTP protocol commands).
     pub(crate) custom_request_original: Option<String>,
+    /// Per-URL original -X value (indexed by URL position, for --next groups).
+    pub(crate) per_url_custom_request: Vec<Option<String>>,
     /// Variables set via `--variable` for `--expand-*` expansion.
     /// Values are stored as raw bytes to support binary data (null bytes etc.).
     pub(crate) variables: Vec<(String, Vec<u8>)>,
@@ -701,6 +703,7 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
         had_next: false,
         per_url_credentials: Vec::new(),
         custom_request_original: None,
+        per_url_custom_request: Vec::new(),
         variables: Vec::new(),
         skip_existing: false,
         json_mode: false,
@@ -1984,6 +1987,7 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
                             opts.per_url_ftp_methods.push(current_ftp_method);
                             opts.per_url_easy.push(None);
                             opts.per_url_upload_files.push(pending_upload_file.take());
+                            opts.per_url_custom_request.push(opts.custom_request_original.clone());
                             opts.per_url_group.push(opts.group_id);
                         }
                     }
@@ -1993,6 +1997,7 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
                     opts.per_url_ftp_methods.push(current_ftp_method);
                     opts.per_url_easy.push(None);
                     opts.per_url_upload_files.push(pending_upload_file.take());
+                    opts.per_url_custom_request.push(opts.custom_request_original.clone());
                     opts.per_url_group.push(opts.group_id);
                     // If etag options are set and this adds a second URL, blame --url
                     if opts.urls.len() > 1
@@ -2070,6 +2075,7 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
                 opts.per_url_credentials.push(opts.user_credentials.clone());
                 opts.per_url_easy.push(None);
                 opts.per_url_upload_files.push(pending_upload_file.take());
+                opts.per_url_custom_request.push(opts.custom_request_original.clone());
                 opts.per_url_group.push(opts.group_id);
                 opts.next_needs_url = false;
             }
@@ -2253,11 +2259,18 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
                         opts.easy.header("Accept", "application/json");
                     }
                 }
-                // Save per-URL Easy handles for the current group
+                // Save per-URL Easy handles and custom requests for the current group
                 let current_easy = opts.easy.clone();
                 for slot in opts.per_url_easy[opts.group_easy_start..].iter_mut() {
                     if slot.is_none() {
                         *slot = Some(current_easy.clone());
+                    }
+                }
+                // Update per-URL custom request for URLs in this group that
+                // were added before -X was processed (curl compat: tests 815, 816)
+                for slot in opts.per_url_custom_request[opts.group_easy_start..].iter_mut() {
+                    if slot.is_none() && opts.custom_request_original.is_some() {
+                        *slot = opts.custom_request_original.clone();
                     }
                 }
                 opts.group_easy_start = opts.per_url_easy.len();
@@ -2272,6 +2285,7 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
                 opts.easy.clear_custom_request_target();
                 opts.easy.set_form_data(false);
                 opts.json_mode = false;
+                opts.custom_request_original = None;
                 opts.next_needs_url = true;
                 opts.had_next = true;
                 opts.group_id += 1;
@@ -2300,6 +2314,7 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
                 opts.per_url_easy.push(None); // Will be filled on --next or at end
                                               // Associate pending -T upload file with this URL (if any)
                 opts.per_url_upload_files.push(pending_upload_file.take());
+                opts.per_url_custom_request.push(opts.custom_request_original.clone());
                 opts.per_url_group.push(opts.group_id);
                 opts.next_needs_url = false;
             }
@@ -2411,6 +2426,12 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
         for slot in opts.per_url_easy[opts.group_easy_start..].iter_mut() {
             if slot.is_none() {
                 *slot = Some(current_easy.clone());
+            }
+        }
+        // Update per-URL custom request for the last group
+        for slot in opts.per_url_custom_request[opts.group_easy_start..].iter_mut() {
+            if slot.is_none() && opts.custom_request_original.is_some() {
+                *slot = opts.custom_request_original.clone();
             }
         }
     }

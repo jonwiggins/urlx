@@ -376,8 +376,12 @@ impl Url {
             let before_colon = &input[..colon_pos];
             if Self::KNOWN_SCHEMES.iter().any(|s| s.eq_ignore_ascii_case(before_colon)) {
                 let after_colon = &input[colon_pos + 1..];
-                // Normalize scheme:/host to scheme://host (test 1143)
+                // Normalize scheme:/path to scheme://path (test 1143)
+                // For file: URLs, file:/path → file:///path (empty host, absolute path)
                 if after_colon.starts_with('/') && !after_colon.starts_with("//") {
+                    if before_colon.eq_ignore_ascii_case("file") {
+                        return format!("{before_colon}://{after_colon}");
+                    }
                     return format!("{before_colon}:/{after_colon}");
                 }
                 return input.to_string();

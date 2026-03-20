@@ -1124,6 +1124,7 @@ pub fn run(args: &[String]) -> ExitCode {
             &opts.per_url_upload_files,
             &opts.per_url_group,
             opts.resume_offset,
+            &opts.per_url_custom_request,
         );
     }
 
@@ -2644,6 +2645,7 @@ pub fn run_multi(
     per_url_upload_files: &[Option<String>],
     per_url_group: &[usize],
     resume_offset: Option<u64>,
+    per_url_custom_request: &[Option<String>],
 ) -> ExitCode {
     if parallel {
         return run_multi_parallel(
@@ -2881,7 +2883,11 @@ pub fn run_multi(
                     &ctx,
                 );
             }
-            last_exit = ExitCode::from(3); // CURLE_URL_MALFORMAT
+            let exit_code = ExitCode::from(3_u8); // CURLE_URL_MALFORMAT
+            if fail_early {
+                return exit_code;
+            }
+            last_exit = exit_code;
             continue;
         }
 
@@ -2953,6 +2959,7 @@ pub fn run_multi(
                 &easy,
                 per_url_easy,
                 per_url_credentials,
+                per_url_custom_request,
                 batch_start,
             ));
             match batch_result {
@@ -3015,7 +3022,11 @@ pub fn run_multi(
                 if !silent || show_error {
                     eprintln!("curl: (1) Protocol \"{scheme}\" not supported");
                 }
-                last_exit = ExitCode::from(1_u8);
+                let exit_code = ExitCode::from(1_u8);
+                if fail_early {
+                    return exit_code;
+                }
+                last_exit = exit_code;
                 continue;
             }
         }
@@ -3240,6 +3251,7 @@ async fn run_imap_batch(
     template_easy: &liburlx::Easy,
     per_url_easy: &[Option<liburlx::Easy>],
     per_url_credentials: &[Option<(String, String)>],
+    per_url_custom_request: &[Option<String>],
     batch_start: usize,
 ) -> Result<Vec<liburlx::Response>, liburlx::Error> {
     let mut ops = Vec::new();
@@ -3281,11 +3293,14 @@ async fn run_imap_batch(
     // custom_request_target (original case). When the method is not a standard
     // HTTP method, it IS the custom command for IMAP.
     let mut custom_requests: Vec<Option<String>> = Vec::new();
-    for easy_clone in &parsed_urls {
+    for (idx, easy_clone) in parsed_urls.iter().enumerate() {
+        let global_idx = batch_start + idx;
+        // Use per-URL original-case custom request if available (curl compat: tests 815, 816)
+        let per_url_cr = per_url_custom_request.get(global_idx).and_then(|v| v.as_deref());
+        let custom_request = easy_clone.custom_request().or(per_url_cr);
         let method = easy_clone.effective_method();
-        let custom_request = easy_clone.custom_request();
-        // If custom_request_target is set, use it; otherwise if the method
-        // is not a standard HTTP method, use it as the custom request (preserving case).
+        // If custom_request is set, use it; otherwise if the method
+        // is not a standard HTTP method, use it as the custom request.
         let effective_custom = if custom_request.is_some() {
             custom_request.map(ToString::to_string)
         } else {

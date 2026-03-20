@@ -15,7 +15,7 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 ## Current Status
 
 **Version:** v0.1.0 published (crates.io + GitHub Releases + Homebrew)
-**curl test suite:** 1,173 pass / 83 fail / 71 skip out of 1,327 tests (93.4% pass rate, tests 1-1400)
+**curl test suite:** 1,025 pass / 49 fail / 60 skip out of 1,134 evaluated tests (95.4% pass rate, tests 1-1400)
 **Rust test count:** 2,655
 **Blockers:** None — infrastructure is live
 
@@ -102,7 +102,7 @@ Some tests are expected to be permanently skipped:
 - Tests requiring curl debug builds (`feat:debug`, `feat:TrackMemory`)
 - Tests requiring protocols we haven't implemented yet (mark as TODO with the protocol name)
 - Tests checking curl-specific version strings
-- **Source/build analysis tests** (17 tests, documented in `tests/excluded-tests.txt`): 745, 971, 1013, 1014, 1022, 1023, 1026, 1027, 1119, 1135, 1139, 1165, 1167, 1173, 1177, 1185, 1222 — these verify curl's own source code structure, build system, man pages, symbol consistency, and documentation sync; not applicable to urlx
+- **Source/build analysis tests** (19 tests, documented in `tests/excluded-tests.txt`): 745, 971, 1013, 1014, 1022, 1023, 1026, 1027, 1119, 1135, 1139, 1140, 1165, 1167, 1173, 1177, 1185, 1222, 1279 — these verify curl's own source code structure, build system, man pages, symbol consistency, and documentation sync; not applicable to urlx
 
 Document every skip with a reason. Skips without rationale are not allowed.
 
@@ -110,74 +110,50 @@ Document every skip with a reason. Skips without rationale are not allowed.
 
 ## Remaining Work: Failure Analysis (as of 2026-03-19)
 
-Full test suite run: 1,173 pass / 83 fail / 71 skip (tests 1-1400, 30s timeout). **93.4% pass rate.**
-17 source/build analysis tests permanently excluded (see `tests/excluded-tests.txt`).
+Full test suite run: 1,025 pass / 49 fail / 60 skip (tests 1-1400). **95.4% pass rate.**
+19 source/build analysis tests permanently excluded (see `tests/excluded-tests.txt`).
 
-### Failing Tests by Category (83 total)
+### Failing Tests by Category (49 total)
 
-| # | Category | Tests | Count | Details |
-|---|----------|-------|-------|---------|
-| 1 | **IMAP edge cases** | 795, 800, 815, 816, 847, 897, 1221 | 7 | STORE/CLOSE/EXPUNGE custom commands, login options, IMAP via HTTP proxy |
-| 2 | **HTTP NTLM auth** | 547, 548, 555, 560, 694, 775, 895 | 7 | NTLM with POST callback, Negotiate, multi-interface |
-| 3 | **FTP over SOCKS/proxy** | 706, 707, 712, 713, 714, 715, 1050, 1059, 1069, 1105 | 10 | FTP via SOCKS4/5, HTTP CONNECT tunnel, IPv6 EPRT, proxy relay |
-| 4 | **HTTP PUT/POST edge cases** | 186, 357, 490, 491, 492, 493, 1015, 1077, 1106 | 9 | Expect 100, PUT methods, POST encoding, cookies with POST |
-| 5 | **HTTP headers/encoding** | 306, 313, 373, 379, 415, 471, 483 | 7 | HTTPS cert/CRL, chunked encoding, Content-Length edge cases, globbing |
-| 6 | **Email via HTTP tunnel** | 1319, 1320, 1321 | 3 | POP3/SMTP/IMAP through HTTP CONNECT proxy |
-| 7 | **HTTP etag/resume** | 338, 369, 481, 482, 484, 485, 487, 497 | 8 | Etag multi-URL, --no-clobber + resume, --remove-on-error |
-| 8 | **CLI/globbing/output** | 760, 761, 762, 776, 988, 1134, 1265, 1268, 1292, 1299, 1328, 1370, 1371, 1400 | 14 | Globbing edge cases, --remote-time, -J Content-Disposition, --libcurl, NO_PROXY IPv6 |
-| 9 | **FTP misc** | 203, 254, 590, 1217, 1224, 1225, 1226 | 7 | file:// edge case, IPv6 EPSV, FTP NLST, PASV RETR |
-| 10 | **SMTP MIME/misc** | 609, 646, 647, 648, 649, 669 | 6 | Multipart MIME, IMAP APPEND upload, SMTP edge cases |
-| 11 | **TLS/HTTPS** | 306, 313 | 2 | PEM cert validation, CRL checking |
-| 12 | **Misc** | 1020, 1105, 1106, 1117, 1147, 1148, 1152 | 7 | Various HTTP edge cases, proxy interactions |
+| # | Category | Tests | Count | Root Cause |
+|---|----------|-------|-------|------------|
+| 1 | **SFTP/SCP** | 600-627, 630-631, 633-642, 664-665 | 38 | SSH data transfer not working — SFTP subsystem connects but data channel fails |
+| 2 | **Multipart form** | 39, 1133, 1189 | 3 | Content-Length calculation off by ~14 bytes, Content-Type defaults wrong |
+| 3 | **-w URL variables** | 423, 424 | 2 | Invalid scheme URLs silently skipped instead of parsed for -w output |
+| 4 | **HTTP etag** | 339 | 1 | --etag-save not writing correct etag value |
+| 5 | **FTP IPv6** | 254 | 1 | --disable-epsv with IPv6 — PASV fallback not completing |
+| 6 | **IMAP auth** | 895 | 1 | --login-options 'AUTH=*' parsing with special chars in credentials |
+| 7 | **HTTP HEAD/0.9** | 1144 | 1 | HEAD request body suppression fails for HTTP/0.9 responses |
+| 8 | **Multipart escape** | 1189 | 1 | --form-escape flag and default Content-Type for text fields |
 
-### Permanently Skipped (17 tests)
+### Permanently Skipped (19 tests)
 
-Source/build analysis tests (745, 971, 1013, 1014, 1022, 1023, 1026, 1027, 1119, 1135, 1139, 1165, 1167, 1173, 1177, 1185, 1222) are permanently excluded via `tests/excluded-tests.txt`. They verify curl's own source code structure, man pages, and build system — not applicable to urlx.
+Source/build analysis tests (745, 971, 1013, 1014, 1022, 1023, 1026, 1027, 1119, 1135, 1139, 1140, 1165, 1167, 1173, 1177, 1185, 1222, 1279) are permanently excluded via `tests/excluded-tests.txt`. They verify curl's own source code structure, man pages, and build system — not applicable to urlx.
 
-### Addressable Failures (~83 tests)
+### Remaining Failures Analysis
 
-| Priority | Category | ~Tests | Effort |
-|----------|----------|--------|--------|
-| High | FTP over SOCKS/proxy | ~10 | 1-2 days |
-| High | HTTP PUT/POST/Expect | ~9 | 1 day |
-| High | IMAP edge cases | ~7 | 1 day |
-| Medium | HTTP NTLM (POST callback) | ~7 | 1-2 days |
-| Medium | CLI/globbing/output | ~14 | 2 days |
-| Medium | HTTP etag/resume | ~8 | 1 day |
-| Medium | Email via HTTP tunnel | ~3 | 0.5 day |
-| Medium | SMTP MIME/misc | ~6 | 1 day |
-| Low | HTTP headers/encoding | ~7 | 1 day |
-| Low | FTP misc | ~7 | 1 day |
-| Low | Misc | ~7 | 1-2 days |
+| Priority | Category | Tests | Effort | Notes |
+|----------|----------|-------|--------|-------|
+| High | SFTP/SCP data transfer | 38 | 2-3 days | Largest block — fixing SSH data channel would pass 38 tests at once |
+| Medium | Multipart form Content-Length | 3 | 0.5 day | Boundary/content-type calculation bug |
+| Medium | -w URL variable output | 2 | 0.5 day | Handle invalid scheme URLs in write-out |
+| Low | HTTP etag, FTP IPv6, IMAP auth | 3 | 1 day | Individual edge cases |
+| Low | HTTP HEAD/0.9, form-escape | 3 | 0.5 day | Minor behavior differences |
 
-### Path to 95%+
+### Path to Higher Pass Rates
 
 | Milestone | Pass Rate | Work |
 |-----------|-----------|------|
-| Current (source analysis skipped, auth cancellation resolved) | 93.4% (1,173/1,256 non-skipped) | Done |
-| FTP proxy + HTTP PUT/POST | 95% (~1,192) | 1 week |
-| IMAP + CLI + etag fixes | 97% (~1,220) | +1 week |
-| Long tail (NTLM, MIME, misc) | 98%+ (~1,240) | +2 weeks |
+| Current | 95.4% (1,025/1,074 run) | Done |
+| Fix SFTP/SCP data transfer | 99.1% (~1,063/1,074) | 2-3 days |
+| Fix multipart + misc | 99.5%+ (~1,069/1,074) | +1 day |
+| Full long tail | ~100% of applicable tests | +1-2 days |
 
 ---
 
 ## Test Suite Progress
 
-1,173 of 1,327 tests pass (93.4%). The test suite spans tests 1-1400 with 71 skipped (54 libtests/missing features/debug-only + 17 source analysis permanently excluded).
-
-### By Range
-
-| Range | Description | Pass/Total | Notes |
-|-------|-------------|------------|-------|
-| 1-99 | HTTP basics | 97/97 | All pass |
-| 100-199 | FTP, HTTP auth/forms | 88/93 | 5 failures (186, 190 timeout edge cases) |
-| 200-399 | file://, HTTPS, proxy | 175/192 | Failures: HTTPS cert CRL, etag, chunked, proxy edge cases |
-| 400-599 | HTTP proxy, POST | 75/103 | ~16 are libtests/skipped; failures in NTLM POST callback, SOCKS |
-| 600-699 | SFTP/SCP, SMTP, IMAP | 63/82 | SMTP MIME, IMAP custom commands |
-| 700-799 | Cookies, HSTS, headers | 73/82 | Globbing, NTLM, etag edge cases |
-| 800-999 | SSH, SMTP, IMAP, POP3 | 270/282 | IMAP login options, 971 skipped (source analysis) |
-| 1000-1199 | HTTP/2, misc, analysis | 158/188 | ~16 source analysis tests (N/A), FTP proxy, NTLM |
-| 1200-1400 | Advanced features | 174/208 | CLI output, Content-Disposition, --libcurl |
+1,025 of 1,074 evaluated tests pass (95.4%). The test suite spans tests 1-1400 with 60 skipped (41 libtests/missing features/debug-only + 19 source analysis permanently excluded).
 
 ---
 
