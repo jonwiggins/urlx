@@ -555,6 +555,16 @@ async fn fetch_inner(
         let force_login_cmd = forced
             .is_some_and(|f| f.eq_ignore_ascii_case("+LOGIN") || f.eq_ignore_ascii_case("LOGIN"));
 
+        // Reject unknown SASL mechanisms early (curl compat: test 896).
+        // curl returns CURLE_URL_MALFORMAT (3) for unrecognized AUTH= values.
+        if let Some(mech) = forced {
+            if !force_login_cmd && !is_known_sasl_mechanism(mech) {
+                return Err(Error::UrlParse(format!(
+                    "unknown IMAP authentication mechanism: {mech}"
+                )));
+            }
+        }
+
         // Authenticate using the best available mechanism
         // Order: EXTERNAL > OAUTHBEARER > XOAUTH2 > CRAM-MD5 > NTLM > LOGIN > PLAIN > LOGIN cmd
         // With downgrade: if CRAM-MD5 or NTLM fails with bad challenge, cancel and try next
@@ -758,6 +768,16 @@ pub async fn fetch_multi(
             .and_then(|lo| lo.strip_prefix("AUTH=").or_else(|| lo.strip_prefix("auth=")));
         let force_login_cmd = forced
             .is_some_and(|f| f.eq_ignore_ascii_case("+LOGIN") || f.eq_ignore_ascii_case("LOGIN"));
+
+        // Reject unknown SASL mechanisms early (curl compat: test 896).
+        if let Some(mech) = forced {
+            if !force_login_cmd && !is_known_sasl_mechanism(mech) {
+                return Err(Error::UrlParse(format!(
+                    "unknown IMAP authentication mechanism: {mech}"
+                )));
+            }
+        }
+
         let auth_result = do_imap_auth(
             &mut reader,
             &mut writer,
@@ -1381,6 +1401,30 @@ fn extract_fetch_body(data: &[String]) -> Vec<u8> {
         }
         out
     }
+}
+
+/// Check whether a SASL mechanism name is recognized.
+///
+/// Returns `true` for standard mechanisms supported by this implementation.
+/// Unknown mechanisms cause `CURLE_URL_MALFORMAT` (curl compat: test 896).
+fn is_known_sasl_mechanism(mech: &str) -> bool {
+    let m = mech.to_ascii_uppercase();
+    matches!(
+        m.as_str(),
+        "PLAIN"
+            | "LOGIN"
+            | "EXTERNAL"
+            | "CRAM-MD5"
+            | "NTLM"
+            | "OAUTHBEARER"
+            | "XOAUTH2"
+            | "SCRAM-SHA-1"
+            | "SCRAM-SHA-256"
+            | "DIGEST-MD5"
+            | "GSSAPI"
+            | "ANONYMOUS"
+            | "*"
+    )
 }
 
 /// Strip `;AUTH=<mechanism>` from a URL username.

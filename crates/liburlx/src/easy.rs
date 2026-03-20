@@ -1002,9 +1002,10 @@ impl Easy {
 
     /// Transfer the cookie jar and HSTS cache from another Easy handle.
     ///
-    /// This preserves accumulated cookies and HSTS entries when switching
-    /// Easy handles in multi-URL sequential mode (curl compat: cookies
-    /// must persist across URLs in the same invocation).
+    /// This preserves accumulated cookies, HSTS entries, and the connection
+    /// pool when switching Easy handles in multi-URL sequential mode.
+    /// The connection pool transfer enables connection reuse across `--next`
+    /// groups even when credentials change (curl compat: test 1134).
     pub fn transfer_state_from(&mut self, other: &mut Self) {
         if other.cookie_jar.is_some() {
             self.cookie_jar = other.cookie_jar.take();
@@ -1013,7 +1014,7 @@ impl Easy {
             self.hsts_cache = other.hsts_cache.take();
         }
         // Transfer connection pool so --next groups can reuse connections
-        // (curl compat: test 338 — ANYAUTH connection reuse across --next boundary).
+        // (curl compat: tests 338, 1134 — connection reuse across --next boundary).
         self.pool = std::mem::replace(&mut other.pool, ConnectionPool::new());
         #[cfg(feature = "http2")]
         {
@@ -2614,6 +2615,8 @@ impl Easy {
         // If the header was already explicitly set (e.g. via -A), remove it first
         // and replace with the sentinel.
         // Non-built-in headers: no-op (there's no default to suppress).
+        // Host uses a special sentinel "\x01REMOVE\x01" to distinguish removal (-H "Host:")
+        // from blank value (-H "Host;") which should emit "Host:\r\n" (curl compat: test 1292).
         // (curl compat: -H "User-Agent:" suppresses User-Agent, tests 4, 1147)
         for removed in &self.removed_headers {
             let name = match removed.as_str() {
@@ -2626,7 +2629,12 @@ impl Easy {
                 // Remove any existing header with this name (e.g. from -A)
                 headers.retain(|(k, _)| !k.eq_ignore_ascii_case(removed));
                 // Add sentinel to suppress the built-in default
-                headers.push((name.to_string(), String::new()));
+                // Host uses a special sentinel to distinguish from -H "Host;" (blank value)
+                if removed == "host" {
+                    headers.push((name.to_string(), "\x01REMOVE\x01".to_string()));
+                } else {
+                    headers.push((name.to_string(), String::new()));
+                }
             }
             // Non-built-in headers: no-op (curl compat: test 4, -H "X-Test:")
         }

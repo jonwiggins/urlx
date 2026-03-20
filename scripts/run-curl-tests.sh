@@ -66,12 +66,21 @@ echo "urlx binary: $URLX"
 echo "Tests: ${*:-ALL}"
 echo ""
 
-# Build exclusion args: use -E file if the exclude file exists
+# Build exclusion args from exclude file (skip test numbers listed there)
 EXCLUDE_ARGS=()
 if [ -f "$EXCLUDE_FILE" ]; then
-    EXCLUDE_ARGS+=(-E "$EXCLUDE_FILE")
-    echo "Excluding tests listed in: $EXCLUDE_FILE"
-    echo ""
+    while IFS= read -r line; do
+        # Skip comments and empty lines
+        [[ "$line" =~ ^#.*$ || -z "$line" ]] && continue
+        # Parse "test:NNN:reason" format
+        if [[ "$line" =~ ^test:([0-9]+): ]]; then
+            EXCLUDE_ARGS+=("!${BASH_REMATCH[1]}")
+        fi
+    done < "$EXCLUDE_FILE"
+    if [ ${#EXCLUDE_ARGS[@]} -gt 0 ]; then
+        echo "Excluding ${#EXCLUDE_ARGS[@]} tests from: $EXCLUDE_FILE"
+        echo ""
+    fi
 fi
 
 perl runtests.pl \
