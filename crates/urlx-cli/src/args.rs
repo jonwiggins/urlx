@@ -2942,12 +2942,18 @@ fn parse_form_field_ext(
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_default();
+            let has_custom_filename = custom_filename.is_some();
             let display_filename = custom_filename.unwrap_or_else(|| original_filename.clone());
 
             if custom_headers.is_empty() && encoder.is_none() && container_stack.is_empty() {
                 // Simple path — use existing API
                 if let Some(ref ct) = custom_type {
                     easy.form_file_with_type(name, &display_filename, ct, &data);
+                } else if has_custom_filename {
+                    // Custom filename but no explicit type — guess content type from
+                    // original filename, not the display filename (curl compat: test 39).
+                    let guessed = liburlx::guess_form_content_type(&original_filename);
+                    easy.form_file_with_type(name, &display_filename, &guessed, &data);
                 } else {
                     // No explicit type — use form_file_data which sets explicit_type=false.
                     // In SMTP/IMAP mode, Content-Type is only output for explicit types.
@@ -3037,9 +3043,11 @@ fn parse_form_field_ext(
                     && !trimmed.starts_with("encoder=")
                     && !trimmed.is_empty()
                 {
-                    // Unknown modifier after type — append as Content-Type sub-param
+                    // Unknown modifier after type — append as Content-Type sub-param.
+                    // Preserve original spacing (curl compat: test 186 has no space,
+                    // test 1133 has space after semicolon).
                     ct.push(';');
-                    ct.push_str(trimmed);
+                    ct.push_str(modifier);
                 }
             }
         }
@@ -3251,8 +3259,10 @@ fn split_modifiers_owned(s: &str) -> Vec<String> {
             in_quote = !in_quote;
             i += 1;
         } else if bytes[i] == b';' && !in_quote {
-            let part = s[start..i].trim().to_string();
-            if !part.is_empty() {
+            // Preserve leading whitespace (needed for Content-Type sub-params
+            // like "; charset=utf-8"), only trim trailing whitespace.
+            let part = s[start..i].trim_end().to_string();
+            if !part.trim().is_empty() {
                 parts.push(part);
             }
             start = i + 1;
@@ -3261,8 +3271,8 @@ fn split_modifiers_owned(s: &str) -> Vec<String> {
             i += 1;
         }
     }
-    let part = s[start..].trim().to_string();
-    if !part.is_empty() {
+    let part = s[start..].trim_end().to_string();
+    if !part.trim().is_empty() {
         parts.push(part);
     }
     parts
