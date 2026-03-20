@@ -1437,9 +1437,8 @@ fn unfold_headers(data: &[u8]) -> std::borrow::Cow<'_, [u8]> {
 /// 1. Unfold continuation lines (`\r\n<SP|HT>` → single space)
 /// 2. Collapse consecutive spaces in header values into a single space
 ///
-/// Tab characters in header values are preserved as-is (curl compat: test 1105).
-///
-/// This matches curl's header output behavior (tests 1105, 1274).
+/// Tab characters in header values are converted to spaces during folding normalization
+/// (curl compat: tests 1105, 1274).
 fn normalize_raw_headers_for_output(data: &[u8]) -> Vec<u8> {
     // Quick check: does this data contain any folds?
     let has_fold = data.windows(2).any(|w| (w[0] == b'\n') && (w[1] == b' ' || w[1] == b'\t'));
@@ -1469,7 +1468,7 @@ fn normalize_raw_headers_for_output(data: &[u8]) -> Vec<u8> {
         if let Some(colon_pos) = line.iter().position(|&b| b == b':') {
             // Emit header name and colon as-is
             result.extend_from_slice(&line[..=colon_pos]);
-            // Process value part: collapse consecutive spaces (preserve tabs)
+            // Process value part: collapse consecutive whitespace (spaces and tabs)
             let value_start = colon_pos + 1;
             let line_content_end = if line.ends_with(b"\r\n") {
                 line.len() - 2
@@ -1479,13 +1478,13 @@ fn normalize_raw_headers_for_output(data: &[u8]) -> Vec<u8> {
                 line.len()
             };
             let value = &line[value_start..line_content_end];
-            // Collapse consecutive spaces (but preserve tabs)
+            // Collapse consecutive whitespace (spaces and tabs → single space)
             let mut prev_space = false;
             let mut value_started = false;
             for &b in value {
-                if b == b' ' {
+                if b == b' ' || b == b'\t' {
                     if !value_started {
-                        // Leading space after colon: emit one space
+                        // Leading whitespace after colon: emit one space
                         result.push(b' ');
                         value_started = true;
                         prev_space = true;
@@ -1493,10 +1492,10 @@ fn normalize_raw_headers_for_output(data: &[u8]) -> Vec<u8> {
                         result.push(b' ');
                         prev_space = true;
                     }
-                    // else: collapse consecutive spaces
+                    // else: collapse consecutive whitespace
                 } else {
                     if !value_started {
-                        // First non-space char without leading space
+                        // First non-whitespace char without leading space
                         value_started = true;
                     }
                     result.push(b);

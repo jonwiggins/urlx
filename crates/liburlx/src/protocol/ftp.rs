@@ -479,6 +479,9 @@ pub struct FtpSession {
     /// Current working directory components (for connection reuse).
     /// Empty means "initial state after login" (home directory).
     current_dir: Vec<String>,
+    /// Home directory from PWD response (for resetting on connection reuse).
+    /// curl CWDs to this path instead of "/" when reusing connections.
+    home_dir: Option<String>,
     /// Current TYPE setting (for skipping redundant TYPE commands on reuse).
     current_type: Option<TransferType>,
     /// Proxy configuration for routing data connections through a proxy.
@@ -575,6 +578,7 @@ impl FtpSession {
             config,
             header_bytes,
             current_dir: Vec::new(),
+            home_dir: None,
             current_type: None,
             proxy_config: proxy,
             connect_response_bytes,
@@ -673,6 +677,7 @@ impl FtpSession {
             config,
             header_bytes,
             current_dir: Vec::new(),
+            home_dir: None,
             current_type: None,
             proxy_config: None,
             connect_response_bytes: Vec::new(),
@@ -794,6 +799,7 @@ impl FtpSession {
             config: self.config,
             header_bytes: self.header_bytes,
             current_dir: self.current_dir,
+            home_dir: self.home_dir,
             current_type: self.current_type,
             proxy_config: self.proxy_config,
             connect_response_bytes: self.connect_response_bytes,
@@ -2245,6 +2251,7 @@ async fn perform_inner(
     if !is_reuse {
         // PWD after login (curl always sends this)
         let pwd_path = session.pwd_safe().await;
+        session.home_dir.clone_from(&pwd_path);
 
         // SYST: detect OS/400 and send SITE NAMEFMT 1.
         // curl only sends SYST when PWD succeeds AND the path does NOT start with '/'
@@ -2313,22 +2320,34 @@ async fn perform_inner(
     };
 
     if need_cwd {
-        // On reuse: reset to root first, then navigate
-        if is_reuse && !session.current_dir.is_empty() {
-            send_command(&mut session.writer, "CWD /").await?;
+        // On reuse: reset to home directory first, then navigate
+        // curl CWDs to the PWD path (home dir) instead of "/" (test 1217)
+        let did_reset_to_root = if is_reuse && !session.current_dir.is_empty() {
+            let reset_dir = session.home_dir.clone().unwrap_or_else(|| "/".to_string());
+            send_command(&mut session.writer, &format!("CWD {reset_dir}")).await?;
             let cwd_resp = session.read_and_record().await?;
             if !cwd_resp.is_complete() {
                 return Err(Error::Transfer {
                     code: 9,
-                    message: format!("FTP CWD / failed: {} {}", cwd_resp.code, cwd_resp.message),
+                    message: format!(
+                        "FTP CWD {reset_dir} failed: {} {}",
+                        cwd_resp.code, cwd_resp.message
+                    ),
                 });
             }
             session.current_dir.clear();
-        }
+            true
+        } else {
+            false
+        };
 
         // Perform CWD navigation
         for component in &dir_components {
             if component.is_empty() {
+                continue;
+            }
+            // Skip "/" component if we already reset to root (avoid duplicate CWD /)
+            if *component == "/" && did_reset_to_root {
                 continue;
             }
             send_command(&mut session.writer, &format!("CWD {component}")).await?;
@@ -3068,6 +3087,9 @@ fn split_path_for_method(path: &str, method: FtpMethod) -> (Vec<&str>, String) {
                 } else {
                     (vec![dir], file.to_string())
                 }
+            } else if path.starts_with("//") {
+                // Root-relative file: //filename → CWD /, RETR filename (tests 1224, 1226)
+                (vec!["/"], trimmed.to_string())
             } else {
                 (Vec::new(), trimmed.to_string())
             }
@@ -3086,6 +3108,9 @@ fn split_path_for_method(path: &str, method: FtpMethod) -> (Vec<&str>, String) {
                     }
                 }
                 (components, file.to_string())
+            } else if path.starts_with("//") {
+                // Root-relative file: //filename → CWD /, RETR filename (test 1224)
+                (vec!["/"], trimmed.to_string())
             } else {
                 (Vec::new(), trimmed.to_string())
             }

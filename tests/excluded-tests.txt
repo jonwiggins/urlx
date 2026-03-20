@@ -30,4 +30,8 @@ test:971:curl source analysis — options-in-versions and docs/cmdline-opts sync
 test:1026:urlx does not embed curl manual — --manual flag not applicable
 test:1027:urlx has different help text format — --help output differs
 test:1139:curl documentation — verifies all libcurl options have man pages
+test:1140:curl documentation — verifies nroff formatting of man pages
 test:1173:curl documentation — man page syntax checks
+
+# curl build artifact tests — urlx does not have libcurl.def
+test:1279:curl build artifact — verifies libcurl.def against CURL_EXTERN declarations

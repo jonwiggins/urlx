@@ -7931,11 +7931,18 @@ fn should_bypass_proxy(url: &Url, noproxy: Option<&str>) -> bool {
         return false;
     };
 
+    // Strip brackets from IPv6 addresses for comparison (e.g., "[::1]" → "::1")
+    let host = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host);
+
     for pattern in noproxy.split(',') {
         let pattern = pattern.trim();
         if pattern.is_empty() {
             continue;
         }
+
+        // Strip brackets from IPv6 patterns too
+        let pattern =
+            pattern.strip_prefix('[').and_then(|p| p.strip_suffix(']')).unwrap_or(pattern);
 
         // "*" matches everything
         if pattern == "*" {
