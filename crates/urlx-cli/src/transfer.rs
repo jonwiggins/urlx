@@ -1449,6 +1449,14 @@ pub fn run(args: &[String]) -> ExitCode {
 
     // Stdin PUT: add chunked Transfer-Encoding and Expect: 100-continue (curl compat)
     if opts.is_stdin_upload {
+        // HTTP/1.0 cannot use chunked encoding, so PUT from stdin with unknown size
+        // is impossible — fail with error 25 (curl compat: test 1069)
+        if opts.easy.is_http10() {
+            if !opts.silent || opts.show_error {
+                eprintln!("curl: (25) Upload failed: HTTP/1.0 does not support chunked transfer encoding for unknown upload sizes");
+            }
+            return ExitCode::from(25);
+        }
         // Enable Expect: 100-continue via the timeout mechanism (h1.rs adds the header)
         opts.easy.expect_100_timeout(std::time::Duration::from_secs(1));
         // Enable chunked upload (unless user explicitly suppressed Transfer-Encoding)
@@ -1480,7 +1488,7 @@ pub fn run(args: &[String]) -> ExitCode {
     // Suppress include_headers for FTP/IMAP/POP3/SMTP/MQTT URLs.
     // Exception: when an HTTP proxy is set, FTP/FTPS requests are relayed
     // as HTTP through the proxy, so headers should be shown (curl compat: test 79).
-    let has_http_proxy = opts.easy.has_proxy();
+    let has_http_proxy = opts.easy.has_http_proxy();
     if opts.urls.first().is_some_and(|u| {
         let lower = u.to_lowercase();
         // FTP/FTPS through HTTP proxy → response is HTTP, keep headers

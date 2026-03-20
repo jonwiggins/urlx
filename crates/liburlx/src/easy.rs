@@ -1059,6 +1059,21 @@ impl Easy {
         self.proxy.is_some()
     }
 
+    /// Returns true if HTTP/1.0 has been forced.
+    #[must_use]
+    pub const fn is_http10(&self) -> bool {
+        matches!(self.http_version, HttpVersion::Http10)
+    }
+
+    /// Returns true if an HTTP/HTTPS proxy has been configured (not SOCKS).
+    #[must_use]
+    pub fn has_http_proxy(&self) -> bool {
+        self.proxy.as_ref().is_some_and(|p| {
+            let s = p.scheme();
+            s == "http" || s == "https"
+        })
+    }
+
     /// Returns a reference to the current URL, if set.
     #[must_use]
     pub const fn url_ref(&self) -> Option<&Url> {
@@ -5103,6 +5118,7 @@ async fn perform_transfer(
                         ftp_config,
                         None,
                         ftp_session,
+                        None,
                     )
                     .await;
 
@@ -5421,6 +5437,10 @@ async fn do_single_request(
                 let s = p.scheme();
                 s == "http" || s == "https"
             });
+            let is_socks_proxy_ftp = proxy.is_some_and(|p| {
+                let s = p.scheme();
+                s == "socks5" || s == "socks4" || s == "socks5h" || s == "socks4a"
+            });
             if is_http_proxy && !http_proxy_tunnel {
                 // Fall through to the HTTP proxy path below — handled after this match
             } else {
@@ -5491,8 +5511,80 @@ async fn do_single_request(
                 ftp_config_with_range.range_end = ftp_range_end;
                 ftp_config_with_range.range_from_end = ftp_range_from_end;
                 let ftp_use_ssl = use_ssl;
-                return crate::protocol::ftp::perform(
-                    url,
+
+                // Build FTP proxy configuration (curl compat: tests 706, 707, 712-715)
+                let ftp_proxy = if is_socks_proxy_ftp {
+                    let proxy_url = proxy.ok_or_else(|| Error::Http("no proxy URL".to_string()))?;
+                    let (ph, pp) = proxy_url.host_and_port()?;
+                    let socks_auth =
+                        proxy_url.credentials().map(|(u, p)| (u.to_string(), p.to_string()));
+                    match proxy_url.scheme() {
+                        "socks5" | "socks5h" => {
+                            Some(crate::protocol::ftp::FtpProxyConfig::Socks5 {
+                                host: ph,
+                                port: pp,
+                                auth: socks_auth,
+                            })
+                        }
+                        "socks4" => Some(crate::protocol::ftp::FtpProxyConfig::Socks4 {
+                            host: ph,
+                            port: pp,
+                            user_id: socks_auth.map_or_else(String::new, |(u, _)| u),
+                            socks4a: false,
+                        }),
+                        "socks4a" => Some(crate::protocol::ftp::FtpProxyConfig::Socks4 {
+                            host: ph,
+                            port: pp,
+                            user_id: socks_auth.map_or_else(String::new, |(u, _)| u),
+                            socks4a: true,
+                        }),
+                        _ => None,
+                    }
+                } else if is_http_proxy && http_proxy_tunnel {
+                    // FTP through HTTP CONNECT tunnel (curl compat: tests 714, 1059)
+                    let proxy_url = proxy.ok_or_else(|| Error::Http("no proxy URL".to_string()))?;
+                    let (ph, pp) = proxy_url.host_and_port()?;
+                    // Extract User-Agent from headers for CONNECT request
+                    let ua = headers
+                        .iter()
+                        .find(|(k, _)| k.eq_ignore_ascii_case("user-agent"))
+                        .map_or_else(|| "curl/0.1.0".to_string(), |(_, v)| v.clone());
+                    Some(crate::protocol::ftp::FtpProxyConfig::HttpConnect {
+                        host: ph,
+                        port: pp,
+                        user_agent: ua,
+                    })
+                } else {
+                    None
+                };
+
+                // Apply --connect-to for FTP target host when using proxy
+                // (curl compat: tests 713, 714, 715)
+                let ftp_url = if ftp_proxy.is_some() && !connect_to.is_empty() {
+                    let (orig_host, orig_port) = url.host_and_port()?;
+                    let (new_host, new_port) = apply_connect_to(&orig_host, orig_port, connect_to);
+                    if new_host != orig_host || new_port != orig_port {
+                        if verbose {
+                            #[allow(clippy::print_stderr)]
+                            {
+                                eprintln!(
+                                    "* FTP connect-to: remapped {orig_host}:{orig_port} -> {new_host}:{new_port}"
+                                );
+                            }
+                        }
+                        // Rebuild URL with remapped host:port
+                        let new_url_str =
+                            format!("{}://{}:{}{}", url.scheme(), new_host, new_port, url.path());
+                        crate::url::Url::parse(&new_url_str)?
+                    } else {
+                        url.clone()
+                    }
+                } else {
+                    url.clone()
+                };
+
+                let mut ftp_result = crate::protocol::ftp::perform(
+                    &ftp_url,
                     upload_data,
                     effective_ssl_mode,
                     ftp_use_ssl,
@@ -5501,8 +5593,29 @@ async fn do_single_request(
                     &ftp_config_with_range,
                     None,
                     ftp_session,
+                    ftp_proxy,
                 )
                 .await;
+
+                // For HTTP CONNECT tunnel FTP, prepend CONNECT response headers
+                // as redirect responses in the output (curl compat: tests 714, 715)
+                if let Ok(ref mut resp) = ftp_result {
+                    if let Some(session) = ftp_session.as_mut() {
+                        let connect_bytes: Vec<u8> = session.take_connect_response_bytes();
+                        if !connect_bytes.is_empty() {
+                            let connect_resp = Response::with_raw_headers(
+                                200,
+                                std::collections::HashMap::new(),
+                                Vec::new(),
+                                url.as_str().to_string(),
+                                connect_bytes,
+                            );
+                            resp.push_redirect_response(connect_resp);
+                        }
+                    }
+                }
+
+                return ftp_result;
             }
         }
         "smtp" | "smtps" => {
