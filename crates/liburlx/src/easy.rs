@@ -1013,11 +1013,13 @@ impl Easy {
         if other.hsts_cache.is_some() {
             self.hsts_cache = other.hsts_cache.take();
         }
-        // Transfer the connection pool so connections are reused across --next
-        // boundaries (curl compat: test 1134 — different credentials reuse same TCP connection).
-        std::mem::swap(&mut self.pool, &mut other.pool);
+        // Transfer connection pool so --next groups can reuse connections
+        // (curl compat: tests 338, 1134 — connection reuse across --next boundary).
+        self.pool = std::mem::replace(&mut other.pool, ConnectionPool::new());
         #[cfg(feature = "http2")]
-        std::mem::swap(&mut self.h2_pool, &mut other.h2_pool);
+        {
+            self.h2_pool = std::mem::replace(&mut other.h2_pool, crate::pool::H2Pool::new());
+        }
     }
 
     /// Set the proxy URL.
@@ -1056,6 +1058,21 @@ impl Easy {
     #[must_use]
     pub const fn has_proxy(&self) -> bool {
         self.proxy.is_some()
+    }
+
+    /// Returns true if HTTP/1.0 has been forced.
+    #[must_use]
+    pub const fn is_http10(&self) -> bool {
+        matches!(self.http_version, HttpVersion::Http10)
+    }
+
+    /// Returns true if an HTTP/HTTPS proxy has been configured (not SOCKS).
+    #[must_use]
+    pub fn has_http_proxy(&self) -> bool {
+        self.proxy.as_ref().is_some_and(|p| {
+            let s = p.scheme();
+            s == "http" || s == "https"
+        })
     }
 
     /// Returns a reference to the current URL, if set.
@@ -1208,6 +1225,63 @@ impl Easy {
     /// Set whether multipart should use SMTP MIME mode.
     pub fn set_form_smtp_mode(&mut self, val: bool) {
         self.multipart.get_or_insert_with(MultipartForm::new).set_smtp_mode(val);
+    }
+
+    /// Open a nested multipart container (for `=(;type=...` syntax).
+    pub fn form_open_container(&mut self, content_type: &str) -> usize {
+        self.multipart.get_or_insert_with(MultipartForm::new).open_multipart_container(content_type)
+    }
+
+    /// Add a part to a previously opened multipart container.
+    pub fn form_add_to_container(
+        &mut self,
+        container_idx: usize,
+        data: &[u8],
+        content_type: Option<&str>,
+        filename: Option<&str>,
+        custom_headers: Vec<String>,
+        encoder: Option<&str>,
+    ) {
+        self.multipart.get_or_insert_with(MultipartForm::new).add_part_to_container(
+            container_idx,
+            data,
+            content_type,
+            filename,
+            custom_headers,
+            encoder,
+        );
+    }
+
+    /// Add a part with custom headers and optional encoder.
+    pub fn form_add_with_options(
+        &mut self,
+        name: &str,
+        data: &[u8],
+        content_type: Option<&str>,
+        filename: Option<&str>,
+        custom_headers: Vec<String>,
+        encoder: Option<&str>,
+    ) {
+        self.multipart.get_or_insert_with(MultipartForm::new).add_part_with_options(
+            name,
+            data,
+            content_type,
+            filename,
+            custom_headers,
+            encoder,
+        );
+    }
+
+    /// Validate multipart encoders (check 7-bit constraint).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if 7-bit encoded content has 8-bit bytes.
+    pub fn validate_form_encoders(&self) -> Result<(), crate::error::Error> {
+        if let Some(ref multipart) = self.multipart {
+            multipart.validate_encoders()?;
+        }
+        Ok(())
     }
 
     /// Set a byte range for the request.
@@ -1469,6 +1543,14 @@ impl Easy {
     /// Equivalent to curl's `--cacert` flag or `CURLOPT_CAINFO`.
     pub fn ssl_ca_cert(&mut self, path: &Path) {
         self.tls_config.ca_cert = Some(path.to_path_buf());
+    }
+
+    /// Set the path to a CRL (Certificate Revocation List) file in PEM format.
+    ///
+    /// When set, the server's certificate chain is checked against this CRL.
+    /// Equivalent to curl's `--crlfile` flag or `CURLOPT_CRLFILE`.
+    pub fn ssl_crl_file(&mut self, path: &Path) {
+        self.tls_config.crl_file = Some(path.to_path_buf());
     }
 
     /// Set the path to a client certificate in PEM format.
@@ -2530,40 +2612,69 @@ impl Easy {
 
         // Apply removed_headers: for built-in default headers (User-Agent, Accept),
         // add a sentinel empty-value entry so the h1 emitter suppresses the default.
-        // Only apply to known built-in defaults — other removal markers just prevent
-        // previously-set custom headers from being emitted.
-        // (curl compat: -H "User-Agent:" suppresses User-Agent, test 1147)
+        // If the header was already explicitly set (e.g. via -A), remove it first
+        // and replace with the sentinel.
+        // Non-built-in headers: no-op (there's no default to suppress).
         // Host uses a special sentinel "\x01REMOVE\x01" to distinguish removal (-H "Host:")
         // from blank value (-H "Host;") which should emit "Host:\r\n" (curl compat: test 1292).
+        // (curl compat: -H "User-Agent:" suppresses User-Agent, tests 4, 1147)
         for removed in &self.removed_headers {
-            let already_set = headers.iter().any(|(k, _)| k.eq_ignore_ascii_case(removed));
-            if !already_set {
-                match removed.as_str() {
-                    "user-agent" => headers.push(("User-Agent".to_string(), String::new())),
-                    "accept" => headers.push(("Accept".to_string(), String::new())),
-                    "host" => {
-                        headers.push(("Host".to_string(), "\x01REMOVE\x01".to_string()));
-                    }
-                    _ => {}
+            let name = match removed.as_str() {
+                "user-agent" => Some("User-Agent"),
+                "accept" => Some("Accept"),
+                "host" => Some("Host"),
+                _ => None,
+            };
+            if let Some(name) = name {
+                // Remove any existing header with this name (e.g. from -A)
+                headers.retain(|(k, _)| !k.eq_ignore_ascii_case(removed));
+                // Add sentinel to suppress the built-in default
+                // Host uses a special sentinel to distinguish from -H "Host;" (blank value)
+                if removed == "host" {
+                    headers.push((name.to_string(), "\x01REMOVE\x01".to_string()));
+                } else {
+                    headers.push((name.to_string(), String::new()));
                 }
             }
+            // Non-built-in headers: no-op (curl compat: test 4, -H "X-Test:")
         }
 
         let (effective_method, effective_body);
 
         if let Some(ref mut multipart) = self.multipart {
             let is_smtp = url.scheme() == "smtp" || url.scheme() == "smtps";
+            let is_imap = url.scheme() == "imap" || url.scheme() == "imaps";
 
-            // For SMTP, enable smtp_mode so the MIME headers are in the body
-            if is_smtp {
+            // For SMTP and IMAP APPEND, enable smtp_mode so the MIME headers are in the body
+            if is_smtp || is_imap {
                 multipart.set_smtp_mode(true);
+                // Collect -H headers for inclusion in the MIME preamble (curl compat: tests 646, 648)
+                // These headers go into the MIME body, not the SMTP envelope.
+                // Exclude Content-Type (handled separately) and internal headers.
+                let mime_headers: Vec<(String, String)> = headers
+                    .iter()
+                    .filter(|(k, _)| {
+                        !k.eq_ignore_ascii_case("content-type")
+                            && !k.starts_with('_')
+                            && !k.eq_ignore_ascii_case("user-agent")
+                            && !k.eq_ignore_ascii_case("accept")
+                    })
+                    .cloned()
+                    .collect();
+                if !mime_headers.is_empty() {
+                    multipart.set_smtp_headers(mime_headers);
+                }
             }
 
             // Check if user provided a custom Content-Type (use "attachment" disposition)
             let ct_idx = headers.iter().position(|(k, _)| k.eq_ignore_ascii_case("content-type"));
             if let Some(idx) = ct_idx {
                 // User provided Content-Type — use "attachment" disposition (curl compat: test 277)
-                if !is_smtp {
+                // Exception: if the user-provided Content-Type is multipart/form-data (possibly
+                // with params like charset), keep "form-data" disposition (curl compat: test 669)
+                let ct_is_formdata =
+                    headers[idx].1.trim().to_lowercase().starts_with("multipart/form-data");
+                if !is_smtp && !ct_is_formdata {
                     multipart.set_use_attachment(true);
                 }
                 let mut ct_value = headers.remove(idx).1;
@@ -2575,7 +2686,15 @@ impl Easy {
                 headers.push(("Content-Type".to_string(), multipart.content_type()));
             }
 
-            // Multipart form: encode body and set content-type header
+            // Validate encoders (7-bit check — curl compat: test 649).
+            // For SMTP, defer validation to the DATA phase.
+            if !is_smtp {
+                multipart.validate_encoders()?;
+            }
+
+            // Multipart form: encode body and set content-type header.
+            // For SMTP, encode even if there's a 7-bit error — the SMTP handler
+            // will abort after DATA is sent (curl compat: test 649).
             effective_body = Some(multipart.encode());
             // Default to POST for multipart
             effective_method = self.method.clone().unwrap_or_else(|| "POST".to_string());
@@ -3738,12 +3857,25 @@ async fn perform_transfer(
                                 if let Some(type2_data) = www_auth.strip_prefix("NTLM ") {
                                     let challenge =
                                         crate::auth::ntlm::parse_type2_message(type2_data)?;
-                                    let type3 = crate::auth::ntlm::create_type3_message(
+                                    let type3 = match crate::auth::ntlm::create_type3_message(
                                         &challenge,
                                         &auth.username,
                                         &auth.password,
                                         domain,
-                                    );
+                                    ) {
+                                        Ok(t3) => t3,
+                                        Err(e) => {
+                                            // NTLM Type 3 too large: store the 401
+                                            // headers (without body) so the CLI can
+                                            // output them before the error (curl compat: test 775).
+                                            let mut headers_only = response.clone();
+                                            headers_only.set_body(Vec::new());
+                                            if let Ok(mut guard) = last_resp_store.lock() {
+                                                *guard = Some(headers_only);
+                                            }
+                                            return Err(e);
+                                        }
+                                    };
 
                                     // Save the Type 2 401 response for --include output
                                     redirect_chain.push(response.clone());
@@ -3941,7 +4073,7 @@ async fn perform_transfer(
                                     &pcreds.username,
                                     &pcreds.password,
                                     domain,
-                                );
+                                )?;
 
                                 // Save the 407 response for --include output
                                 redirect_chain.push(response.clone());
@@ -4257,12 +4389,13 @@ async fn perform_transfer(
                                                         type2_data,
                                                     )?;
                                                 let domain = pcreds.domain.as_deref().unwrap_or("");
-                                                let type3 = crate::auth::ntlm::create_type3_message(
-                                                    &challenge,
-                                                    &pcreds.username,
-                                                    &pcreds.password,
-                                                    domain,
-                                                );
+                                                let type3 =
+                                                    crate::auth::ntlm::create_type3_message(
+                                                        &challenge,
+                                                        &pcreds.username,
+                                                        &pcreds.password,
+                                                        domain,
+                                                    )?;
                                                 redirect_chain.push(type1_resp);
                                                 let mut type3_headers = request_headers.clone();
                                                 type3_headers.retain(|(k, _)| {
@@ -4719,13 +4852,10 @@ async fn perform_transfer(
             }
         }
 
-        // Check for failed resume: 416 Range Not Satisfiable means server rejected our range
-        if response.status() == 416 {
-            let has_range = headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("range"));
-            if has_range {
-                return Err(Error::Http("range not satisfiable".to_string()));
-            }
-        }
+        // 416 Range Not Satisfiable: let the CLI handle it via resume_check.
+        // Don't error here — the response should be returned normally so that
+        // multi-URL transfers can output the 416 response and continue
+        // (curl compat: test 1117).
 
         // Store cookies from response.
         // Use custom Host header for cookie domain matching if present (curl compat).
@@ -4996,6 +5126,7 @@ async fn perform_transfer(
                         ftp_config,
                         None,
                         ftp_session,
+                        None,
                     )
                     .await;
 
@@ -5006,6 +5137,99 @@ async fn perform_transfer(
                             ftp_resp.set_raw_headers(Vec::new());
                             ftp_resp.set_redirect_responses(redirect_chain);
                             return Ok(ftp_resp);
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+
+                // Cross-protocol redirect to IMAP: perform IMAP transfer
+                // (curl compat: test 795)
+                if next_scheme == "imap" || next_scheme == "imaps" {
+                    redirect_chain.push(response);
+
+                    let imap_result = Box::pin(do_single_request(
+                        &next_url,
+                        "GET",
+                        &[],
+                        None,
+                        verbose,
+                        false,
+                        connect_timeout,
+                        proxy.cloned().as_ref(),
+                        proxy_credentials,
+                        resolve_overrides,
+                        tls_config,
+                        tcp_nodelay,
+                        tcp_keepalive,
+                        unix_socket,
+                        interface,
+                        local_port,
+                        dns_shuffle,
+                        dns_cache,
+                        pool,
+                        #[cfg(feature = "http2")]
+                        h2_pool,
+                        http_version,
+                        expect_100_timeout,
+                        happy_eyeballs_timeout,
+                        ignore_content_length,
+                        speed_limits,
+                        ftp_ssl_mode,
+                        use_ssl,
+                        ssh_key_path,
+                        proxy_tls_config,
+                        alt_svc_cache,
+                        #[cfg(feature = "http2")]
+                        h2_config,
+                        dns_resolver,
+                        custom_request_target,
+                        tftp_blksize,
+                        tftp_no_options,
+                        #[cfg(feature = "ssh")]
+                        ssh_host_key_policy,
+                        mail_from,
+                        mail_rcpt,
+                        fresh_connect,
+                        forbid_reuse,
+                        ftp_config,
+                        proxy_headers,
+                        connect_to,
+                        path_as_is,
+                        #[cfg(feature = "ssh")]
+                        ssh_public_keyfile,
+                        #[cfg(not(feature = "ssh"))]
+                        None,
+                        #[cfg(feature = "ssh")]
+                        ssh_auth_types,
+                        #[cfg(not(feature = "ssh"))]
+                        None,
+                        mail_auth,
+                        sasl_authzid,
+                        login_options,
+                        sasl_ir,
+                        oauth2_bearer,
+                        haproxy_protocol,
+                        abstract_unix_socket,
+                        chunked_upload,
+                        http09_allowed,
+                        deadline,
+                        http_proxy_tunnel,
+                        proxy_http_10,
+                        raw,
+                        ftp_session,
+                        true,
+                    ))
+                    .await;
+
+                    match imap_result {
+                        Ok(mut imap_resp) => {
+                            // Clear IMAP protocol headers and body — don't include them
+                            // in output when redirecting from HTTP to IMAP.
+                            // Only the HTTP redirect headers are shown (curl compat: test 795).
+                            imap_resp.set_raw_headers(Vec::new());
+                            imap_resp.set_body(Vec::new());
+                            imap_resp.set_redirect_responses(redirect_chain);
+                            return Ok(imap_resp);
                         }
                         Err(e) => return Err(e),
                     }
@@ -5221,6 +5445,10 @@ async fn do_single_request(
                 let s = p.scheme();
                 s == "http" || s == "https"
             });
+            let is_socks_proxy_ftp = proxy.is_some_and(|p| {
+                let s = p.scheme();
+                s == "socks5" || s == "socks4" || s == "socks5h" || s == "socks4a"
+            });
             if is_http_proxy && !http_proxy_tunnel {
                 // Fall through to the HTTP proxy path below — handled after this match
             } else {
@@ -5291,8 +5519,80 @@ async fn do_single_request(
                 ftp_config_with_range.range_end = ftp_range_end;
                 ftp_config_with_range.range_from_end = ftp_range_from_end;
                 let ftp_use_ssl = use_ssl;
-                return crate::protocol::ftp::perform(
-                    url,
+
+                // Build FTP proxy configuration (curl compat: tests 706, 707, 712-715)
+                let ftp_proxy = if is_socks_proxy_ftp {
+                    let proxy_url = proxy.ok_or_else(|| Error::Http("no proxy URL".to_string()))?;
+                    let (ph, pp) = proxy_url.host_and_port()?;
+                    let socks_auth =
+                        proxy_url.credentials().map(|(u, p)| (u.to_string(), p.to_string()));
+                    match proxy_url.scheme() {
+                        "socks5" | "socks5h" => {
+                            Some(crate::protocol::ftp::FtpProxyConfig::Socks5 {
+                                host: ph,
+                                port: pp,
+                                auth: socks_auth,
+                            })
+                        }
+                        "socks4" => Some(crate::protocol::ftp::FtpProxyConfig::Socks4 {
+                            host: ph,
+                            port: pp,
+                            user_id: socks_auth.map_or_else(String::new, |(u, _)| u),
+                            socks4a: false,
+                        }),
+                        "socks4a" => Some(crate::protocol::ftp::FtpProxyConfig::Socks4 {
+                            host: ph,
+                            port: pp,
+                            user_id: socks_auth.map_or_else(String::new, |(u, _)| u),
+                            socks4a: true,
+                        }),
+                        _ => None,
+                    }
+                } else if is_http_proxy && http_proxy_tunnel {
+                    // FTP through HTTP CONNECT tunnel (curl compat: tests 714, 1059)
+                    let proxy_url = proxy.ok_or_else(|| Error::Http("no proxy URL".to_string()))?;
+                    let (ph, pp) = proxy_url.host_and_port()?;
+                    // Extract User-Agent from headers for CONNECT request
+                    let ua = headers
+                        .iter()
+                        .find(|(k, _)| k.eq_ignore_ascii_case("user-agent"))
+                        .map_or_else(|| "curl/0.1.0".to_string(), |(_, v)| v.clone());
+                    Some(crate::protocol::ftp::FtpProxyConfig::HttpConnect {
+                        host: ph,
+                        port: pp,
+                        user_agent: ua,
+                    })
+                } else {
+                    None
+                };
+
+                // Apply --connect-to for FTP target host when using proxy
+                // (curl compat: tests 713, 714, 715)
+                let ftp_url = if ftp_proxy.is_some() && !connect_to.is_empty() {
+                    let (orig_host, orig_port) = url.host_and_port()?;
+                    let (new_host, new_port) = apply_connect_to(&orig_host, orig_port, connect_to);
+                    if new_host != orig_host || new_port != orig_port {
+                        if verbose {
+                            #[allow(clippy::print_stderr)]
+                            {
+                                eprintln!(
+                                    "* FTP connect-to: remapped {orig_host}:{orig_port} -> {new_host}:{new_port}"
+                                );
+                            }
+                        }
+                        // Rebuild URL with remapped host:port
+                        let new_url_str =
+                            format!("{}://{}:{}{}", url.scheme(), new_host, new_port, url.path());
+                        crate::url::Url::parse(&new_url_str)?
+                    } else {
+                        url.clone()
+                    }
+                } else {
+                    url.clone()
+                };
+
+                let mut ftp_result = crate::protocol::ftp::perform(
+                    &ftp_url,
                     upload_data,
                     effective_ssl_mode,
                     ftp_use_ssl,
@@ -5301,8 +5601,29 @@ async fn do_single_request(
                     &ftp_config_with_range,
                     None,
                     ftp_session,
+                    ftp_proxy,
                 )
                 .await;
+
+                // For HTTP CONNECT tunnel FTP, prepend CONNECT response headers
+                // as redirect responses in the output (curl compat: tests 714, 715)
+                if let Ok(ref mut resp) = ftp_result {
+                    if let Some(session) = ftp_session.as_mut() {
+                        let connect_bytes: Vec<u8> = session.take_connect_response_bytes();
+                        if !connect_bytes.is_empty() {
+                            let connect_resp = Response::with_raw_headers(
+                                200,
+                                std::collections::HashMap::new(),
+                                Vec::new(),
+                                url.as_str().to_string(),
+                                connect_bytes,
+                            );
+                            resp.push_redirect_response(connect_resp);
+                        }
+                    }
+                }
+
+                return ftp_result;
             }
         }
         "smtp" | "smtps" => {
@@ -5325,18 +5646,27 @@ async fn do_single_request(
                 password: header_creds.as_ref().map(|(_, p)| p.as_str()),
                 login_options: effective_login_opts.as_deref(),
             };
-            let smtp_use_ssl = if url.scheme() == "smtps" {
-                // Implicit TLS: signal with a special value
-                crate::protocol::ftp::UseSsl::All
-            } else {
-                use_ssl
-            };
+            let smtp_use_ssl =
+                if url.scheme() == "smtps" { crate::protocol::ftp::UseSsl::All } else { use_ssl };
+            // HTTP CONNECT proxy tunnel for email protocols (curl compat: tests 1319-1321)
+            let tunnel_stream = establish_email_proxy_tunnel(
+                proxy,
+                http_proxy_tunnel,
+                proxy_credentials,
+                proxy_headers,
+                verbose,
+                proxy_http_10,
+                headers,
+                url,
+            )
+            .await?;
             return crate::protocol::smtp::send_mail(
                 url,
                 mail_data,
                 &smtp_config,
                 smtp_use_ssl,
                 tls_config,
+                tunnel_stream,
             )
             .await;
         }
@@ -5347,9 +5677,19 @@ async fn do_single_request(
                 .or_else(|| extract_login_options_from_url(url));
             let imap_use_ssl =
                 if url.scheme() == "imaps" { crate::protocol::ftp::UseSsl::All } else { use_ssl };
-            // curl uses 'A' + N for IMAP tags where N is the connection number.
-            // Direct IMAP = 'A' (first connection), redirect from HTTP = 'B' (second connection).
             let tag_prefix = if redirected_from_http { 'B' } else { 'A' };
+            // HTTP CONNECT proxy tunnel for email protocols (curl compat: tests 1319-1321)
+            let tunnel_stream = establish_email_proxy_tunnel(
+                proxy,
+                http_proxy_tunnel,
+                proxy_credentials,
+                proxy_headers,
+                verbose,
+                proxy_http_10,
+                headers,
+                url,
+            )
+            .await?;
             return crate::protocol::imap::fetch(
                 url,
                 method,
@@ -5363,6 +5703,7 @@ async fn do_single_request(
                 tag_prefix,
                 imap_use_ssl,
                 tls_config,
+                tunnel_stream,
             )
             .await;
         }
@@ -5381,6 +5722,18 @@ async fn do_single_request(
                 .or_else(|| extract_login_options_from_url(url));
             let pop3_use_ssl =
                 if url.scheme() == "pop3s" { crate::protocol::ftp::UseSsl::All } else { use_ssl };
+            // HTTP CONNECT proxy tunnel for email protocols (curl compat: tests 1319-1321)
+            let tunnel_stream = establish_email_proxy_tunnel(
+                proxy,
+                http_proxy_tunnel,
+                proxy_credentials,
+                proxy_headers,
+                verbose,
+                proxy_http_10,
+                headers,
+                url,
+            )
+            .await?;
             return crate::protocol::pop3::retrieve(
                 url,
                 creds_tuple,
@@ -5392,6 +5745,7 @@ async fn do_single_request(
                 sasl_authzid,
                 pop3_use_ssl,
                 tls_config,
+                tunnel_stream,
             )
             .await;
         }
@@ -5549,7 +5903,16 @@ async fn do_single_request(
                     }
                     return Ok(maybe_decompress_inner(response, accept_encoding, raw));
                 }
-                Err(_) => {
+                Err(e) => {
+                    // Only retry on a fresh connection for I/O-level errors
+                    // (stale/reset connections). For protocol-level errors like
+                    // version mismatch or weird server reply, propagate immediately
+                    // (curl compat: test 471 — HTTP/1.1 to HTTP/2 switch).
+                    match &e {
+                        Error::Http(msg) if msg.contains("Weird server reply") => return Err(e),
+                        Error::UnsupportedProtocol(_) => return Err(e),
+                        _ => {}
+                    }
                     // Pooled connection was stale — fall through to create new one
                     if verbose {
                         #[allow(clippy::print_stderr)]
@@ -6631,6 +6994,81 @@ enum ConnectTunnelResult<S> {
 ///
 /// Sends a CONNECT request to the proxy and validates the 200 response
 /// before returning the stream for TLS negotiation.
+/// Establish an HTTP CONNECT proxy tunnel for email protocols (SMTP, IMAP, POP3).
+///
+/// Returns `Some(TcpStream)` if a proxy is configured with tunnel mode,
+/// `None` if no proxy is needed (direct connection).
+#[allow(clippy::too_many_arguments)]
+async fn establish_email_proxy_tunnel(
+    proxy: Option<&crate::url::Url>,
+    http_proxy_tunnel: bool,
+    proxy_credentials: Option<&ProxyAuthCredentials>,
+    proxy_headers: &[(String, String)],
+    verbose: bool,
+    proxy_http_10: bool,
+    headers: &[(String, String)],
+    target_url: &crate::url::Url,
+) -> Result<Option<tokio::net::TcpStream>, Error> {
+    let proxy_url = match proxy {
+        Some(p) if http_proxy_tunnel => p,
+        _ => return Ok(None),
+    };
+
+    let proxy_scheme = proxy_url.scheme();
+    if proxy_scheme != "http" && proxy_scheme != "https" {
+        return Ok(None);
+    }
+
+    let (proxy_host, proxy_port) = proxy_url.host_and_port()?;
+    let (target_host, target_port) = target_url.host_and_port()?;
+
+    let proxy_addr = format!("{proxy_host}:{proxy_port}");
+    let tcp = tokio::net::TcpStream::connect(&proxy_addr).await.map_err(Error::Connect)?;
+
+    let result = establish_connect_tunnel(
+        tcp,
+        &target_host,
+        target_port,
+        headers,
+        proxy_credentials,
+        proxy_headers,
+        verbose,
+        proxy_http_10,
+    )
+    .await?;
+
+    match result {
+        ConnectTunnelResult::Connected { stream, .. } => Ok(Some(stream)),
+        ConnectTunnelResult::Failed { status, .. } => {
+            Err(Error::Http(format!("CONNECT tunnel failed: {status}")))
+        }
+        ConnectTunnelResult::NeedReconnect { .. } => {
+            // Reconnect and try again (proxy closed connection after 407)
+            let tcp2 = tokio::net::TcpStream::connect(&proxy_addr).await.map_err(Error::Connect)?;
+            let result2 = establish_connect_tunnel(
+                tcp2,
+                &target_host,
+                target_port,
+                headers,
+                proxy_credentials,
+                proxy_headers,
+                verbose,
+                proxy_http_10,
+            )
+            .await?;
+            match result2 {
+                ConnectTunnelResult::Connected { stream, .. } => Ok(Some(stream)),
+                ConnectTunnelResult::Failed { status, .. } => {
+                    Err(Error::Http(format!("CONNECT tunnel failed: {status}")))
+                }
+                ConnectTunnelResult::NeedReconnect { .. } => {
+                    Err(Error::Http("CONNECT tunnel: too many reconnects".to_string()))
+                }
+            }
+        }
+    }
+}
+
 /// Handles 407 Proxy Authentication Required for Digest and NTLM auth.
 ///
 /// The stream type is generic to support both plain TCP (HTTP proxy) and
@@ -6768,7 +7206,7 @@ where
                                 &creds.username,
                                 &creds.password,
                                 domain,
-                            );
+                            )?;
 
                             // Send CONNECT with Type 3
                             let (status3, _, raw3) = send_connect_request(
@@ -6856,7 +7294,7 @@ where
                                                 &creds.username,
                                                 &creds.password,
                                                 domain,
-                                            );
+                                            )?;
                                             let (status3, _, raw3) = send_connect_request(
                                                 &mut stream,
                                                 target_host,
@@ -7280,12 +7718,26 @@ fn find_header_end(data: &[u8]) -> Option<usize> {
 /// Checks `http_proxy`/`HTTP_PROXY` for HTTP, `https_proxy`/`HTTPS_PROXY` for HTTPS.
 /// curl convention: lowercase takes priority for `http_proxy`.
 fn proxy_from_env(scheme: &str) -> Option<Url> {
-    let var_names = match scheme {
-        "https" => &["https_proxy", "HTTPS_PROXY"][..],
-        _ => &["http_proxy", "HTTP_PROXY"][..],
+    // Check protocol-specific proxy env vars first, then fallback to all_proxy
+    // (curl compat: test 1106 — ftp_proxy for FTP URLs)
+    let var_names: &[&str] = match scheme {
+        "https" => &["https_proxy", "HTTPS_PROXY"],
+        "ftp" | "ftps" => &["ftp_proxy", "FTP_PROXY"],
+        _ => &["http_proxy", "HTTP_PROXY"],
     };
 
     for var in var_names {
+        if let Ok(val) = std::env::var(var) {
+            if !val.is_empty() {
+                if let Ok(url) = Url::parse(&val) {
+                    return Some(url);
+                }
+            }
+        }
+    }
+
+    // Fallback: check all_proxy / ALL_PROXY
+    for var in &["all_proxy", "ALL_PROXY"] {
         if let Ok(val) = std::env::var(var) {
             if !val.is_empty() {
                 if let Ok(url) = Url::parse(&val) {

@@ -10,6 +10,23 @@ use crate::error::Error;
 use crate::protocol::ftp::UseSsl;
 use crate::protocol::http::response::Response;
 
+tokio::task_local! {
+    /// Per-task IMAP protocol transcript buffer for `-D` header dump.
+    static IMAP_TRANSCRIPT: std::cell::RefCell<Vec<u8>>;
+}
+
+/// Record a line to the IMAP protocol transcript (if recording is active).
+fn record_transcript(data: &[u8]) {
+    let _ = IMAP_TRANSCRIPT.try_with(|t| {
+        t.borrow_mut().extend_from_slice(data);
+    });
+}
+
+/// Take the accumulated IMAP transcript, leaving an empty buffer.
+fn take_transcript() -> Vec<u8> {
+    IMAP_TRANSCRIPT.try_with(|t| std::mem::take(&mut *t.borrow_mut())).unwrap_or_default()
+}
+
 /// An IMAP response from the server.
 #[derive(Debug, Clone)]
 pub struct ImapResponse {
@@ -70,6 +87,8 @@ async fn read_response<S: AsyncRead + Unpin>(
         if bytes_read == 0 {
             return Err(Error::Http("IMAP connection closed unexpectedly".to_string()));
         }
+
+        record_transcript(line.as_bytes());
 
         let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
 
@@ -147,6 +166,8 @@ async fn read_greeting<S: AsyncRead + Unpin>(stream: &mut BufReader<S>) -> Resul
             return Err(Error::Http("IMAP connection closed before greeting".to_string()));
         }
 
+        record_transcript(line.as_bytes());
+
         let trimmed = line.trim();
         if trimmed.starts_with("* OK") || trimmed.starts_with("* PREAUTH") {
             return Ok(trimmed.to_string());
@@ -171,6 +192,7 @@ async fn read_continuation<S: AsyncRead + Unpin>(
     if bytes_read == 0 {
         return Err(Error::Http("IMAP connection closed waiting for continuation".to_string()));
     }
+    record_transcript(line.as_bytes());
     Ok(line.trim().to_string())
 }
 
@@ -360,6 +382,46 @@ pub async fn fetch(
     tag_prefix: char,
     use_ssl: UseSsl,
     tls_config: &crate::tls::TlsConfig,
+    pre_connected: Option<tokio::net::TcpStream>,
+) -> Result<Response, Error> {
+    IMAP_TRANSCRIPT
+        .scope(std::cell::RefCell::new(Vec::new()), async {
+            fetch_inner(
+                url,
+                method,
+                body,
+                custom_request,
+                sasl_ir,
+                oauth2_bearer,
+                login_options,
+                sasl_authzid,
+                resolve_overrides,
+                tag_prefix,
+                use_ssl,
+                tls_config,
+                pre_connected,
+            )
+            .await
+        })
+        .await
+}
+
+/// Inner implementation of [`fetch`], runs within an `IMAP_TRANSCRIPT` scope.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+async fn fetch_inner(
+    url: &crate::url::Url,
+    method: &str,
+    body: Option<&[u8]>,
+    custom_request: Option<&str>,
+    sasl_ir: bool,
+    oauth2_bearer: Option<&str>,
+    login_options: Option<&str>,
+    sasl_authzid: Option<&str>,
+    resolve_overrides: &[(String, String)],
+    tag_prefix: char,
+    use_ssl: UseSsl,
+    tls_config: &crate::tls::TlsConfig,
+    pre_connected: Option<tokio::net::TcpStream>,
 ) -> Result<Response, Error> {
     // Reject URLs with CR or LF in the path (curl compat: test 829).
     // Check BEFORE credentials or connection setup.
@@ -403,8 +465,12 @@ pub async fn fetch(
                 }
             })
             .unwrap_or(&host);
-    let addr = format!("{resolved_host}:{port}");
-    let tcp = tokio::net::TcpStream::connect(&addr).await.map_err(Error::Connect)?;
+    let tcp = if let Some(stream) = pre_connected {
+        stream
+    } else {
+        let addr = format!("{resolved_host}:{port}");
+        tokio::net::TcpStream::connect(&addr).await.map_err(Error::Connect)?
+    };
     let mut tags = TagCounter::new(tag_prefix);
 
     // Establish connection with appropriate TLS mode.
@@ -540,6 +606,10 @@ pub async fn fetch(
     )
     .await;
 
+    // Capture protocol transcript BEFORE LOGOUT for -D header dump (curl compat: test 897).
+    // Strip FETCH body content from the transcript — only protocol framing should appear.
+    let transcript_data = strip_fetch_body_from_transcript(&take_transcript());
+
     // LOGOUT — always send, even on error (curl compat: test 803)
     let tag = tags.next_tag();
     if send_command(&mut writer, &tag, "LOGOUT").await.is_ok() {
@@ -551,9 +621,8 @@ pub async fn fetch(
 
     let headers = std::collections::HashMap::new();
     let mut resp = Response::new(200, headers, response_body, url.as_str().to_string());
-    // Set empty raw headers so the CLI doesn't synthesize HTTP framing for
-    // a non-HTTP protocol response.
-    resp.set_raw_headers(Vec::new());
+    // Set the protocol transcript as raw headers for -D header dump.
+    resp.set_raw_headers(transcript_data);
     Ok(resp)
 }
 
@@ -987,7 +1056,7 @@ async fn do_imap_auth<S: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         let cont2 = read_continuation(reader).await?;
         let challenge_b64 = cont2.trim_start_matches('+').trim();
         if let Ok(challenge) = crate::auth::ntlm::parse_type2_message(challenge_b64) {
-            let type3 = crate::auth::ntlm::create_type3_message(&challenge, user, pass, "");
+            let type3 = crate::auth::ntlm::create_type3_message(&challenge, user, pass, "")?;
             send_raw(writer, type3.as_bytes()).await?;
             let auth_resp = read_response(reader, &tag).await?;
             if auth_resp.is_ok() {
@@ -1136,10 +1205,11 @@ async fn dispatch_imap_operation<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         Ok(Some(resp))
     }
 
-    // Upload via -T: IMAP APPEND command.
+    // Upload via -T or -F: IMAP APPEND command.
     // Check this BEFORE custom_request, since -T sets method=PUT and
     // custom_request="PUT", but we want APPEND behavior, not a literal "PUT" cmd.
-    let is_upload = method == "PUT" && body.is_some();
+    // -F (multipart) also triggers APPEND (method=POST, curl compat: test 647).
+    let is_upload = (method == "PUT" || method == "POST") && body.is_some();
     if is_upload {
         if let Some(upload_data) = body {
             if !has_mailbox {
@@ -1361,6 +1431,58 @@ fn is_known_sasl_mechanism(mech: &str) -> bool {
 fn strip_auth_from_username(username: &str) -> String {
     let upper = username.to_uppercase();
     upper.find(";AUTH=").map_or_else(|| username.to_string(), |pos| username[..pos].to_string())
+}
+
+/// Strip FETCH body content from an IMAP protocol transcript.
+///
+/// IMAP FETCH responses include literal body data between `{SIZE}\r\n` and the
+/// closing envelope line.  The `-D` header dump should only contain protocol
+/// framing, not message body content (curl compat: test 897).
+fn strip_fetch_body_from_transcript(transcript: &[u8]) -> Vec<u8> {
+    let text = String::from_utf8_lossy(transcript);
+    let mut result = Vec::with_capacity(transcript.len());
+    let mut skip_body = false;
+    let mut literal_remaining: usize = 0;
+
+    for line in text.split_inclusive('\n') {
+        if skip_body {
+            // Count consumed bytes until we've passed the literal size
+            if literal_remaining > 0 {
+                let line_bytes = line.len();
+                if line_bytes >= literal_remaining {
+                    literal_remaining = 0;
+                    // This line contains the end of the literal; skip it entirely.
+                    // The next line is the closing envelope.
+                    continue;
+                }
+                literal_remaining -= line_bytes;
+                continue;
+            }
+            // Literal exhausted — this line is the closing envelope (ends with `)\r\n`)
+            result.extend_from_slice(line.as_bytes());
+            skip_body = false;
+            continue;
+        }
+
+        // Check for FETCH literal: `* NNN FETCH (BODY[...] {SIZE}\r\n`
+        if line.contains("FETCH") && line.contains('{') {
+            if let Some(brace_start) = line.rfind('{') {
+                let after_brace = &line[brace_start + 1..];
+                let size_str: String =
+                    after_brace.chars().take_while(char::is_ascii_digit).collect();
+                if let Ok(size) = size_str.parse::<usize>() {
+                    result.extend_from_slice(line.as_bytes());
+                    skip_body = true;
+                    literal_remaining = size;
+                    continue;
+                }
+            }
+        }
+
+        result.extend_from_slice(line.as_bytes());
+    }
+
+    result
 }
 
 /// Percent-decode a URL path segment.

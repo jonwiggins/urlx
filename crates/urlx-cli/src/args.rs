@@ -92,6 +92,8 @@ pub struct CliOptions {
     pub(crate) proto_default: Option<String>,
     pub(crate) output_dir: Option<String>,
     pub(crate) remove_on_error: bool,
+    /// `--no-clobber`: don't overwrite existing output files, append `.1`, `.2`, etc.
+    pub(crate) no_clobber: bool,
     pub(crate) fail_with_body: bool,
     pub(crate) fail_early: bool,
     pub(crate) retry_all_errors: bool,
@@ -159,6 +161,10 @@ pub struct CliOptions {
     pub(crate) per_url_group: Vec<usize>,
     /// Current group ID counter (incremented on --next).
     group_id: usize,
+    /// Tracks which option to blame when etag + multiple URLs conflict.
+    /// Set to "--url" when --url adds a URL while etag is set, or to
+    /// "--etag-save"/etc. when etag is set after multiple URLs exist.
+    etag_conflict_blame: Option<String>,
     /// URL index where the current --next group starts (for per-URL Easy handles).
     pub(crate) group_easy_start: usize,
 }
@@ -669,6 +675,7 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
         proto_default: None,
         output_dir: None,
         remove_on_error: false,
+        no_clobber: false,
         fail_with_body: false,
         fail_early: false,
         retry_all_errors: false,
@@ -702,6 +709,7 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
         per_url_group: Vec::new(),
         group_id: 0,
         group_easy_start: 0,
+        etag_conflict_blame: None,
     };
 
     let mut i = 1;
@@ -712,6 +720,8 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
     // Track whether any per-request option was set in the current --next group.
     // Used to distinguish "no-op --next" from "badly used --next" (curl compat: tests 422, 430).
     let mut group_has_options = false;
+    // Stack for nested multipart containers (`-F "=(;type=..."` / `-F "=)"`)
+    let mut mime_container_stack: Vec<usize> = Vec::new();
     while i < args.len() {
         // No per-iteration tracking needed here — group_has_options is set
         // by specific URL-consuming options (-O, -I, -d, -T, etc.) below.
@@ -721,7 +731,9 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
                 let val = require_arg(args, i, "-X")?;
                 opts.easy.method(val);
                 // Store original case value for non-HTTP protocols
-                // (IMAP/POP3/SMTP use -X as custom protocol command)
+                // (IMAP/POP3/SMTP use -X as custom protocol command).
+                // Don't set custom_request_target here — that's for --request-target.
+                // The transfer code applies custom_request_original to email protocols only.
                 opts.custom_request_original = Some(val.to_string());
             }
             "-H" | "--header" => {
@@ -1033,7 +1045,9 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
             "-F" | "--form" => {
                 i += 1;
                 let val = require_arg(args, i, "-F")?;
-                if let Err(msg) = parse_form_field(&mut opts.easy, val) {
+                if let Err(msg) =
+                    parse_form_field_ext(&mut opts.easy, val, &mut mime_container_stack, false)
+                {
                     eprintln!("curl: {msg}");
                     // Exit code 26 = CURLE_READ_ERROR (file not found / read error)
                     return Err(26);
@@ -1075,6 +1089,11 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
                 i += 1;
                 let val = require_arg(args, i, "--cacert")?;
                 opts.easy.ssl_ca_cert(std::path::Path::new(val));
+            }
+            "--crlfile" => {
+                i += 1;
+                let val = require_arg(args, i, "--crlfile")?;
+                opts.easy.ssl_crl_file(std::path::Path::new(val));
             }
             "--cert" => {
                 i += 1;
@@ -1304,8 +1323,14 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
             "--data-urlencode" => {
                 i += 1;
                 let val = require_arg(args, i, "--data-urlencode")?;
-                let encoded = urlencoded(val);
-                opts.easy.body(encoded.as_bytes());
+                let encoded = data_urlencode(val)?;
+                // Concatenate multiple --data-urlencode with & separator (curl compat: test 1015)
+                if opts.easy.has_body() {
+                    opts.easy.append_body(b"&");
+                    opts.easy.append_body(encoded.as_bytes());
+                } else {
+                    opts.easy.body(encoded.as_bytes());
+                }
                 opts.has_post_data = true;
                 if opts.easy.method_is_default() {
                     opts.easy.method("POST");
@@ -1806,11 +1831,18 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
                 i += 1;
                 let val = require_arg(args, i, "--etag-save")?;
                 opts.etag_save_file = Some(val.to_string());
+                // If multiple URLs already exist, this etag option is the culprit
+                if opts.urls.len() > 1 {
+                    opts.etag_conflict_blame = Some("--etag-save".to_string());
+                }
             }
             "--etag-compare" => {
                 i += 1;
                 let val = require_arg(args, i, "--etag-compare")?;
                 opts.etag_compare_file = Some(val.to_string());
+                if opts.urls.len() > 1 {
+                    opts.etag_conflict_blame = Some("--etag-compare".to_string());
+                }
             }
             "--haproxy-protocol" => {
                 opts.easy.haproxy_protocol(true);
@@ -1962,6 +1994,12 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
                     opts.per_url_easy.push(None);
                     opts.per_url_upload_files.push(pending_upload_file.take());
                     opts.per_url_group.push(opts.group_id);
+                    // If etag options are set and this adds a second URL, blame --url
+                    if opts.urls.len() > 1
+                        && (opts.etag_save_file.is_some() || opts.etag_compare_file.is_some())
+                    {
+                        opts.etag_conflict_blame = Some("--url".to_string());
+                    }
                 }
                 opts.next_needs_url = false;
             }
@@ -1972,6 +2010,9 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
             }
             "--remove-on-error" => {
                 opts.remove_on_error = true;
+            }
+            "--no-clobber" => {
+                opts.no_clobber = true;
             }
             "--skip-existing" => {
                 opts.skip_existing = true;
@@ -2060,7 +2101,6 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
             | "--basic"
             | "--proxy-basic"
             | "--tcp-fastopen"
-            | "--no-clobber"
             | "--ca-native"
             | "--no-ca-native"
             | "--disallow-username-in-url"
@@ -2147,7 +2187,6 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
             | "--pass"
             | "--proxy-cert-type"
             | "--proxy-key-type"
-            | "--crlfile"
             | "--proxy-crlfile"
             | "--proxy-pinnedpubkey"
             | "--proxy-pass"
@@ -2230,6 +2269,7 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
                 opts.easy.clear_body();
                 opts.has_post_data = false;
                 opts.easy.reset_method();
+                opts.easy.clear_custom_request_target();
                 opts.easy.set_form_data(false);
                 opts.json_mode = false;
                 opts.next_needs_url = true;
@@ -2282,19 +2322,38 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
         *slot = current_ftp_method;
     }
 
-    // Assign last group's Easy handle to URLs that weren't assigned yet
-    {
-        let current_easy = opts.easy.clone();
-        for slot in opts.per_url_easy[opts.group_easy_start..].iter_mut() {
-            if slot.is_none() {
-                *slot = Some(current_easy.clone());
-            }
-        }
-    }
-
     // --next at the end with no URL is a parse error (curl returns exit code 2)
     if opts.next_needs_url {
         eprintln!("curl: (2) no URL specified after --next");
+        return Err(2);
+    }
+
+    // Detect mutually exclusive option combinations (curl compat: tests 481, 482)
+    if opts.resume_check && opts.no_clobber {
+        eprintln!("curl: --continue-at is mutually exclusive with --no-clobber");
+        eprintln!("curl: option -C: is badly used here");
+        eprintln!("curl: try 'curl --help' or 'curl --manual' for more information");
+        return Err(2);
+    }
+    if opts.resume_check && opts.remove_on_error {
+        eprintln!("curl: --continue-at is mutually exclusive with --remove-on-error");
+        eprintln!("curl: option -C: is badly used here");
+        eprintln!("curl: try 'curl --help' or 'curl --manual' for more information");
+        return Err(2);
+    }
+
+    // Etag options only work with a single URL (curl compat: tests 484, 485).
+    // With --next, URLs in different groups don't conflict (test 369).
+    if (opts.etag_save_file.is_some() || opts.etag_compare_file.is_some())
+        && !opts.had_next
+        && opts.urls.len() > 1
+    {
+        eprintln!("curl: The etag options only work on a single URL");
+        eprintln!(
+            "curl: option {}: is badly used here",
+            opts.etag_conflict_blame.as_deref().unwrap_or("--etag-save")
+        );
+        eprintln!("curl: try 'curl --help' or 'curl --manual' for more information");
         return Err(2);
     }
 
@@ -2344,6 +2403,18 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
     }
     // Note: netrc credential loading is deferred to run() where the URL is known
 
+    // Assign last group's Easy handle to URLs that weren't assigned yet.
+    // This must happen AFTER auth credentials are applied so per-URL Easy
+    // handles have correct auth state (curl compat: test 338 — ANYAUTH).
+    {
+        let current_easy = opts.easy.clone();
+        for slot in opts.per_url_easy[opts.group_easy_start..].iter_mut() {
+            if slot.is_none() {
+                *slot = Some(current_easy.clone());
+            }
+        }
+    }
+
     // Apply accumulated inline cookies as a single Cookie header
     if !opts.inline_cookies.is_empty() {
         let cookie_header = opts.inline_cookies.join("; ");
@@ -2389,18 +2460,116 @@ pub fn read_data_source(path: &str) -> Result<Vec<u8>, std::io::Error> {
     }
 }
 
-/// If the value contains `=`, only the part after the first `=` is encoded
-/// (the name is passed through as-is). Otherwise the entire value is encoded.
+/// Encode a string for form-URL-encoding (application/x-www-form-urlencoded).
+///
+/// Supports the following formats (matching curl):
+/// - `content` — encode entire string
+/// - `=content` — use content as-is (no encoding)
+/// - `name=content` — encode only the content, prepend `name=`
+/// - `@filename` — read file, encode contents
+/// - `name@filename` — read file, encode contents, prepend `name=`
+#[cfg(test)]
 pub fn urlencoded(input: &str) -> String {
+    // Check for @filename (starts with @)
+    if let Some(filename) = input.strip_prefix('@') {
+        let data = std::fs::read_to_string(filename).unwrap_or_default();
+        return form_urlencode(&data);
+    }
+    // Check for =content (starts with =) — use as-is
+    if let Some(content) = input.strip_prefix('=') {
+        return content.to_string();
+    }
+    // Check for name@filename (has @ before any =)
+    if let Some(at_pos) = input.find('@') {
+        let eq_pos = input.find('=');
+        if eq_pos.is_none() || at_pos < eq_pos.unwrap_or(usize::MAX) {
+            let name = &input[..at_pos];
+            let filename = &input[at_pos + 1..];
+            let data = std::fs::read_to_string(filename).unwrap_or_default();
+            return format!("{}={}", name, form_urlencode(&data));
+        }
+    }
+    // name=content or plain content
     if let Some((name, value)) = input.split_once('=') {
-        let encoded = percent_encode(value);
+        let encoded = form_urlencode(value);
         format!("{name}={encoded}")
     } else {
-        percent_encode(input)
+        form_urlencode(input)
     }
 }
 
+/// Handle `--data-urlencode` with full curl syntax (curl compat: test 1015).
+///
+/// Supported forms:
+/// - `content` — URL-encode the entire string
+/// - `=content` — URL-encode content (no name prefix)
+/// - `name=content` — name is literal, content is URL-encoded
+/// - `@filename` — read file, URL-encode entire contents
+/// - `name@filename` — name is literal, file contents are URL-encoded as value
+fn data_urlencode(input: &str) -> Result<String, u8> {
+    // Check for @filename form first (no name prefix)
+    if let Some(path) = input.strip_prefix('@') {
+        let data = std::fs::read(path).map_err(|e| {
+            eprintln!("curl: error reading data file '{path}': {e}");
+            1_u8
+        })?;
+        let s = String::from_utf8_lossy(&data);
+        return Ok(curl_urlencode(&s));
+    }
+
+    // Check for name@filename form: find @ before any =
+    if let Some(at_pos) = input.find('@') {
+        let eq_pos = input.find('=');
+        if eq_pos.is_none() || at_pos < eq_pos.unwrap_or(usize::MAX) {
+            let name = &input[..at_pos];
+            let path = &input[at_pos + 1..];
+            let data = std::fs::read(path).map_err(|e| {
+                eprintln!("curl: error reading data file '{path}': {e}");
+                1_u8
+            })?;
+            let s = String::from_utf8_lossy(&data);
+            return Ok(format!("{name}={}", curl_urlencode(&s)));
+        }
+    }
+
+    // =content form: encode entire content without name
+    if let Some(content) = input.strip_prefix('=') {
+        return Ok(curl_urlencode(content));
+    }
+
+    // name=content form: name is literal, content is URL-encoded
+    if let Some((name, content)) = input.split_once('=') {
+        return Ok(format!("{name}={}", curl_urlencode(content)));
+    }
+
+    // Plain content: URL-encode the entire string
+    Ok(curl_urlencode(input))
+}
+
+/// URL-encode using curl's convention: spaces become `+`, other special chars
+/// become `%XX`. This matches `application/x-www-form-urlencoded` encoding.
+pub fn curl_urlencode(input: &str) -> String {
+    let mut result = String::with_capacity(input.len());
+    for byte in input.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                result.push(byte as char);
+            }
+            b' ' => {
+                result.push('+');
+            }
+            _ => {
+                result.push('%');
+                result.push(char::from(HEX_CHARS[(byte >> 4) as usize]));
+                result.push(char::from(HEX_CHARS[(byte & 0x0F) as usize]));
+            }
+        }
+    }
+    result
+}
+
 /// Percent-encode a string per RFC 3986 (unreserved characters are not encoded).
+#[cfg(test)]
 pub fn percent_encode(input: &str) -> String {
     let mut result = String::with_capacity(input.len());
     for byte in input.bytes() {
@@ -2418,8 +2587,36 @@ pub fn percent_encode(input: &str) -> String {
     result
 }
 
-/// Hex lookup table for percent encoding.
+/// Form-URL-encode a string (application/x-www-form-urlencoded).
+///
+/// Like `percent_encode` but encodes spaces as `+` instead of `%20`,
+/// matching curl's `--data-urlencode` and `--url-query` behavior.
+/// Uses lowercase hex digits to match curl's output.
+pub fn form_urlencode(input: &str) -> String {
+    let mut result = String::with_capacity(input.len());
+    for byte in input.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                result.push(byte as char);
+            }
+            b' ' => {
+                result.push('+');
+            }
+            _ => {
+                result.push('%');
+                result.push(char::from(HEX_CHARS_LOWER[(byte >> 4) as usize]));
+                result.push(char::from(HEX_CHARS_LOWER[(byte & 0x0F) as usize]));
+            }
+        }
+    }
+    result
+}
+
+/// Hex lookup table for percent encoding (uppercase, used by `percent_encode`).
 const HEX_CHARS: [u8; 16] = *b"0123456789ABCDEF";
+
+/// Hex lookup table for percent encoding (lowercase, used by `form_urlencode`).
+const HEX_CHARS_LOWER: [u8; 16] = *b"0123456789abcdef";
 
 /// Extract filename from URL for `-O/--remote-name`.
 ///
@@ -2599,8 +2796,14 @@ fn unescape(s: &str) -> String {
     result
 }
 
-/// Helper to require an argument value for an option flag.
-/// Parse a `-F name=value` form field with full curl syntax.
+/// Parse a `-F name=value` form field (simple wrapper for backward compatibility).
+#[allow(dead_code)]
+fn parse_form_field(easy: &mut liburlx::Easy, val: &str) -> Result<(), String> {
+    let mut stack = Vec::new();
+    parse_form_field_ext(easy, val, &mut stack, false)
+}
+
+/// Parse a `-F name=value` form field with full curl MIME API syntax.
 ///
 /// Supports:
 /// - `name=value` — text field
@@ -2608,14 +2811,50 @@ fn unescape(s: &str) -> String {
 /// - `name=@filepath;type=mime` — file with custom Content-Type
 /// - `name=@filepath;filename=custom` — file with custom filename
 /// - `name=@"filepath"` — quoted file path
-/// - Complex backslash escaping in filenames
-fn parse_form_field(easy: &mut liburlx::Easy, val: &str) -> Result<(), String> {
+/// - `=(;type=multipart/alternative` — open nested multipart container
+/// - `=)` — close nested multipart container
+/// - `;encoder=base64` — Content-Transfer-Encoding
+/// - `;headers=Header: value` — custom part header
+/// - `;headers=@file` or `;headers=<file` — headers from file
+#[allow(clippy::too_many_lines)]
+fn parse_form_field_ext(
+    easy: &mut liburlx::Easy,
+    val: &str,
+    container_stack: &mut Vec<usize>,
+    _form_string: bool,
+) -> Result<(), String> {
     let (name, value) =
         val.split_once('=').ok_or_else(|| format!("invalid form field format: {val}"))?;
 
+    // Handle multipart container open: "=(;type=multipart/alternative"
+    if let Some(rest) = value.strip_prefix('(') {
+        let mut content_type = "multipart/mixed".to_string();
+        // Parse modifiers after '('
+        if let Some(mods) = rest.strip_prefix(';') {
+            let parts: Vec<&str> = mods.split(';').collect();
+            for part in parts {
+                let trimmed = part.trim();
+                if let Some(t) = trimmed.strip_prefix("type=") {
+                    content_type = t.to_string();
+                }
+            }
+        }
+        let idx = easy.form_open_container(&content_type);
+        container_stack.push(idx);
+        return Ok(());
+    }
+
+    // Handle multipart container close: "=)"
+    if value == ")" {
+        if container_stack.is_empty() {
+            return Err("unmatched =) — no open multipart container".to_string());
+        }
+        let _ = container_stack.pop();
+        return Ok(());
+    }
+
     if let Some(rest) = value.strip_prefix('@') {
-        // File upload — parse filepath and optional ;type= ;filename= modifiers
-        // Check for comma-separated multi-file syntax (commas outside quotes split files)
+        // File upload — parse filepath and optional modifiers
         let file_specs = split_comma_file_specs(rest);
 
         if file_specs.len() > 1 {
@@ -2646,19 +2885,23 @@ fn parse_form_field(easy: &mut liburlx::Easy, val: &str) -> Result<(), String> {
 
             let mut custom_type: Option<String> = None;
             let mut custom_filename: Option<String> = None;
+            let mut custom_headers: Vec<String> = Vec::new();
+            let mut encoder: Option<String> = None;
 
-            // Parse semicolon-separated modifiers
             for modifier in modifiers {
                 if let Some(t) = modifier.strip_prefix("type=") {
                     custom_type = Some(t.to_string());
                 } else if let Some(f) = modifier.strip_prefix("filename=") {
                     custom_filename = Some(unescape_form_filename(f));
                 } else if let Some(f) = modifier.strip_prefix("format=") {
-                    // format= appends to type: e.g., type=text/x-null;format=x-curl
                     if let Some(ref mut ct) = custom_type {
                         ct.push_str(";format=");
                         ct.push_str(f);
                     }
+                } else if let Some(h) = modifier.strip_prefix("headers=") {
+                    parse_headers_modifier(h, &mut custom_headers)?;
+                } else if let Some(e) = modifier.strip_prefix("encoder=") {
+                    encoder = Some(e.to_string());
                 }
             }
 
@@ -2680,15 +2923,36 @@ fn parse_form_field(easy: &mut liburlx::Easy, val: &str) -> Result<(), String> {
                 .unwrap_or_default();
             let display_filename = custom_filename.unwrap_or_else(|| original_filename.clone());
 
-            if let Some(ref ct) = custom_type {
-                easy.form_file_with_type(name, &display_filename, ct, &data);
-            } else {
-                // Guess content type from the original filepath, not the custom filename
-                easy.form_file_with_type(
-                    name,
-                    &display_filename,
-                    &liburlx::guess_form_content_type(&original_filename),
+            if custom_headers.is_empty() && encoder.is_none() && container_stack.is_empty() {
+                // Simple path — use existing API
+                if let Some(ref ct) = custom_type {
+                    easy.form_file_with_type(name, &display_filename, ct, &data);
+                } else {
+                    // No explicit type — use form_file_data which sets explicit_type=false.
+                    // In SMTP/IMAP mode, Content-Type is only output for explicit types.
+                    // For HTTP, Content-Type is always output (explicit_type=false still
+                    // outputs a guessed type in the non-SMTP encode path).
+                    easy.form_file_data(name, &display_filename, &data);
+                }
+            } else if let Some(&container_idx) = container_stack.last() {
+                // Inside a nested container
+                easy.form_add_to_container(
+                    container_idx,
                     &data,
+                    custom_type.as_deref(),
+                    Some(&display_filename),
+                    custom_headers,
+                    encoder.as_deref(),
+                );
+            } else {
+                // Top-level part with custom headers/encoder
+                easy.form_add_with_options(
+                    name,
+                    &data,
+                    custom_type.as_deref(),
+                    Some(&display_filename),
+                    custom_headers,
+                    encoder.as_deref(),
                 );
             }
         }
@@ -2715,10 +2979,15 @@ fn parse_form_field(easy: &mut liburlx::Easy, val: &str) -> Result<(), String> {
         // Text field — parse value and optional modifiers (;type=, ;filename=)
         // The value can be quoted: "..." — in which case the closing quote ends the value
         // and modifiers follow after a `;`.
-        let (field_value, modifiers) = parse_text_value_and_modifiers(value);
+        let (raw_value, modifiers) = parse_text_value_and_modifiers(value);
+        // curl strips leading whitespace from unquoted text field values (curl compat: tests 186, 646)
+        let field_value =
+            if value.starts_with('"') { raw_value } else { raw_value.trim_start().to_string() };
 
         let mut custom_type: Option<String> = None;
         let mut custom_filename: Option<String> = None;
+        let mut custom_headers: Vec<String> = Vec::new();
+        let mut encoder: Option<String> = None;
 
         for modifier in &modifiers {
             let trimmed = modifier.trim();
@@ -2726,33 +2995,59 @@ fn parse_form_field(easy: &mut liburlx::Easy, val: &str) -> Result<(), String> {
                 custom_type = Some(t.to_string());
             } else if let Some(f) = trimmed.strip_prefix("filename=") {
                 custom_filename = Some(unescape_form_filename(f));
+            } else if let Some(h) = trimmed.strip_prefix("headers=") {
+                parse_headers_modifier(h, &mut custom_headers)?;
+            } else if let Some(e) = trimmed.strip_prefix("encoder=") {
+                encoder = Some(e.to_string());
             }
         }
 
-        // Merge type sub-parameters: e.g., "type=text/foo; charset=utf-8" where
+        // Merge type sub-parameters: e.g., "type=text/html;charset=utf-8" where
         // charset= is a Content-Type parameter, not a form modifier.
-        // curl treats unknown modifiers after type= as Content-Type sub-params.
+        // curl treats unknown modifiers after type= as Content-Type sub-params
+        // and joins them with `;` (no space) matching the original input (curl compat: test 186).
         if let Some(ref mut ct) = custom_type {
             for modifier in &modifiers {
                 let trimmed = modifier.trim();
                 if !trimmed.starts_with("type=")
                     && !trimmed.starts_with("filename=")
                     && !trimmed.starts_with("format=")
+                    && !trimmed.starts_with("headers=")
+                    && !trimmed.starts_with("encoder=")
                     && !trimmed.is_empty()
                 {
                     // Unknown modifier after type — append as Content-Type sub-param
-                    ct.push_str("; ");
+                    ct.push(';');
                     ct.push_str(trimmed);
                 }
             }
         }
 
-        if let Some(ref filename) = custom_filename {
-            // Text value with filename → file-like part
+        if !container_stack.is_empty() {
+            // Inside a nested container — add as subpart
+            let container_idx = *container_stack.last().unwrap_or(&0);
+            easy.form_add_to_container(
+                container_idx,
+                field_value.as_bytes(),
+                custom_type.as_deref(),
+                custom_filename.as_deref(),
+                custom_headers,
+                encoder.as_deref(),
+            );
+        } else if !custom_headers.is_empty() || encoder.is_some() {
+            // Top-level with custom headers/encoder
+            easy.form_add_with_options(
+                name,
+                field_value.as_bytes(),
+                custom_type.as_deref(),
+                custom_filename.as_deref(),
+                custom_headers,
+                encoder.as_deref(),
+            );
+        } else if let Some(ref filename) = custom_filename {
             if let Some(ref ct) = custom_type {
                 easy.form_file_with_type(name, filename, ct, field_value.as_bytes());
             } else {
-                // No explicit type → don't set Content-Type (curl compat: SMTP test 1187)
                 easy.form_file_no_type(name, filename, field_value.as_bytes());
             }
         } else if let Some(ref ct) = custom_type {
@@ -2763,6 +3058,67 @@ fn parse_form_field(easy: &mut liburlx::Easy, val: &str) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+/// Parse a `headers=` modifier value.
+///
+/// Supports:
+/// - `headers=Header-Name: value` — inline header
+/// - `headers=@filename` or `headers=<filename` — headers from file
+fn parse_headers_modifier(value: &str, headers: &mut Vec<String>) -> Result<(), String> {
+    if let Some(path) = value.strip_prefix('@').or_else(|| value.strip_prefix('<')) {
+        // Headers from file
+        let contents = std::fs::read_to_string(path)
+            .map_err(|e| format!("error reading headers file: {e}"))?;
+        read_header_file_contents(&contents, headers);
+    } else {
+        // Inline header
+        headers.push(value.to_string());
+    }
+    Ok(())
+}
+
+/// Read headers from file contents (curl format).
+///
+/// Lines starting with `#` are comments. Header folding (continuation with space/tab)
+/// is supported. Blank lines are ignored.
+fn read_header_file_contents(contents: &str, headers: &mut Vec<String>) {
+    let mut current_header: Option<String> = None;
+
+    for line in contents.lines() {
+        // Skip comment lines (starting with #)
+        if line.starts_with('#') {
+            continue;
+        }
+        // Skip empty lines
+        if line.trim().is_empty() {
+            // Flush current header
+            if let Some(h) = current_header.take() {
+                headers.push(h);
+            }
+            continue;
+        }
+        // Folded header (continuation line starts with space or tab)
+        if line.starts_with(' ') || line.starts_with('\t') {
+            if let Some(ref mut h) = current_header {
+                // Fold: join with single space, trim the leading whitespace from continuation
+                h.push(' ');
+                h.push_str(line.trim());
+                continue;
+            }
+        }
+        // New header — flush previous
+        if let Some(h) = current_header.take() {
+            headers.push(h);
+        }
+        // Strip trailing whitespace and \r
+        let trimmed = line.trim_end().trim_end_matches('\r');
+        current_header = Some(trimmed.to_string());
+    }
+    // Flush last header
+    if let Some(h) = current_header {
+        headers.push(h);
+    }
 }
 
 /// Split comma-separated file specs, respecting quoted paths.
@@ -2839,7 +3195,7 @@ fn parse_text_value_and_modifiers(s: &str) -> (String, Vec<String>) {
     }
 }
 
-/// Find the position of the first `;` that starts a known modifier (type=, filename=, format=).
+/// Find the position of the first `;` that starts a known modifier.
 fn find_first_modifier_semicolon(s: &str) -> Option<usize> {
     let bytes = s.as_bytes();
     let mut i = 0;
@@ -2849,6 +3205,8 @@ fn find_first_modifier_semicolon(s: &str) -> Option<usize> {
             if rest.starts_with("type=")
                 || rest.starts_with("filename=")
                 || rest.starts_with("format=")
+                || rest.starts_with("headers=")
+                || rest.starts_with("encoder=")
             {
                 return Some(i);
             }
@@ -3363,8 +3721,12 @@ fn apply_variable_function(value: &[u8], func: &str) -> Result<Vec<u8>, u8> {
         }
         "b64" | "base64" => Ok(simple_base64_encode(value).into_bytes()),
         "64dec" | "b64dec" | "base64dec" => {
-            // Base64 decode
-            Ok(simple_base64_decode(value))
+            // Base64 decode — if input is invalid base64, return "[64dec-fail]"
+            // (curl compat: test 487)
+            match strict_base64_decode(value) {
+                Some(decoded) => Ok(decoded),
+                None => Ok(b"[64dec-fail]".to_vec()),
+            }
         }
         "json" => {
             // JSON string escaping (no wrapping quotes — curl compat).
@@ -3392,6 +3754,21 @@ fn apply_variable_function(value: &[u8], func: &str) -> Result<Vec<u8>, u8> {
             Err(2)
         }
     }
+}
+
+/// Strict base64 decoder that returns `None` if input contains invalid characters.
+/// Used by `{{var:64dec}}` to detect bad input (curl compat: test 487).
+fn strict_base64_decode(data: &[u8]) -> Option<Vec<u8>> {
+    // Check that all non-whitespace, non-padding characters are valid base64
+    for &b in data {
+        if b == b'=' || b == b'\n' || b == b'\r' || b == b' ' {
+            continue;
+        }
+        if !matches!(b, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'+' | b'/') {
+            return None;
+        }
+    }
+    Some(simple_base64_decode(data))
 }
 
 /// Simple base64 decoder.
@@ -4402,19 +4779,20 @@ mod tests {
 
     #[test]
     fn urlencoded_basic() {
-        assert_eq!(urlencoded("hello world"), "hello%20world");
+        // form_urlencode uses + for spaces (matching curl's --data-urlencode)
+        assert_eq!(urlencoded("hello world"), "hello+world");
     }
 
     #[test]
     fn urlencoded_with_name() {
-        assert_eq!(urlencoded("key=hello world"), "key=hello%20world");
+        assert_eq!(urlencoded("key=hello world"), "key=hello+world");
     }
 
     #[test]
     fn urlencoded_special_chars() {
         // Input has '=' so it splits: name="a&b", value="c" → "a&b=c"
         assert_eq!(urlencoded("a&b=c"), "a&b=c");
-        // Without '=', the whole string is encoded
+        // Without '=', the whole string is encoded (lowercase hex)
         assert_eq!(urlencoded("a&b"), "a%26b");
     }
 
@@ -5318,7 +5696,7 @@ mod tests {
             "http://example.com",
             &["a=1".to_string(), "b=hello world".to_string()],
         );
-        assert!(result.starts_with("http://example.com?a=1&b=hello%20world"));
+        assert!(result.starts_with("http://example.com?a=1&b=hello+world"));
     }
 
     #[test]

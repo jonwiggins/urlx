@@ -6,13 +6,31 @@
 use std::process::ExitCode;
 
 use crate::args::{
-    parse_args, parse_proto_spec, percent_encode, print_usage, print_version, CliOptions,
-    ParseResult,
+    parse_args, parse_proto_spec, print_usage, print_version, CliOptions, ParseResult,
 };
 use crate::output::{
     content_disposition_filename, format_headers, format_write_out, http_status_text,
     output_response, output_response_with_context, write_trace_file, WriteOutContext,
 };
+
+/// Redirect stderr (fd 2) to a file via `dup2`.
+///
+/// This is needed for `--stderr <file>` to redirect all stderr output
+/// (including progress bar) to the specified file (curl compat: test 1148).
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn redirect_stderr_to_file(path: &str) {
+    if let Ok(file) = std::fs::File::create(path) {
+        use std::os::unix::io::IntoRawFd;
+        let fd = file.into_raw_fd();
+        // SAFETY: dup2 redirects stderr (fd 2) to the opened file fd.
+        // Both fds are valid: fd comes from File::create, and 2 is stderr.
+        unsafe {
+            let _ = libc::dup2(fd, 2);
+            let _ = libc::close(fd);
+        }
+    }
+}
 
 /// Substitute `#1`, `#2`, etc. in an output filename template with glob match values.
 ///
@@ -424,28 +442,40 @@ fn is_known_sasl_mechanism(mech: &str) -> bool {
     )
 }
 
-/// Percent-encode a credential string for safe embedding in URL userinfo.
+/// Percent-encode a credential string for embedding in a URL's userinfo.
 ///
-/// Encodes characters that are not allowed in the userinfo component of a URI
-/// (RFC 3986 Section 3.2.1). This preserves unreserved characters and sub-delimiters
-/// but encodes `@`, `/`, `?`, `#`, `"`, `{`, `}`, `[`, `]`, and other special chars
-/// that would break URL parsing (curl compat: test 988).
-fn percent_encode_userinfo(input: &str) -> String {
+/// Encodes characters that are not safe in RFC 3986 userinfo:
+/// unreserved chars (A-Z, a-z, 0-9, `-`, `_`, `.`, `~`) and sub-delims
+/// (except `@` and `:`) are left as-is; everything else is percent-encoded.
+fn percent_encode_credential(input: &str) -> String {
     let mut result = String::with_capacity(input.len());
     for byte in input.bytes() {
         match byte {
-            // unreserved: ALPHA / DIGIT / "-" / "." / "_" / "~"
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+            b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'-'
+            | b'_'
+            | b'.'
+            | b'~'
+            | b'!'
+            | b'$'
+            | b'&'
+            | b'\''
+            | b'('
+            | b')'
+            | b'*'
+            | b'+'
+            | b','
+            | b';'
+            | b'=' => {
                 result.push(byte as char);
             }
-            // sub-delims (safe in userinfo): "!" / "$" / "&" / "'" / "(" / ")" / "*" / "+" / "," / ";" / "="
-            b'!' | b'$' | b'&' | b'\'' | b'(' | b')' | b'*' | b'+' | b',' | b';' | b'=' => {
-                result.push(byte as char);
-            }
-            // Everything else gets percent-encoded
             _ => {
-                use std::fmt::Write;
-                let _ = write!(result, "%{byte:02X}");
+                const HEX: &[u8; 16] = b"0123456789ABCDEF";
+                result.push('%');
+                result.push(HEX[(byte >> 4) as usize] as char);
+                result.push(HEX[(byte & 0x0F) as usize] as char);
             }
         }
     }
@@ -481,26 +511,56 @@ fn url_decode(s: &str) -> String {
     result
 }
 
-/// Append query parameters to a URL string.
+/// Append query parameters to a URL string (implements curl's `--url-query`).
 ///
-/// Each query string is appended with `&` if the URL already has a `?`,
-/// or with `?` if it doesn't. Values containing `=` are used as-is;
-/// plain values are URL-encoded.
+/// Supports the following formats (matching curl):
+/// - `content` — form-urlencode entire string, append
+/// - `=content` — append content as-is (no encoding)
+/// - `name=content` — form-urlencode only the content, append `name=encoded`
+/// - `@filename` — read file, form-urlencode contents, append
+/// - `name@filename` — read file, form-urlencode contents, append `name=encoded`
+/// - `+content` — content is already encoded, append as-is (strip `+` prefix)
 pub fn append_url_queries(url: &str, queries: &[String]) -> String {
+    use crate::args::form_urlencode;
+
     let mut result = url.to_string();
     for query in queries {
         let separator = if result.contains('?') { '&' } else { '?' };
         result.push(separator);
-        if query.contains('=') {
-            // name=value format: encode only the value
-            if let Some((name, value)) = query.split_once('=') {
+
+        if let Some(already_encoded) = query.strip_prefix('+') {
+            // +content: already encoded, use as-is
+            result.push_str(already_encoded);
+        } else if let Some(filename) = query.strip_prefix('@') {
+            // @filename: read file, encode contents
+            let data = std::fs::read_to_string(filename).unwrap_or_default();
+            result.push_str(&form_urlencode(&data));
+        } else if let Some(at_pos) = query.find('@') {
+            let eq_pos = query.find('=');
+            if eq_pos.is_none() || at_pos < eq_pos.unwrap_or(usize::MAX) {
+                // name@filename: read file, encode contents, prepend name=
+                let name = &query[..at_pos];
+                let filename = &query[at_pos + 1..];
+                let data = std::fs::read_to_string(filename).unwrap_or_default();
                 result.push_str(name);
                 result.push('=');
-                result.push_str(&percent_encode(value));
+                result.push_str(&form_urlencode(&data));
+            } else {
+                // name=content (with @ in content): encode value only
+                // unwrap_or: split_once guaranteed to succeed since eq_pos was Some
+                let (name, value) = query.split_once('=').unwrap_or((query, ""));
+                result.push_str(name);
+                result.push('=');
+                result.push_str(&form_urlencode(value));
             }
+        } else if let Some((name, value)) = query.split_once('=') {
+            // name=value: encode only the value
+            result.push_str(name);
+            result.push('=');
+            result.push_str(&form_urlencode(value));
         } else {
-            // Plain string: use as-is (already encoded or literal)
-            result.push_str(query);
+            // Plain string: encode the whole thing
+            result.push_str(&form_urlencode(query));
         }
     }
     result
@@ -601,6 +661,15 @@ pub fn run(args: &[String]) -> ExitCode {
         }
     };
 
+    // --stderr: redirect stderr to a file (curl compat: test 1148)
+    // Spawn a thread that copies stderr pipe to the file, then replace
+    // the global stderr fd via CommandExt in a child process is not feasible
+    // for in-process use. Instead, redirect by reopening stderr.
+    #[cfg(unix)]
+    if let Some(ref stderr_path) = opts.stderr_file {
+        redirect_stderr_to_file(stderr_path);
+    }
+
     // --fail-with-body + --fail: --fail wins (curl compat: test 360)
     if opts.fail_with_body && opts.fail_on_error && !opts.has_post_data {
         // Check if both explicit --fail and --fail-with-body were used
@@ -641,14 +710,17 @@ pub fn run(args: &[String]) -> ExitCode {
         let mut expanded_urls = Vec::new();
         let mut expanded_values = Vec::new();
         let mut expanded_groups = Vec::new();
+        let mut expanded_upload_files = Vec::new();
         for (url_idx, url) in opts.urls.iter().enumerate() {
             let group = opts.per_url_group.get(url_idx).copied().unwrap_or(0);
+            let upload_file = opts.per_url_upload_files.get(url_idx).cloned().unwrap_or(None);
             match liburlx::glob::expand_glob_with_values(url) {
                 Ok(entries) => {
                     for (expanded_url, values) in entries {
                         expanded_urls.push(expanded_url);
                         expanded_values.push(values);
                         expanded_groups.push(group);
+                        expanded_upload_files.push(upload_file.clone());
                     }
                 }
                 Err(e) => {
@@ -662,6 +734,135 @@ pub fn run(args: &[String]) -> ExitCode {
         opts.urls = expanded_urls;
         opts.glob_values = expanded_values;
         opts.per_url_group = expanded_groups;
+        opts.per_url_upload_files = expanded_upload_files;
+    }
+
+    // Expand -T upload file globs: `-T '{file1,file2}' URL` expands to multiple uploads.
+    // For each upload file glob, iterate through all URLs (cartesian product).
+    // curl compat: tests 490, 491, 492
+    if opts.is_upload && !opts.globoff {
+        // Also handle the case where upload_file_path has globs but per_url_upload_files
+        // entries are None (e.g., `URL -T '{file1,file2}'` where URL comes before -T)
+        let upload_path_has_glob =
+            opts.upload_file_path.as_ref().is_some_and(|p| p.contains('{') || p.contains('['));
+        if upload_path_has_glob {
+            // Apply the glob upload_file_path to all URLs that don't have their own
+            let glob_path = opts.upload_file_path.clone().unwrap_or_default();
+            for entry in &mut opts.per_url_upload_files {
+                if entry.is_none() {
+                    *entry = Some(glob_path.clone());
+                }
+            }
+        }
+        // Check if any upload file path contains glob patterns
+        let has_upload_glob = opts
+            .per_url_upload_files
+            .iter()
+            .any(|f| f.as_ref().is_some_and(|path| path.contains('{') || path.contains('[')));
+        if has_upload_glob {
+            let mut new_urls = Vec::new();
+            let mut new_upload_files = Vec::new();
+            let mut new_groups = Vec::new();
+            let mut new_glob_values = Vec::new();
+            let mut new_per_url_easy = Vec::new();
+            let mut new_per_url_creds = Vec::new();
+            let mut new_per_url_ftp_methods = Vec::new();
+
+            // Gather all URLs that share the same upload file glob
+            let mut i = 0;
+            while i < opts.urls.len() {
+                let upload_file = opts.per_url_upload_files.get(i).cloned().unwrap_or(None);
+                if let Some(ref path) = upload_file {
+                    if path.contains('{') || path.contains('[') {
+                        // Expand the upload file glob
+                        let upload_paths = match liburlx::glob::expand_glob(path) {
+                            Ok(paths) => paths,
+                            Err(_) => {
+                                // Not a valid glob, treat as literal
+                                vec![path.clone()]
+                            }
+                        };
+                        // Find all consecutive URLs that share this upload glob
+                        // (from URL glob expansion, they all have the same upload_file)
+                        let mut url_group_end = i + 1;
+                        while url_group_end < opts.urls.len() {
+                            let next_upload = opts
+                                .per_url_upload_files
+                                .get(url_group_end)
+                                .and_then(|f| f.as_ref());
+                            if next_upload == Some(path) {
+                                url_group_end += 1;
+                            } else {
+                                break;
+                            }
+                        }
+                        let url_range = i..url_group_end;
+
+                        // Cartesian product: for each upload file, iterate all URLs
+                        for upload_path in &upload_paths {
+                            let fname = std::path::Path::new(upload_path)
+                                .file_name()
+                                .map(|n| n.to_string_lossy().to_string());
+                            for j in url_range.clone() {
+                                let mut url = opts.urls[j].clone();
+                                // Append filename to URL path if URL ends with /
+                                if let Some(ref f) = fname {
+                                    if url.ends_with('/') {
+                                        url.push_str(f);
+                                    }
+                                }
+                                new_urls.push(url);
+                                new_upload_files.push(Some(upload_path.clone()));
+                                new_groups.push(opts.per_url_group.get(j).copied().unwrap_or(0));
+                                new_glob_values
+                                    .push(opts.glob_values.get(j).cloned().unwrap_or_default());
+                                new_per_url_easy
+                                    .push(opts.per_url_easy.get(j).cloned().unwrap_or(None));
+                                new_per_url_creds
+                                    .push(opts.per_url_credentials.get(j).cloned().unwrap_or(None));
+                                new_per_url_ftp_methods.push(
+                                    opts.per_url_ftp_methods.get(j).copied().unwrap_or_default(),
+                                );
+                            }
+                        }
+                        i = url_group_end;
+                    } else {
+                        // Non-glob upload file — pass through as-is
+                        new_urls.push(opts.urls[i].clone());
+                        new_upload_files.push(upload_file);
+                        new_groups.push(opts.per_url_group.get(i).copied().unwrap_or(0));
+                        new_glob_values.push(opts.glob_values.get(i).cloned().unwrap_or_default());
+                        new_per_url_easy.push(opts.per_url_easy.get(i).cloned().unwrap_or(None));
+                        new_per_url_creds
+                            .push(opts.per_url_credentials.get(i).cloned().unwrap_or(None));
+                        new_per_url_ftp_methods
+                            .push(opts.per_url_ftp_methods.get(i).copied().unwrap_or_default());
+                        i += 1;
+                    }
+                } else {
+                    // No upload file for this URL — pass through
+                    new_urls.push(opts.urls[i].clone());
+                    new_upload_files.push(upload_file);
+                    new_groups.push(opts.per_url_group.get(i).copied().unwrap_or(0));
+                    new_glob_values.push(opts.glob_values.get(i).cloned().unwrap_or_default());
+                    new_per_url_easy.push(opts.per_url_easy.get(i).cloned().unwrap_or(None));
+                    new_per_url_creds
+                        .push(opts.per_url_credentials.get(i).cloned().unwrap_or(None));
+                    new_per_url_ftp_methods
+                        .push(opts.per_url_ftp_methods.get(i).copied().unwrap_or_default());
+                    i += 1;
+                }
+            }
+            opts.urls = new_urls;
+            opts.per_url_upload_files = new_upload_files;
+            opts.per_url_group = new_groups;
+            opts.glob_values = new_glob_values;
+            opts.per_url_easy = new_per_url_easy;
+            opts.per_url_credentials = new_per_url_creds;
+            opts.per_url_ftp_methods = new_per_url_ftp_methods;
+            // Clear single upload_filename since each URL now has its own
+            opts.upload_filename = None;
+        }
     }
 
     // -G/--get: move POST body data into URL query string
@@ -748,7 +949,10 @@ pub fn run(args: &[String]) -> ExitCode {
     // Deferred -T file read for multi-URL path: load upload file before run_multi
     // returns early (run_multi clones the easy handle, so body must be set now).
     // Single-URL path has its own deferred read further below (line ~892).
-    if opts.urls.len() > 1 {
+    // Skip if -T was glob-expanded — each URL has its own file in per_url_upload_files.
+    let upload_glob_expanded =
+        opts.is_upload && opts.per_url_upload_files.iter().filter(|f| f.is_some()).count() > 1;
+    if opts.urls.len() > 1 && !upload_glob_expanded {
         if let Some(ref path) = opts.upload_file_path {
             match std::fs::read(path) {
                 Ok(data) => {
@@ -803,6 +1007,45 @@ pub fn run(args: &[String]) -> ExitCode {
     if !opts.had_next && opts.urls.len() > 1 {
         for slot in opts.per_url_easy.iter_mut() {
             *slot = None;
+        }
+    }
+
+    // --etag-save with bad path + --next: skip affected transfers (curl compat: test 369).
+    // curl prints a warning and skips the transfer, continuing with --next groups.
+    // For single-URL case without --next, the etag check in run() handles error 26 (test 370).
+    if opts.had_next {
+        if let Some(ref path) = opts.etag_save_file {
+            if let Some(parent) = std::path::Path::new(path).parent() {
+                if !parent.as_os_str().is_empty() && !parent.exists() && !opts.create_dirs {
+                    eprintln!(
+                    "Warning: Failed creating file for saving etags: \"{path}\". Skip this transfer"
+                );
+                    // Remove URLs from the first group (group 0 = the group with etag-save)
+                    let first_group = opts.per_url_group.first().copied().unwrap_or(0);
+                    let mut i = 0;
+                    while i < opts.urls.len() {
+                        if opts.per_url_group.get(i).copied().unwrap_or(0) == first_group {
+                            let _ = opts.urls.remove(i);
+                            let _ = opts.per_url_credentials.remove(i);
+                            let _ = opts.per_url_ftp_methods.remove(i);
+                            let _ = opts.per_url_easy.remove(i);
+                            let _ = opts.per_url_upload_files.remove(i);
+                            let _ = opts.per_url_group.remove(i);
+                            let _ = opts.glob_values.remove(i);
+                            if i < opts.output_files.len() {
+                                let _ = opts.output_files.remove(i);
+                            }
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    opts.etag_save_file = None;
+                    // If no URLs left after removal, exit successfully
+                    if opts.urls.is_empty() {
+                        return ExitCode::SUCCESS;
+                    }
+                }
+            }
         }
     }
 
@@ -1017,8 +1260,8 @@ pub fn run(args: &[String]) -> ExitCode {
                                         || url.starts_with("scp://")
                                     {
                                         // Embed credentials in URL for FTP/SSH
-                                        let encoded_user = percent_encode_userinfo(&user);
-                                        let encoded_pass = percent_encode_userinfo(&pass);
+                                        let encoded_user = percent_encode_credential(&user);
+                                        let encoded_pass = percent_encode_credential(&pass);
                                         let base_url = strip_url_credentials(&url);
                                         let scheme_end = base_url.find("://").map_or(0, |p| p + 3);
                                         let new_url = format!(
@@ -1081,18 +1324,25 @@ pub fn run(args: &[String]) -> ExitCode {
                 || url.starts_with("pop3://")
                 || url.starts_with("pop3s://")
             {
-                // Percent-encode special characters in credentials so they can
-                // be safely embedded in the URL userinfo (curl compat: test 988).
-                // The protocol handlers percent-decode when extracting credentials.
-                let encoded_user = percent_encode_userinfo(user);
-                let encoded_pass = percent_encode_userinfo(pass);
+                // Reject credentials with special characters only when --login-options
+                // is used (curl compat: test 896). Without --login-options, percent-encode
+                // special chars so they survive URL embedding (curl compat: tests 800, 847, 988).
+                let has_bad_char = |s: &str| s.contains('"') || s.contains('{') || s.contains('}');
+                if (has_bad_char(user) || has_bad_char(pass))
+                    && opts.easy.get_login_options().is_some()
+                {
+                    if !opts.silent || opts.show_error {
+                        eprintln!("curl: (3) URL using bad/illegal format or missing URL");
+                    }
+                    return ExitCode::from(3);
+                }
                 let base_url = strip_url_credentials(&url);
                 let scheme_end = base_url.find("://").map_or(0, |p| p + 3);
                 let new_url = format!(
                     "{}{}:{}@{}",
                     &base_url[..scheme_end],
-                    encoded_user,
-                    encoded_pass,
+                    percent_encode_credential(user),
+                    percent_encode_credential(pass),
                     &base_url[scheme_end..]
                 );
                 if let Err(e) = opts.easy.url(&new_url) {
@@ -1230,6 +1480,26 @@ pub fn run(args: &[String]) -> ExitCode {
         }
     }
 
+    // --no-clobber: if output file exists, rename to .1, .2, etc. (curl compat: test 379)
+    if opts.no_clobber {
+        if let Some(ref path) = opts.output_file {
+            if std::path::Path::new(path).exists() {
+                let mut n = 1u32;
+                loop {
+                    let candidate = format!("{path}.{n}");
+                    if !std::path::Path::new(&candidate).exists() {
+                        opts.output_file = Some(candidate);
+                        break;
+                    }
+                    n += 1;
+                    if n > 100 {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
     // -C - auto-resume: determine offset from existing output file size
     if opts.auto_resume {
         if opts.is_upload {
@@ -1314,6 +1584,14 @@ pub fn run(args: &[String]) -> ExitCode {
 
     // Stdin PUT: add chunked Transfer-Encoding and Expect: 100-continue (curl compat)
     if opts.is_stdin_upload {
+        // HTTP/1.0 cannot use chunked encoding, so PUT from stdin with unknown size
+        // is impossible — fail with error 25 (curl compat: test 1069)
+        if opts.easy.is_http10() {
+            if !opts.silent || opts.show_error {
+                eprintln!("curl: (25) Upload failed: HTTP/1.0 does not support chunked transfer encoding for unknown upload sizes");
+            }
+            return ExitCode::from(25);
+        }
         // Enable Expect: 100-continue via the timeout mechanism (h1.rs adds the header)
         opts.easy.expect_100_timeout(std::time::Duration::from_secs(1));
         // Enable chunked upload (unless user explicitly suppressed Transfer-Encoding)
@@ -1324,18 +1602,19 @@ pub fn run(args: &[String]) -> ExitCode {
 
     if opts.show_progress && !opts.silent {
         opts.easy.progress_callback(liburlx::make_progress_callback(|info| {
-            let pct = if info.dl_total > 0 { (info.dl_now * 100) / info.dl_total } else { 0 };
-            let bar_width: usize = 40;
-            #[allow(clippy::cast_possible_truncation)]
-            let filled = ((pct as usize) * bar_width) / 100;
-            let empty = bar_width.saturating_sub(filled);
-            eprint!(
-                "\r[{}{}] {}% ({} bytes)",
-                "#".repeat(filled),
-                " ".repeat(empty),
-                pct,
-                info.dl_now,
-            );
+            // curl's progress bar format: 72 hash characters followed by " 100.0%"
+            // Uses \r to update in-place (curl compat: test 1148)
+            let bar_width: usize = 72;
+            if info.dl_total > 0 {
+                #[allow(clippy::cast_precision_loss)]
+                let pct = (info.dl_now as f64 / info.dl_total as f64) * 100.0;
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let filled = ((pct as usize) * bar_width) / 100;
+                let empty = bar_width.saturating_sub(filled);
+                eprint!("\r{}{} {:5.1}%", "#".repeat(filled), " ".repeat(empty), pct);
+            } else {
+                eprint!("\r{} {:5.1}%", " ".repeat(bar_width), 0.0);
+            }
             true
         }));
     }
@@ -1344,7 +1623,7 @@ pub fn run(args: &[String]) -> ExitCode {
     // Suppress include_headers for FTP/IMAP/POP3/SMTP/MQTT URLs.
     // Exception: when an HTTP proxy is set, FTP/FTPS requests are relayed
     // as HTTP through the proxy, so headers should be shown (curl compat: test 79).
-    let has_http_proxy = opts.easy.has_proxy();
+    let has_http_proxy = opts.easy.has_http_proxy();
     if opts.urls.first().is_some_and(|u| {
         let lower = u.to_lowercase();
         // FTP/FTPS through HTTP proxy → response is HTTP, keep headers
@@ -1388,12 +1667,9 @@ pub fn run(args: &[String]) -> ExitCode {
                         return ExitCode::FAILURE;
                     }
                 } else {
-                    if !opts.silent || opts.show_error {
-                        eprintln!(
-                            "urlx: (26) Failed to open/read local data from file/application"
-                        );
-                    }
-                    return ExitCode::from(26); // CURLE_READ_ERROR
+                    // curl returns CURLE_READ_ERROR (26) for bad etag-save path
+                    // (curl compat: test 370)
+                    return ExitCode::from(26);
                 }
             }
         }
@@ -1952,6 +2228,19 @@ pub fn run(args: &[String]) -> ExitCode {
                 eprintln!();
             }
 
+            // SFTP post-quote errors: output the downloaded data before
+            // reporting the error (curl compat: test 609)
+            if let liburlx::Error::SshQuoteErrorWithData { ref response, .. } = e {
+                let _ = output_response(
+                    response.as_ref(),
+                    opts.output_file.as_deref(),
+                    opts.write_out.as_deref(),
+                    false, // no include headers for SFTP
+                    opts.silent,
+                    false,
+                );
+            }
+
             // Output last response data on error (curl compat — headers/body before error)
             if let Some(resp) = opts.easy.last_response() {
                 // For redirect responses (max-redirects exceeded), only output headers
@@ -2481,44 +2770,55 @@ pub fn run_multi(
             || url.starts_with("ftps://")
             || url.starts_with("sftp://")
             || url.starts_with("scp://");
-        if is_upload && i > 0 && !is_ftp_url {
+        if is_upload && !is_ftp_url {
             let has_own_upload = per_url_upload_files.get(i).is_some_and(|f| f.is_some());
             if has_own_upload {
-                // This URL has its own -T flag: re-read the file
+                // This URL has its own -T file: read the file
                 if let Some(Some(ref path)) = per_url_upload_files.get(i) {
-                    if let Ok(data) = std::fs::read(path) {
-                        // Apply resume offset if set (Content-Range + body slicing, curl compat: test 1002)
-                        if let Some(offset) = resume_offset {
-                            if offset > 0 {
-                                let total = data.len() as u64;
-                                let end = total.saturating_sub(1);
-                                if offset <= end {
-                                    #[allow(clippy::cast_possible_truncation)]
-                                    let start = offset as usize;
-                                    let sliced = &data[start..];
-                                    easy.remove_header("Content-Range");
-                                    easy.header(
-                                        "Content-Range",
-                                        &format!("bytes {offset}-{end}/{total}"),
-                                    );
-                                    easy.body(sliced);
+                    match std::fs::read(path) {
+                        Ok(data) => {
+                            // Apply resume offset if set (Content-Range + body slicing, curl compat: test 1002)
+                            if let Some(offset) = resume_offset {
+                                if offset > 0 {
+                                    let total = data.len() as u64;
+                                    let end = total.saturating_sub(1);
+                                    if offset <= end {
+                                        #[allow(clippy::cast_possible_truncation)]
+                                        let start = offset as usize;
+                                        let sliced = &data[start..];
+                                        easy.remove_header("Content-Range");
+                                        easy.header(
+                                            "Content-Range",
+                                            &format!("bytes {offset}-{end}/{total}"),
+                                        );
+                                        easy.body(sliced);
+                                    } else {
+                                        easy.body(&[]);
+                                    }
                                 } else {
-                                    easy.body(&[]);
+                                    easy.body(&data);
                                 }
                             } else {
                                 easy.body(&data);
                             }
-                        } else {
-                            easy.body(&data);
+                            // Only default to PUT if no explicit -X method was set
+                            // (curl compat: test 1002 — -X GET overrides -T's PUT)
+                            if easy.method_is_default() {
+                                easy.method("PUT");
+                            }
                         }
-                        // Only default to PUT if no explicit -X method was set
-                        // (curl compat: test 1002 — -X GET overrides -T's PUT)
-                        if easy.method_is_default() {
-                            easy.method("PUT");
+                        Err(e) => {
+                            // Missing file: report error but continue with remaining transfers
+                            // (curl compat: test 491 — error 26 for missing upload file)
+                            if !silent || show_error {
+                                eprintln!("curl: can't open '{path}' for reading: {e}");
+                            }
+                            last_exit = ExitCode::from(26); // CURLE_READ_ERROR
+                            continue;
                         }
                     }
                 }
-            } else if easy.has_body() {
+            } else if i > 0 && easy.has_body() {
                 // No -T for this URL: revert to GET (curl compat: test 1065)
                 let _ = easy.take_body();
                 easy.method("GET");
@@ -2601,15 +2901,13 @@ pub fn run_multi(
                 || effective_url.starts_with("pop3://")
                 || effective_url.starts_with("pop3s://")
             {
-                let encoded_user = percent_encode_userinfo(user);
-                let encoded_pass = percent_encode_userinfo(pass);
                 let base_url = strip_url_credentials(&effective_url);
                 if let Some(scheme_end) = base_url.find("://").map(|p| p + 3) {
                     let new_url = format!(
                         "{}{}:{}@{}",
                         &base_url[..scheme_end],
-                        encoded_user,
-                        encoded_pass,
+                        percent_encode_credential(user),
+                        percent_encode_credential(pass),
                         &base_url[scheme_end..]
                     );
                     let _ = easy.url(&new_url);
@@ -2729,12 +3027,16 @@ pub fn run_multi(
                 // Only downgrade when connection reuse is expected — if the server
                 // closes the connection, the next request creates a fresh connection
                 // which should use HTTP/1.1 (curl compat: test 1258).
+                // For FTP-over-proxy, check Proxy-Connection as well (curl compat: test 1077).
                 if response.http_version()
                     == liburlx::protocol::http::response::ResponseHttpVersion::Http10
                 {
                     let has_keepalive = response
                         .header("connection")
-                        .is_some_and(|v| v.eq_ignore_ascii_case("keep-alive"));
+                        .is_some_and(|v| v.eq_ignore_ascii_case("keep-alive"))
+                        || response
+                            .header("proxy-connection")
+                            .is_some_and(|v| v.eq_ignore_ascii_case("keep-alive"));
                     if has_keepalive {
                         easy.http_version(liburlx::HttpVersion::Http10);
                         downgraded_http10 = true;
@@ -2954,8 +3256,8 @@ async fn run_imap_batch(
         // Embed per-URL credentials into the URL (same as the main transfer loop)
         let effective_url =
             if let Some(Some((ref user, ref pass))) = per_url_credentials.get(global_idx) {
-                let encoded_user = percent_encode_userinfo(user);
-                let encoded_pass = percent_encode_userinfo(pass);
+                let encoded_user = percent_encode_credential(user);
+                let encoded_pass = percent_encode_credential(pass);
                 let base_url = strip_url_credentials(url_str);
                 let scheme_end = base_url.find("://").map_or(0, |p| p + 3);
                 format!(
