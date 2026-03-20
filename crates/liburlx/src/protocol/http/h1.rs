@@ -1217,17 +1217,17 @@ fn unfold_headers(data: &[u8]) -> std::borrow::Cow<'_, [u8]> {
 
 /// Normalize raw header bytes for output display (e.g., `-D`, `-i`).
 ///
-/// Performs three transformations on header values:
+/// Performs two transformations on header values:
 /// 1. Unfold continuation lines (`\r\n<SP|HT>` → single space)
-/// 2. Replace tabs with spaces in header values
-/// 3. Collapse consecutive spaces in header values into a single space
+/// 2. Collapse consecutive spaces in header values into a single space
 ///
-/// This matches curl's header output behavior (test 1274).
+/// Tab characters in header values are preserved as-is (curl compat: test 1105).
+///
+/// This matches curl's header output behavior (tests 1105, 1274).
 fn normalize_raw_headers_for_output(data: &[u8]) -> Vec<u8> {
-    // Quick check: does this data contain any folds or tabs?
+    // Quick check: does this data contain any folds?
     let has_fold = data.windows(2).any(|w| (w[0] == b'\n') && (w[1] == b' ' || w[1] == b'\t'));
-    let has_tab = data.contains(&b'\t');
-    if !has_fold && !has_tab {
+    if !has_fold {
         return data.to_vec();
     }
 
@@ -1235,7 +1235,7 @@ fn normalize_raw_headers_for_output(data: &[u8]) -> Vec<u8> {
     let unfolded = unfold_headers(data);
     let unfolded = unfolded.as_ref();
 
-    // Now process each line: replace tabs and collapse whitespace in header values
+    // Now process each line: collapse consecutive spaces in header values
     let mut result = Vec::with_capacity(unfolded.len());
     let mut i = 0;
     while i < unfolded.len() {
@@ -1253,7 +1253,7 @@ fn normalize_raw_headers_for_output(data: &[u8]) -> Vec<u8> {
         if let Some(colon_pos) = line.iter().position(|&b| b == b':') {
             // Emit header name and colon as-is
             result.extend_from_slice(&line[..=colon_pos]);
-            // Process value part: replace tabs with spaces, collapse consecutive spaces
+            // Process value part: collapse consecutive spaces (preserve tabs)
             let value_start = colon_pos + 1;
             let line_content_end = if line.ends_with(b"\r\n") {
                 line.len() - 2
@@ -1263,12 +1263,11 @@ fn normalize_raw_headers_for_output(data: &[u8]) -> Vec<u8> {
                 line.len()
             };
             let value = &line[value_start..line_content_end];
-            // Replace tabs with spaces and collapse
+            // Collapse consecutive spaces (but preserve tabs)
             let mut prev_space = false;
             let mut value_started = false;
             for &b in value {
-                let ch = if b == b'\t' { b' ' } else { b };
-                if ch == b' ' {
+                if b == b' ' {
                     if !value_started {
                         // Leading space after colon: emit one space
                         result.push(b' ');
@@ -1284,7 +1283,7 @@ fn normalize_raw_headers_for_output(data: &[u8]) -> Vec<u8> {
                         // First non-space char without leading space
                         value_started = true;
                     }
-                    result.push(ch);
+                    result.push(b);
                     prev_space = false;
                 }
             }
