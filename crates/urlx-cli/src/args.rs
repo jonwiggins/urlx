@@ -157,6 +157,10 @@ pub struct CliOptions {
     pub(crate) per_url_group: Vec<usize>,
     /// Current group ID counter (incremented on --next).
     group_id: usize,
+    /// Tracks which option to blame when etag + multiple URLs conflict.
+    /// Set to "--url" when --url adds a URL while etag is set, or to
+    /// "--etag-save"/etc. when etag is set after multiple URLs exist.
+    etag_conflict_blame: Option<String>,
     /// URL index where the current --next group starts (for per-URL Easy handles).
     pub(crate) group_easy_start: usize,
 }
@@ -698,6 +702,7 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
         per_url_group: Vec::new(),
         group_id: 0,
         group_easy_start: 0,
+        etag_conflict_blame: None,
     };
 
     let mut i = 1;
@@ -1809,11 +1814,18 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
                 i += 1;
                 let val = require_arg(args, i, "--etag-save")?;
                 opts.etag_save_file = Some(val.to_string());
+                // If multiple URLs already exist, this etag option is the culprit
+                if opts.urls.len() > 1 {
+                    opts.etag_conflict_blame = Some("--etag-save".to_string());
+                }
             }
             "--etag-compare" => {
                 i += 1;
                 let val = require_arg(args, i, "--etag-compare")?;
                 opts.etag_compare_file = Some(val.to_string());
+                if opts.urls.len() > 1 {
+                    opts.etag_conflict_blame = Some("--etag-compare".to_string());
+                }
             }
             "--haproxy-protocol" => {
                 opts.easy.haproxy_protocol(true);
@@ -1965,6 +1977,12 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
                     opts.per_url_easy.push(None);
                     opts.per_url_upload_files.push(pending_upload_file.take());
                     opts.per_url_group.push(opts.group_id);
+                    // If etag options are set and this adds a second URL, blame --url
+                    if opts.urls.len() > 1
+                        && (opts.etag_save_file.is_some() || opts.etag_compare_file.is_some())
+                    {
+                        opts.etag_conflict_blame = Some("--url".to_string());
+                    }
                 }
                 opts.next_needs_url = false;
             }
@@ -2286,19 +2304,38 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
         *slot = current_ftp_method;
     }
 
-    // Assign last group's Easy handle to URLs that weren't assigned yet
-    {
-        let current_easy = opts.easy.clone();
-        for slot in opts.per_url_easy[opts.group_easy_start..].iter_mut() {
-            if slot.is_none() {
-                *slot = Some(current_easy.clone());
-            }
-        }
-    }
-
     // --next at the end with no URL is a parse error (curl returns exit code 2)
     if opts.next_needs_url {
         eprintln!("curl: (2) no URL specified after --next");
+        return Err(2);
+    }
+
+    // Detect mutually exclusive option combinations (curl compat: tests 481, 482)
+    if opts.resume_check && opts.no_clobber {
+        eprintln!("curl: --continue-at is mutually exclusive with --no-clobber");
+        eprintln!("curl: option -C: is badly used here");
+        eprintln!("curl: try 'curl --help' or 'curl --manual' for more information");
+        return Err(2);
+    }
+    if opts.resume_check && opts.remove_on_error {
+        eprintln!("curl: --continue-at is mutually exclusive with --remove-on-error");
+        eprintln!("curl: option -C: is badly used here");
+        eprintln!("curl: try 'curl --help' or 'curl --manual' for more information");
+        return Err(2);
+    }
+
+    // Etag options only work with a single URL (curl compat: tests 484, 485).
+    // With --next, URLs in different groups don't conflict (test 369).
+    if (opts.etag_save_file.is_some() || opts.etag_compare_file.is_some())
+        && !opts.had_next
+        && opts.urls.len() > 1
+    {
+        eprintln!("curl: The etag options only work on a single URL");
+        eprintln!(
+            "curl: option {}: is badly used here",
+            opts.etag_conflict_blame.as_deref().unwrap_or("--etag-save")
+        );
+        eprintln!("curl: try 'curl --help' or 'curl --manual' for more information");
         return Err(2);
     }
 
@@ -2347,6 +2384,18 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
         }
     }
     // Note: netrc credential loading is deferred to run() where the URL is known
+
+    // Assign last group's Easy handle to URLs that weren't assigned yet.
+    // This must happen AFTER auth credentials are applied so per-URL Easy
+    // handles have correct auth state (curl compat: test 338 — ANYAUTH).
+    {
+        let current_easy = opts.easy.clone();
+        for slot in opts.per_url_easy[opts.group_easy_start..].iter_mut() {
+            if slot.is_none() {
+                *slot = Some(current_easy.clone());
+            }
+        }
+    }
 
     // Apply accumulated inline cookies as a single Cookie header
     if !opts.inline_cookies.is_empty() {
@@ -3442,8 +3491,12 @@ fn apply_variable_function(value: &[u8], func: &str) -> Result<Vec<u8>, u8> {
         }
         "b64" | "base64" => Ok(simple_base64_encode(value).into_bytes()),
         "64dec" | "b64dec" | "base64dec" => {
-            // Base64 decode
-            Ok(simple_base64_decode(value))
+            // Base64 decode — if input is invalid base64, return "[64dec-fail]"
+            // (curl compat: test 487)
+            match strict_base64_decode(value) {
+                Some(decoded) => Ok(decoded),
+                None => Ok(b"[64dec-fail]".to_vec()),
+            }
         }
         "json" => {
             // JSON string escaping (no wrapping quotes — curl compat).
@@ -3471,6 +3524,21 @@ fn apply_variable_function(value: &[u8], func: &str) -> Result<Vec<u8>, u8> {
             Err(2)
         }
     }
+}
+
+/// Strict base64 decoder that returns `None` if input contains invalid characters.
+/// Used by `{{var:64dec}}` to detect bad input (curl compat: test 487).
+fn strict_base64_decode(data: &[u8]) -> Option<Vec<u8>> {
+    // Check that all non-whitespace, non-padding characters are valid base64
+    for &b in data {
+        if b == b'=' || b == b'\n' || b == b'\r' || b == b' ' {
+            continue;
+        }
+        if !matches!(b, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'+' | b'/') {
+            return None;
+        }
+    }
+    Some(simple_base64_decode(data))
 }
 
 /// Simple base64 decoder.

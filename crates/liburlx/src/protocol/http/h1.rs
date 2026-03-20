@@ -46,11 +46,9 @@ pub(crate) fn te_compression_encoding(te: &str) -> Option<String> {
 const MAX_HEADER_LINE_SIZE: usize = 100 * 1024;
 
 /// Maximum total response header section size per response.
-/// This is the same as curl's `MAX_HTTP_RESP_HEADER_SIZE` (6000 * 1024).
-/// Individual responses are allowed to have large headers as long as the total
-/// stays under this limit; the cumulative limit across redirects is enforced
-/// separately in the redirect loop.
-const MAX_HEADER_SIZE: usize = 6000 * 1024;
+/// This matches curl's `MAX_HTTP_RESP_HEADER_SIZE` (300 * 1024 = 307,200 bytes).
+/// When accumulated headers exceed this, curl returns `CURLE_RECV_ERROR` (56).
+const MAX_HEADER_SIZE: usize = 300 * 1024;
 
 /// Send an HTTP/1.x request and read the response.
 ///
