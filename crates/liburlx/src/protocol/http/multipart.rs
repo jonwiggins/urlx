@@ -28,6 +28,8 @@ pub struct MultipartForm {
     smtp_mode: bool,
     /// Filename escape mode.
     escape_mode: FilenameEscapeMode,
+    /// Extra headers to include in the SMTP MIME preamble (from `-H` flags).
+    smtp_headers: Vec<(String, String)>,
 }
 
 /// A single part in a multipart form.
@@ -41,6 +43,14 @@ struct Part {
     sub_files: Vec<SubFile>,
     /// Whether the content type was explicitly set (vs guessed from filename).
     explicit_type: bool,
+    /// Custom headers for this part (e.g., `headers=X-Custom: value`).
+    custom_headers: Vec<String>,
+    /// Transfer encoding (e.g., `quoted-printable`, `base64`, `7bit`).
+    encoder: Option<String>,
+    /// Nested multipart sub-parts (for `=(;type=multipart/...` syntax).
+    subparts: Vec<Self>,
+    /// Whether this is a nested multipart container.
+    is_multipart_container: bool,
 }
 
 /// A file within a multipart/mixed sub-part.
@@ -61,6 +71,7 @@ impl MultipartForm {
             use_attachment: false,
             smtp_mode: false,
             escape_mode: FilenameEscapeMode::default(),
+            smtp_headers: Vec::new(),
         }
     }
 
@@ -73,6 +84,7 @@ impl MultipartForm {
             use_attachment: false,
             smtp_mode: false,
             escape_mode: FilenameEscapeMode::default(),
+            smtp_headers: Vec::new(),
         }
     }
 
@@ -93,6 +105,11 @@ impl MultipartForm {
         self.escape_mode = mode;
     }
 
+    /// Set extra headers for the SMTP MIME preamble (from `-H` flags).
+    pub fn set_smtp_headers(&mut self, headers: Vec<(String, String)>) {
+        self.smtp_headers = headers;
+    }
+
     /// Add a text field to the form.
     pub fn field(&mut self, name: &str, value: &str) {
         self.parts.push(Part {
@@ -102,6 +119,10 @@ impl MultipartForm {
             data: value.as_bytes().to_vec(),
             sub_files: Vec::new(),
             explicit_type: false,
+            custom_headers: Vec::new(),
+            encoder: None,
+            subparts: Vec::new(),
+            is_multipart_container: false,
         });
     }
 
@@ -114,6 +135,10 @@ impl MultipartForm {
             data: value.as_bytes().to_vec(),
             sub_files: Vec::new(),
             explicit_type: true,
+            custom_headers: Vec::new(),
+            encoder: None,
+            subparts: Vec::new(),
+            is_multipart_container: false,
         });
     }
 
@@ -142,6 +167,10 @@ impl MultipartForm {
             data,
             sub_files: Vec::new(),
             explicit_type: false,
+            custom_headers: Vec::new(),
+            encoder: None,
+            subparts: Vec::new(),
+            is_multipart_container: false,
         });
 
         Ok(())
@@ -156,6 +185,10 @@ impl MultipartForm {
             data: data.to_vec(),
             sub_files: Vec::new(),
             explicit_type: false,
+            custom_headers: Vec::new(),
+            encoder: None,
+            subparts: Vec::new(),
+            is_multipart_container: false,
         });
     }
 
@@ -170,6 +203,10 @@ impl MultipartForm {
             data: data.to_vec(),
             sub_files: Vec::new(),
             explicit_type: false,
+            custom_headers: Vec::new(),
+            encoder: None,
+            subparts: Vec::new(),
+            is_multipart_container: false,
         });
     }
 
@@ -188,6 +225,10 @@ impl MultipartForm {
             data: data.to_vec(),
             sub_files: Vec::new(),
             explicit_type: true,
+            custom_headers: Vec::new(),
+            encoder: None,
+            subparts: Vec::new(),
+            is_multipart_container: false,
         });
     }
 
@@ -206,6 +247,82 @@ impl MultipartForm {
             data: Vec::new(),
             sub_files,
             explicit_type: false,
+            custom_headers: Vec::new(),
+            encoder: None,
+            subparts: Vec::new(),
+            is_multipart_container: false,
+        });
+    }
+
+    /// Begin a nested multipart container (for `=(;type=multipart/alternative` syntax).
+    ///
+    /// Returns the index of the container part. Use `close_multipart_container` to
+    /// finalize it, or `add_part_to_container` to add subparts.
+    pub fn open_multipart_container(&mut self, content_type: &str) -> usize {
+        let idx = self.parts.len();
+        self.parts.push(Part {
+            name: String::new(),
+            filename: None,
+            content_type: Some(content_type.to_string()),
+            data: Vec::new(),
+            sub_files: Vec::new(),
+            explicit_type: true,
+            custom_headers: Vec::new(),
+            encoder: None,
+            subparts: Vec::new(),
+            is_multipart_container: true,
+        });
+        idx
+    }
+
+    /// Add a subpart to a previously opened multipart container.
+    pub fn add_part_to_container(
+        &mut self,
+        container_idx: usize,
+        data: &[u8],
+        content_type: Option<&str>,
+        filename: Option<&str>,
+        custom_headers: Vec<String>,
+        encoder: Option<&str>,
+    ) {
+        let part = Part {
+            name: String::new(),
+            filename: filename.map(ToString::to_string),
+            content_type: content_type.map(ToString::to_string),
+            data: data.to_vec(),
+            sub_files: Vec::new(),
+            explicit_type: content_type.is_some(),
+            custom_headers,
+            encoder: encoder.map(ToString::to_string),
+            subparts: Vec::new(),
+            is_multipart_container: false,
+        };
+        if let Some(container) = self.parts.get_mut(container_idx) {
+            container.subparts.push(part);
+        }
+    }
+
+    /// Add a part with custom headers and optional encoder.
+    pub fn add_part_with_options(
+        &mut self,
+        name: &str,
+        data: &[u8],
+        content_type: Option<&str>,
+        filename: Option<&str>,
+        custom_headers: Vec<String>,
+        encoder: Option<&str>,
+    ) {
+        self.parts.push(Part {
+            name: name.to_string(),
+            filename: filename.map(ToString::to_string),
+            content_type: content_type.map(ToString::to_string),
+            data: data.to_vec(),
+            sub_files: Vec::new(),
+            explicit_type: content_type.is_some(),
+            custom_headers,
+            encoder: encoder.map(ToString::to_string),
+            subparts: Vec::new(),
+            is_multipart_container: false,
         });
     }
 
@@ -251,6 +368,16 @@ impl MultipartForm {
         } else {
             "form-data"
         }
+    }
+
+    /// Build the encoded multipart body, validating 7-bit constraints for SMTP.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if 7-bit encoded content has 8-bit bytes.
+    pub fn encode_checked(&self) -> Result<Vec<u8>, Error> {
+        self.validate_encoders()?;
+        Ok(self.encode())
     }
 
     /// Build the encoded multipart body.
@@ -368,47 +495,32 @@ impl MultipartForm {
         // MIME headers
         body.extend_from_slice(b"Content-Type: multipart/mixed; boundary=");
         body.extend_from_slice(self.boundary.as_bytes());
-        body.extend_from_slice(b"\r\nMime-Version: 1.0\r\n\r\n");
+        body.extend_from_slice(b"\r\nMime-Version: 1.0\r\n");
 
-        for part in &self.parts {
-            // Boundary delimiter
-            body.extend_from_slice(b"--");
-            body.extend_from_slice(self.boundary.as_bytes());
-            body.extend_from_slice(b"\r\n");
-
-            // For SMTP: text parts (no filename) have no Content-Disposition.
-            // File parts have Content-Disposition: attachment; filename="..."
-            if let Some(ref filename) = part.filename {
-                body.extend_from_slice(b"Content-Disposition: attachment; filename=\"");
-                // SMTP always uses backslash escaping for filenames
-                let escaped = escape_filename_backslash(filename);
-                body.extend_from_slice(escaped.as_bytes());
-                body.extend_from_slice(b"\"\r\n");
-            }
-
-            // Content-Type header only when explicitly set (not guessed)
-            if part.explicit_type {
-                if let Some(ref ct) = part.content_type {
-                    body.extend_from_slice(b"Content-Type: ");
-                    body.extend_from_slice(ct.as_bytes());
-                    body.extend_from_slice(b"\r\n");
-                }
-            }
-
-            // Empty line separating headers from body
-            body.extend_from_slice(b"\r\n");
-
-            // Part body
-            body.extend_from_slice(&part.data);
+        // Extra headers from -H flags (curl compat: tests 646, 648)
+        for (name, value) in &self.smtp_headers {
+            body.extend_from_slice(name.as_bytes());
+            body.extend_from_slice(b": ");
+            body.extend_from_slice(value.as_bytes());
             body.extend_from_slice(b"\r\n");
         }
 
-        // Closing boundary
-        body.extend_from_slice(b"--");
-        body.extend_from_slice(self.boundary.as_bytes());
-        body.extend_from_slice(b"--\r\n");
+        body.extend_from_slice(b"\r\n");
+
+        encode_smtp_parts(&mut body, &self.parts, &self.boundary);
 
         body
+    }
+
+    /// Validate that all parts with `7bit` encoder contain only 7-bit ASCII data.
+    ///
+    /// Returns `Err` if any 7-bit encoded part contains 8-bit bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Transfer`] with code 26 if 8-bit data is found in a 7-bit part.
+    pub fn validate_encoders(&self) -> Result<(), Error> {
+        validate_parts_7bit(&self.parts)
     }
 }
 
@@ -416,6 +528,186 @@ impl Default for MultipartForm {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Recursively encode SMTP parts into the given buffer.
+fn encode_smtp_parts(body: &mut Vec<u8>, parts: &[Part], boundary: &str) {
+    for part in parts {
+        // Nested multipart container
+        if part.is_multipart_container {
+            let sub_boundary = generate_boundary();
+            body.extend_from_slice(b"--");
+            body.extend_from_slice(boundary.as_bytes());
+            body.extend_from_slice(b"\r\n");
+
+            // Content-Type with sub-boundary
+            if let Some(ref ct) = part.content_type {
+                body.extend_from_slice(b"Content-Type: ");
+                body.extend_from_slice(ct.as_bytes());
+                body.extend_from_slice(b"; boundary=");
+                body.extend_from_slice(sub_boundary.as_bytes());
+                body.extend_from_slice(b"\r\n");
+            }
+
+            body.extend_from_slice(b"\r\n");
+
+            // Encode subparts with the sub-boundary
+            encode_smtp_parts(body, &part.subparts, &sub_boundary);
+
+            body.extend_from_slice(b"\r\n");
+            continue;
+        }
+
+        // Boundary delimiter
+        body.extend_from_slice(b"--");
+        body.extend_from_slice(boundary.as_bytes());
+        body.extend_from_slice(b"\r\n");
+
+        // For SMTP: text parts (no filename) have no Content-Disposition.
+        // File parts have Content-Disposition: attachment; filename="..."
+        if let Some(ref filename) = part.filename {
+            body.extend_from_slice(b"Content-Disposition: attachment; filename=\"");
+            let escaped = escape_filename_backslash(filename);
+            body.extend_from_slice(escaped.as_bytes());
+            body.extend_from_slice(b"\"\r\n");
+        }
+
+        // Content-Type header only when explicitly set (not guessed)
+        if part.explicit_type {
+            if let Some(ref ct) = part.content_type {
+                body.extend_from_slice(b"Content-Type: ");
+                body.extend_from_slice(ct.as_bytes());
+                body.extend_from_slice(b"\r\n");
+            }
+        }
+
+        // Content-Transfer-Encoding header
+        if let Some(ref enc) = part.encoder {
+            body.extend_from_slice(b"Content-Transfer-Encoding: ");
+            body.extend_from_slice(enc.as_bytes());
+            body.extend_from_slice(b"\r\n");
+        } else if part.explicit_type && !part.is_multipart_container {
+            // SMTP default: 8bit for non-multipart parts with explicit content type
+            body.extend_from_slice(b"Content-Transfer-Encoding: 8bit\r\n");
+        }
+
+        // Custom headers
+        for header in &part.custom_headers {
+            body.extend_from_slice(header.as_bytes());
+            body.extend_from_slice(b"\r\n");
+        }
+
+        // Empty line separating headers from body
+        body.extend_from_slice(b"\r\n");
+
+        // Part body (apply encoding if specified)
+        if let Some(ref enc) = part.encoder {
+            match enc.as_str() {
+                "base64" => {
+                    let encoded = encode_base64(&part.data);
+                    body.extend_from_slice(encoded.as_bytes());
+                }
+                "quoted-printable" => {
+                    let encoded = encode_quoted_printable(&part.data);
+                    body.extend_from_slice(encoded.as_bytes());
+                }
+                _ => {
+                    // 7bit, 8bit, binary — pass through
+                    body.extend_from_slice(&part.data);
+                }
+            }
+        } else {
+            body.extend_from_slice(&part.data);
+        }
+        body.extend_from_slice(b"\r\n");
+    }
+
+    // Closing boundary
+    body.extend_from_slice(b"--");
+    body.extend_from_slice(boundary.as_bytes());
+    body.extend_from_slice(b"--\r\n");
+}
+
+/// Validate 7-bit encoding constraint recursively.
+fn validate_parts_7bit(parts: &[Part]) -> Result<(), Error> {
+    for part in parts {
+        if part.encoder.as_deref() == Some("7bit") && part.data.iter().any(|&b| b > 127) {
+            return Err(Error::Transfer {
+                code: 26,
+                message: "7-bit encoding applied to 8-bit data".to_string(),
+            });
+        }
+        validate_parts_7bit(&part.subparts)?;
+    }
+    Ok(())
+}
+
+/// Encode data as base64, wrapping at 76 characters per line.
+fn encode_base64(data: &[u8]) -> String {
+    use std::fmt::Write as _;
+
+    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    let mut result = String::new();
+    let mut line_len = 0;
+
+    let mut i = 0;
+    while i < data.len() {
+        let remaining = data.len() - i;
+        let b0 = data[i];
+        let b1 = if remaining > 1 { data[i + 1] } else { 0 };
+        let b2 = if remaining > 2 { data[i + 2] } else { 0 };
+
+        let c0 = CHARS[(b0 >> 2) as usize] as char;
+        let c1 = CHARS[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char;
+        let c2 = if remaining > 1 {
+            CHARS[(((b1 & 0x0F) << 2) | (b2 >> 6)) as usize] as char
+        } else {
+            '='
+        };
+        let c3 = if remaining > 2 { CHARS[(b2 & 0x3F) as usize] as char } else { '=' };
+
+        let _ = write!(result, "{c0}{c1}{c2}{c3}");
+        line_len += 4;
+
+        if line_len >= 76 {
+            result.push_str("\r\n");
+            line_len = 0;
+        }
+
+        i += 3;
+    }
+
+    // Don't add trailing CRLF — caller handles that
+    result
+}
+
+/// Encode data as quoted-printable (RFC 2045).
+fn encode_quoted_printable(data: &[u8]) -> String {
+    let mut result = String::new();
+    let mut line_len = 0;
+
+    for &byte in data {
+        let encoded = if byte == b'\t' || ((32..=126).contains(&byte) && byte != b'=') {
+            // Printable ASCII (except '=') — pass through
+            String::from(byte as char)
+        } else {
+            // Encode as =XX
+            format!("={byte:02X}")
+        };
+
+        // Soft line break before exceeding 76 chars
+        // (76 - 1 for potential = soft break marker)
+        if line_len + encoded.len() > 75 {
+            result.push_str("=\r\n");
+            line_len = 0;
+        }
+
+        result.push_str(&encoded);
+        line_len += encoded.len();
+    }
+
+    result
 }
 
 /// Backslash-escape a filename (for SMTP MIME).

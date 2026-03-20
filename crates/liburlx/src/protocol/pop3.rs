@@ -88,6 +88,53 @@ pub async fn read_multiline<S: AsyncRead + Unpin>(
     Ok(lines)
 }
 
+/// Read POP3 multiline response preserving original line endings.
+///
+/// Unlike `read_multiline`, this preserves the server's line ending style
+/// (LF vs CRLF) in the output. Used for RETR data output where curl
+/// preserves the wire format (curl compat: test 1319).
+async fn read_multiline_raw<S: AsyncRead + Unpin>(
+    stream: &mut BufReader<S>,
+) -> Result<Vec<u8>, Error> {
+    let mut body = Vec::new();
+
+    loop {
+        let mut line = String::new();
+        let bytes_read = stream
+            .read_line(&mut line)
+            .await
+            .map_err(|e| Error::Http(format!("POP3 read error: {e}")))?;
+
+        if bytes_read == 0 {
+            return Err(Error::Http("POP3 connection closed during multi-line read".to_string()));
+        }
+
+        // Check for terminator: line is ".\r\n" or ".\n"
+        let check = line.trim_end_matches('\n').trim_end_matches('\r');
+        if check == "." {
+            break;
+        }
+
+        // Byte-stuffing: leading dot is removed
+        if let Some(destuffed) = check.strip_prefix('.') {
+            // Remove leading dot, preserve the rest including original line ending
+            body.extend_from_slice(destuffed.as_bytes());
+            // Re-attach original line ending
+            if line.ends_with("\r\n") {
+                body.extend_from_slice(b"\r\n");
+            } else if line.ends_with('\n') {
+                body.push(b'\n');
+            }
+        } else {
+            // No byte-stuffing — output line as-is, preserving original line endings
+            // (curl compat: test 1319 — curl passes through POP3 data verbatim)
+            body.extend_from_slice(line.as_bytes());
+        }
+    }
+
+    Ok(body)
+}
+
 /// Read the POP3 server greeting, skipping any banner lines.
 ///
 /// The greeting must start with `+OK` or `-ERR`.
@@ -239,6 +286,7 @@ pub async fn retrieve(
     sasl_authzid: Option<&str>,
     use_ssl: UseSsl,
     tls_config: &crate::tls::TlsConfig,
+    pre_connected: Option<tokio::net::TcpStream>,
 ) -> Result<Response, Error> {
     // Reject URLs with CR/LF (curl returns exit code 3, test 875)
     let raw_url = url.as_str();
@@ -271,8 +319,12 @@ pub async fn retrieve(
     let use_implicit_tls = url.scheme() == "pop3s";
     let use_starttls = !use_implicit_tls && use_ssl != UseSsl::None;
 
-    let addr = format!("{host}:{port}");
-    let tcp = tokio::net::TcpStream::connect(&addr).await.map_err(Error::Connect)?;
+    let tcp = if let Some(stream) = pre_connected {
+        stream
+    } else {
+        let addr = format!("{host}:{port}");
+        tokio::net::TcpStream::connect(&addr).await.map_err(Error::Connect)?
+    };
 
     // Establish connection with appropriate TLS mode.
     // For STLS (POP3's STARTTLS), we use concrete types for the initial
@@ -452,12 +504,8 @@ pub async fn retrieve(
             let _ = read_response(&mut reader).await;
             return Err(Error::Protocol(8));
         }
-        let lines = read_multiline(&mut reader).await?;
-        let mut body_str = lines.join("\r\n");
-        if !body_str.is_empty() {
-            body_str.push_str("\r\n");
-        }
-        let body = body_str.into_bytes();
+        // Use raw read to preserve original line endings (curl compat: test 1319)
+        let body = read_multiline_raw(&mut reader).await?;
 
         // QUIT
         send_command(&mut writer, "QUIT").await?;

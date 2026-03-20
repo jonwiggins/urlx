@@ -382,6 +382,7 @@ pub async fn fetch(
     tag_prefix: char,
     use_ssl: UseSsl,
     tls_config: &crate::tls::TlsConfig,
+    pre_connected: Option<tokio::net::TcpStream>,
 ) -> Result<Response, Error> {
     IMAP_TRANSCRIPT
         .scope(std::cell::RefCell::new(Vec::new()), async {
@@ -462,8 +463,12 @@ async fn fetch_inner(
                 }
             })
             .unwrap_or(&host);
-    let addr = format!("{resolved_host}:{port}");
-    let tcp = tokio::net::TcpStream::connect(&addr).await.map_err(Error::Connect)?;
+    let tcp = if let Some(stream) = pre_connected {
+        stream
+    } else {
+        let addr = format!("{resolved_host}:{port}");
+        tokio::net::TcpStream::connect(&addr).await.map_err(Error::Connect)?
+    };
     let mut tags = TagCounter::new(tag_prefix);
 
     // Establish connection with appropriate TLS mode.
@@ -1178,10 +1183,11 @@ async fn dispatch_imap_operation<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         Ok(Some(resp))
     }
 
-    // Upload via -T: IMAP APPEND command.
+    // Upload via -T or -F: IMAP APPEND command.
     // Check this BEFORE custom_request, since -T sets method=PUT and
     // custom_request="PUT", but we want APPEND behavior, not a literal "PUT" cmd.
-    let is_upload = method == "PUT" && body.is_some();
+    // -F (multipart) also triggers APPEND (method=POST, curl compat: test 647).
+    let is_upload = (method == "PUT" || method == "POST") && body.is_some();
     if is_upload {
         if let Some(upload_data) = body {
             if !has_mailbox {
