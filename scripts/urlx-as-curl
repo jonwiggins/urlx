@@ -25,22 +25,31 @@ fi
 args=()
 has_user_agent=false
 stderr_to_stdout=false
+stderr_to_file=""
 skip_next=false
+skip_next_passthrough=""
 for arg in "$@"; do
     if $skip_next; then
         skip_next=false
-        # Check if this is the value for --stderr
-        if [ "$arg" = "-" ]; then
-            stderr_to_stdout=true
+        if [ -n "$skip_next_passthrough" ]; then
+            # Pass through both the flag and its value unchanged
+            args+=("$skip_next_passthrough" "$arg")
+            skip_next_passthrough=""
         else
-            args+=("--stderr" "$arg")
+            # Check if this is the value for --stderr
+            if [ "$arg" = "-" ]; then
+                stderr_to_stdout=true
+            else
+                stderr_to_file="$arg"
+            fi
         fi
         continue
     fi
     case "$arg" in
         -q) ;; # urlx has no .curlrc, -q is a no-op
         -A|--user-agent) has_user_agent=true; args+=("$arg") ;;
-        --stderr) skip_next=true ;;
+        --stderr) skip_next=true; skip_next_passthrough="" ;;
+        --unix-socket|--abstract-unix-socket) skip_next=true; skip_next_passthrough="$arg" ;;
         *)  args+=("$arg") ;;
     esac
 done
@@ -52,8 +61,11 @@ fi
 
 # Run urlx, translating "urlx:" to "curl:" in stderr for test compatibility
 # When --stderr - is used, redirect translated stderr to stdout
+# When --stderr <file> is used, redirect translated stderr to the file
 if $stderr_to_stdout; then
-    "$URLX" "${args[@]}" 2> >(sed 's/^urlx:/curl:/' >&1)
+    "$URLX" "${args[@]}" 2>&1
+elif [ -n "$stderr_to_file" ]; then
+    "$URLX" "${args[@]}" 2>"$stderr_to_file"
 else
     "$URLX" "${args[@]}" 2> >(sed 's/^urlx:/curl:/' >&2)
 fi

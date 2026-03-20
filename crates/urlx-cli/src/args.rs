@@ -68,7 +68,7 @@ pub struct CliOptions {
     pub(crate) no_keepalive: bool,
     pub(crate) proto: Option<String>,
     pub(crate) proto_redir: Option<String>,
-    pub(crate) libcurl: bool,
+    pub(crate) libcurl: Option<String>,
     pub(crate) netrc_file: Option<String>,
     pub(crate) netrc_optional: bool,
     pub(crate) post301: bool,
@@ -77,10 +77,14 @@ pub struct CliOptions {
     pub(crate) remote_time: bool,
     pub(crate) stderr_file: Option<String>,
     pub(crate) remote_header_name: bool,
+    /// Whether `-o` was explicitly specified (vs derived from `-O`).
+    pub(crate) explicit_output: bool,
     pub(crate) url_queries: Vec<String>,
     pub(crate) rate: Option<String>,
     pub(crate) use_ntlm: bool,
     pub(crate) use_anyauth: bool,
+    /// User-Agent string set via -A/--user-agent (for --libcurl output).
+    pub(crate) user_agent_str: Option<String>,
     pub(crate) globoff: bool,
     pub(crate) alt_svc_file: Option<String>,
     pub(crate) etag_save_file: Option<String>,
@@ -261,7 +265,7 @@ pub fn print_usage() {
     eprintln!("      --trace-ascii <file>  Write wire debug output to file (ASCII)");
     eprintln!("      --trace-time          Add timestamps to trace output");
     eprintln!("  -K, --config <file>       Read arguments from config file");
-    eprintln!("      --libcurl             Output equivalent C code using libcurl");
+    eprintln!("      --libcurl <file>       Output equivalent C code using libcurl to file");
     eprintln!("      --proto <protocols>   Enable protocols (e.g., =http,https)");
     eprintln!("      --proto-redir <p>     Enable protocols for redirects");
     eprintln!("      --max-filesize <bytes> Maximum file size to download");
@@ -584,6 +588,7 @@ fn expand_combined_flags(args: &[String]) -> Vec<String> {
                         | "--ftp-ssl-ccc-mode"
                         | "--tftp-blksize"
                         | "--http2-ping-interval"
+                        | "--libcurl"
                 ) {
                     skip_next = true;
                 }
@@ -642,7 +647,7 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
         no_keepalive: false,
         proto: None,
         proto_redir: None,
-        libcurl: false,
+        libcurl: None,
         netrc_file: None,
         netrc_optional: false,
         post301: false,
@@ -651,10 +656,12 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
         remote_time: false,
         stderr_file: None,
         remote_header_name: false,
+        explicit_output: false,
         url_queries: Vec::new(),
         rate: None,
         use_ntlm: false,
         use_anyauth: false,
+        user_agent_str: None,
         globoff: false,
         alt_svc_file: None,
         etag_save_file: None,
@@ -860,6 +867,7 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
                 i += 1;
                 let val = require_arg(args, i, "-o")?;
                 opts.output_files.push(val.to_string());
+                opts.explicit_output = true;
                 group_has_options = true;
             }
             "--out-null" => {
@@ -1012,6 +1020,7 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
             "-A" | "--user-agent" => {
                 i += 1;
                 let val = require_arg(args, i, "-A")?;
+                opts.user_agent_str = Some(val.to_string());
                 if val.is_empty() {
                     // -A "" removes the User-Agent header entirely (curl compat).
                     // Set empty value so h1 detects it and suppresses the default.
@@ -1554,7 +1563,9 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
                 }
             }
             "--libcurl" => {
-                opts.libcurl = true;
+                i += 1;
+                let val = require_arg(args, i, "--libcurl")?;
+                opts.libcurl = Some(val.to_string());
             }
             "--proto" => {
                 i += 1;
@@ -4709,9 +4720,10 @@ mod tests {
 
     #[test]
     fn parse_args_libcurl() {
-        let args = vec!["urlx".into(), "--libcurl".into(), "http://example.com".into()];
+        let args =
+            vec!["urlx".into(), "--libcurl".into(), "out.c".into(), "http://example.com".into()];
         let opts = unwrap_opts(parse_args(&args));
-        assert!(opts.libcurl);
+        assert_eq!(opts.libcurl, Some("out.c".to_string()));
     }
 
     #[test]

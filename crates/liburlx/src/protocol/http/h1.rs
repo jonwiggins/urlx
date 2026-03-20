@@ -139,14 +139,19 @@ where
     }
 
     // Emit custom Host header immediately (if user provided one via -H)
-    // Empty value means "suppress Host header entirely" (curl compat: test 461)
+    // Empty value from -H "Host;" sends "Host:\r\n" (curl compat: test 1292)
+    // Removal sentinel "\x01REMOVE\x01" from -H "Host:" suppresses entirely (curl compat: test 461)
     if custom_host {
         for (i, (name, value)) in custom_headers.iter().enumerate() {
             if keep[i] && name.eq_ignore_ascii_case("host") {
-                if !value.is_empty() {
+                if value == "\x01REMOVE\x01" {
+                    // -H "Host:" → suppress Host header entirely
+                } else if value.is_empty() {
+                    // -H "Host;" → send Host with empty value
+                    let _ = write!(req, "{name}:\r\n");
+                } else {
                     let _ = write!(req, "{name}: {value}\r\n");
                 }
-                // Empty value: intentionally suppress Host header
                 break;
             }
         }

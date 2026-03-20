@@ -15,6 +15,12 @@ use crate::error::Error;
 /// NTLM message signature: `NTLMSSP\0`.
 const NTLMSSP_SIGNATURE: &[u8; 8] = b"NTLMSSP\0";
 
+/// Maximum allowed size for a decoded NTLM Type 2 (Challenge) message.
+/// curl rejects oversized Type 2 messages with `CURLE_TOO_LARGE` (100).
+/// 64 KiB is a generous upper bound — legitimate Type 2 messages are typically
+/// a few hundred bytes.
+const MAX_TYPE2_SIZE: usize = 64 * 1024;
+
 /// NTLM message type constants.
 const NEGOTIATE_MESSAGE: u32 = 1;
 const CHALLENGE_MESSAGE: u32 = 2;
@@ -87,6 +93,13 @@ pub fn parse_type2_message(base64_msg: &str) -> Result<NtlmChallenge, Error> {
 
     if data.len() < 32 {
         return Err(Error::Http(format!("NTLM Type 2 message too short: {} bytes", data.len())));
+    }
+
+    // Reject oversized Type 2 messages (curl compat: test 776).
+    // Malicious servers can send extremely large challenges; curl rejects
+    // these with CURLE_TOO_LARGE (100).
+    if data.len() > MAX_TYPE2_SIZE {
+        return Err(Error::Protocol(100));
     }
 
     // Verify signature

@@ -81,9 +81,22 @@ impl Segment {
     }
 }
 
-/// Maximum number of glob patterns (sets + ranges) allowed in a single URL.
-/// Matches curl's `CURL_GLOB_PATTERNS_MAX`.
-const MAX_GLOB_PATTERNS: usize = 100;
+/// Maximum number of glob segments (literals + sets + ranges) allowed in a single URL.
+/// Matches curl's limit: 255 total segments before the error triggers.
+/// curl counts ALL segments (literal strings between patterns + the patterns themselves).
+const MAX_GLOB_SEGMENTS: usize = 255;
+
+/// Compute the truncated URL for "too many" glob errors.
+/// curl uses a 512-byte buffer for the error message + URL + caret indicator.
+/// The URL is truncated to fit within that buffer after the message header.
+fn glob_truncate_url(pattern: &str, display_pos: usize) -> String {
+    let header = format!("too many {{}} sets in URL position {display_pos}:\n");
+    let header_len = header.len();
+    // curl's text[512] buffer: 511 usable chars. URL follows the header.
+    // After URL there would be \n + spaces + ^ but those get truncated.
+    let max_url_len = 511_usize.saturating_sub(header_len);
+    pattern.chars().take(max_url_len).collect()
+}
 
 /// Parse a URL glob pattern into segments, tracking character position for errors.
 ///
@@ -96,7 +109,9 @@ fn parse_glob(pattern: &str) -> Result<Vec<Segment>, Error> {
     let mut chars = pattern.chars().peekable();
     let mut literal = String::new();
     let mut pos: usize = 0;
-    let mut glob_count: usize = 0;
+    // segment_count tracks ALL segments (literals + sets + ranges), matching curl's
+    // `add_glob` counter which checks against 255 total segments.
+    let mut segment_count: usize = 0;
 
     while let Some(&ch) = chars.peek() {
         match ch {
@@ -119,25 +134,34 @@ fn parse_glob(pattern: &str) -> Result<Vec<Segment>, Error> {
                 }
             }
             '{' => {
-                glob_count += 1;
-                if glob_count > MAX_GLOB_PATTERNS {
-                    // Truncate the URL display for the error message
-                    // 1-indexed position for display
-                    let display_pos = pos + 1;
-                    let truncated: String = pattern.chars().take(pos + 2).collect();
-                    return Err(Error::UrlGlob {
-                        message: format!("too many {{}} sets in URL position {display_pos}:"),
-                        url: truncated,
-                        position: pos,
-                    });
-                }
+                // Flush pending literal as a segment
                 if !literal.is_empty() {
+                    segment_count += 1;
+                    if segment_count > MAX_GLOB_SEGMENTS {
+                        let display_pos = pos + 1;
+                        let truncated = glob_truncate_url(pattern, display_pos);
+                        return Err(Error::UrlGlob {
+                            message: format!("too many {{}} sets in URL position {display_pos}:"),
+                            url: truncated,
+                            position: pos,
+                        });
+                    }
                     segments.push(Segment::Literal(std::mem::take(&mut literal)));
                 }
                 let _ = chars.next(); // consume '{'
                 pos += 1;
                 let (set, consumed) = parse_set_with_len(&mut chars)?;
                 pos += consumed;
+                segment_count += 1;
+                if segment_count > MAX_GLOB_SEGMENTS {
+                    let display_pos = pos + 1;
+                    let truncated = glob_truncate_url(pattern, display_pos);
+                    return Err(Error::UrlGlob {
+                        message: format!("too many {{}} sets in URL position {display_pos}:"),
+                        url: truncated,
+                        position: pos,
+                    });
+                }
                 segments.push(set);
             }
             '[' => {
@@ -195,17 +219,18 @@ fn parse_glob(pattern: &str) -> Result<Vec<Segment>, Error> {
                         }
                     }
                 } else {
-                    glob_count += 1;
-                    if glob_count > MAX_GLOB_PATTERNS {
-                        let display_pos = pos + 1;
-                        let truncated: String = pattern.chars().take(pos + 2).collect();
-                        return Err(Error::UrlGlob {
-                            message: format!("too many [] sets in URL position {display_pos}:"),
-                            url: truncated,
-                            position: pos,
-                        });
-                    }
+                    // Flush pending literal as a segment
                     if !literal.is_empty() {
+                        segment_count += 1;
+                        if segment_count > MAX_GLOB_SEGMENTS {
+                            let display_pos = pos + 1;
+                            let truncated = glob_truncate_url(pattern, display_pos);
+                            return Err(Error::UrlGlob {
+                                message: format!("too many [] sets in URL position {display_pos}:"),
+                                url: truncated,
+                                position: pos,
+                            });
+                        }
                         segments.push(Segment::Literal(std::mem::take(&mut literal)));
                     }
                     let open_pos = pos;
@@ -213,6 +238,16 @@ fn parse_glob(pattern: &str) -> Result<Vec<Segment>, Error> {
                     pos += 1;
                     let (range, consumed) = parse_range_with_len(&mut chars, pattern, open_pos)?;
                     pos += consumed;
+                    segment_count += 1;
+                    if segment_count > MAX_GLOB_SEGMENTS {
+                        let display_pos = pos + 1;
+                        let truncated = glob_truncate_url(pattern, display_pos);
+                        return Err(Error::UrlGlob {
+                            message: format!("too many [] sets in URL position {display_pos}:"),
+                            url: truncated,
+                            position: pos,
+                        });
+                    }
                     segments.push(range);
                 }
             }
@@ -254,7 +289,9 @@ fn parse_set_with_len(
                     if items.is_empty() {
                         return Err(Error::Http("empty glob set {}".to_string()));
                     }
-                    return Ok((Segment::Set(items), consumed));
+                    // Don't count the closing '}' in consumed — curl doesn't count it
+                    // in its pos tracking (curl compat: test 761)
+                    return Ok((Segment::Set(items), consumed - 1));
                 }
                 current.push(ch);
             }

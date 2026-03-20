@@ -1002,9 +1002,10 @@ impl Easy {
 
     /// Transfer the cookie jar and HSTS cache from another Easy handle.
     ///
-    /// This preserves accumulated cookies and HSTS entries when switching
-    /// Easy handles in multi-URL sequential mode (curl compat: cookies
-    /// must persist across URLs in the same invocation).
+    /// This preserves accumulated cookies, HSTS entries, and the connection
+    /// pool when switching Easy handles in multi-URL sequential mode.
+    /// The connection pool transfer enables connection reuse across `--next`
+    /// groups even when credentials change (curl compat: test 1134).
     pub fn transfer_state_from(&mut self, other: &mut Self) {
         if other.cookie_jar.is_some() {
             self.cookie_jar = other.cookie_jar.take();
@@ -1012,6 +1013,11 @@ impl Easy {
         if other.hsts_cache.is_some() {
             self.hsts_cache = other.hsts_cache.take();
         }
+        // Transfer the connection pool so connections are reused across --next
+        // boundaries (curl compat: test 1134 — different credentials reuse same TCP connection).
+        std::mem::swap(&mut self.pool, &mut other.pool);
+        #[cfg(feature = "http2")]
+        std::mem::swap(&mut self.h2_pool, &mut other.h2_pool);
     }
 
     /// Set the proxy URL.
@@ -2527,17 +2533,18 @@ impl Easy {
         // Only apply to known built-in defaults — other removal markers just prevent
         // previously-set custom headers from being emitted.
         // (curl compat: -H "User-Agent:" suppresses User-Agent, test 1147)
+        // Host uses a special sentinel "\x01REMOVE\x01" to distinguish removal (-H "Host:")
+        // from blank value (-H "Host;") which should emit "Host:\r\n" (curl compat: test 1292).
         for removed in &self.removed_headers {
             let already_set = headers.iter().any(|(k, _)| k.eq_ignore_ascii_case(removed));
             if !already_set {
-                let name = match removed.as_str() {
-                    "user-agent" => Some("User-Agent"),
-                    "accept" => Some("Accept"),
-                    "host" => Some("Host"),
-                    _ => None,
-                };
-                if let Some(name) = name {
-                    headers.push((name.to_string(), String::new()));
+                match removed.as_str() {
+                    "user-agent" => headers.push(("User-Agent".to_string(), String::new())),
+                    "accept" => headers.push(("Accept".to_string(), String::new())),
+                    "host" => {
+                        headers.push(("Host".to_string(), "\x01REMOVE\x01".to_string()));
+                    }
+                    _ => {}
                 }
             }
         }
