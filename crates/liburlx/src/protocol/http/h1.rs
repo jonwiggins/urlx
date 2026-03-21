@@ -87,6 +87,7 @@ pub async fn request<S>(
     http09_allowed: bool,
     deadline: Option<tokio::time::Instant>,
     raw: bool,
+    fail_on_error: bool,
 ) -> Result<(Response, bool), Error>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -762,8 +763,18 @@ where
         && ph.headers.get("location").is_some_and(|v| !v.trim().is_empty())
         && !ph.headers.contains_key("content-length")
         && !ph.headers.get("transfer-encoding").is_some_and(|te| te_contains_chunked(te));
-    let no_body =
-        is_head || ph.status == 204 || ph.status == 304 || range_failed || is_redirect_no_cl;
+    // When --fail is set and the server returns >= 400 without Content-Length
+    // or chunked encoding, skip the body read to avoid hanging on HTTP/1.0
+    // responses that never send EOF. We guard on !has_body_framing so that
+    // NTLM auth 401 responses with Content-Length still get their body consumed
+    // (curl compat: test 24).
+    let fail_skip_body = fail_on_error && ph.status >= 400 && !has_body_framing;
+    let no_body = is_head
+        || ph.status == 204
+        || ph.status == 304
+        || range_failed
+        || is_redirect_no_cl
+        || fail_skip_body;
 
     // Read body with download rate limiting
     let mut recv_limiter = RateLimiter::for_recv(speed_limits);
@@ -2414,6 +2425,7 @@ mod tests {
             true,
             None,
             false,
+            false,
         )
         .await
         .unwrap();
@@ -2458,6 +2470,7 @@ mod tests {
             false,
             true,
             None,
+            false,
             false,
         )
         .await
@@ -2508,6 +2521,7 @@ mod tests {
             true,
             None,
             false,
+            false,
         )
         .await
         .unwrap();
@@ -2551,6 +2565,7 @@ mod tests {
             false,
             true,
             None,
+            false,
             false,
         )
         .await
@@ -2596,6 +2611,7 @@ mod tests {
             false,
             true,
             None,
+            false,
             false,
         )
         .await
@@ -2646,6 +2662,7 @@ mod tests {
             false,
             true,
             None,
+            false,
             false,
         )
         .await
@@ -2703,6 +2720,7 @@ mod tests {
             false,
             true,
             None,
+            false,
             false,
         )
         .await
@@ -2775,6 +2793,7 @@ mod tests {
             true,
             None,
             false,
+            false,
         )
         .await
         .unwrap();
@@ -2827,6 +2846,7 @@ mod tests {
             true,
             None,
             false,
+            false,
         )
         .await
         .unwrap();
@@ -2878,6 +2898,7 @@ mod tests {
             true,
             None,
             false,
+            false,
         )
         .await
         .unwrap();
@@ -2927,6 +2948,7 @@ mod tests {
             true,
             None,
             false,
+            false,
         )
         .await
         .unwrap();
@@ -2967,6 +2989,7 @@ mod tests {
             false,
             true,
             None,
+            false,
             false,
         )
         .await
@@ -3015,6 +3038,7 @@ mod tests {
             true,
             None,
             false,
+            false,
         )
         .await
         .unwrap();
@@ -3061,6 +3085,7 @@ mod tests {
             false,
             true,
             None,
+            false,
             false,
         )
         .await
@@ -3133,6 +3158,7 @@ mod tests {
             true,
             None,
             false,
+            false,
         )
         .await
         .unwrap();
@@ -3197,6 +3223,7 @@ mod tests {
             true,
             None,
             false,
+            false,
         )
         .await
         .unwrap();
@@ -3244,6 +3271,7 @@ mod tests {
             false,
             true,
             None,
+            false,
             false,
         )
         .await
@@ -3293,6 +3321,7 @@ mod tests {
             true,
             None,
             false,
+            false,
         )
         .await
         .unwrap();
@@ -3336,6 +3365,7 @@ mod tests {
                 false,
                 true,
                 None,
+                false,
                 false,
             ),
         )
@@ -3383,6 +3413,7 @@ mod tests {
                 false,
                 true,
                 None,
+                false,
                 false,
             ),
         )
@@ -3460,10 +3491,111 @@ mod tests {
             true,
             None,
             false,
+            false,
         )
         .await
         .unwrap();
         assert_eq!(resp.status(), 200);
+
+        server_task.await.unwrap();
+    }
+
+    /// When fail_on_error is set and the server returns HTTP/1.0 404 without
+    /// Content-Length, body reading should be skipped to avoid hanging
+    /// (curl compat: test 24).
+    #[tokio::test]
+    async fn fail_on_error_skips_body_on_http10_404_without_content_length() {
+        use tokio::io::duplex;
+
+        let (mut client, mut server) = duplex(4096);
+
+        let server_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            let _n = server.read(&mut buf).await.unwrap();
+
+            // HTTP/1.0 404 without Content-Length — server keeps connection open.
+            let response = b"HTTP/1.0 404 Not Found\r\n\r\n";
+            server.write_all(response).await.unwrap();
+            // Intentionally do NOT shutdown — simulates a server that keeps the
+            // connection open, which would hang a naive read-to-EOF.
+        });
+
+        // With fail_on_error=true the request should complete without hanging
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            request(
+                &mut client,
+                "GET",
+                "example.com",
+                "/test",
+                &[],
+                None,
+                "http://example.com/test",
+                false,
+                true, // HTTP/1.0
+                None,
+                false,
+                &SpeedLimits::default(),
+                false,
+                true,
+                None,
+                false,
+                true, // fail_on_error
+            ),
+        )
+        .await;
+
+        let (resp, _) = result.expect("fail_on_error should skip body and not hang").unwrap();
+        assert_eq!(resp.status(), 404);
+        assert!(resp.body().is_empty(), "Body should be empty when skipped");
+
+        server_task.abort();
+    }
+
+    /// When fail_on_error is set but the 404 response has Content-Length,
+    /// body should still be read (needed for NTLM auth flow).
+    #[tokio::test]
+    async fn fail_on_error_reads_body_when_content_length_present() {
+        use tokio::io::duplex;
+
+        let (mut client, mut server) = duplex(4096);
+
+        let server_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            let _n = server.read(&mut buf).await.unwrap();
+
+            let response = b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nnot found";
+            server.write_all(response).await.unwrap();
+            server.shutdown().await.unwrap();
+        });
+
+        let (resp, _) = request(
+            &mut client,
+            "GET",
+            "example.com",
+            "/test",
+            &[],
+            None,
+            "http://example.com/test",
+            false,
+            false,
+            None,
+            false,
+            &SpeedLimits::default(),
+            false,
+            true,
+            None,
+            false,
+            true, // fail_on_error
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 404);
+        assert_eq!(
+            resp.body_str().unwrap(),
+            "not found",
+            "Body should be read when Content-Length is present"
+        );
 
         server_task.await.unwrap();
     }

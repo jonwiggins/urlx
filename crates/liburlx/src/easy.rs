@@ -2934,6 +2934,7 @@ impl Easy {
             self.allowed_protocols.as_deref(),
             &mut self.ftp_session,
             self.netrc_content.as_deref(),
+            self.fail_on_error,
         );
 
         // Apply total transfer timeout if set.
@@ -3095,6 +3096,7 @@ async fn perform_transfer(
     allowed_protocols: Option<&[String]>,
     ftp_session: &mut Option<crate::protocol::ftp::FtpSession>,
     netrc_content: Option<&str>,
+    fail_on_error: bool,
 ) -> Result<Response, Error> {
     let transfer_start = Instant::now();
     let original_url = url.clone();
@@ -3387,6 +3389,7 @@ async fn perform_transfer(
             raw,
             ftp_session,
             redirected_from_http,
+            fail_on_error,
         ))
         .await?;
 
@@ -3485,6 +3488,7 @@ async fn perform_transfer(
                         raw,
                         ftp_session,
                         redirected_from_http,
+                        fail_on_error,
                     ))
                     .await?;
                 }
@@ -3642,6 +3646,7 @@ async fn perform_transfer(
                                 raw,
                                 ftp_session,
                                 redirected_from_http,
+                                fail_on_error,
                             ))
                             .await?;
 
@@ -3751,6 +3756,7 @@ async fn perform_transfer(
                                         raw,
                                         ftp_session,
                                         redirected_from_http,
+                                        fail_on_error,
                                     ))
                                     .await?;
                                 }
@@ -3847,6 +3853,7 @@ async fn perform_transfer(
                                 raw,
                                 ftp_session,
                                 redirected_from_http,
+                                fail_on_error,
                             ))
                             .await?;
                         }
@@ -3957,6 +3964,7 @@ async fn perform_transfer(
                                         raw,
                                         ftp_session,
                                         redirected_from_http,
+                                        fail_on_error,
                                     ))
                                     .await?;
                                 }
@@ -4047,6 +4055,7 @@ async fn perform_transfer(
                             raw,
                             ftp_session,
                             redirected_from_http,
+                            fail_on_error,
                         ))
                         .await?;
                     }
@@ -4162,6 +4171,7 @@ async fn perform_transfer(
                                     raw,
                                     ftp_session,
                                     redirected_from_http,
+                                    fail_on_error,
                                 ))
                                 .await?;
                             }
@@ -4277,6 +4287,7 @@ async fn perform_transfer(
                                     raw,
                                     ftp_session,
                                     redirected_from_http,
+                                    fail_on_error,
                                 ))
                                 .await?;
                             }
@@ -4375,6 +4386,7 @@ async fn perform_transfer(
                                         raw,
                                         ftp_session,
                                         redirected_from_http,
+                                        fail_on_error,
                                     ))
                                     .await?;
 
@@ -4476,6 +4488,7 @@ async fn perform_transfer(
                                                     raw,
                                                     ftp_session,
                                                     redirected_from_http,
+                                                    fail_on_error,
                                                 ))
                                                 .await?;
                                             }
@@ -4577,6 +4590,7 @@ async fn perform_transfer(
                                             raw,
                                             ftp_session,
                                             redirected_from_http,
+                                            fail_on_error,
                                         ))
                                         .await?;
                                     }
@@ -4722,6 +4736,7 @@ async fn perform_transfer(
                                         raw,
                                         ftp_session,
                                         redirected_from_http,
+                                        fail_on_error,
                                     ))
                                     .await?;
                                 }
@@ -4843,6 +4858,7 @@ async fn perform_transfer(
                                     raw,
                                     ftp_session,
                                     redirected_from_http,
+                                    fail_on_error,
                                 ))
                                 .await?;
                             }
@@ -5218,6 +5234,7 @@ async fn perform_transfer(
                         raw,
                         ftp_session,
                         true,
+                        fail_on_error,
                     ))
                     .await;
 
@@ -5345,6 +5362,7 @@ async fn do_single_request(
     raw: bool,
     ftp_session: &mut Option<crate::protocol::ftp::FtpSession>,
     redirected_from_http: bool,
+    fail_on_error: bool,
 ) -> Result<Response, Error> {
     // Handle non-HTTP schemes directly
     match url.scheme() {
@@ -5879,6 +5897,7 @@ async fn do_single_request(
                 http09_allowed,
                 deadline,
                 raw,
+                fail_on_error,
             )
             .await;
 
@@ -6020,6 +6039,7 @@ async fn do_single_request(
             http09_allowed,
             deadline,
             raw,
+            fail_on_error,
         )
         .await?;
         let time_starttransfer = request_start.elapsed();
@@ -6352,6 +6372,7 @@ async fn do_single_request(
                         http09_allowed,
                         deadline,
                         raw,
+                        fail_on_error,
                     )
                     .await?;
                     let time_starttransfer = request_start.elapsed();
@@ -6487,6 +6508,7 @@ async fn do_single_request(
                     http09_allowed,
                     deadline,
                     raw,
+                    fail_on_error,
                 )
                 .await?;
                 let time_starttransfer = request_start.elapsed();
@@ -6643,6 +6665,7 @@ async fn do_single_request(
                     http09_allowed,
                     deadline,
                     raw,
+                    fail_on_error,
                 )
                 .await?;
                 let time_starttransfer = request_start.elapsed();
@@ -6763,6 +6786,7 @@ async fn do_single_request(
                     http09_allowed,
                     deadline,
                     raw,
+                    fail_on_error,
                 )
                 .await?;
                 let time_starttransfer = request_start.elapsed();
