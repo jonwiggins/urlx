@@ -1589,14 +1589,21 @@ where
 /// Read exactly `content_length` bytes of body, using any already-read prefix.
 ///
 /// When a rate limiter is active, reads in chunks with throttling.
-/// When a `deadline` is provided, respects it and returns partial body on timeout
-/// (curl compat: test 223 — broken deflate detected via partial body).
+/// When a `deadline` is provided, respects it and returns partial body on timeout.
+///
+/// When `content_encoding` is provided, reads incrementally and checks
+/// decompression validity after each chunk. If the accumulated data fails
+/// decompression (corrupt encoding), returns immediately with a
+/// `bad_content_encoding` error instead of blocking forever waiting for
+/// Content-Length bytes that may never arrive
+/// (curl compat: test 223 — broken deflate detected via incremental read).
 async fn read_exact_body<S>(
     stream: &mut S,
     content_length: usize,
     prefix: Vec<u8>,
     limiter: &mut RateLimiter,
     deadline: Option<tokio::time::Instant>,
+    content_encoding: Option<&str>,
 ) -> Result<Vec<u8>, Error>
 where
     S: AsyncRead + Unpin,
@@ -1609,6 +1616,21 @@ where
             limiter.record(content_length).await?;
         }
         return Ok(body);
+    }
+
+    // When Content-Encoding is present and Content-Length exceeds actual data,
+    // we must read incrementally and check decompression validity to detect
+    // broken encoding without blocking forever (curl compat: test 223).
+    if let Some(encoding) = content_encoding {
+        return read_exact_body_with_encoding_check(
+            stream,
+            content_length,
+            body,
+            limiter,
+            deadline,
+            encoding,
+        )
+        .await;
     }
 
     if !limiter.is_active() {
@@ -1698,6 +1720,126 @@ where
     Ok(body)
 }
 
+/// Incremental body reading with decompression validity checking.
+///
+/// Reads body data in chunks using `read()` (not `read_exact`). After each
+/// chunk, attempts to decompress the accumulated data. If decompression fails
+/// (indicating corrupt encoding), returns immediately with a
+/// `bad_content_encoding` error instead of blocking forever.
+///
+/// This handles the case where Content-Length exceeds the actual data sent
+/// and the data has broken compression (curl compat: test 223).
+async fn read_exact_body_with_encoding_check<S>(
+    stream: &mut S,
+    content_length: usize,
+    mut body: Vec<u8>,
+    limiter: &mut RateLimiter,
+    deadline: Option<tokio::time::Instant>,
+    encoding: &str,
+) -> Result<Vec<u8>, Error>
+where
+    S: AsyncRead + Unpin,
+{
+    // Account for prefix bytes in limiter
+    if limiter.is_active() && !body.is_empty() {
+        limiter.record(body.len()).await?;
+    }
+
+    // Check prefix data for encoding validity before reading more
+    if !body.is_empty() && is_encoding_corrupt(&body, encoding) {
+        return Err(Error::PartialBody {
+            message: "bad_content_encoding".to_string(),
+            partial_body: body,
+        });
+    }
+
+    while body.len() < content_length {
+        let remaining = content_length - body.len();
+        // Read in reasonably-sized chunks to allow incremental checking
+        let buf_size = remaining.min(THROTTLE_CHUNK_SIZE);
+        let mut chunk_buf = vec![0u8; buf_size];
+
+        // Use read() (not read_exact) so we process whatever data is available
+        let read_fut = stream.read(&mut chunk_buf);
+        let result = if let Some(dl) = deadline {
+            match tokio::time::timeout_at(dl, read_fut).await {
+                Ok(inner) => inner,
+                Err(_) => {
+                    return Err(Error::PartialBody {
+                        message: "transfer closed with outstanding read data remaining".to_string(),
+                        partial_body: body,
+                    });
+                }
+            }
+        } else {
+            read_fut.await
+        };
+
+        match result {
+            Ok(0) => {
+                // EOF before Content-Length reached
+                return Err(Error::PartialBody {
+                    message: "transfer closed with outstanding read data remaining".to_string(),
+                    partial_body: body,
+                });
+            }
+            Ok(n) => {
+                body.extend_from_slice(&chunk_buf[..n]);
+                if limiter.is_active() {
+                    limiter.record(n).await?;
+                }
+
+                // After each read, check if the accumulated data has corrupt encoding.
+                // For valid (possibly truncated) data, decompress returns Ok.
+                // For corrupt data, decompress returns Err — bail immediately.
+                if is_encoding_corrupt(&body, encoding) {
+                    return Err(Error::PartialBody {
+                        message: "bad_content_encoding".to_string(),
+                        partial_body: body,
+                    });
+                }
+            }
+            Err(e)
+                if is_close_notify_error(&e) || e.kind() == std::io::ErrorKind::UnexpectedEof =>
+            {
+                return Err(Error::PartialBody {
+                    message: "transfer closed with outstanding read data remaining".to_string(),
+                    partial_body: body,
+                });
+            }
+            Err(e) => return Err(Error::Http(format!("body read failed: {e}"))),
+        }
+    }
+
+    Ok(body)
+}
+
+/// Check if compressed data is corrupt by attempting decompression.
+///
+/// Returns `true` if decompression definitively fails (corrupt data).
+/// Returns `false` if decompression succeeds (data is valid, possibly truncated).
+///
+/// Uses the same decompression logic as `maybe_decompress_inner` — the outermost
+/// encoding in a multi-layer chain is checked first.
+fn is_encoding_corrupt(data: &[u8], content_encoding: &str) -> bool {
+    // Skip identity encoding — it's always valid
+    if content_encoding.eq_ignore_ascii_case("identity")
+        || content_encoding.eq_ignore_ascii_case("none")
+    {
+        return false;
+    }
+
+    // For multi-layer encoding (e.g., "deflate, gzip"), check the outermost
+    // encoding (rightmost) since that's what we'd decompress first.
+    let outermost = content_encoding
+        .rsplit(',')
+        .map(str::trim)
+        .find(|s| !s.is_empty() && !s.eq_ignore_ascii_case("identity"))
+        .unwrap_or_else(|| content_encoding.trim());
+
+    super::decompress::decompress(data, outermost).is_err()
+}
+
 /// Read the response body based on headers (Content-Length, chunked, or EOF).
 ///
 /// Returns the body bytes, whether the body was read to EOF, any trailer headers,
@@ -1736,8 +1878,20 @@ where
     } else if !ignore_content_length && headers.contains_key("content-length") {
         let cl = &headers["content-length"];
         if let Ok(content_length) = cl.parse::<usize>() {
-            let body =
-                read_exact_body(stream, content_length, body_prefix, limiter, deadline).await?;
+            // Pass Content-Encoding to enable incremental decompression checking
+            // (curl compat: test 223 — detect broken encoding without reading full
+            // Content-Length). Only when not in raw mode (raw skips decompression).
+            let content_encoding =
+                if raw { None } else { headers.get("content-encoding").map(String::as_str) };
+            let body = read_exact_body(
+                stream,
+                content_length,
+                body_prefix,
+                limiter,
+                deadline,
+                content_encoding,
+            )
+            .await?;
             Ok((body, false, HashMap::new(), Vec::new()))
         } else {
             // Content-Length overflows usize — read to EOF (curl compat: test 395)
@@ -3466,5 +3620,153 @@ mod tests {
         assert_eq!(resp.status(), 200);
 
         server_task.await.unwrap();
+    }
+
+    #[test]
+    fn is_encoding_corrupt_detects_bad_deflate() {
+        // Random bytes that are not valid deflate
+        let bad_data = b"\x58\xdb\x6e\xe3\x36\x10\x7d\x37\x90\x7f";
+        assert!(is_encoding_corrupt(bad_data, "deflate"));
+    }
+
+    #[test]
+    fn is_encoding_corrupt_accepts_valid_deflate() {
+        use flate2::write::DeflateEncoder;
+        use std::io::Write;
+
+        let original = b"hello deflate world";
+        let mut encoder = DeflateEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(original).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        assert!(!is_encoding_corrupt(&compressed, "deflate"));
+    }
+
+    #[test]
+    fn is_encoding_corrupt_accepts_truncated_valid_deflate() {
+        use flate2::write::DeflateEncoder;
+        use std::io::Write;
+
+        // Create valid deflate data, then truncate it
+        let original = b"hello deflate world with enough data to have multiple blocks";
+        let mut encoder = DeflateEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(original).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        // Truncate to half — should still be considered valid (not corrupt)
+        let truncated = &compressed[..compressed.len() / 2];
+        assert!(!is_encoding_corrupt(truncated, "deflate"));
+    }
+
+    #[test]
+    fn is_encoding_corrupt_detects_bad_gzip() {
+        // Bytes with gzip magic removed (broken header)
+        let bad_data = b"\x08\x79\x9e\xab\x41\x00\x03";
+        assert!(is_encoding_corrupt(bad_data, "gzip"));
+    }
+
+    #[test]
+    fn is_encoding_corrupt_identity_always_valid() {
+        assert!(!is_encoding_corrupt(b"anything", "identity"));
+        assert!(!is_encoding_corrupt(b"", "identity"));
+    }
+
+    #[test]
+    fn is_encoding_corrupt_none_always_valid() {
+        assert!(!is_encoding_corrupt(b"anything", "none"));
+    }
+
+    #[tokio::test]
+    async fn read_exact_body_with_encoding_check_detects_corrupt_deflate() {
+        use tokio::io::AsyncWriteExt;
+
+        // Simulate test 223: server sends broken deflate data, fewer bytes than
+        // Content-Length, and keeps connection open.
+        // The broken data bytes (from test 223 — deflate with header removed)
+        let broken_deflate: &[u8] = &[
+            0x58, 0xdb, 0x6e, 0xe3, 0x36, 0x10, 0x7d, 0x37, 0x90, 0x7f, 0x60, 0xfd, 0xd4, 0x02,
+            0xb6, 0x6e,
+        ];
+        let content_length = 1305; // Larger than actual data
+
+        // Use a duplex stream: write the broken data, then keep the writer alive
+        // (don't drop it) so the reader blocks waiting for more data.
+        let (mut writer, mut reader) = tokio::io::duplex(4096);
+        writer.write_all(broken_deflate).await.unwrap();
+        // Don't drop writer — keeps connection open (simulates server holding connection)
+
+        let mut limiter = RateLimiter::for_recv(&SpeedLimits::default());
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            read_exact_body(
+                &mut reader,
+                content_length,
+                Vec::new(),
+                &mut limiter,
+                None,
+                Some("deflate"),
+            ),
+        )
+        .await;
+
+        // Must hold writer alive through the test
+        drop(writer);
+
+        // Should complete (not hang) and return bad_content_encoding error
+        let result = result.expect("should not hang/timeout");
+        assert!(
+            matches!(&result, Err(Error::PartialBody { message, .. }) if message == "bad_content_encoding"),
+            "expected PartialBody with bad_content_encoding"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_exact_body_without_encoding_reads_normally() {
+        let data = b"hello world!";
+        let mut cursor = std::io::Cursor::new(data.to_vec());
+        let mut limiter = RateLimiter::for_recv(&SpeedLimits::default());
+
+        let result = read_exact_body(
+            &mut cursor,
+            data.len(),
+            Vec::new(),
+            &mut limiter,
+            None,
+            None, // No content encoding — normal path
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, data);
+    }
+
+    #[tokio::test]
+    async fn read_exact_body_with_valid_encoding_reads_fully() {
+        use flate2::write::DeflateEncoder;
+        use std::io::Write;
+
+        // Create valid deflate data
+        let original = b"hello deflate world";
+        let mut encoder = DeflateEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(original).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let content_length = compressed.len();
+
+        let mut cursor = std::io::Cursor::new(compressed.clone());
+        let mut limiter = RateLimiter::for_recv(&SpeedLimits::default());
+
+        // With encoding check — should still read all data successfully
+        let result = read_exact_body(
+            &mut cursor,
+            content_length,
+            Vec::new(),
+            &mut limiter,
+            None,
+            Some("deflate"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, compressed);
     }
 }
