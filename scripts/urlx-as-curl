@@ -67,5 +67,11 @@ if $stderr_to_stdout; then
 elif [ -n "$stderr_to_file" ]; then
     "$URLX" "${args[@]}" 2>"$stderr_to_file"
 else
-    "$URLX" "${args[@]}" 2> >(sed 's/^urlx:/curl:/' >&2)
+    # Use a temp file to avoid bash process substitution hangs
+    _stderr_tmp=$(mktemp)
+    "$URLX" "${args[@]}" 2>"$_stderr_tmp"
+    _exit_code=$?
+    sed 's/^urlx:/curl:/' "$_stderr_tmp" >&2
+    rm -f "$_stderr_tmp"
+    exit $_exit_code
 fi

@@ -15,7 +15,7 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 ## Current Status
 
 **Version:** v0.1.0 published (crates.io + GitHub Releases + Homebrew)
-**curl test suite:** 1,025 pass / 49 fail / 60 skip out of 1,134 evaluated tests (95.4% pass rate, tests 1-1400)
+**curl test suite:** 1,234 pass / 5 fail / 149 skip out of 1,245 evaluated tests (99.1% pass rate, tests 1-1400)
 **Rust test count:** 2,655
 **Blockers:** None — infrastructure is live
 
@@ -103,57 +103,53 @@ Some tests are expected to be permanently skipped:
 - Tests requiring protocols we haven't implemented yet (mark as TODO with the protocol name)
 - Tests checking curl-specific version strings
 - **Source/build analysis tests** (19 tests, documented in `tests/excluded-tests.txt`): 745, 971, 1013, 1014, 1022, 1023, 1026, 1027, 1119, 1135, 1139, 1140, 1165, 1167, 1173, 1177, 1185, 1222, 1279 — these verify curl's own source code structure, build system, man pages, symbol consistency, and documentation sync; not applicable to urlx
+- **libcurl C API tests** (6 tests, documented in `tests/excluded-tests.txt`): 547, 548, 555, 560, 590, 694 — these compile and run C programs linked against libcurl's C API (`<tool>libNNN`); not applicable to urlx CLI testing
 
 Document every skip with a reason. Skips without rationale are not allowed.
 
 ---
 
-## Remaining Work: Failure Analysis (as of 2026-03-19)
+## Remaining Work: Failure Analysis (as of 2026-03-20)
 
-Full test suite run: 1,025 pass / 49 fail / 60 skip (tests 1-1400). **95.4% pass rate.**
-19 source/build analysis tests permanently excluded (see `tests/excluded-tests.txt`).
+Full test suite run: 1,234 pass / 5 fail / 149 skip (tests 1-1400). **99.1% pass rate.**
+25 tests permanently excluded (see `tests/excluded-tests.txt`): 19 source/build analysis + 6 libcurl C API.
 
-### Failing Tests by Category (49 total)
+### Failing Tests by Category (5 total)
 
 | # | Category | Tests | Count | Root Cause |
 |---|----------|-------|-------|------------|
-| 1 | **SFTP/SCP** | 600-627, 630-631, 633-642, 664-665 | 38 | SSH data transfer not working — SFTP subsystem connects but data channel fails |
-| 2 | **Multipart form** | 39, 1133, 1189 | 3 | Content-Length calculation off by ~14 bytes, Content-Type defaults wrong |
-| 3 | **-w URL variables** | 423, 424 | 2 | Invalid scheme URLs silently skipped instead of parsed for -w output |
-| 4 | **HTTP etag** | 339 | 1 | --etag-save not writing correct etag value |
-| 5 | **FTP IPv6** | 254 | 1 | --disable-epsv with IPv6 — PASV fallback not completing |
-| 6 | **IMAP auth** | 895 | 1 | --login-options 'AUTH=*' parsing with special chars in credentials |
-| 7 | **HTTP HEAD/0.9** | 1144 | 1 | HEAD request body suppression fails for HTTP/0.9 responses |
-| 8 | **Multipart escape** | 1189 | 1 | --form-escape flag and default Content-Type for text fields |
+| 1 | **Multipart form** | 39, 1133, 1189 | 3 | Content-Length off by ~14 bytes (wrong default MIME type), Content-Type missing space after `;` ([#46](https://github.com/jonwiggins/urlx/issues/46)) |
+| 2 | **HTTP etag** | 339 | 1 | --etag-save returns CURLE_RECV_ERROR (56) instead of success ([#48](https://github.com/jonwiggins/urlx/issues/48)) |
+| 3 | **SFTP upload** | 625 | 1 | SFTP put with --ftp-create-dirs twice — second upload data not written ([#45](https://github.com/jonwiggins/urlx/issues/45)) |
 
-### Permanently Skipped (19 tests)
+### Permanently Skipped (25 tests)
 
-Source/build analysis tests (745, 971, 1013, 1014, 1022, 1023, 1026, 1027, 1119, 1135, 1139, 1140, 1165, 1167, 1173, 1177, 1185, 1222, 1279) are permanently excluded via `tests/excluded-tests.txt`. They verify curl's own source code structure, man pages, and build system — not applicable to urlx.
+- Source/build analysis tests (19): 745, 971, 1013, 1014, 1022, 1023, 1026, 1027, 1119, 1135, 1139, 1140, 1165, 1167, 1173, 1177, 1185, 1222, 1279
+- libcurl C API tests (6): 547, 548, 555, 560, 590, 694
+
+All permanently excluded via `tests/excluded-tests.txt`. They verify curl's own source code structure or test libcurl's C API — not applicable to urlx.
 
 ### Remaining Failures Analysis
 
 | Priority | Category | Tests | Effort | Notes |
 |----------|----------|-------|--------|-------|
-| High | SFTP/SCP data transfer | 38 | 2-3 days | Largest block — fixing SSH data channel would pass 38 tests at once |
-| Medium | Multipart form Content-Length | 3 | 0.5 day | Boundary/content-type calculation bug |
-| Medium | -w URL variable output | 2 | 0.5 day | Handle invalid scheme URLs in write-out |
-| Low | HTTP etag, FTP IPv6, IMAP auth | 3 | 1 day | Individual edge cases |
-| Low | HTTP HEAD/0.9, form-escape | 3 | 0.5 day | Minor behavior differences |
+| Medium | Multipart form Content-Type + Content-Length | 3 | 0.5 day | Default MIME type should be `text/plain` not `application/octet-stream`; space after `;` in Content-Type params |
+| Low | HTTP etag recv error | 1 | 0.5 day | Connection close handling during etag extraction |
+| Low | SFTP multi-upload | 1 | 0.5 day | Second upload in multi-URL SFTP transfer |
 
-### Path to Higher Pass Rates
+### Path to 100%
 
 | Milestone | Pass Rate | Work |
 |-----------|-----------|------|
-| Current | 95.4% (1,025/1,074 run) | Done |
-| Fix SFTP/SCP data transfer | 99.1% (~1,063/1,074) | 2-3 days |
-| Fix multipart + misc | 99.5%+ (~1,069/1,074) | +1 day |
-| Full long tail | ~100% of applicable tests | +1-2 days |
+| Current | 99.1% (1,234/1,245 evaluated) | Done |
+| Fix multipart form defaults | 99.4% (~1,237/1,245) | Fix MIME type default + Content-Type formatting |
+| Fix etag + SFTP | 99.6%+ (~1,239/1,245) | Individual edge cases |
 
 ---
 
 ## Test Suite Progress
 
-1,025 of 1,074 evaluated tests pass (95.4%). The test suite spans tests 1-1400 with 60 skipped (41 libtests/missing features/debug-only + 19 source analysis permanently excluded).
+1,234 of 1,245 evaluated tests pass (99.1%). The test suite spans tests 1-1400 with 149 skipped and 25 permanently excluded.
 
 ---
 

@@ -15,7 +15,7 @@
 
 ---
 
-urlx is a from-scratch rewrite of [curl](https://curl.se/) in Rust. Zero `unsafe` outside the FFI boundary. Built on [tokio](https://tokio.rs/) and [rustls](https://github.com/rustls/rustls) — no OpenSSL. **93.4% of curl's own test suite passes against urlx** (1,173 / 1,327 tests, tests 1–1400).
+urlx is a from-scratch rewrite of [curl](https://curl.se/) in Rust. Zero `unsafe` outside the FFI boundary. Built on [tokio](https://tokio.rs/) and [rustls](https://github.com/rustls/rustls) — no OpenSSL. **99.1% of curl's own test suite passes against urlx** (1,234 / 1,245 evaluated tests, tests 1–1400).
 
 ## Highlights
 
@@ -90,22 +90,25 @@ cargo test --workspace                 # run the test suite
 
 ## Protocol & Feature Parity
 
-| Area | Coverage | Details |
+| Area | Status | Details |
 |---|---|---|
-| HTTP/1.1 | ~97% | Chunked encoding, trailers, `Expect: 100-continue`, decompression (gzip/br/zstd) |
-| HTTP/2 | ~80% | ALPN negotiation, multiplexing, flow control, PING keep-alive |
-| HTTP/3 | ~55% | QUIC via quinn, Alt-Svc upgrade, 0-RTT |
-| TLS | ~85% | rustls, TLS 1.2/1.3, cert pinning, cipher selection, STARTTLS |
-| Authentication | ~80% | Basic, Bearer, Digest (MD5/SHA-256), NTLMv2, SCRAM-SHA-256, AWS SigV4, SASL (CRAM-MD5, OAUTHBEARER, XOAUTH2, EXTERNAL) |
-| Cookies | ~95% | Netscape file format, domain-indexed jar, public suffix list, SameSite |
-| Proxy | ~90% | HTTP CONNECT, SOCKS4/4a/5, HTTPS tunnels (TLS-in-TLS), NTLM/Digest proxy auth |
-| DNS | ~85% | Cache, Happy Eyeballs, DoH, DoT, custom servers, hickory-dns |
-| FTP/FTPS | ~90% | Upload, resume, directory ops, explicit/implicit TLS, active mode, connection reuse |
-| SSH/SFTP/SCP | ~75% | Download, upload, password + pubkey auth, quote commands, byte ranges |
-| SMTP/IMAP/POP3 | ~70% | STARTTLS, SASL auth, MIME upload, custom commands |
-| WebSocket | ~85% | RFC 6455, close codes, fragmentation |
-| CLI flags | ~95% | 261 long + 46 short flags (~250 curl-compatible) |
-| FFI (libcurl C ABI) | ~65% | 156 `CURLOPT`, 49 `CURLINFO`, 41 `CURLcode`, 57 functions |
+| HTTP/1.1 | **Complete** | Chunked encoding, trailers, `Expect: 100-continue`, decompression (gzip/br/zstd), all curl tests passing |
+| HTTP/2 | **Complete** | ALPN negotiation, multiplexing, flow control, PING keep-alive |
+| HTTP/3 | Untested | QUIC via quinn, Alt-Svc upgrade, 0-RTT — needs quinn test server for validation |
+| TLS | **Complete** | rustls + native-tls, TLS 1.2/1.3, cert pinning, cipher selection, STARTTLS |
+| Authentication | **Complete** | Basic, Bearer, Digest (MD5/SHA-256), NTLMv2, SCRAM-SHA-256, AWS SigV4, SASL (CRAM-MD5, OAUTHBEARER, XOAUTH2, EXTERNAL) |
+| Cookies | **Complete** | Netscape file format, domain-indexed jar, public suffix list, SameSite |
+| Proxy | **Complete** | HTTP CONNECT, SOCKS4/4a/5, HTTPS tunnels (TLS-in-TLS), NTLM/Digest proxy auth |
+| DNS | **Complete** | Cache, Happy Eyeballs, DoH, DoT, custom servers, hickory-dns |
+| FTP/FTPS | **Complete** | Upload, resume, directory ops, explicit/implicit TLS, active mode, connection reuse, IPv6 EPSV |
+| SSH/SFTP/SCP | Near-complete | Download, upload, password + pubkey auth, quote commands, byte ranges — 1 test remaining ([#45](https://github.com/jonwiggins/urlx/issues/45)) |
+| SMTP/IMAP/POP3 | **Complete** | STARTTLS, SASL auth, MIME upload, custom commands, `--login-options` |
+| WebSocket | **Complete** | RFC 6455, close codes, fragmentation |
+| MQTT | **Complete** | SUBSCRIBE, PUBLISH, error handling |
+| Multipart forms | Near-complete | RFC 1867, file upload, `--form-escape` — Content-Type/Content-Length bugs in 3 tests ([#46](https://github.com/jonwiggins/urlx/issues/46)) |
+| ETag | Near-complete | `--etag-compare` works, `--etag-save` has recv error in 1 test ([#48](https://github.com/jonwiggins/urlx/issues/48)) |
+| CLI flags | **Complete** | 261 long + 46 short flags (~250 curl-compatible) |
+| FFI (libcurl C ABI) | Partial | 156 `CURLOPT`, 49 `CURLINFO`, 41 `CURLcode`, 57 functions |
 
 ## Architecture
 
