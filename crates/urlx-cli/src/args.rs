@@ -5701,13 +5701,13 @@ mod tests {
 
     #[test]
     fn append_url_queries_basic() {
-        let result = append_url_queries("http://example.com", &["key=value".to_string()]);
+        let result = append_url_queries("http://example.com", &["key=value".to_string()]).unwrap();
         assert_eq!(result, "http://example.com?key=value");
     }
 
     #[test]
     fn append_url_queries_existing_query() {
-        let result = append_url_queries("http://example.com?a=1", &["b=2".to_string()]);
+        let result = append_url_queries("http://example.com?a=1", &["b=2".to_string()]).unwrap();
         assert_eq!(result, "http://example.com?a=1&b=2");
     }
 
@@ -5716,13 +5716,14 @@ mod tests {
         let result = append_url_queries(
             "http://example.com",
             &["a=1".to_string(), "b=hello world".to_string()],
-        );
+        )
+        .unwrap();
         assert!(result.starts_with("http://example.com?a=1&b=hello+world"));
     }
 
     #[test]
     fn append_url_queries_no_equals() {
-        let result = append_url_queries("http://example.com", &["raw_string".to_string()]);
+        let result = append_url_queries("http://example.com", &["raw_string".to_string()]).unwrap();
         assert_eq!(result, "http://example.com?raw_string");
     }
 

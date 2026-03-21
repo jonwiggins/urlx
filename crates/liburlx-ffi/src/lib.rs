@@ -415,10 +415,12 @@ type CurlTimerCallback = unsafe extern "C" fn(*mut c_void, c_long, *mut c_void) 
 // ───────────────────────── Callback types ─────────────────────────
 
 /// Write callback type matching libcurl's `CURLOPT_WRITEFUNCTION`.
-type WriteCallback = unsafe extern "C" fn(*mut c_char, usize, usize, *mut c_void) -> usize;
+/// The data pointer is const — the callback receives data from the library.
+type WriteCallback = unsafe extern "C" fn(*const c_char, usize, usize, *mut c_void) -> usize;
 
 /// Header callback type matching libcurl's `CURLOPT_HEADERFUNCTION`.
-type HeaderCallback = unsafe extern "C" fn(*mut c_char, usize, usize, *mut c_void) -> usize;
+/// The data pointer is const — the callback receives header data from the library.
+type HeaderCallback = unsafe extern "C" fn(*const c_char, usize, usize, *mut c_void) -> usize;
 
 /// Read callback type matching libcurl's `CURLOPT_READFUNCTION`.
 ///
@@ -430,8 +432,9 @@ type ReadCallback = unsafe extern "C" fn(*mut c_char, usize, usize, *mut c_void)
 ///
 /// Called with debug information during transfer. The `info_type` parameter
 /// indicates the type of data (text, header in/out, data in/out).
+/// The data pointer is const — the callback receives debug info from the library.
 type DebugCallback =
-    unsafe extern "C" fn(*mut c_void, c_long, *mut c_char, usize, *mut c_void) -> c_long;
+    unsafe extern "C" fn(*mut c_void, c_long, *const c_char, usize, *mut c_void) -> c_long;
 
 /// Progress callback type matching libcurl's `CURLOPT_PROGRESSFUNCTION`.
 ///
@@ -2829,7 +2832,7 @@ pub unsafe extern "C" fn curl_easy_perform(handle: *mut c_void) -> CURLcode {
                         debug_cb(
                             handle,
                             1, // CURLINFO_HEADER_IN
-                            bytes.as_ptr().cast_mut().cast::<c_char>(),
+                            bytes.as_ptr().cast::<c_char>(),
                             bytes.len(),
                             h.debug_data,
                         )
@@ -2844,7 +2847,7 @@ pub unsafe extern "C" fn curl_easy_perform(handle: *mut c_void) -> CURLcode {
                         debug_cb(
                             handle,
                             2, // CURLINFO_DATA_IN
-                            body.as_ptr().cast_mut().cast::<c_char>(),
+                            body.as_ptr().cast::<c_char>(),
                             body.len(),
                             h.debug_data,
                         )
@@ -2857,9 +2860,8 @@ pub unsafe extern "C" fn curl_easy_perform(handle: *mut c_void) -> CURLcode {
                 let body = response.body();
                 if !body.is_empty() {
                     // SAFETY: Caller set up the callback and data pointer correctly
-                    let written = unsafe {
-                        cb(body.as_ptr().cast_mut().cast::<c_char>(), 1, body.len(), h.write_data)
-                    };
+                    let written =
+                        unsafe { cb(body.as_ptr().cast::<c_char>(), 1, body.len(), h.write_data) };
                     if written != body.len() {
                         return CURLcode::CURLE_WRITE_ERROR;
                     }
@@ -2873,12 +2875,7 @@ pub unsafe extern "C" fn curl_easy_perform(handle: *mut c_void) -> CURLcode {
                     let bytes = header_line.as_bytes();
                     // SAFETY: Caller set up the callback and data pointer correctly
                     let _written = unsafe {
-                        cb(
-                            bytes.as_ptr().cast_mut().cast::<c_char>(),
-                            1,
-                            bytes.len(),
-                            h.header_data,
-                        )
+                        cb(bytes.as_ptr().cast::<c_char>(), 1, bytes.len(), h.header_data)
                     };
                 }
             }

@@ -520,7 +520,7 @@ fn url_decode(s: &str) -> String {
 /// - `@filename` — read file, form-urlencode contents, append
 /// - `name@filename` — read file, form-urlencode contents, append `name=encoded`
 /// - `+content` — content is already encoded, append as-is (strip `+` prefix)
-pub fn append_url_queries(url: &str, queries: &[String]) -> String {
+pub fn append_url_queries(url: &str, queries: &[String]) -> Result<String, String> {
     use crate::args::form_urlencode;
 
     let mut result = url.to_string();
@@ -533,7 +533,8 @@ pub fn append_url_queries(url: &str, queries: &[String]) -> String {
             result.push_str(already_encoded);
         } else if let Some(filename) = query.strip_prefix('@') {
             // @filename: read file, encode contents
-            let data = std::fs::read_to_string(filename).unwrap_or_default();
+            let data = std::fs::read_to_string(filename)
+                .map_err(|e| format!("curl: Failed to open '{filename}' for reading: {e}"))?;
             result.push_str(&form_urlencode(&data));
         } else if let Some(at_pos) = query.find('@') {
             let eq_pos = query.find('=');
@@ -541,7 +542,8 @@ pub fn append_url_queries(url: &str, queries: &[String]) -> String {
                 // name@filename: read file, encode contents, prepend name=
                 let name = &query[..at_pos];
                 let filename = &query[at_pos + 1..];
-                let data = std::fs::read_to_string(filename).unwrap_or_default();
+                let data = std::fs::read_to_string(filename)
+                    .map_err(|e| format!("curl: Failed to open '{filename}' for reading: {e}"))?;
                 result.push_str(name);
                 result.push('=');
                 result.push_str(&form_urlencode(&data));
@@ -563,7 +565,7 @@ pub fn append_url_queries(url: &str, queries: &[String]) -> String {
             result.push_str(&form_urlencode(query));
         }
     }
-    result
+    Ok(result)
 }
 
 /// Extract filename from a `Content-Disposition` response header.
@@ -1134,7 +1136,15 @@ pub fn run(args: &[String]) -> ExitCode {
         let url = if opts.url_queries.is_empty() {
             url.clone()
         } else {
-            append_url_queries(url, &opts.url_queries)
+            match append_url_queries(url, &opts.url_queries) {
+                Ok(u) => u,
+                Err(msg) => {
+                    if !opts.silent || opts.show_error {
+                        eprintln!("{msg}");
+                    }
+                    return ExitCode::from(26); // CURLE_READ_ERROR
+                }
+            }
         };
 
         // --proto-default: add default scheme if URL has none
@@ -2068,7 +2078,13 @@ pub fn run(args: &[String]) -> ExitCode {
                         // Handle write-out
                         if let Some(ref fmt) = opts.write_out {
                             let real_fmt = if let Some(p) = fmt.strip_prefix('@') {
-                                std::fs::read_to_string(p).unwrap_or_default()
+                                match std::fs::read_to_string(p) {
+                                    Ok(s) => s,
+                                    Err(e) => {
+                                        eprintln!("curl: Failed to read {p}: {e}");
+                                        String::new()
+                                    }
+                                }
                             } else {
                                 fmt.clone()
                             };
@@ -2108,7 +2124,13 @@ pub fn run(args: &[String]) -> ExitCode {
                             // Handle write-out
                             if let Some(ref fmt) = opts.write_out {
                                 let real_fmt = if let Some(path) = fmt.strip_prefix('@') {
-                                    std::fs::read_to_string(path).unwrap_or_default()
+                                    match std::fs::read_to_string(path) {
+                                        Ok(s) => s,
+                                        Err(e) => {
+                                            eprintln!("curl: Failed to read {path}: {e}");
+                                            String::new()
+                                        }
+                                    }
                                 } else {
                                     fmt.clone()
                                 };
@@ -2335,6 +2357,20 @@ pub fn run(args: &[String]) -> ExitCode {
             // Process -w write-out even on error (curl compat: test 196)
             if let Some(ref w) = opts.write_out {
                 use std::io::Write as _;
+                // @filename: resolve write-out format from file
+                let resolved;
+                let w = if let Some(path) = w.strip_prefix('@') {
+                    resolved = match std::fs::read_to_string(path) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("curl: Failed to read {path}: {e}");
+                            String::new()
+                        }
+                    };
+                    resolved.as_str()
+                } else {
+                    w.as_str()
+                };
                 // Create a minimal response for write-out formatting
                 let wo = if let Some(resp) = opts.easy.last_response() {
                     format_write_out(w, resp, false)

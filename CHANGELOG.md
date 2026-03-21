@@ -46,7 +46,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- **curl test suite compatibility: 1,171 pass / 102 fail / 54 skip** (tests 1–1400, 92% pass rate), up from 69/98 at v0.1.0
+- **curl test suite compatibility: 1,234 pass / 5 fail / 149 skip** (tests 1–1400, 99.1% pass rate), up from 69/98 at v0.1.0
 - **2,655 Rust tests**, up from 2,288
 - **141 source files, ~72,000 lines of Rust**
 - **261 long + 46 short CLI flags** (up from ~150)

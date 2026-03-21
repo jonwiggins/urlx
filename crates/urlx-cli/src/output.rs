@@ -345,6 +345,20 @@ pub fn output_response_with_context(
     }
 
     if let Some(fmt) = write_out {
+        // @filename: read write-out format from file (curl compat)
+        let resolved;
+        let fmt = if let Some(path) = fmt.strip_prefix('@') {
+            resolved = match std::fs::read_to_string(path) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("curl: Failed to read {path}: {e}");
+                    String::new()
+                }
+            };
+            resolved.as_str()
+        } else {
+            fmt
+        };
         // Check for %output{file} prefix: directs write-out to a file
         // %output{>>file} = append, %output{file} = create/overwrite
         let (out_file, append_mode, real_fmt) = if let Some(rest) = fmt.strip_prefix("%output{") {
