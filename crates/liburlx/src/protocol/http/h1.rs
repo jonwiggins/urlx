@@ -87,6 +87,7 @@ pub async fn request<S>(
     http09_allowed: bool,
     deadline: Option<tokio::time::Instant>,
     raw: bool,
+    fail_on_error: bool,
 ) -> Result<(Response, bool), Error>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -762,8 +763,15 @@ where
         && ph.headers.get("location").is_some_and(|v| !v.trim().is_empty())
         && !ph.headers.contains_key("content-length")
         && !ph.headers.get("transfer-encoding").is_some_and(|te| te_contains_chunked(te));
-    let no_body =
-        is_head || ph.status == 204 || ph.status == 304 || range_failed || is_redirect_no_cl;
+    // When fail_on_error is set and the status is >= 400, skip body read to avoid
+    // hanging on HTTP/1.0 responses without Content-Length (curl compat: test 24).
+    let fail_skip = fail_on_error && ph.status >= 400;
+    let no_body = is_head
+        || ph.status == 204
+        || ph.status == 304
+        || range_failed
+        || is_redirect_no_cl
+        || fail_skip;
 
     // Read body with download rate limiting
     let mut recv_limiter = RateLimiter::for_recv(speed_limits);
@@ -2568,6 +2576,7 @@ mod tests {
             true,
             None,
             false,
+            false,
         )
         .await
         .unwrap();
@@ -2612,6 +2621,7 @@ mod tests {
             false,
             true,
             None,
+            false,
             false,
         )
         .await
@@ -2662,6 +2672,7 @@ mod tests {
             true,
             None,
             false,
+            false,
         )
         .await
         .unwrap();
@@ -2705,6 +2716,7 @@ mod tests {
             false,
             true,
             None,
+            false,
             false,
         )
         .await
@@ -2750,6 +2762,7 @@ mod tests {
             false,
             true,
             None,
+            false,
             false,
         )
         .await
@@ -2800,6 +2813,7 @@ mod tests {
             false,
             true,
             None,
+            false,
             false,
         )
         .await
@@ -2857,6 +2871,7 @@ mod tests {
             false,
             true,
             None,
+            false,
             false,
         )
         .await
@@ -2929,6 +2944,7 @@ mod tests {
             true,
             None,
             false,
+            false,
         )
         .await
         .unwrap();
@@ -2981,6 +2997,7 @@ mod tests {
             true,
             None,
             false,
+            false,
         )
         .await
         .unwrap();
@@ -3032,6 +3049,7 @@ mod tests {
             true,
             None,
             false,
+            false,
         )
         .await
         .unwrap();
@@ -3081,6 +3099,7 @@ mod tests {
             true,
             None,
             false,
+            false,
         )
         .await
         .unwrap();
@@ -3121,6 +3140,7 @@ mod tests {
             false,
             true,
             None,
+            false,
             false,
         )
         .await
@@ -3169,6 +3189,7 @@ mod tests {
             true,
             None,
             false,
+            false,
         )
         .await
         .unwrap();
@@ -3215,6 +3236,7 @@ mod tests {
             false,
             true,
             None,
+            false,
             false,
         )
         .await
@@ -3287,6 +3309,7 @@ mod tests {
             true,
             None,
             false,
+            false,
         )
         .await
         .unwrap();
@@ -3351,6 +3374,7 @@ mod tests {
             true,
             None,
             false,
+            false,
         )
         .await
         .unwrap();
@@ -3398,6 +3422,7 @@ mod tests {
             false,
             true,
             None,
+            false,
             false,
         )
         .await
@@ -3447,6 +3472,7 @@ mod tests {
             true,
             None,
             false,
+            false,
         )
         .await
         .unwrap();
@@ -3490,6 +3516,7 @@ mod tests {
                 false,
                 true,
                 None,
+                false,
                 false,
             ),
         )
@@ -3537,6 +3564,7 @@ mod tests {
                 false,
                 true,
                 None,
+                false,
                 false,
             ),
         )
@@ -3613,6 +3641,7 @@ mod tests {
             false,
             true,
             None,
+            false,
             false,
         )
         .await
