@@ -103,6 +103,7 @@ Some tests are expected to be permanently skipped:
 - Tests requiring protocols we haven't implemented yet (mark as TODO with the protocol name)
 - Tests checking curl-specific version strings
 - **Source/build analysis tests** (19 tests, documented in `tests/excluded-tests.txt`): 745, 971, 1013, 1014, 1022, 1023, 1026, 1027, 1119, 1135, 1139, 1140, 1165, 1167, 1173, 1177, 1185, 1222, 1279 — these verify curl's own source code structure, build system, man pages, symbol consistency, and documentation sync; not applicable to urlx
+- **libcurl C API tests** (6 tests, documented in `tests/excluded-tests.txt`): 547, 548, 555, 560, 590, 694 — these compile and run C programs linked against libcurl (lib547, lib555, lib560, lib590, lib694); not applicable to urlx CLI testing
 
 Document every skip with a reason. Skips without rationale are not allowed.
 
@@ -111,7 +112,7 @@ Document every skip with a reason. Skips without rationale are not allowed.
 ## Remaining Work: Failure Analysis (as of 2026-03-19)
 
 Full test suite run: 1,025 pass / 49 fail / 60 skip (tests 1-1400). **95.4% pass rate.**
-19 source/build analysis tests permanently excluded (see `tests/excluded-tests.txt`).
+25 tests permanently excluded (19 source/build analysis + 6 libcurl C API tests; see `tests/excluded-tests.txt`).
 
 ### Failing Tests by Category (49 total)
 
@@ -126,9 +127,11 @@ Full test suite run: 1,025 pass / 49 fail / 60 skip (tests 1-1400). **95.4% pass
 | 7 | **HTTP HEAD/0.9** | 1144 | 1 | HEAD request body suppression fails for HTTP/0.9 responses |
 | 8 | **Multipart escape** | 1189 | 1 | --form-escape flag and default Content-Type for text fields |
 
-### Permanently Skipped (19 tests)
+### Permanently Skipped (25 tests)
 
 Source/build analysis tests (745, 971, 1013, 1014, 1022, 1023, 1026, 1027, 1119, 1135, 1139, 1140, 1165, 1167, 1173, 1177, 1185, 1222, 1279) are permanently excluded via `tests/excluded-tests.txt`. They verify curl's own source code structure, man pages, and build system — not applicable to urlx.
+
+libcurl C API tests (547, 548, 555, 560, 590, 694) are permanently excluded via `tests/excluded-tests.txt`. They compile and run C programs linked against libcurl — not applicable to urlx CLI testing.
 
 ### Remaining Failures Analysis
 
@@ -153,7 +156,7 @@ Source/build analysis tests (745, 971, 1013, 1014, 1022, 1023, 1026, 1027, 1119,
 
 ## Test Suite Progress
 
-1,025 of 1,074 evaluated tests pass (95.4%). The test suite spans tests 1-1400 with 60 skipped (41 libtests/missing features/debug-only + 19 source analysis permanently excluded).
+1,025 of 1,074 evaluated tests pass (95.4%). The test suite spans tests 1-1400 with 60 skipped (41 libtests/missing features/debug-only + 25 permanently excluded).
 
 ---
 

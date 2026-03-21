@@ -35,3 +35,11 @@ test:1173:curl documentation — man page syntax checks
 
 # curl build artifact tests — urlx does not have libcurl.def
 test:1279:curl build artifact — verifies libcurl.def against CURL_EXTERN declarations
+
+# libcurl C API tests — compile and run C programs linked against libcurl
+test:547:libcurl C API test — HTTP proxy auth NTLM with POST from read callback (lib547)
+test:548:libcurl C API test — HTTP proxy auth NTLM with POST from CURLOPT_POSTFIELDS (lib547)
+test:555:libcurl C API test — HTTP proxy auth NTLM with POST via multi interface (lib555)
+test:560:libcurl C API test — simple HTTPS GET with multi interface (lib560)
+test:590:libcurl C API test — HTTP proxy Negotiate+NTLM selection (lib590)
+test:694:libcurl C API test — HTTP NTLM twice, verify CURLINFO_HTTPAUTH_USED (lib694)
