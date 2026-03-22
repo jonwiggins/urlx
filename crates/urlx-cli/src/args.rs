@@ -87,6 +87,7 @@ pub struct CliOptions {
     pub(crate) user_agent_str: Option<String>,
     pub(crate) globoff: bool,
     pub(crate) alt_svc_file: Option<String>,
+    pub(crate) ssl_session_file: Option<String>,
     pub(crate) etag_save_file: Option<String>,
     pub(crate) etag_compare_file: Option<String>,
     pub(crate) proto_default: Option<String>,
@@ -183,7 +184,7 @@ pub fn print_version() {
     println!("curl {version} ({arch}-{os}) libcurl/{version} rustls",);
     println!("Release-Date: 2026-03-16");
     println!("Protocols: dict file ftp ftps http https imap imaps mqtt pop3 pop3s scp sftp smtp smtps ws wss");
-    println!("Features: alt-svc AsynchDNS brotli cookies Digest HSTS HTTP2 HTTP3 HTTPS-proxy IPv6 Largefile libz NTLM SSL UnixSockets zstd");
+    println!("Features: alt-svc AsynchDNS brotli cookies Digest HSTS HTTP2 HTTP3 HTTPS-proxy IPv6 Largefile libz NTLM ssl-sessions SSL UnixSockets zstd");
 }
 
 /// Print usage information to stderr.
@@ -593,6 +594,7 @@ fn expand_combined_flags(args: &[String]) -> Vec<String> {
                         | "--ftp-port"
                         | "--quote"
                         | "--ftp-alternative-to-user"
+                        | "--ssl-sessions"
                         | "--ftp-ssl-ccc-mode"
                         | "--tftp-blksize"
                         | "--http2-ping-interval"
@@ -672,6 +674,7 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
         user_agent_str: None,
         globoff: false,
         alt_svc_file: None,
+        ssl_session_file: None,
         etag_save_file: None,
         etag_compare_file: None,
         proto_default: None,
@@ -1829,6 +1832,11 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
                 i += 1;
                 let val = require_arg(args, i, "--alt-svc")?;
                 opts.alt_svc_file = Some(val.to_string());
+            }
+            "--ssl-sessions" => {
+                i += 1;
+                let val = require_arg(args, i, "--ssl-sessions")?;
+                opts.ssl_session_file = Some(val.to_string());
             }
             "--etag-save" => {
                 i += 1;
@@ -5914,6 +5922,13 @@ mod tests {
         let args = make_args(&["--alt-svc", "/tmp/altsvc.txt", "http://example.com"]);
         let opts = unwrap_opts(parse_args(&args));
         assert_eq!(opts.alt_svc_file.as_deref(), Some("/tmp/altsvc.txt"));
+    }
+
+    #[test]
+    fn parse_ssl_sessions() {
+        let args = make_args(&["--ssl-sessions", "/tmp/sessions.txt", "http://example.com"]);
+        let opts = unwrap_opts(parse_args(&args));
+        assert_eq!(opts.ssl_session_file.as_deref(), Some("/tmp/sessions.txt"));
     }
 
     #[test]
