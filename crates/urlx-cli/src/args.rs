@@ -183,7 +183,7 @@ pub fn print_version() {
     let os = std::env::consts::OS;
     println!("curl {version} ({arch}-{os}) libcurl/{version} rustls",);
     println!("Release-Date: 2026-03-16");
-    println!("Protocols: dict file ftp ftps http https imap imaps mqtt pop3 pop3s scp sftp smtp smtps ws wss");
+    println!("Protocols: dict file ftp ftps gopher gophers http https imap imaps mqtt pop3 pop3s scp sftp smtp smtps ws wss");
     println!("Features: alt-svc AsynchDNS brotli cookies Digest HSTS HTTP2 HTTP3 HTTPS-proxy IPv6 Largefile libz NTLM PSL ssl-sessions SSL UnixSockets zstd");
 }
 
@@ -3529,7 +3529,7 @@ pub fn is_protocol_allowed(url: &str, proto_list: &str) -> bool {
 pub fn parse_proto_spec(spec: &str) -> Vec<String> {
     let all_protocols: &[&str] = &[
         "http", "https", "ftp", "ftps", "scp", "sftp", "imap", "imaps", "pop3", "pop3s", "smtp",
-        "smtps", "dict", "file", "tftp", "mqtt", "ws", "wss",
+        "smtps", "dict", "file", "tftp", "mqtt", "ws", "wss", "gopher", "gophers",
     ];
 
     // "=proto1,proto2" means exactly these protocols

@@ -1657,7 +1657,9 @@ pub fn run(args: &[String]) -> ExitCode {
                 || lower.starts_with("pop3s://")
                 || lower.starts_with("smtp://")
                 || lower.starts_with("smtps://")
-                || lower.starts_with("mqtt://"))
+                || lower.starts_with("mqtt://")
+                || lower.starts_with("gopher://")
+                || lower.starts_with("gophers://"))
     }) {
         opts.include_headers = false;
     }

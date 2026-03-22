@@ -5778,6 +5778,10 @@ async fn do_single_request(
         "dict" => {
             return crate::protocol::dict::lookup(url).await;
         }
+        "gopher" | "gophers" => {
+            let use_tls = url.scheme() == "gophers";
+            return crate::protocol::gopher::transfer(url, tls_config, use_tls).await;
+        }
         "ws" | "wss" => {
             return crate::protocol::ws::connect(url, headers, tls_config).await;
         }

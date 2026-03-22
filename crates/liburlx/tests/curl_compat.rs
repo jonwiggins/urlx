@@ -527,9 +527,9 @@ async fn response_header_casing_preserved() {
 #[tokio::test]
 async fn unsupported_protocol_error() {
     let mut easy = liburlx::Easy::new();
-    easy.url("gopher://example.com/").unwrap();
+    easy.url("telnet://example.com/").unwrap();
     let result = easy.perform_async().await;
-    assert!(result.is_err(), "gopher:// should fail on perform");
+    assert!(result.is_err(), "telnet:// should fail on perform");
     let err = result.unwrap_err();
     assert!(
         matches!(err, liburlx::Error::UnsupportedProtocol(_)),
