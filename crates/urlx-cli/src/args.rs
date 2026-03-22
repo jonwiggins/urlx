@@ -90,6 +90,8 @@ pub struct CliOptions {
     pub(crate) ssl_session_file: Option<String>,
     pub(crate) etag_save_file: Option<String>,
     pub(crate) etag_compare_file: Option<String>,
+    /// IPFS gateway URL from `--ipfs-gateway`.
+    pub(crate) ipfs_gateway: Option<String>,
     pub(crate) proto_default: Option<String>,
     pub(crate) output_dir: Option<String>,
     pub(crate) remove_on_error: bool,
@@ -183,7 +185,7 @@ pub fn print_version() {
     let os = std::env::consts::OS;
     println!("curl {version} ({arch}-{os}) libcurl/{version} rustls",);
     println!("Release-Date: 2026-03-16");
-    println!("Protocols: dict file ftp ftps http https imap imaps mqtt pop3 pop3s scp sftp smtp smtps ws wss");
+    println!("Protocols: dict file ftp ftps http https imap imaps ipfs ipns mqtt pop3 pop3s scp sftp smtp smtps ws wss");
     println!("Features: alt-svc AsynchDNS brotli cookies Digest HSTS HTTP2 HTTP3 HTTPS-proxy IPv6 Largefile libz NTLM PSL ssl-sessions SSL UnixSockets zstd");
 }
 
@@ -599,6 +601,7 @@ fn expand_combined_flags(args: &[String]) -> Vec<String> {
                         | "--tftp-blksize"
                         | "--http2-ping-interval"
                         | "--libcurl"
+                        | "--ipfs-gateway"
                 ) {
                     skip_next = true;
                 }
@@ -677,6 +680,7 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
         ssl_session_file: None,
         etag_save_file: None,
         etag_compare_file: None,
+        ipfs_gateway: None,
         proto_default: None,
         output_dir: None,
         remove_on_error: false,
@@ -1854,6 +1858,11 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
                 if opts.urls.len() > 1 {
                     opts.etag_conflict_blame = Some("--etag-compare".to_string());
                 }
+            }
+            "--ipfs-gateway" => {
+                i += 1;
+                let val = require_arg(args, i, "--ipfs-gateway")?;
+                opts.ipfs_gateway = Some(val.to_string());
             }
             "--haproxy-protocol" => {
                 opts.easy.haproxy_protocol(true);
@@ -3528,8 +3537,8 @@ pub fn is_protocol_allowed(url: &str, proto_list: &str) -> bool {
 /// Returns the list of allowed protocol names (lowercase).
 pub fn parse_proto_spec(spec: &str) -> Vec<String> {
     let all_protocols: &[&str] = &[
-        "http", "https", "ftp", "ftps", "scp", "sftp", "imap", "imaps", "pop3", "pop3s", "smtp",
-        "smtps", "dict", "file", "tftp", "mqtt", "ws", "wss",
+        "http", "https", "ftp", "ftps", "scp", "sftp", "imap", "imaps", "ipfs", "ipns", "pop3",
+        "pop3s", "smtp", "smtps", "dict", "file", "tftp", "mqtt", "ws", "wss",
     ];
 
     // "=proto1,proto2" means exactly these protocols
@@ -5943,6 +5952,13 @@ mod tests {
         let args = make_args(&["--etag-compare", "/tmp/etag.txt", "http://example.com"]);
         let opts = unwrap_opts(parse_args(&args));
         assert_eq!(opts.etag_compare_file.as_deref(), Some("/tmp/etag.txt"));
+    }
+
+    #[test]
+    fn parse_ipfs_gateway() {
+        let args = make_args(&["--ipfs-gateway", "http://127.0.0.1:8080", "ipfs://bafyhash"]);
+        let opts = unwrap_opts(parse_args(&args));
+        assert_eq!(opts.ipfs_gateway.as_deref(), Some("http://127.0.0.1:8080"));
     }
 
     #[test]
