@@ -57,6 +57,15 @@ if [ -d libtest ] && [ -d "$CURL_SRC/tests/libtest" ]; then
     done
 fi
 
+# Patch sshserver.pl to also generate ed25519 host keys.
+# russh 0.57.x has issues verifying RSA server signatures with some
+# OpenSSH versions. Adding an ed25519 host key lets russh negotiate
+# ed25519 instead, which works reliably.
+if [ -L sshserver.pl ]; then
+    cp --remove-destination "$CURL_SRC/tests/sshserver.pl" sshserver.pl
+    python3 "$SCRIPT_DIR/patch-sshserver.py" sshserver.pl
+fi
+
 # Run the tests
 # -a = continue after failures
 # -c = custom curl binary
