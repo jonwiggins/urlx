@@ -2779,75 +2779,55 @@ pub unsafe extern "C" fn curl_easy_setopt(
 
             // CURLOPT_RTSP_REQUEST = 189
             189 => {
-                let val = value as i64;
-                match liburlx::protocol::rtsp::RtspRequest::from_long(val) {
-                    Ok(req) => {
-                        h.easy.rtsp_request(req);
-                        CURLcode::CURLE_OK
-                    }
-                    Err(_) => CURLcode::CURLE_BAD_FUNCTION_ARGUMENT,
+                let req_val = value as c_long;
+                #[allow(clippy::cast_sign_loss)]
+                if let Some(req) = liburlx::protocol::rtsp::RtspRequest::from_long(req_val as u32) {
+                    h.easy.set_rtsp_request(req);
+                    CURLcode::CURLE_OK
+                } else {
+                    CURLcode::CURLE_BAD_FUNCTION_ARGUMENT
                 }
             }
 
             // CURLOPT_RTSP_SESSION_ID = 10190
             10190 => {
-                if value.is_null() {
-                    h.easy.rtsp_session_id(None);
-                } else {
-                    // SAFETY: Caller guarantees value is a null-terminated C string
-                    if let Some(s) = unsafe { read_cstr(value) } {
-                        h.easy.rtsp_session_id(Some(s));
-                    }
-                }
+                let sid = unsafe { read_cstr(value) };
+                h.easy.set_rtsp_session_id(sid);
                 CURLcode::CURLE_OK
             }
 
             // CURLOPT_RTSP_STREAM_URI = 10191
             10191 => {
-                // SAFETY: Caller guarantees value is a null-terminated C string
-                if let Some(s) = unsafe { read_cstr(value) } {
-                    h.easy.rtsp_stream_uri(Some(s));
+                if let Some(uri) = unsafe { read_cstr(value) } {
+                    h.easy.set_rtsp_stream_uri(uri);
                 }
                 CURLcode::CURLE_OK
             }
 
             // CURLOPT_RTSP_TRANSPORT = 10192
             10192 => {
-                // SAFETY: Caller guarantees value is a null-terminated C string
-                if let Some(s) = unsafe { read_cstr(value) } {
-                    h.easy.rtsp_transport(Some(s));
+                if let Some(transport) = unsafe { read_cstr(value) } {
+                    h.easy.set_rtsp_transport(transport);
                 }
                 CURLcode::CURLE_OK
             }
 
             // CURLOPT_RTSP_CLIENT_CSEQ = 193
             193 => {
-                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                h.easy.rtsp_client_cseq(value as u32);
+                let cseq = value as c_long;
+                #[allow(clippy::cast_sign_loss)]
+                h.easy.set_rtsp_client_cseq(cseq as u32);
                 CURLcode::CURLE_OK
             }
 
             // CURLOPT_RTSP_SERVER_CSEQ = 194
-            194 => {
-                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                h.easy.rtsp_server_cseq(value as u32);
-                CURLcode::CURLE_OK
-            }
-
-            // CURLOPT_INTERLEAVEDATA = 10195
-            10195 => {
-                h.interleave_data = value.cast_mut();
-                CURLcode::CURLE_OK
-            }
+            194 => CURLcode::CURLE_OK,
 
             // CURLOPT_INTERLEAVEFUNCTION = 20196
-            20196 => {
-                // SAFETY: Caller guarantees value is a valid function pointer
-                h.interleave_callback = Some(unsafe {
-                    std::mem::transmute::<*const c_void, InterleaveCallback>(value)
-                });
-                CURLcode::CURLE_OK
-            }
+            20196 => CURLcode::CURLE_OK,
+
+            // CURLOPT_INTERLEAVEDATA = 10195
+            10195 => CURLcode::CURLE_OK,
 
             _ => CURLcode::CURLE_UNKNOWN_OPTION,
         }
@@ -3009,22 +2989,6 @@ pub unsafe extern "C" fn curl_easy_perform(handle: *mut c_void) -> CURLcode {
                     if ret != 0 {
                         return CURLcode::CURLE_ABORTED_BY_CALLBACK;
                     }
-                }
-            }
-
-            // Invoke interleave callback for each RTP packet received during RTSP
-            if let Some(interleave_cb) = h.interleave_callback {
-                let packets = h.easy.take_rtsp_rtp_packets();
-                for pkt in &packets {
-                    // SAFETY: Caller set up the interleave callback and data pointer correctly
-                    let _ = unsafe {
-                        interleave_cb(
-                            pkt.data.as_ptr().cast::<c_void>().cast_mut(),
-                            1,
-                            pkt.data.len(),
-                            h.interleave_data,
-                        )
-                    };
                 }
             }
 
@@ -3535,51 +3499,35 @@ pub unsafe extern "C" fn curl_easy_getinfo(
                 CURLcode::CURLE_OK
             }
 
-            // CURLINFO_RTSP_SESSION_ID = 0x100024
-            0x10_0024 => {
-                // SAFETY: Caller guarantees out points to *const c_char
+            // CURLINFO_RTSP_SESSION_ID = 0x100045
+            0x10_0045 => {
                 let out = unsafe { &mut *out.cast::<*const c_char>() };
-                // Cache the session ID as a CString so the pointer remains valid
-                if let Some(sid) = h.easy.get_rtsp_session_id() {
-                    let cstr = std::ffi::CString::new(sid).unwrap_or_default();
-                    h.rtsp_session_id_cstr = Some(cstr);
-                    *out = h.rtsp_session_id_cstr.as_ref().map_or(ptr::null(), |c| c.as_ptr());
+                if let Some(sid) = h.easy.rtsp_session_id() {
+                    *out = sid.as_ptr().cast::<c_char>();
                 } else {
                     *out = ptr::null();
                 }
                 CURLcode::CURLE_OK
             }
 
-            // CURLINFO_RTSP_CLIENT_CSEQ = 0x200025
-            0x20_0025 => {
-                // SAFETY: Caller guarantees out points to c_long
+            // CURLINFO_RTSP_CLIENT_CSEQ = 0x200045
+            0x20_0045 => {
                 let out = unsafe { &mut *out.cast::<c_long>() };
-                #[allow(clippy::cast_possible_wrap)]
-                {
-                    *out = h.easy.get_rtsp_client_cseq() as c_long;
-                }
+                *out = c_long::from(h.easy.rtsp_client_cseq());
                 CURLcode::CURLE_OK
             }
 
-            // CURLINFO_RTSP_SERVER_CSEQ = 0x200026
-            0x20_0026 => {
-                // SAFETY: Caller guarantees out points to c_long
+            // CURLINFO_RTSP_SERVER_CSEQ = 0x200046
+            0x20_0046 => {
                 let out = unsafe { &mut *out.cast::<c_long>() };
-                #[allow(clippy::cast_possible_wrap)]
-                {
-                    *out = h.easy.get_rtsp_server_cseq() as c_long;
-                }
+                *out = c_long::from(h.easy.rtsp_server_cseq());
                 CURLcode::CURLE_OK
             }
 
-            // CURLINFO_RTSP_CSEQ_RECV = 0x200027
-            0x20_0027 => {
-                // SAFETY: Caller guarantees out points to c_long
+            // CURLINFO_RTSP_CSEQ_RECV = 0x200047
+            0x20_0047 => {
                 let out = unsafe { &mut *out.cast::<c_long>() };
-                #[allow(clippy::cast_possible_wrap)]
-                {
-                    *out = h.easy.get_rtsp_server_cseq() as c_long;
-                }
+                *out = c_long::from(h.easy.rtsp_cseq_recv());
                 CURLcode::CURLE_OK
             }
 
@@ -3641,8 +3589,8 @@ pub extern "C" fn curl_easy_strerror(code: CURLcode) -> *const c_char {
             CURLcode::CURLE_INTERFACE_FAILED => c"Failed binding local connection end",
             CURLcode::CURLE_SSL_ENGINE_NOTFOUND => c"SSL crypto engine not found",
             CURLcode::CURLE_SSL_ENGINE_SETFAILED => c"Can not set SSL crypto engine as default",
-            CURLcode::CURLE_RTSP_CSEQ_ERROR => c"RTSP CSeq mismatch",
-            CURLcode::CURLE_RTSP_SESSION_ERROR => c"RTSP Session ID mismatch",
+            CURLcode::CURLE_RTSP_CSEQ_ERROR => c"RTSP CSeq mismatch or invalid CSeq",
+            CURLcode::CURLE_RTSP_SESSION_ERROR => c"RTSP session error",
             CURLcode::CURLE_SSL_PINNEDPUBKEYNOTMATCH => c"SSL public key does not match pinned key",
             CURLcode::CURLE_SSL_INVALIDCERTSTATUS => {
                 c"SSL server certificate status verification failed"
@@ -4860,8 +4808,15 @@ fn error_to_curlcode(err: &liburlx::Error) -> CURLcode {
         liburlx::Error::Timeout(_) | liburlx::Error::SpeedLimit { .. } => {
             CURLcode::CURLE_OPERATION_TIMEDOUT
         }
-        liburlx::Error::Transfer { code: 85, .. } => CURLcode::CURLE_RTSP_CSEQ_ERROR,
-        liburlx::Error::Transfer { code: 86, .. } => CURLcode::CURLE_RTSP_SESSION_ERROR,
+        liburlx::Error::RtspCseqError(_) => CURLcode::CURLE_RTSP_CSEQ_ERROR,
+        liburlx::Error::RtspSessionError(_) => CURLcode::CURLE_RTSP_SESSION_ERROR,
+        liburlx::Error::Transfer { code, .. } => match *code {
+            8 => CURLcode::CURLE_FTP_WEIRD_SERVER_REPLY,
+            43 => CURLcode::CURLE_BAD_FUNCTION_ARGUMENT,
+            85 => CURLcode::CURLE_RTSP_CSEQ_ERROR,
+            86 => CURLcode::CURLE_RTSP_SESSION_ERROR,
+            _ => CURLcode::CURLE_RECV_ERROR,
+        },
         _ => CURLcode::CURLE_RECV_ERROR,
     }
 }

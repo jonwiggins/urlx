@@ -156,6 +156,7 @@ impl Url {
             "ftps" => Some(990),
             "sftp" | "scp" | "ssh" => Some(22),
             "rtsp" => Some(554),
+            "rtsps" => Some(322),
             _ => None,
         })
     }

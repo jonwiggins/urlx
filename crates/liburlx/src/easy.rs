@@ -246,22 +246,18 @@ pub struct Easy {
     /// Netrc file contents for credential lookup during redirects.
     /// When set, the redirect handler can look up credentials for new hosts.
     netrc_content: Option<String>,
-    /// RTSP request type for the next transfer.
+    /// RTSP request type (OPTIONS, DESCRIBE, SETUP, etc.).
     rtsp_request: crate::protocol::rtsp::RtspRequest,
-    /// RTSP stream URI (used in request line instead of URL).
+    /// RTSP stream URI (overrides URL for the request line).
     rtsp_stream_uri: Option<String>,
-    /// RTSP Transport header value.
+    /// RTSP Transport header value (required for SETUP).
     rtsp_transport: Option<String>,
-    /// RTSP session ID (tracked automatically from server responses).
-    rtsp_session_id: Option<String>,
-    /// RTSP client CSeq counter (auto-incremented after each request).
-    rtsp_client_cseq: u32,
-    /// RTSP server CSeq from the last response.
-    rtsp_server_cseq: u32,
-    /// Persistent RTSP connection for multi-request sessions.
+    /// RTSP session ID override (set via CURLOPT_RTSP_SESSION_ID).
+    rtsp_session_id_override: Option<String>,
+    /// Custom RTSP headers (set via CURLOPT_RTSPHEADER).
+    rtsp_headers: Vec<(String, String)>,
+    /// Persistent RTSP session state (TCP connection, CSeq, session ID).
     rtsp_session: Option<crate::protocol::rtsp::RtspSession>,
-    /// Interleaved RTP packets from the last RTSP transfer.
-    rtsp_rtp_packets: Vec<crate::protocol::rtsp::RtpPacket>,
 }
 
 #[allow(clippy::missing_fields_in_debug, clippy::too_many_lines)] // h2_pool is cfg-gated and opaque
@@ -377,9 +373,7 @@ impl std::fmt::Debug for Easy {
             .field("rtsp_request", &self.rtsp_request)
             .field("rtsp_stream_uri", &self.rtsp_stream_uri)
             .field("rtsp_transport", &self.rtsp_transport)
-            .field("rtsp_session_id", &self.rtsp_session_id)
-            .field("rtsp_client_cseq", &self.rtsp_client_cseq)
-            .field("rtsp_server_cseq", &self.rtsp_server_cseq)
+            .field("rtsp_session_id_override", &self.rtsp_session_id_override)
             .finish()
     }
 }
@@ -515,11 +509,9 @@ impl Clone for Easy {
             rtsp_request: self.rtsp_request,
             rtsp_stream_uri: self.rtsp_stream_uri.clone(),
             rtsp_transport: self.rtsp_transport.clone(),
-            rtsp_session_id: self.rtsp_session_id.clone(),
-            rtsp_client_cseq: self.rtsp_client_cseq,
-            rtsp_server_cseq: self.rtsp_server_cseq,
+            rtsp_session_id_override: self.rtsp_session_id_override.clone(),
+            rtsp_headers: self.rtsp_headers.clone(),
             rtsp_session: None, // ephemeral — not cloned (connection state)
-            rtsp_rtp_packets: Vec::new(),
         }
     }
 }
@@ -657,11 +649,9 @@ impl Easy {
             rtsp_request: crate::protocol::rtsp::RtspRequest::None,
             rtsp_stream_uri: None,
             rtsp_transport: None,
-            rtsp_session_id: None,
-            rtsp_client_cseq: 1,
-            rtsp_server_cseq: 0,
+            rtsp_session_id_override: None,
+            rtsp_headers: Vec::new(),
             rtsp_session: None,
-            rtsp_rtp_packets: Vec::new(),
         }
     }
 
@@ -685,120 +675,65 @@ impl Easy {
         self.ftp_session = other.ftp_session.take();
     }
 
-    // --- RTSP setters ---
-
-    /// Set the RTSP request type.
-    pub fn rtsp_request(&mut self, request: crate::protocol::rtsp::RtspRequest) {
-        self.rtsp_request = request;
+    /// Set the RTSP request type (`CURLOPT_RTSP_REQUEST`).
+    pub fn set_rtsp_request(&mut self, req: crate::protocol::rtsp::RtspRequest) {
+        self.rtsp_request = req;
     }
 
-    /// Set the RTSP stream URI.
-    pub fn rtsp_stream_uri(&mut self, uri: Option<&str>) {
-        self.rtsp_stream_uri = uri.map(String::from);
+    /// Set the RTSP stream URI (`CURLOPT_RTSP_STREAM_URI`).
+    pub fn set_rtsp_stream_uri(&mut self, uri: &str) {
+        self.rtsp_stream_uri = Some(uri.to_string());
     }
 
-    /// Set the RTSP Transport header value.
-    pub fn rtsp_transport(&mut self, transport: Option<&str>) {
-        self.rtsp_transport = transport.map(String::from);
+    /// Set the RTSP Transport header (`CURLOPT_RTSP_TRANSPORT`).
+    pub fn set_rtsp_transport(&mut self, transport: &str) {
+        self.rtsp_transport = Some(transport.to_string());
     }
 
-    /// Set or clear the RTSP session ID.
-    pub fn rtsp_session_id(&mut self, id: Option<&str>) {
-        self.rtsp_session_id = id.map(String::from);
-    }
-
-    /// Set the RTSP client CSeq counter.
-    pub fn rtsp_client_cseq(&mut self, cseq: u32) {
-        self.rtsp_client_cseq = cseq;
-    }
-
-    /// Set the RTSP server CSeq counter.
-    pub fn rtsp_server_cseq(&mut self, cseq: u32) {
-        self.rtsp_server_cseq = cseq;
-    }
-
-    /// Get the current RTSP session ID.
-    #[must_use]
-    pub fn get_rtsp_session_id(&self) -> Option<&str> {
-        self.rtsp_session_id.as_deref()
-    }
-
-    /// Get the RTSP client CSeq value.
-    #[must_use]
-    pub fn get_rtsp_client_cseq(&self) -> u32 {
-        self.rtsp_client_cseq
-    }
-
-    /// Get the RTSP server CSeq value.
-    #[must_use]
-    pub fn get_rtsp_server_cseq(&self) -> u32 {
-        self.rtsp_server_cseq
-    }
-
-    /// Get the last received RTP packets.
-    #[must_use]
-    pub fn get_rtsp_rtp_packets(&self) -> &[crate::protocol::rtsp::RtpPacket] {
-        &self.rtsp_rtp_packets
-    }
-
-    /// Take the RTP packets (moving them out).
-    pub fn take_rtsp_rtp_packets(&mut self) -> Vec<crate::protocol::rtsp::RtpPacket> {
-        std::mem::take(&mut self.rtsp_rtp_packets)
-    }
-
-    /// Transfer the RTSP session from another Easy handle into this one.
-    pub fn take_rtsp_session_from(&mut self, other: &mut Self) {
-        self.rtsp_session = other.rtsp_session.take();
-    }
-
-    /// Perform an RTSP transfer.
-    ///
-    /// Called from `perform_async()` when the URL scheme is `rtsp://`.
-    /// Handles CSeq tracking, session persistence, and RTP interleaving.
-    async fn perform_rtsp(&mut self, url: &Url) -> Result<Response, Error> {
-        let mut rtsp_config = crate::protocol::rtsp::RtspConfig {
-            request: self.rtsp_request,
-            stream_uri: self.rtsp_stream_uri.clone(),
-            transport: self.rtsp_transport.clone(),
-            session_id: self.rtsp_session_id.clone(),
-            client_cseq: self.rtsp_client_cseq,
-            headers: self.headers.clone(),
-            body: self.body.clone(),
-            upload_body: None,
-            verbose: self.verbose,
-        };
-
-        // If we have an infilesize (upload/PUT style), use body as upload
-        if self.infilesize.is_some() && rtsp_config.body.is_some() {
-            rtsp_config.upload_body = rtsp_config.body.take();
+    /// Set/clear the RTSP session ID override (`CURLOPT_RTSP_SESSION_ID`).
+    pub fn set_rtsp_session_id(&mut self, id: Option<&str>) {
+        self.rtsp_session_id_override = id.map(ToString::to_string);
+        if id.is_none() {
+            if let Some(ref mut sess) = self.rtsp_session {
+                sess.session_id = None;
+            }
         }
+    }
 
-        let session = self.rtsp_session.take();
-        match crate::protocol::rtsp::perform(url, &mut rtsp_config, session).await {
-            Ok(result) => {
-                self.rtsp_session_id = result.session_id;
-                self.rtsp_client_cseq = result.client_cseq;
-                if let Some(s) = result.server_cseq {
-                    self.rtsp_server_cseq = s;
-                }
-                self.rtsp_session = result.session;
-                self.rtsp_rtp_packets = result.rtp_packets;
-                Ok(result.response)
-            }
-            Err(Error::RtspCseqMismatch { session: s, .. }) => {
-                if let Some(s) = s {
-                    self.rtsp_session = Some(s);
-                }
-                Err(Error::Transfer { code: 85, message: "RTSP CSeq mismatch".to_string() })
-            }
-            Err(Error::RtspSessionMismatch { session: s, .. }) => {
-                if let Some(s) = s {
-                    self.rtsp_session = Some(s);
-                }
-                Err(Error::Transfer { code: 86, message: "RTSP Session ID mismatch".to_string() })
-            }
-            Err(e) => Err(e),
+    /// Set custom RTSP headers (`CURLOPT_RTSPHEADER`).
+    pub fn set_rtsp_headers(&mut self, headers: Vec<(String, String)>) {
+        self.rtsp_headers = headers;
+    }
+
+    /// Set the RTSP client CSeq counter (`CURLOPT_RTSP_CLIENT_CSEQ`).
+    pub fn set_rtsp_client_cseq(&mut self, cseq: u32) {
+        if let Some(ref mut sess) = self.rtsp_session {
+            sess.set_client_cseq(cseq);
         }
+    }
+
+    /// Get the RTSP session ID (from response or override).
+    #[must_use]
+    pub fn rtsp_session_id(&self) -> Option<&str> {
+        self.rtsp_session.as_ref().and_then(|s| s.session_id())
+    }
+
+    /// Get the RTSP client CSeq counter.
+    #[must_use]
+    pub fn rtsp_client_cseq(&self) -> u32 {
+        self.rtsp_session.as_ref().map_or(1, |s| s.client_cseq())
+    }
+
+    /// Get the RTSP server CSeq counter.
+    #[must_use]
+    pub fn rtsp_server_cseq(&self) -> u32 {
+        self.rtsp_session.as_ref().map_or(0, |s| s.server_cseq())
+    }
+
+    /// Get the last RTSP CSeq received from the server.
+    #[must_use]
+    pub fn rtsp_cseq_recv(&self) -> u32 {
+        self.rtsp_session.as_ref().map_or(0, |s| s.cseq_recv())
     }
 
     /// Set the URL to transfer.
@@ -2761,11 +2696,6 @@ impl Easy {
             }
         }
 
-        // RTSP: handle directly here since it needs &mut self for session state
-        if url.scheme() == "rtsp" {
-            return self.perform_rtsp(&url).await;
-        }
-
         // Build effective headers, body, and method considering multipart and range
         let mut headers = self.headers.clone();
 
@@ -2994,6 +2924,30 @@ impl Easy {
             alternative_to_user: self.ftp_alternative_to_user.clone(),
         };
 
+        // Handle RTSP directly (uses persistent session, bypasses HTTP pipeline)
+        if url.scheme() == "rtsp" {
+            let result = crate::protocol::rtsp::perform_with_session(
+                &url,
+                &headers,
+                effective_body.as_deref(),
+                self.verbose,
+                &mut self.rtsp_session,
+                self.rtsp_request,
+                self.rtsp_stream_uri.as_deref(),
+                self.rtsp_transport.as_deref(),
+                self.rtsp_session_id_override.as_deref(),
+                &self.rtsp_headers,
+            )
+            .await;
+            match result {
+                Ok(response) => {
+                    self.last_response = Some(response.clone());
+                    return Ok(response);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
         let dns_resolver = self.build_dns_resolver();
 
         #[cfg(feature = "ssh")]
@@ -3092,6 +3046,12 @@ impl Easy {
             self.form_data,
             self.allowed_protocols.as_deref(),
             &mut self.ftp_session,
+            &mut self.rtsp_session,
+            self.rtsp_request,
+            self.rtsp_stream_uri.as_deref(),
+            self.rtsp_transport.as_deref(),
+            self.rtsp_session_id_override.as_deref(),
+            &self.rtsp_headers,
             self.netrc_content.as_deref(),
             self.fail_on_error,
         );
@@ -3254,6 +3214,12 @@ async fn perform_transfer(
     form_data: bool,
     allowed_protocols: Option<&[String]>,
     ftp_session: &mut Option<crate::protocol::ftp::FtpSession>,
+    rtsp_session: &mut Option<crate::protocol::rtsp::RtspSession>,
+    rtsp_request_type: crate::protocol::rtsp::RtspRequest,
+    rtsp_stream_uri: Option<&str>,
+    rtsp_transport: Option<&str>,
+    rtsp_session_id_override: Option<&str>,
+    rtsp_headers: &[(String, String)],
     netrc_content: Option<&str>,
     fail_on_error: bool,
 ) -> Result<Response, Error> {
@@ -3547,6 +3513,12 @@ async fn perform_transfer(
             proxy_http_10,
             raw,
             ftp_session,
+            rtsp_session,
+            rtsp_request_type,
+            rtsp_stream_uri,
+            rtsp_transport,
+            rtsp_session_id_override,
+            rtsp_headers,
             redirected_from_http,
             fail_on_error,
         ))
@@ -3646,6 +3618,12 @@ async fn perform_transfer(
                         proxy_http_10,
                         raw,
                         ftp_session,
+                        rtsp_session,
+                        rtsp_request_type,
+                        rtsp_stream_uri,
+                        rtsp_transport,
+                        rtsp_session_id_override,
+                        rtsp_headers,
                         redirected_from_http,
                         fail_on_error,
                     ))
@@ -3804,6 +3782,12 @@ async fn perform_transfer(
                                 proxy_http_10,
                                 raw,
                                 ftp_session,
+                                rtsp_session,
+                                rtsp_request_type,
+                                rtsp_stream_uri,
+                                rtsp_transport,
+                                rtsp_session_id_override,
+                                rtsp_headers,
                                 redirected_from_http,
                                 fail_on_error,
                             ))
@@ -3914,6 +3898,12 @@ async fn perform_transfer(
                                         proxy_http_10,
                                         raw,
                                         ftp_session,
+                                        rtsp_session,
+                                        rtsp_request_type,
+                                        rtsp_stream_uri,
+                                        rtsp_transport,
+                                        rtsp_session_id_override,
+                                        rtsp_headers,
                                         redirected_from_http,
                                         fail_on_error,
                                     ))
@@ -4011,6 +4001,12 @@ async fn perform_transfer(
                                 proxy_http_10,
                                 raw,
                                 ftp_session,
+                                rtsp_session,
+                                rtsp_request_type,
+                                rtsp_stream_uri,
+                                rtsp_transport,
+                                rtsp_session_id_override,
+                                rtsp_headers,
                                 redirected_from_http,
                                 fail_on_error,
                             ))
@@ -4122,6 +4118,12 @@ async fn perform_transfer(
                                         proxy_http_10,
                                         raw,
                                         ftp_session,
+                                        rtsp_session,
+                                        rtsp_request_type,
+                                        rtsp_stream_uri,
+                                        rtsp_transport,
+                                        rtsp_session_id_override,
+                                        rtsp_headers,
                                         redirected_from_http,
                                         fail_on_error,
                                     ))
@@ -4213,6 +4215,12 @@ async fn perform_transfer(
                             proxy_http_10,
                             raw,
                             ftp_session,
+                            rtsp_session,
+                            rtsp_request_type,
+                            rtsp_stream_uri,
+                            rtsp_transport,
+                            rtsp_session_id_override,
+                            rtsp_headers,
                             redirected_from_http,
                             fail_on_error,
                         ))
@@ -4329,6 +4337,12 @@ async fn perform_transfer(
                                     proxy_http_10,
                                     raw,
                                     ftp_session,
+                                    rtsp_session,
+                                    rtsp_request_type,
+                                    rtsp_stream_uri,
+                                    rtsp_transport,
+                                    rtsp_session_id_override,
+                                    rtsp_headers,
                                     redirected_from_http,
                                     fail_on_error,
                                 ))
@@ -4445,6 +4459,12 @@ async fn perform_transfer(
                                     proxy_http_10,
                                     raw,
                                     ftp_session,
+                                    rtsp_session,
+                                    rtsp_request_type,
+                                    rtsp_stream_uri,
+                                    rtsp_transport,
+                                    rtsp_session_id_override,
+                                    rtsp_headers,
                                     redirected_from_http,
                                     fail_on_error,
                                 ))
@@ -4544,6 +4564,12 @@ async fn perform_transfer(
                                         proxy_http_10,
                                         raw,
                                         ftp_session,
+                                        rtsp_session,
+                                        rtsp_request_type,
+                                        rtsp_stream_uri,
+                                        rtsp_transport,
+                                        rtsp_session_id_override,
+                                        rtsp_headers,
                                         redirected_from_http,
                                         fail_on_error,
                                     ))
@@ -4646,6 +4672,12 @@ async fn perform_transfer(
                                                     proxy_http_10,
                                                     raw,
                                                     ftp_session,
+                                                    rtsp_session,
+                                                    rtsp_request_type,
+                                                    rtsp_stream_uri,
+                                                    rtsp_transport,
+                                                    rtsp_session_id_override,
+                                                    rtsp_headers,
                                                     redirected_from_http,
                                                     fail_on_error,
                                                 ))
@@ -4748,6 +4780,12 @@ async fn perform_transfer(
                                             proxy_http_10,
                                             raw,
                                             ftp_session,
+                                            rtsp_session,
+                                            rtsp_request_type,
+                                            rtsp_stream_uri,
+                                            rtsp_transport,
+                                            rtsp_session_id_override,
+                                            rtsp_headers,
                                             redirected_from_http,
                                             fail_on_error,
                                         ))
@@ -4894,6 +4932,12 @@ async fn perform_transfer(
                                         proxy_http_10,
                                         raw,
                                         ftp_session,
+                                        rtsp_session,
+                                        rtsp_request_type,
+                                        rtsp_stream_uri,
+                                        rtsp_transport,
+                                        rtsp_session_id_override,
+                                        rtsp_headers,
                                         redirected_from_http,
                                         fail_on_error,
                                     ))
@@ -5016,6 +5060,12 @@ async fn perform_transfer(
                                     proxy_http_10,
                                     raw,
                                     ftp_session,
+                                    rtsp_session,
+                                    rtsp_request_type,
+                                    rtsp_stream_uri,
+                                    rtsp_transport,
+                                    rtsp_session_id_override,
+                                    rtsp_headers,
                                     redirected_from_http,
                                     fail_on_error,
                                 ))
@@ -5392,6 +5442,12 @@ async fn perform_transfer(
                         proxy_http_10,
                         raw,
                         ftp_session,
+                        rtsp_session,
+                        rtsp_request_type,
+                        rtsp_stream_uri,
+                        rtsp_transport,
+                        rtsp_session_id_override,
+                        rtsp_headers,
                         true,
                         fail_on_error,
                     ))
@@ -5520,6 +5576,12 @@ async fn do_single_request(
     proxy_http_10: bool,
     raw: bool,
     ftp_session: &mut Option<crate::protocol::ftp::FtpSession>,
+    _rtsp_session: &mut Option<crate::protocol::rtsp::RtspSession>,
+    _rtsp_request_type: crate::protocol::rtsp::RtspRequest,
+    _rtsp_stream_uri: Option<&str>,
+    _rtsp_transport: Option<&str>,
+    _rtsp_session_id_override: Option<&str>,
+    _rtsp_headers: &[(String, String)],
     redirected_from_http: bool,
     fail_on_error: bool,
 ) -> Result<Response, Error> {
@@ -5561,6 +5623,9 @@ async fn do_single_request(
                 })
                 .unwrap_or((None, None));
             return crate::protocol::file::read_file(url, range_start, range_end);
+        }
+        "rtsp" => {
+            return crate::protocol::rtsp::perform(url, method, headers, body, verbose).await;
         }
         "tftp" => {
             return crate::protocol::tftp::download(url, tftp_blksize, tftp_no_options).await;

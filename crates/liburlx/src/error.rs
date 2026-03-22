@@ -119,31 +119,17 @@ pub enum Error {
     #[error("SMTP send error: {0}")]
     SmtpSend(String),
 
+    /// RTSP CSeq mismatch between client and server (maps to `CURLE_RTSP_CSEQ_ERROR` = 85).
+    #[error("RTSP CSeq mismatch: {0}")]
+    RtspCseqError(String),
+
+    /// RTSP Session ID mismatch (maps to `CURLE_RTSP_SESSION_ERROR` = 86).
+    #[error("RTSP Session mismatch: {0}")]
+    RtspSessionError(String),
+
     /// A generic protocol error with a curl error code.
     #[error("protocol error (code {0})")]
     Protocol(u32),
-
-    /// RTSP CSeq mismatch (maps to `CURLE_RTSP_CSEQ_ERROR` = 85).
-    #[error("RTSP CSeq mismatch: expected {expected}, got {got}")]
-    RtspCseqMismatch {
-        /// The CSeq we sent.
-        expected: u32,
-        /// The CSeq the server returned.
-        got: u32,
-        /// The RTSP session (connection) to preserve for reuse.
-        session: Option<crate::protocol::rtsp::RtspSession>,
-    },
-
-    /// RTSP Session ID mismatch (maps to `CURLE_RTSP_SESSION_ERROR` = 86).
-    #[error("RTSP session mismatch: expected {expected}, got {got}")]
-    RtspSessionMismatch {
-        /// Our session ID.
-        expected: String,
-        /// The session ID the server returned.
-        got: String,
-        /// The RTSP session (connection) to preserve for reuse.
-        session: Option<crate::protocol::rtsp::RtspSession>,
-    },
 
     /// A URL glob pattern error with position info (curl-compatible format).
     /// Formats as:
