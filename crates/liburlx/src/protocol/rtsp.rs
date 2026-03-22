@@ -40,9 +40,9 @@ pub enum RtspRequest {
     Pause = 6,
     /// TEARDOWN request.
     Teardown = 7,
-    /// GET_PARAMETER request.
+    /// `GET_PARAMETER` request.
     GetParameter = 8,
-    /// SET_PARAMETER request.
+    /// `SET_PARAMETER` request.
     SetParameter = 9,
     /// RECORD request.
     Record = 10,
@@ -52,7 +52,8 @@ pub enum RtspRequest {
 
 impl RtspRequest {
     /// Convert from a numeric value (curl RTSPREQ enum).
-    pub fn from_long(v: u32) -> Option<Self> {
+    #[must_use]
+    pub const fn from_long(v: u32) -> Option<Self> {
         match v {
             0 => Some(Self::None),
             1 => Some(Self::Options),
@@ -71,7 +72,8 @@ impl RtspRequest {
     }
 
     /// Get the RTSP method string.
-    pub fn method_str(self) -> &'static str {
+    #[must_use]
+    pub const fn method_str(self) -> &'static str {
         match self {
             Self::None | Self::Options => "OPTIONS",
             Self::Describe => "DESCRIBE",
@@ -92,19 +94,19 @@ impl RtspRequest {
 pub struct RtspSession {
     /// The TCP stream to the RTSP server.
     stream: TcpStream,
-    /// Client CSeq counter (incremented per request).
+    /// Client `CSeq` counter (incremented per request).
     pub client_cseq: u32,
-    /// Server CSeq counter (from last response).
+    /// Server `CSeq` counter (from last response).
     pub server_cseq: u32,
-    /// Last received CSeq from server response.
+    /// Last received `CSeq` from server response.
     pub cseq_recv: u32,
     /// Session ID extracted from response `Session:` header.
     pub session_id: Option<String>,
 }
 
 impl RtspSession {
-    /// Set the client CSeq counter.
-    pub fn set_client_cseq(&mut self, cseq: u32) {
+    /// Set the client `CSeq` counter.
+    pub const fn set_client_cseq(&mut self, cseq: u32) {
         self.client_cseq = cseq;
     }
 
@@ -113,23 +115,27 @@ impl RtspSession {
         self.session_id.as_deref()
     }
 
-    /// Get the client CSeq counter.
-    pub fn client_cseq(&self) -> u32 {
+    /// Get the client `CSeq` counter.
+    pub const fn client_cseq(&self) -> u32 {
         self.client_cseq
     }
 
-    /// Get the server CSeq counter.
-    pub fn server_cseq(&self) -> u32 {
+    /// Get the server `CSeq` counter.
+    pub const fn server_cseq(&self) -> u32 {
         self.server_cseq
     }
 
-    /// Get the last received CSeq.
-    pub fn cseq_recv(&self) -> u32 {
+    /// Get the last received `CSeq`.
+    pub const fn cseq_recv(&self) -> u32 {
         self.cseq_recv
     }
 }
 
 /// Send an RTSP request and read the response.
+///
+/// # Errors
+///
+/// Returns errors for write failures and response parsing errors.
 #[allow(clippy::too_many_arguments)]
 pub async fn request<S>(
     stream: &mut S,
@@ -183,7 +189,12 @@ where
 }
 
 /// Perform an RTSP transfer using a persistent session.
-#[allow(clippy::too_many_arguments)]
+///
+/// # Errors
+///
+/// Returns errors for connection failures, protocol errors, `CSeq`
+/// mismatches, and session ID mismatches.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub async fn perform_with_session(
     url: &crate::url::Url,
     headers: &[(String, String)],
@@ -339,6 +350,10 @@ pub async fn perform_with_session(
 }
 
 /// Perform an RTSP transfer (simple, non-session mode for CLI).
+///
+/// # Errors
+///
+/// Returns errors for connection or protocol failures.
 pub async fn perform(
     url: &crate::url::Url,
     method: &str,

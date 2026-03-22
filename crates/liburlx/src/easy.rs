@@ -252,11 +252,11 @@ pub struct Easy {
     rtsp_stream_uri: Option<String>,
     /// RTSP Transport header value (required for SETUP).
     rtsp_transport: Option<String>,
-    /// RTSP session ID override (set via CURLOPT_RTSP_SESSION_ID).
+    /// RTSP session ID override (set via `CURLOPT_RTSP_SESSION_ID`).
     rtsp_session_id_override: Option<String>,
-    /// Custom RTSP headers (set via CURLOPT_RTSPHEADER).
+    /// Custom RTSP headers (set via `CURLOPT_RTSPHEADER`).
     rtsp_headers: Vec<(String, String)>,
-    /// Persistent RTSP session state (TCP connection, CSeq, session ID).
+    /// Persistent RTSP session state (TCP connection, `CSeq`, session ID).
     rtsp_session: Option<crate::protocol::rtsp::RtspSession>,
 }
 
@@ -676,7 +676,7 @@ impl Easy {
     }
 
     /// Set the RTSP request type (`CURLOPT_RTSP_REQUEST`).
-    pub fn set_rtsp_request(&mut self, req: crate::protocol::rtsp::RtspRequest) {
+    pub const fn set_rtsp_request(&mut self, req: crate::protocol::rtsp::RtspRequest) {
         self.rtsp_request = req;
     }
 
@@ -705,7 +705,7 @@ impl Easy {
         self.rtsp_headers = headers;
     }
 
-    /// Set the RTSP client CSeq counter (`CURLOPT_RTSP_CLIENT_CSEQ`).
+    /// Set the RTSP client `CSeq` counter (`CURLOPT_RTSP_CLIENT_CSEQ`).
     pub fn set_rtsp_client_cseq(&mut self, cseq: u32) {
         if let Some(ref mut sess) = self.rtsp_session {
             sess.set_client_cseq(cseq);
@@ -718,22 +718,22 @@ impl Easy {
         self.rtsp_session.as_ref().and_then(|s| s.session_id())
     }
 
-    /// Get the RTSP client CSeq counter.
+    /// Get the RTSP client `CSeq` counter.
     #[must_use]
     pub fn rtsp_client_cseq(&self) -> u32 {
-        self.rtsp_session.as_ref().map_or(1, |s| s.client_cseq())
+        self.rtsp_session.as_ref().map_or(1, crate::protocol::rtsp::RtspSession::client_cseq)
     }
 
-    /// Get the RTSP server CSeq counter.
+    /// Get the RTSP server `CSeq` counter.
     #[must_use]
     pub fn rtsp_server_cseq(&self) -> u32 {
-        self.rtsp_session.as_ref().map_or(0, |s| s.server_cseq())
+        self.rtsp_session.as_ref().map_or(0, crate::protocol::rtsp::RtspSession::server_cseq)
     }
 
-    /// Get the last RTSP CSeq received from the server.
+    /// Get the last RTSP `CSeq` received from the server.
     #[must_use]
     pub fn rtsp_cseq_recv(&self) -> u32 {
-        self.rtsp_session.as_ref().map_or(0, |s| s.cseq_recv())
+        self.rtsp_session.as_ref().map_or(0, crate::protocol::rtsp::RtspSession::cseq_recv)
     }
 
     /// Set the URL to transfer.
