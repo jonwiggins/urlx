@@ -56,7 +56,7 @@ tokio-rustls = { version = "0.26", optional = true, default-features = false, fe
 quinn = { version = "0.11", optional = true, default-features = false, features = ["ring", "runtime-tokio", "rustls"] }
 h3 = { version = "0.0.8", optional = true }
 h3-quinn = { version = "0.0.10", optional = true }
-russh = { version = "0.57", optional = true, default-features = false, features = ["ring"] }
+russh = { version = "0.57", optional = true, default-features = false, features = ["ring", "rsa"] }
 russh-sftp = { version = "2.1", optional = true }
 flate2 = { version = "1", optional = true }
 brotli = { version = "7", optional = true }

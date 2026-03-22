@@ -524,6 +524,30 @@ pub struct SshSession {
     handle: russh::client::Handle<SshHandler>,
 }
 
+/// Build an SSH client config that prefers `rsa-sha2-256` over `rsa-sha2-512`
+/// for host key algorithms. russh 0.57.x has a bug verifying RSA-SHA2-512
+/// server signatures with some OpenSSH server versions; preferring SHA-256
+/// avoids the issue while remaining compatible with all servers.
+fn ssh_client_config() -> Arc<russh::client::Config> {
+    use std::borrow::Cow;
+
+    let mut config = russh::client::Config::default();
+    let mut preferred = config.preferred.clone();
+
+    // Re-order host key algorithms: put rsa-sha2-256 before rsa-sha2-512
+    preferred.key = Cow::Owned(vec![
+        russh::keys::Algorithm::Ed25519,
+        russh::keys::Algorithm::Ecdsa { curve: russh::keys::EcdsaCurve::NistP256 },
+        russh::keys::Algorithm::Ecdsa { curve: russh::keys::EcdsaCurve::NistP384 },
+        russh::keys::Algorithm::Ecdsa { curve: russh::keys::EcdsaCurve::NistP521 },
+        russh::keys::Algorithm::Rsa { hash: Some(russh::keys::HashAlg::Sha256) },
+        russh::keys::Algorithm::Rsa { hash: Some(russh::keys::HashAlg::Sha512) },
+        russh::keys::Algorithm::Rsa { hash: None },
+    ]);
+    config.preferred = preferred;
+    Arc::new(config)
+}
+
 impl SshSession {
     /// Connect to an SSH server and authenticate with a password.
     ///
@@ -537,7 +561,7 @@ impl SshSession {
         pass: &str,
         policy: SshHostKeyPolicy,
     ) -> Result<Self, Error> {
-        let config = Arc::new(russh::client::Config::default());
+        let config = ssh_client_config();
         let handler = SshHandler { policy, hostname: host.to_string() };
         let mut handle = russh::client::connect(config, (host, port), handler).await?;
 
@@ -565,7 +589,7 @@ impl SshSession {
         key_path: &str,
         policy: SshHostKeyPolicy,
     ) -> Result<Self, Error> {
-        let config = Arc::new(russh::client::Config::default());
+        let config = ssh_client_config();
         let handler = SshHandler { policy, hostname: host.to_string() };
         let mut handle = russh::client::connect(config, (host, port), handler).await?;
 

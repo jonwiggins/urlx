@@ -1,5 +1,11 @@
 [advisories]
-ignore = []
+ignore = [
+    # RUSTSEC-2023-0071: Marvin Attack timing sidechannel in `rsa` crate.
+    # Transitive dependency via russh -> internal-russh-forked-ssh-key -> rsa.
+    # No upstream fix available. Acceptable risk: SSH key operations are local,
+    # not exposed to network-observable timing attacks in our usage.
+    "RUSTSEC-2023-0071",
+]
 
 [licenses]
 allow = [

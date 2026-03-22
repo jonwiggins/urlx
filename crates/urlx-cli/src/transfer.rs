@@ -2809,14 +2809,15 @@ pub fn run_multi(
 
         // -T upload: per-URL upload tracking. Each URL with its own -T flag
         // gets PUT with the upload body. URLs without their own -T revert to GET.
-        // For FTP, all URLs keep the upload body (curl compat: tests 149, 216).
+        // For FTP/SFTP, all URLs keep the upload body (curl compat: tests 149, 216).
         // Test 1064: `-T file URL1 -T file URL2` → both PUT
         // Test 1065: `-T file URL1 URL2` → first PUT, second GET
+        // Test 625: `-T file sftp://URL1 -T file sftp://URL2` → both upload
         let is_ftp_url = url.starts_with("ftp://")
             || url.starts_with("ftps://")
             || url.starts_with("sftp://")
             || url.starts_with("scp://");
-        if is_upload && !is_ftp_url {
+        if is_upload {
             let has_own_upload = per_url_upload_files.get(i).is_some_and(|f| f.is_some());
             if has_own_upload {
                 // This URL has its own -T file: read the file
@@ -2864,8 +2865,8 @@ pub fn run_multi(
                         }
                     }
                 }
-            } else if i > 0 && easy.has_body() {
-                // No -T for this URL: revert to GET (curl compat: test 1065)
+            } else if !is_ftp_url && i > 0 && easy.has_body() {
+                // No -T for this URL and not FTP/SFTP: revert to GET (curl compat: test 1065)
                 let _ = easy.take_body();
                 easy.method("GET");
             }
