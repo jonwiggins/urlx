@@ -555,17 +555,21 @@ impl CookieJar {
         // Reject cookies with explicit Domain attribute set to a public suffix
         // (e.g., "com", "co.uk", "github.io") to prevent super-domain cookie attacks.
         // Host-only cookies (no Domain attr) are always allowed.
-        if has_explicit_domain && is_public_suffix(&domain) {
+        // Exception: when the request host exactly equals the cookie domain, the
+        // cookie is always accepted (curl compat — matches libpsl's
+        // psl_is_cookie_domain_acceptable() which accepts hostname == cookie_domain).
+        let req_lower = request_host.to_ascii_lowercase();
+        if has_explicit_domain
+            && !req_lower.eq_ignore_ascii_case(&domain)
+            && is_public_suffix(&domain)
+        {
             return;
         }
 
         // Validate domain against request host (RFC 6265 §5.3 step 6):
         // The domain must domain-match the request host.
-        if has_explicit_domain && !request_host.is_empty() {
-            let req_lower = request_host.to_ascii_lowercase();
-            if !domain_matches(&req_lower, &domain) {
-                return; // Reject: domain doesn't match request host
-            }
+        if has_explicit_domain && !request_host.is_empty() && !domain_matches(&req_lower, &domain) {
+            return; // Reject: domain doesn't match request host
         }
 
         // Build display domain for jar output
@@ -689,14 +693,37 @@ impl CookieJar {
 fn is_public_suffix(domain: &str) -> bool {
     use psl::Psl;
     let domain_bytes = domain.as_bytes();
-    // psl::List.suffix() returns the public suffix portion of the domain.
-    // If the suffix IS the entire domain, then the domain is a public suffix.
-    // Only block if the suffix is a "known" entry in the PSL — this allows
-    // unknown single-label domains like "localhost" and "moo" (curl compat).
+
+    // If the domain has a registrable domain (eTLD+1), it's not a public suffix.
+    if psl::List.domain(domain_bytes).is_some() {
+        return false;
+    }
+
+    // domain() returned None — the domain is either a known public suffix
+    // or an unknown single-label domain (like "localhost").
     let Some(suffix) = psl::List.suffix(domain_bytes) else {
         return false;
     };
-    suffix.is_known() && suffix.as_bytes().eq_ignore_ascii_case(domain_bytes)
+
+    if suffix.is_known() {
+        // Known suffix that equals the full domain (e.g., "com", "co.uk",
+        // "example.ck" under *.ck rule, "github.io").
+        return true;
+    }
+
+    // Unknown suffix. For single-label domains (bare TLDs), check if the
+    // PSL has wildcard rules for this TLD by testing a synthetic child
+    // domain. If "x.{domain}" has a known suffix, then {domain} is a real
+    // TLD with PSL rules (e.g., "ck" has "*.ck"). This distinguishes real
+    // TLDs from unknown hostnames like "localhost" or "moo".
+    if !domain.contains('.') {
+        let test_domain = format!("x.{domain}");
+        if let Some(child_suffix) = psl::List.suffix(test_domain.as_bytes()) {
+            return child_suffix.is_known();
+        }
+    }
+
+    false
 }
 
 /// Check if a request host matches a cookie domain.
@@ -1371,6 +1398,48 @@ mod tests {
         assert!(is_public_suffix("co.uk"));
         assert!(!is_public_suffix("example.com"));
         assert!(!is_public_suffix("www.example.com"));
+    }
+
+    #[test]
+    fn psl_test1136_domains() {
+        // Domains from curl test 1136 + existing test domains
+        let test_cases: &[(&str, bool)] = &[
+            // Known TLDs (explicitly in PSL)
+            ("com", true),
+            ("org", true),
+            ("net", true),
+            // Multi-label public suffixes
+            ("co.uk", true),
+            ("github.io", true),
+            ("tokyo.jp", true),
+            // Bare TLD with wildcard rules (*.ck in PSL) — test 1136
+            ("ck", true),
+            // Public suffix under wildcard *.ck — test 1136
+            ("example.ck", true),
+            // eTLD+1 under *.ck — test 1136
+            ("www.example.ck", false),
+            // Exception !www.ck — test 1136
+            ("www.ck", false),
+            // PRIVATE PSL rule *.compute-1.amazonaws.com — test 1136
+            // (is_public_suffix returns true, but cookie storage skips
+            // PSL check when hostname == cookie_domain)
+            ("z-1.compute-1.amazonaws.com", true),
+            // Not in PSL, just a regular domain
+            ("compute-1.amazonaws.com", false),
+            ("example.com", false),
+            ("www.example.com", false),
+            // Unknown single-label domains — should NOT be public suffixes
+            ("localhost", false),
+            ("moo", false),
+        ];
+
+        for (domain, expected) in test_cases {
+            let result = is_public_suffix(domain);
+            assert_eq!(
+                result, *expected,
+                "is_public_suffix({domain}) = {result}, expected {expected}"
+            );
+        }
     }
 
     #[test]
