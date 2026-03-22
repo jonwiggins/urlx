@@ -706,6 +706,7 @@ impl Easy {
     }
 
     /// Set the RTSP client `CSeq` counter (`CURLOPT_RTSP_CLIENT_CSEQ`).
+    #[allow(clippy::missing_const_for_fn)] // mutating Option<T> via if-let is not yet const-friendly in practice
     pub fn set_rtsp_client_cseq(&mut self, cseq: u32) {
         if let Some(ref mut sess) = self.rtsp_session {
             sess.set_client_cseq(cseq);

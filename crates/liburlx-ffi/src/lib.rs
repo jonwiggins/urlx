@@ -1279,7 +1279,7 @@ struct EasyHandle {
     error_buf: [u8; 256],
     interleave_callback: Option<InterleaveCallback>,
     interleave_data: *mut c_void,
-    /// Cached CString for RTSP session ID (kept alive for getinfo pointers).
+    /// Cached `CString` for RTSP session ID (kept alive for getinfo pointers).
     rtsp_session_id_cstr: Option<std::ffi::CString>,
 }
 
@@ -2780,7 +2780,7 @@ pub unsafe extern "C" fn curl_easy_setopt(
             // CURLOPT_RTSP_REQUEST = 189
             189 => {
                 let req_val = value as c_long;
-                #[allow(clippy::cast_sign_loss)]
+                #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
                 if let Some(req) = liburlx::protocol::rtsp::RtspRequest::from_long(req_val as u32) {
                     h.easy.set_rtsp_request(req);
                     CURLcode::CURLE_OK
@@ -2815,19 +2815,14 @@ pub unsafe extern "C" fn curl_easy_setopt(
             // CURLOPT_RTSP_CLIENT_CSEQ = 193
             193 => {
                 let cseq = value as c_long;
-                #[allow(clippy::cast_sign_loss)]
+                #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
                 h.easy.set_rtsp_client_cseq(cseq as u32);
                 CURLcode::CURLE_OK
             }
 
-            // CURLOPT_RTSP_SERVER_CSEQ = 194
-            194 => CURLcode::CURLE_OK,
-
-            // CURLOPT_INTERLEAVEFUNCTION = 20196
-            20196 => CURLcode::CURLE_OK,
-
+            // CURLOPT_RTSP_SERVER_CSEQ = 194, CURLOPT_INTERLEAVEFUNCTION = 20196,
             // CURLOPT_INTERLEAVEDATA = 10195
-            10195 => CURLcode::CURLE_OK,
+            194 | 20196 | 10195 => CURLcode::CURLE_OK,
 
             _ => CURLcode::CURLE_UNKNOWN_OPTION,
         }
