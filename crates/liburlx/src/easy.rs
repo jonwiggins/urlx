@@ -246,6 +246,22 @@ pub struct Easy {
     /// Netrc file contents for credential lookup during redirects.
     /// When set, the redirect handler can look up credentials for new hosts.
     netrc_content: Option<String>,
+    /// RTSP request type for the next transfer.
+    rtsp_request: crate::protocol::rtsp::RtspRequest,
+    /// RTSP stream URI (used in request line instead of URL).
+    rtsp_stream_uri: Option<String>,
+    /// RTSP Transport header value.
+    rtsp_transport: Option<String>,
+    /// RTSP session ID (tracked automatically from server responses).
+    rtsp_session_id: Option<String>,
+    /// RTSP client CSeq counter (auto-incremented after each request).
+    rtsp_client_cseq: u32,
+    /// RTSP server CSeq from the last response.
+    rtsp_server_cseq: u32,
+    /// Persistent RTSP connection for multi-request sessions.
+    rtsp_session: Option<crate::protocol::rtsp::RtspSession>,
+    /// Interleaved RTP packets from the last RTSP transfer.
+    rtsp_rtp_packets: Vec<crate::protocol::rtsp::RtpPacket>,
 }
 
 #[allow(clippy::missing_fields_in_debug, clippy::too_many_lines)] // h2_pool is cfg-gated and opaque
@@ -358,6 +374,12 @@ impl std::fmt::Debug for Easy {
             .field("pre_proxy", &self.pre_proxy)
             .field("tftp_blksize", &self.tftp_blksize)
             .field("tftp_no_options", &self.tftp_no_options)
+            .field("rtsp_request", &self.rtsp_request)
+            .field("rtsp_stream_uri", &self.rtsp_stream_uri)
+            .field("rtsp_transport", &self.rtsp_transport)
+            .field("rtsp_session_id", &self.rtsp_session_id)
+            .field("rtsp_client_cseq", &self.rtsp_client_cseq)
+            .field("rtsp_server_cseq", &self.rtsp_server_cseq)
             .finish()
     }
 }
@@ -490,6 +512,14 @@ impl Clone for Easy {
             ftp_session: None,   // ephemeral — not cloned (connection state)
             last_response: None, // ephemeral — not cloned
             netrc_content: self.netrc_content.clone(),
+            rtsp_request: self.rtsp_request,
+            rtsp_stream_uri: self.rtsp_stream_uri.clone(),
+            rtsp_transport: self.rtsp_transport.clone(),
+            rtsp_session_id: self.rtsp_session_id.clone(),
+            rtsp_client_cseq: self.rtsp_client_cseq,
+            rtsp_server_cseq: self.rtsp_server_cseq,
+            rtsp_session: None, // ephemeral — not cloned (connection state)
+            rtsp_rtp_packets: Vec::new(),
         }
     }
 }
@@ -624,6 +654,14 @@ impl Easy {
             ftp_session: None,
             last_response: None,
             netrc_content: None,
+            rtsp_request: crate::protocol::rtsp::RtspRequest::None,
+            rtsp_stream_uri: None,
+            rtsp_transport: None,
+            rtsp_session_id: None,
+            rtsp_client_cseq: 1,
+            rtsp_server_cseq: 0,
+            rtsp_session: None,
+            rtsp_rtp_packets: Vec::new(),
         }
     }
 
@@ -645,6 +683,122 @@ impl Easy {
     /// is moved, leaving the source handle with no session.
     pub fn take_ftp_session_from(&mut self, other: &mut Self) {
         self.ftp_session = other.ftp_session.take();
+    }
+
+    // --- RTSP setters ---
+
+    /// Set the RTSP request type.
+    pub fn rtsp_request(&mut self, request: crate::protocol::rtsp::RtspRequest) {
+        self.rtsp_request = request;
+    }
+
+    /// Set the RTSP stream URI.
+    pub fn rtsp_stream_uri(&mut self, uri: Option<&str>) {
+        self.rtsp_stream_uri = uri.map(String::from);
+    }
+
+    /// Set the RTSP Transport header value.
+    pub fn rtsp_transport(&mut self, transport: Option<&str>) {
+        self.rtsp_transport = transport.map(String::from);
+    }
+
+    /// Set or clear the RTSP session ID.
+    pub fn rtsp_session_id(&mut self, id: Option<&str>) {
+        self.rtsp_session_id = id.map(String::from);
+    }
+
+    /// Set the RTSP client CSeq counter.
+    pub fn rtsp_client_cseq(&mut self, cseq: u32) {
+        self.rtsp_client_cseq = cseq;
+    }
+
+    /// Set the RTSP server CSeq counter.
+    pub fn rtsp_server_cseq(&mut self, cseq: u32) {
+        self.rtsp_server_cseq = cseq;
+    }
+
+    /// Get the current RTSP session ID.
+    #[must_use]
+    pub fn get_rtsp_session_id(&self) -> Option<&str> {
+        self.rtsp_session_id.as_deref()
+    }
+
+    /// Get the RTSP client CSeq value.
+    #[must_use]
+    pub fn get_rtsp_client_cseq(&self) -> u32 {
+        self.rtsp_client_cseq
+    }
+
+    /// Get the RTSP server CSeq value.
+    #[must_use]
+    pub fn get_rtsp_server_cseq(&self) -> u32 {
+        self.rtsp_server_cseq
+    }
+
+    /// Get the last received RTP packets.
+    #[must_use]
+    pub fn get_rtsp_rtp_packets(&self) -> &[crate::protocol::rtsp::RtpPacket] {
+        &self.rtsp_rtp_packets
+    }
+
+    /// Take the RTP packets (moving them out).
+    pub fn take_rtsp_rtp_packets(&mut self) -> Vec<crate::protocol::rtsp::RtpPacket> {
+        std::mem::take(&mut self.rtsp_rtp_packets)
+    }
+
+    /// Transfer the RTSP session from another Easy handle into this one.
+    pub fn take_rtsp_session_from(&mut self, other: &mut Self) {
+        self.rtsp_session = other.rtsp_session.take();
+    }
+
+    /// Perform an RTSP transfer.
+    ///
+    /// Called from `perform_async()` when the URL scheme is `rtsp://`.
+    /// Handles CSeq tracking, session persistence, and RTP interleaving.
+    async fn perform_rtsp(&mut self, url: &Url) -> Result<Response, Error> {
+        let mut rtsp_config = crate::protocol::rtsp::RtspConfig {
+            request: self.rtsp_request,
+            stream_uri: self.rtsp_stream_uri.clone(),
+            transport: self.rtsp_transport.clone(),
+            session_id: self.rtsp_session_id.clone(),
+            client_cseq: self.rtsp_client_cseq,
+            headers: self.headers.clone(),
+            body: self.body.clone(),
+            upload_body: None,
+            verbose: self.verbose,
+        };
+
+        // If we have an infilesize (upload/PUT style), use body as upload
+        if self.infilesize.is_some() && rtsp_config.body.is_some() {
+            rtsp_config.upload_body = rtsp_config.body.take();
+        }
+
+        let session = self.rtsp_session.take();
+        match crate::protocol::rtsp::perform(url, &mut rtsp_config, session).await {
+            Ok(result) => {
+                self.rtsp_session_id = result.session_id;
+                self.rtsp_client_cseq = result.client_cseq;
+                if let Some(s) = result.server_cseq {
+                    self.rtsp_server_cseq = s;
+                }
+                self.rtsp_session = result.session;
+                self.rtsp_rtp_packets = result.rtp_packets;
+                Ok(result.response)
+            }
+            Err(Error::RtspCseqMismatch { session: s, .. }) => {
+                if let Some(s) = s {
+                    self.rtsp_session = Some(s);
+                }
+                Err(Error::Transfer { code: 85, message: "RTSP CSeq mismatch".to_string() })
+            }
+            Err(Error::RtspSessionMismatch { session: s, .. }) => {
+                if let Some(s) = s {
+                    self.rtsp_session = Some(s);
+                }
+                Err(Error::Transfer { code: 86, message: "RTSP Session ID mismatch".to_string() })
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Set the URL to transfer.
@@ -2605,6 +2759,11 @@ impl Easy {
                     allowed.join(",")
                 )));
             }
+        }
+
+        // RTSP: handle directly here since it needs &mut self for session state
+        if url.scheme() == "rtsp" {
+            return self.perform_rtsp(&url).await;
         }
 
         // Build effective headers, body, and method considering multipart and range
