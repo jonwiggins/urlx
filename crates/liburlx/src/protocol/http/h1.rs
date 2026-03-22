@@ -1761,6 +1761,18 @@ where
         });
     }
 
+    // Determine if the encoding can be checked incrementally (gzip/deflate)
+    // or requires stall-based detection (brotli/zstd).
+    // Brotli and zstd decompressors can't distinguish truncated valid data from
+    // corrupt data on partial streams, so we use a stall timeout instead.
+    let outermost = encoding
+        .rsplit(',')
+        .map(str::trim)
+        .find(|s| !s.is_empty() && !s.eq_ignore_ascii_case("identity"))
+        .unwrap_or_else(|| encoding.trim());
+    let needs_stall_detection =
+        outermost.eq_ignore_ascii_case("br") || outermost.eq_ignore_ascii_case("zstd");
+
     while body.len() < content_length {
         let remaining = content_length - body.len();
         // Read in reasonably-sized chunks to allow incremental checking
@@ -1769,15 +1781,45 @@ where
 
         // Use read() (not read_exact) so we process whatever data is available
         let read_fut = stream.read(&mut chunk_buf);
-        let result = if let Some(dl) = deadline {
-            match tokio::time::timeout_at(dl, read_fut).await {
-                Ok(inner) => inner,
-                Err(_) => {
+
+        // For brotli/zstd: if we already have data and the next read stalls,
+        // try decompression to detect corrupt encoding without blocking forever
+        // (curl compat: test 315 — broken brotli with Content-Length > actual data).
+        let stall_deadline = if needs_stall_detection && !body.is_empty() {
+            Some(tokio::time::Instant::now() + std::time::Duration::from_millis(500))
+        } else {
+            None
+        };
+
+        // Use the earlier of: transfer deadline, stall deadline
+        let effective_deadline = match (deadline, stall_deadline) {
+            (Some(d), Some(s)) => Some(d.min(s)),
+            (d, s) => d.or(s),
+        };
+
+        let result = if let Some(dl) = effective_deadline {
+            if let Ok(inner) = tokio::time::timeout_at(dl, read_fut).await {
+                inner
+            } else {
+                // Check if this was a stall timeout (not the transfer deadline)
+                let is_stall = stall_deadline.is_some_and(|s| deadline.is_none_or(|d| s <= d));
+                if is_stall {
+                    // Stall detected: try decompressing accumulated data.
+                    // If decompression succeeds, the compressed stream is
+                    // complete despite Content-Length mismatch — return data.
+                    // If decompression fails, it's corrupt encoding.
+                    if super::decompress::decompress(&body, encoding).is_ok() {
+                        return Ok(body);
+                    }
                     return Err(Error::PartialBody {
-                        message: "transfer closed with outstanding read data remaining".to_string(),
+                        message: "bad_content_encoding".to_string(),
                         partial_body: body,
                     });
                 }
+                return Err(Error::PartialBody {
+                    message: "transfer closed with outstanding read data remaining".to_string(),
+                    partial_body: body,
+                });
             }
         } else {
             read_fut.await
