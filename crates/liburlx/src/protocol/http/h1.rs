@@ -1825,10 +1825,16 @@ where
 /// Check if compressed data is corrupt by attempting decompression.
 ///
 /// Returns `true` if decompression definitively fails (corrupt data).
-/// Returns `false` if decompression succeeds (data is valid, possibly truncated).
+/// Returns `false` if decompression succeeds or the data is valid but truncated.
 ///
-/// Uses the same decompression logic as `maybe_decompress_inner` — the outermost
-/// encoding in a multi-layer chain is checked first.
+/// Encoding-specific behavior:
+/// - **deflate:** Full decompression is attempted. `DeflateDecoder::read_to_end()` succeeds
+///   on partial valid deflate data, so this correctly distinguishes corrupt vs truncated.
+/// - **gzip/x-gzip:** Only the magic bytes (`\x1f\x8b`) are checked. Full decompression
+///   cannot be used incrementally because `GzDecoder` requires the trailing checksum/length
+///   to return `Ok` — truncated valid gzip always fails `read_to_end()`.
+/// - **Other encodings (br, zstd):** Not checked incrementally (returns `false`), since
+///   their decompressors also require complete streams.
 fn is_encoding_corrupt(data: &[u8], content_encoding: &str) -> bool {
     // Skip identity encoding — it's always valid
     if content_encoding.eq_ignore_ascii_case("identity")
@@ -1845,7 +1851,26 @@ fn is_encoding_corrupt(data: &[u8], content_encoding: &str) -> bool {
         .find(|s| !s.is_empty() && !s.eq_ignore_ascii_case("identity"))
         .unwrap_or_else(|| content_encoding.trim());
 
-    super::decompress::decompress(data, outermost).is_err()
+    if outermost.eq_ignore_ascii_case("deflate") {
+        // Deflate decompression of partial valid data succeeds (returns decoded bytes
+        // so far), so we can use full decompress to detect corrupt data incrementally.
+        return super::decompress::decompress(data, outermost).is_err();
+    }
+
+    if outermost.eq_ignore_ascii_case("gzip") || outermost.eq_ignore_ascii_case("x-gzip") {
+        // Gzip requires the full stream (including footer checksum) to decompress
+        // successfully, so full decompression of truncated valid data always fails.
+        // Only check magic bytes to detect obviously corrupt data without false
+        // positives on valid-but-incomplete streams (curl compat: tests 220, 224, 230).
+        if data.len() < 2 {
+            return false;
+        }
+        return data[0] != 0x1f || data[1] != 0x8b;
+    }
+
+    // For other encodings (br, zstd), full decompression of partial data may fail
+    // due to missing stream footers, so don't attempt incremental checking.
+    false
 }
 
 /// Read the response body based on headers (Content-Length, chunked, or EOF).
@@ -3692,6 +3717,30 @@ mod tests {
         // Bytes with gzip magic removed (broken header)
         let bad_data = b"\x08\x79\x9e\xab\x41\x00\x03";
         assert!(is_encoding_corrupt(bad_data, "gzip"));
+    }
+
+    #[test]
+    fn is_encoding_corrupt_accepts_truncated_valid_gzip() {
+        use flate2::write::GzEncoder;
+        use std::io::Write;
+
+        // Create valid gzip data, then truncate it — should NOT be flagged as corrupt.
+        // Gzip decompression of truncated data fails (needs footer checksum), but
+        // the magic bytes are valid so we know the encoding isn't corrupt.
+        let original = b"hello gzip world with enough data to produce a multi-byte stream";
+        let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(original).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        // Full data is valid
+        assert!(!is_encoding_corrupt(&compressed, "gzip"));
+
+        // Truncated data should still not be flagged as corrupt (valid magic bytes)
+        let truncated = &compressed[..compressed.len() / 2];
+        assert!(!is_encoding_corrupt(truncated, "gzip"));
+
+        // Even just the first 2 bytes (magic only) should not be corrupt
+        assert!(!is_encoding_corrupt(&compressed[..2], "gzip"));
     }
 
     #[test]
