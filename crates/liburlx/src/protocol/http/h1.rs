@@ -1789,10 +1789,10 @@ where
         // - brotli/zstd: only stall-based detection works (decompressors can't
         //   distinguish truncated from corrupt on partial streams)
         // (curl compat: test 223 — broken deflate, test 315 — broken brotli)
-        let stall_deadline = if !body.is_empty() {
-            Some(tokio::time::Instant::now() + std::time::Duration::from_millis(500))
-        } else {
+        let stall_deadline = if body.is_empty() {
             None
+        } else {
+            Some(tokio::time::Instant::now() + std::time::Duration::from_millis(500))
         };
 
         // Use the earlier of: transfer deadline, stall deadline
