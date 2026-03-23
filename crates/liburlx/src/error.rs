@@ -119,6 +119,14 @@ pub enum Error {
     #[error("SMTP send error: {0}")]
     SmtpSend(String),
 
+    /// RTSP `CSeq` mismatch between client and server (maps to `CURLE_RTSP_CSEQ_ERROR` = 85).
+    #[error("RTSP CSeq mismatch: {0}")]
+    RtspCseqError(String),
+
+    /// RTSP `Session` ID mismatch (maps to `CURLE_RTSP_SESSION_ERROR` = 86).
+    #[error("RTSP Session mismatch: {0}")]
+    RtspSessionError(String),
+
     /// A generic protocol error with a curl error code.
     #[error("protocol error (code {0})")]
     Protocol(u32),
