@@ -1577,6 +1577,13 @@ impl Easy {
         self.tls_config.ca_cert_blob = Some(blob);
     }
 
+    /// Clear the in-memory CA certificate bundle.
+    ///
+    /// Resets the setting so the default CA store is used.
+    pub fn clear_ssl_ca_cert_blob(&mut self) {
+        self.tls_config.ca_cert_blob = None;
+    }
+
     /// Set an in-memory client certificate (PEM format).
     ///
     /// Alternative to `ssl_client_cert` (file path).
@@ -6869,14 +6876,11 @@ fn maybe_decompress_inner(mut response: Response, accept_encoding: bool, raw: bo
         return response;
     }
 
-    // If the body reader already detected bad content encoding, clear the body
-    // immediately. The partial body contains raw compressed data that failed
-    // decompression and must not be output (curl compat: test 223).
-    if response
-        .body_error()
-        .is_some_and(|e| e.contains("bad_content_encoding"))
-    {
-        response.set_body(Vec::new());
+    // If the body reader already detected an error (e.g., bad_content_encoding
+    // from incremental encoding check, or transfer closed), skip decompression
+    // entirely to avoid overwriting the original error. The body is preserved
+    // as-is so callers can inspect or discard it. (curl compat: test 223)
+    if response.body_error().is_some() {
         return response;
     }
 
@@ -10361,5 +10365,57 @@ mod tests {
                 || err_msg.contains("not yet supported"),
             "unexpected error: {err_msg}"
         );
+    }
+
+    #[test]
+    fn maybe_decompress_preserves_existing_body_error() {
+        // When body_error is already set (e.g., from incremental encoding
+        // check in read_exact_body), decompression should be skipped entirely
+        // to avoid overwriting the original error. curl compat: test 223.
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("content-encoding".to_string(), "deflate".to_string());
+        let broken_body = vec![0x58, 0xdb, 0x6e, 0xe3]; // broken deflate
+        let mut resp = crate::protocol::http::response::Response::new(
+            200,
+            headers,
+            broken_body.clone(),
+            "http://example.com".to_string(),
+        );
+        resp.set_body_error(Some("bad_content_encoding".to_string()));
+
+        let result = maybe_decompress_inner(resp, true, false);
+        assert_eq!(
+            result.body_error(),
+            Some("bad_content_encoding"),
+            "body_error should be preserved"
+        );
+        assert_eq!(result.body(), &broken_body, "body should not be modified");
+    }
+
+    #[test]
+    fn maybe_decompress_preserves_transfer_closed_error() {
+        // When body_error is "transfer closed..." (exit 18), decompression
+        // must not overwrite it with "bad_content_encoding" (exit 61).
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("content-encoding".to_string(), "gzip".to_string());
+        // Partial gzip body (valid magic but truncated — decompression would fail)
+        let partial_body = vec![0x1f, 0x8b, 0x08, 0x00, 0x00];
+        let mut resp = crate::protocol::http::response::Response::new(
+            200,
+            headers,
+            partial_body.clone(),
+            "http://example.com".to_string(),
+        );
+        resp.set_body_error(Some(
+            "transfer closed with outstanding read data remaining".to_string(),
+        ));
+
+        let result = maybe_decompress_inner(resp, true, false);
+        assert_eq!(
+            result.body_error(),
+            Some("transfer closed with outstanding read data remaining"),
+            "body_error should not be overwritten by decompression failure"
+        );
+        assert_eq!(result.body(), &partial_body, "body should not be modified");
     }
 }

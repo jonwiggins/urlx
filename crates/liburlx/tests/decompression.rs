@@ -176,12 +176,11 @@ async fn broken_deflate_content_length_mismatch_returns_bad_encoding() {
         let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
 
         // Send response with Content-Length: 1305 but only broken_deflate.len() bytes of body
-        let headers = format!(
-            "HTTP/1.1 200 OK\r\n\
+        let headers = "HTTP/1.1 200 OK\r\n\
              Content-Encoding: deflate\r\n\
              Content-Length: 1305\r\n\
              \r\n"
-        );
+            .to_string();
         stream.write_all(headers.as_bytes()).await.unwrap();
         stream.write_all(&broken_deflate).await.unwrap();
         stream.flush().await.unwrap();

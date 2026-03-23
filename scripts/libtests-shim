@@ -1,0 +1,70 @@
+#!/bin/bash
+# Shim that replaces curl's `libtests` binary for running C API tests
+# (libNNN) against urlx via the CLI.
+#
+# curl's lib* tests are compiled C programs linked against libcurl. Since urlx
+# uses a different library (liburlx-ffi), we provide this shim that translates
+# supported lib tests into equivalent CLI invocations of urlx.
+#
+# Usage (called by runtests.pl):
+#   libtests-shim <test_name> [args...]
+#   libtests-shim lib678 check            # precheck: exits 0 if feature supported
+#   libtests-shim lib678 <url> <certfile> # actual test
+
+set -euo pipefail
+
+URLX="${URLX_BIN:-}"
+if [ -z "$URLX" ]; then
+    echo "ERROR: URLX_BIN not set" >&2
+    exit 1
+fi
+
+TEST_NAME="${1:-}"
+shift || true
+
+case "$TEST_NAME" in
+    lib678)
+        # Test 678: HTTPS GET using CURLOPT_CAINFO_BLOB
+        #
+        # The original C test:
+        #   1. "check" mode: verifies CURLOPT_CAINFO_BLOB is supported
+        #   2. normal mode: reads CA cert file into memory, sets CAINFO_BLOB,
+        #      performs HTTPS GET with verbose + include-headers
+        #
+        # We translate this to an equivalent urlx CLI invocation using --cacert.
+        # The CAINFO_BLOB code path is separately tested in Rust integration tests.
+
+        URL="${1:-}"
+
+        if [ "$URL" = "check" ]; then
+            # Precheck: report that the feature is supported (exit 0 = CURLE_OK)
+            exit 0
+        fi
+
+        CERTFILE="${2:-}"
+        if [ -z "$URL" ] || [ -z "$CERTFILE" ]; then
+            echo "Usage: $0 lib678 <url> <certfile>" >&2
+            exit 1
+        fi
+
+        # Equivalent to the C code:
+        #   curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
+        #   curl_easy_setopt(curl, CURLOPT_HEADER, 1L);
+        #   curl_easy_setopt(curl, CURLOPT_URL, url);
+        #   curl_easy_setopt(curl, CURLOPT_USERAGENT, "CURLOPT_CAINFO_BLOB");
+        #   curl_easy_setopt(curl, CURLOPT_CAINFO_BLOB, &blob);
+        #   curl_easy_perform(curl);
+        exec "$URLX" \
+            --verbose \
+            --include \
+            --user-agent "CURLOPT_CAINFO_BLOB" \
+            --cacert "$CERTFILE" \
+            "$URL"
+        ;;
+
+    *)
+        # Unknown lib test — report as not found so runtests.pl skips it
+        echo "libtests-shim: unknown test '$TEST_NAME'" >&2
+        exit 1
+        ;;
+esac

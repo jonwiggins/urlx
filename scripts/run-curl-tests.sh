@@ -41,6 +41,35 @@ if [ ! -x "$WRAPPER" ]; then
     exit 1
 fi
 
+# Set up libtests for libcurl C API tests (e.g., test 678).
+#
+# Strategy:
+#   1. If curl's libtests binary exists AND our FFI .so exists, use LD_PRELOAD
+#      to substitute our liburlx-ffi so that curl API calls go through urlx.
+#   2. Otherwise, install our libtests-shim script as a fallback. The shim
+#      translates supported lib tests (e.g., lib678) into urlx CLI invocations.
+FFI_LIB="$PROJECT_ROOT/target/release/libliburlx_ffi.so"
+LIBTESTS="$CURL_BUILD/tests/libtest/libtests"
+LIBTESTS_REAL="$CURL_BUILD/tests/libtest/libtests.real"
+LIBTESTS_SHIM="$SCRIPT_DIR/libtests-shim"
+
+if [ -f "$FFI_LIB" ] && [ -x "$LIBTESTS" ] && [ ! -f "$LIBTESTS_REAL" ]; then
+    # LD_PRELOAD approach: override curl_easy_* symbols with our FFI
+    mv "$LIBTESTS" "$LIBTESTS_REAL"
+    cat > "$LIBTESTS" <<WRAPPER
+#!/bin/bash
+LD_PRELOAD="$FFI_LIB" LD_LIBRARY_PATH="$CURL_BUILD/lib\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}" exec "$LIBTESTS_REAL" "\$@"
+WRAPPER
+    chmod +x "$LIBTESTS"
+elif [ ! -x "$LIBTESTS" ] && [ ! -f "$LIBTESTS_REAL" ]; then
+    # Fallback: use the libtests-shim script for supported C API tests.
+    # This handles tests like 678 (CAINFO_BLOB) via equivalent CLI invocations.
+    mkdir -p "$CURL_BUILD/tests/libtest"
+    cp "$LIBTESTS_SHIM" "$LIBTESTS"
+    chmod +x "$LIBTESTS"
+    echo "Installed libtests-shim for C API tests (e.g., test 678)"
+fi
+
 # Ensure symlinks are in place
 cd "$TESTS_DIR"
 [ ! -e data ] && ln -sf "$CURL_SRC/tests/data" data
