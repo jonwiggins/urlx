@@ -9,6 +9,7 @@ repository.workspace = true
 homepage.workspace = true
 keywords = ["ffi", "libcurl", "curl", "http"]
 categories = ["network-programming", "api-bindings"]
+readme = "../../README.md"
 
 [lib]
 crate-type = ["cdylib", "staticlib"]

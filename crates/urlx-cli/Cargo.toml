@@ -9,6 +9,7 @@ repository.workspace = true
 homepage.workspace = true
 keywords = ["cli", "curl", "http", "transfer"]
 categories = ["command-line-utilities", "network-programming"]
+readme = "../../README.md"
 
 [[bin]]
 name = "urlx"

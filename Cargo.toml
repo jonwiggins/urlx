@@ -4,13 +4,14 @@ exclude = ["crates/liburlx/fuzz"]
 resolver = "2"
 
 [workspace.package]
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 rust-version = "1.85.0"
 license = "MIT"
 repository = "https://github.com/jonwiggins/urlx"
 homepage = "https://github.com/jonwiggins/urlx"
 documentation = "https://docs.rs/liburlx"
+readme = "README.md"
 
 [workspace.lints.rust]
 missing_docs = "warn"

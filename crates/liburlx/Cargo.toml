@@ -10,6 +10,7 @@ homepage.workspace = true
 documentation.workspace = true
 keywords = ["http", "curl", "transfer", "tls", "async"]
 categories = ["network-programming", "web-programming::http-client"]
+readme = "../../README.md"
 
 [lints]
 workspace = true
