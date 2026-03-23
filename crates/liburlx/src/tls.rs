@@ -900,4 +900,59 @@ mod tests {
         let connector = TlsConnector::new_no_alpn(&config);
         assert!(connector.is_ok());
     }
+
+    #[test]
+    fn tls_config_default_has_no_ca_cert_blob() {
+        let config = TlsConfig::default();
+        assert!(config.ca_cert_blob.is_none());
+    }
+
+    #[cfg(feature = "rustls")]
+    #[test]
+    fn tls_connector_with_valid_ca_cert_blob() {
+        let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_params.distinguished_name.push(rcgen::DnType::CommonName, "Test CA");
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+        let ca_pem = ca_cert.pem().into_bytes();
+
+        let config = TlsConfig { ca_cert_blob: Some(ca_pem), ..TlsConfig::default() };
+        let connector = TlsConnector::new(&config);
+        assert!(connector.is_ok(), "valid PEM CA cert blob should create TLS connector");
+    }
+
+    #[cfg(feature = "rustls")]
+    #[test]
+    fn tls_connector_with_invalid_ca_cert_blob_fails() {
+        let config = TlsConfig {
+            ca_cert_blob: Some(b"not valid PEM data".to_vec()),
+            ..TlsConfig::default()
+        };
+        let result = TlsConnector::new(&config);
+        assert!(result.is_err(), "invalid PEM blob should fail");
+    }
+
+    #[cfg(feature = "rustls")]
+    #[test]
+    fn tls_connector_with_empty_ca_cert_blob_fails() {
+        let config = TlsConfig { ca_cert_blob: Some(Vec::new()), ..TlsConfig::default() };
+        let result = TlsConnector::new(&config);
+        assert!(result.is_err(), "empty blob should fail");
+    }
+
+    #[cfg(feature = "rustls")]
+    #[test]
+    fn tls_connector_ca_cert_blob_no_alpn() {
+        let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_params.distinguished_name.push(rcgen::DnType::CommonName, "Test CA");
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+        let ca_pem = ca_cert.pem().into_bytes();
+
+        let config = TlsConfig { ca_cert_blob: Some(ca_pem), ..TlsConfig::default() };
+        let connector = TlsConnector::new_no_alpn(&config);
+        assert!(connector.is_ok(), "valid PEM CA cert blob should work without ALPN");
+    }
 }

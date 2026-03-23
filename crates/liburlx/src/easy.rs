@@ -1577,6 +1577,13 @@ impl Easy {
         self.tls_config.ca_cert_blob = Some(blob);
     }
 
+    /// Clear the in-memory CA certificate bundle.
+    ///
+    /// Resets the setting so the default CA store is used.
+    pub fn clear_ssl_ca_cert_blob(&mut self) {
+        self.tls_config.ca_cert_blob = None;
+    }
+
     /// Set an in-memory client certificate (PEM format).
     ///
     /// Alternative to `ssl_client_cert` (file path).
