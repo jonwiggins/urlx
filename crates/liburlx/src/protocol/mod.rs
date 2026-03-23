@@ -10,6 +10,7 @@ pub mod http;
 pub mod imap;
 pub mod mqtt;
 pub mod pop3;
+pub mod rtsp;
 pub mod smtp;
 #[cfg(feature = "ssh")]
 pub mod ssh;
