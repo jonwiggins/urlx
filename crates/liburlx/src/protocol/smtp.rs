@@ -70,6 +70,8 @@ struct EhloCapabilities {
     size: bool,
     /// Whether the server supports STARTTLS.
     starttls: bool,
+    /// Whether the server supports SMTPUTF8 (RFC 6531).
+    smtputf8: bool,
     /// Supported AUTH mechanisms (uppercased).
     auth_mechanisms: Vec<String>,
 }
@@ -83,6 +85,8 @@ fn parse_ehlo_capabilities(message: &str) -> EhloCapabilities {
             caps.size = true;
         } else if line_upper == "STARTTLS" || line_upper.starts_with("STARTTLS ") {
             caps.starttls = true;
+        } else if line_upper == "SMTPUTF8" || line_upper.starts_with("SMTPUTF8 ") {
+            caps.smtputf8 = true;
         } else if let Some(mechs) = line_upper.strip_prefix("AUTH ") {
             for mech in mechs.split_whitespace() {
                 caps.auth_mechanisms.push(mech.to_string());
@@ -398,20 +402,39 @@ pub async fn send_mail(
         }
     }
 
+    // Convert IDN hostnames in recipient addresses and detect SMTPUTF8 need.
+    let idn_rcpts: Vec<String> = config
+        .mail_rcpt
+        .iter()
+        .map(|r| crate::idn::idn_email_address(r).unwrap_or_else(|_| r.clone()))
+        .collect();
+    let need_smtputf8 = config.mail_rcpt.iter().any(|r| crate::idn::has_non_ascii(r))
+        || config.mail_from.is_some_and(|f| crate::idn::has_non_ascii(f));
+
     // Execute the appropriate SMTP mode
     let mut response_body = Vec::new();
     match mode {
         SmtpMode::Send => {
-            do_send_mail(&mut reader, &mut writer, mail_data, config, &caps).await?;
+            do_send_mail(
+                &mut reader,
+                &mut writer,
+                mail_data,
+                config,
+                &caps,
+                &idn_rcpts,
+                need_smtputf8,
+            )
+            .await?;
         }
         SmtpMode::Vrfy => {
-            // Send VRFY for each recipient
-            // curl allows 2xx and 553 (ambiguous) responses; other codes → error 8
-            for rcpt in config.mail_rcpt {
-                send_command(&mut writer, &format!("VRFY {rcpt}")).await?;
+            for rcpt in &idn_rcpts {
+                let mut vrfy_cmd = format!("VRFY {rcpt}");
+                if caps.smtputf8 && need_smtputf8 {
+                    vrfy_cmd.push_str(" SMTPUTF8");
+                }
+                send_command(&mut writer, &vrfy_cmd).await?;
                 let resp = read_response(&mut reader).await?;
                 if !resp.is_ok() && resp.code != 553 {
-                    // Non-2xx/non-553 → QUIT + CURLE_WEIRD_SERVER_REPLY (8)
                     let _ = send_command(&mut writer, "QUIT").await;
                     return Err(Error::Protocol(8));
                 }
@@ -419,18 +442,20 @@ pub async fn send_mail(
             }
         }
         SmtpMode::Custom(cmd) => {
-            // Custom command (e.g., EXPN, NOOP, RSET, vrfy)
-            if config.mail_rcpt.is_empty() {
+            if idn_rcpts.is_empty() {
                 send_command(&mut writer, &cmd).await?;
             } else {
-                for rcpt in config.mail_rcpt {
-                    send_command(&mut writer, &format!("{cmd} {rcpt}")).await?;
+                for rcpt in &idn_rcpts {
+                    let mut custom_cmd = format!("{cmd} {rcpt}");
+                    if caps.smtputf8 && need_smtputf8 {
+                        custom_cmd.push_str(" SMTPUTF8");
+                    }
+                    send_command(&mut writer, &custom_cmd).await?;
                 }
             }
             let resp = read_response(&mut reader).await?;
             response_body.extend_from_slice(resp.raw.as_bytes());
             if !resp.is_ok() {
-                // Non-2xx custom command → QUIT + return CURLE_WEIRD_SERVER_REPLY (8)
                 let _ = send_command(&mut writer, "QUIT").await;
                 return Err(Error::Protocol(8));
             }
@@ -750,9 +775,13 @@ async fn do_send_mail<S: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     mail_data: &[u8],
     config: &SmtpConfig<'_>,
     caps: &EhloCapabilities,
+    idn_rcpts: &[String],
+    need_smtputf8: bool,
 ) -> Result<(), Error> {
     // Determine sender address — default to empty (curl compat: test 915)
     let from_addr = config.mail_from.unwrap_or("");
+    let from_addr =
+        crate::idn::idn_email_address(from_addr).unwrap_or_else(|_| from_addr.to_string());
 
     // Build MAIL FROM command
     let mut mail_from_cmd = format!("MAIL FROM:<{from_addr}>");
@@ -769,6 +798,11 @@ async fn do_send_mail<S: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         let _ = write!(mail_from_cmd, " SIZE={}", mail_data.len());
     }
 
+    // Add SMTPUTF8 if server supports it and addresses have non-ASCII (RFC 6531)
+    if caps.smtputf8 && need_smtputf8 {
+        mail_from_cmd.push_str(" SMTPUTF8");
+    }
+
     send_command(writer, &mail_from_cmd).await?;
     let mail_resp = read_response(reader).await?;
     if !mail_resp.is_ok() {
@@ -781,7 +815,7 @@ async fn do_send_mail<S: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     }
 
     // RCPT TO (one per recipient)
-    for rcpt in config.mail_rcpt {
+    for rcpt in idn_rcpts {
         send_command(writer, &format!("RCPT TO:<{rcpt}>")).await?;
         let rcpt_resp = read_response(reader).await?;
         if !rcpt_resp.is_ok() {

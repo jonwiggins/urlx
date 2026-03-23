@@ -186,7 +186,7 @@ pub fn print_version() {
     println!("curl {version} ({arch}-{os}) libcurl/{version} rustls",);
     println!("Release-Date: 2026-03-16");
     println!("Protocols: dict file ftp ftps http https imap imaps ipfs ipns mqtt pop3 pop3s scp sftp smtp smtps ws wss");
-    println!("Features: alt-svc AsynchDNS brotli cookies Digest HSTS HTTP2 HTTP3 HTTPS-proxy IPv6 Largefile libz NTLM PSL ssl-sessions SSL UnixSockets zstd");
+    println!("Features: alt-svc AsynchDNS brotli cookies Digest HSTS HTTP2 HTTP3 HTTPS-proxy IDN IPv6 Largefile libz NTLM PSL ssl-sessions SSL UnixSockets zstd");
 }
 
 /// Print usage information to stderr.
