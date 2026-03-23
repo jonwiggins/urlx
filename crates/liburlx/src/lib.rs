@@ -20,7 +20,7 @@
 //!
 //! println!("Status: {}", response.status());          // 200
 //! println!("Body: {}", response.body_str()?);          // {"origin": ...}
-//! println!("Time: {:?}", response.info.time_total);    // 0.234s
+//! println!("Content-Type: {:?}", response.content_type()); // Some("application/json")
 //! # Ok(())
 //! # }
 //! ```
@@ -35,7 +35,7 @@
 //! easy.header("Content-Type", "application/json");
 //! easy.body(br#"{"key": "value"}"#);
 //! easy.basic_auth("user", "password");
-//! easy.follow_redirects = true;
+//! easy.follow_redirects(true);
 //!
 //! let response = easy.perform()?;
 //! assert_eq!(response.status(), 200);
