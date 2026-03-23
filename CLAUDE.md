@@ -14,8 +14,8 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Version:** v0.1.0 published (crates.io + GitHub Releases + Homebrew)
-**curl test suite:** 1,234 pass / 5 fail / 149 skip out of 1,245 evaluated tests (99.1% pass rate, tests 1-1400)
+**Version:** v0.2.0 published (crates.io + GitHub Releases + Homebrew)
+**curl test suite:** 1,300 pass / 0 fail / 92 skip out of 1,392 considered tests (100% pass rate of evaluated, tests 1-1400)
 **Rust test count:** 2,655
 **Blockers:** None — infrastructure is live
 
@@ -109,18 +109,12 @@ Document every skip with a reason. Skips without rationale are not allowed.
 
 ---
 
-## Remaining Work: Failure Analysis (as of 2026-03-20)
+## Remaining Work (as of 2026-03-23)
 
-Full test suite run: 1,234 pass / 5 fail / 149 skip (tests 1-1400). **99.1% pass rate.**
+Full test suite run: 1,300 pass / 0 fail / 92 skip (tests 1-1400). **100% pass rate of evaluated tests.**
 25 tests permanently excluded (see `tests/excluded-tests.txt`): 19 source/build analysis + 6 libcurl C API.
-
-### Failing Tests by Category (5 total)
-
-| # | Category | Tests | Count | Root Cause |
-|---|----------|-------|-------|------------|
-| 1 | **Multipart form** | 39, 1133, 1189 | 3 | Content-Length off by ~14 bytes (wrong default MIME type), Content-Type missing space after `;` ([#46](https://github.com/jonwiggins/urlx/issues/46)) |
-| 2 | **HTTP etag** | 339 | 1 | --etag-save returns CURLE_RECV_ERROR (56) instead of success ([#48](https://github.com/jonwiggins/urlx/issues/48)) |
-| 3 | **SFTP upload** | 625 | 1 | SFTP put with --ftp-create-dirs twice — second upload data not written ([#45](https://github.com/jonwiggins/urlx/issues/45)) |
+2 tests (24, 223) hang due to HTTP body read blocking — tracked in [#96](https://github.com/jonwiggins/urlx/issues/96) and [#97](https://github.com/jonwiggins/urlx/issues/97).
+1 test (625) fails for SFTP multi-upload — tracked in [#45](https://github.com/jonwiggins/urlx/issues/45).
 
 ### Permanently Skipped (25 tests)
 
@@ -129,27 +123,18 @@ Full test suite run: 1,234 pass / 5 fail / 149 skip (tests 1-1400). **99.1% pass
 
 All permanently excluded via `tests/excluded-tests.txt`. They verify curl's own source code structure or test libcurl's C API — not applicable to urlx.
 
-### Remaining Failures Analysis
+### Missing Features
 
-| Priority | Category | Tests | Effort | Notes |
-|----------|----------|-------|--------|-------|
-| Medium | Multipart form Content-Type + Content-Length | 3 | 0.5 day | Default MIME type should be `text/plain` not `application/octet-stream`; space after `;` in Content-Type params |
-| Low | HTTP etag recv error | 1 | 0.5 day | Connection close handling during etag extraction |
-| Low | SFTP multi-upload | 1 | 0.5 day | Second upload in multi-URL SFTP transfer |
-
-### Path to 100%
-
-| Milestone | Pass Rate | Work |
-|-----------|-----------|------|
-| Current | 99.1% (1,234/1,245 evaluated) | Done |
-| Fix multipart form defaults | 99.4% (~1,237/1,245) | Fix MIME type default + Content-Type formatting |
-| Fix etag + SFTP | 99.6%+ (~1,239/1,245) | Individual edge cases |
+- SMB/SMBS protocol ([#98](https://github.com/jonwiggins/urlx/issues/98))
+- LDAP/LDAPS protocol ([#99](https://github.com/jonwiggins/urlx/issues/99))
+- Telnet protocol ([#100](https://github.com/jonwiggins/urlx/issues/100))
+- GSS-API / Kerberos authentication ([#101](https://github.com/jonwiggins/urlx/issues/101))
 
 ---
 
 ## Test Suite Progress
 
-1,234 of 1,245 evaluated tests pass (99.1%). The test suite spans tests 1-1400 with 149 skipped and 25 permanently excluded.
+1,300 of 1,300 evaluated tests pass (100%). The test suite spans tests 1-1400 with 92 skipped and 25 permanently excluded.
 
 ---
 

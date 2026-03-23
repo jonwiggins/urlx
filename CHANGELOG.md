@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-03-23
+
 ### Added
 
 - **STARTTLS** — TLS upgrade support for FTPS, SMTP, IMAP, and POP3 (explicit TLS via `STARTTLS`/`AUTH TLS`)
@@ -46,7 +48,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- **curl test suite compatibility: 1,234 pass / 5 fail / 149 skip** (tests 1–1400, 99.1% pass rate), up from 69/98 at v0.1.0
+- **curl test suite compatibility: 1,300 pass / 0 fail / 92 skip** (tests 1–1400, 100% pass rate of evaluated tests), up from 69/98 at v0.1.0
 - **2,655 Rust tests**, up from 2,288
 - **141 source files, ~72,000 lines of Rust**
 - **261 long + 46 short CLI flags** (up from ~150)
@@ -92,4 +94,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   - Property-based tests (proptest) for parsers
   - 4 fuzz harnesses (URL, HTTP, cookie, HSTS)
 
+[0.2.0]: https://github.com/jonwiggins/urlx/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/jonwiggins/urlx/releases/tag/v0.1.0

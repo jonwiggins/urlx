@@ -22,8 +22,8 @@ For bugs that are not security-sensitive, please open a regular [GitHub issue](h
 
 | Version | Supported |
 |---------|-----------|
-| 0.1.x   | Yes       |
-| < 0.1   | No        |
+| 0.2.x   | Yes       |
+| 0.1.x   | No        |
 
 ## License
 
