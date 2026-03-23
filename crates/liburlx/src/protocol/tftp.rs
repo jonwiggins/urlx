@@ -111,7 +111,7 @@ impl TftpErrorCode {
 const DEFAULT_BLOCK_SIZE: usize = 512;
 const MAX_BLOCK_SIZE: usize = 65464;
 /// Maximum TFTP filename length.
-const MAX_TFTP_FILENAME: usize = 512;
+const _MAX_TFTP_FILENAME: usize = 512;
 const OACK_OPCODE: u16 = 6;
 const DEFAULT_TFTP_TIMEOUT: u16 = 6;
 const TFTP_RETRY_COUNT: u64 = 50;
@@ -169,23 +169,25 @@ fn parse_tftp_error(packet: &[u8]) -> Error {
     } else {
         TftpErrorCode::NotDefined
     };
-    let msg = if packet.len() > 5 {
+    let _msg = if packet.len() > 5 {
         let end = if packet[packet.len() - 1] == 0 { packet.len() - 1 } else { packet.len() };
         String::from_utf8_lossy(&packet[4..end]).to_string()
     } else {
         error_code.description().to_string()
     };
-    Error::Transfer { code: error_code.to_curl_code(), message: error_code.curl_message().to_string() }
+    Error::Transfer {
+        code: error_code.to_curl_code(),
+        message: error_code.curl_message().to_string(),
+    }
 }
 
 fn parse_tftp_path(url: &crate::url::Url) -> (String, String) {
     let raw = url.path();
     let path = raw.strip_prefix('/').unwrap_or(raw);
-    if let Some(idx) = path.find(";mode=") {
-        (path[..idx].to_string(), path[idx + 6..].to_string())
-    } else {
-        (path.to_string(), "octet".to_string())
-    }
+    path.find(";mode=").map_or_else(
+        || (path.to_string(), "octet".to_string()),
+        |idx| (path[..idx].to_string(), path[idx + 6..].to_string()),
+    )
 }
 
 async fn bind_socket(interface: Option<&str>, local_port: Option<u16>) -> Result<UdpSocket, Error> {
@@ -212,7 +214,7 @@ fn compute_tftp_timeout(ct: Option<u64>) -> u16 {
 /// # Errors
 ///
 /// Returns an error if the download fails.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub async fn download(
     url: &crate::url::Url,
     blksize: Option<u16>,
@@ -227,6 +229,8 @@ pub async fn download(
     if filename.is_empty() {
         return Err(Error::Http("TFTP filename is required in URL path".to_string()));
     }
+    // DEFAULT_BLOCK_SIZE (512) always fits in u16
+    #[allow(clippy::cast_possible_truncation)]
     let bs = blksize.unwrap_or(DEFAULT_BLOCK_SIZE as u16);
     // Check filename length BEFORE attempting connection (curl compat: test 1453)
     // curl's check: filename_len + mode_len + 4 > blksize
@@ -236,7 +240,7 @@ pub async fn download(
     let socket = bind_socket(interface, local_port).await?;
     let addr = format!("{host}:{port}");
     let rrq = build_request(Opcode::Rrq, &filename, &mode, bs, 0, no_options);
-    socket
+    let _ = socket
         .send_to(&rrq, &addr)
         .await
         .map_err(|e| Error::Http(format!("TFTP send RRQ error: {e}")))?;
@@ -245,7 +249,7 @@ pub async fn download(
     let mut exp_block: u16 = 1;
     let mut buf = vec![0u8; 4 + MAX_BLOCK_SIZE];
     let start = Instant::now();
-    let sl = low_speed_limit.unwrap_or(0) as u64;
+    let sl = u64::from(low_speed_limit.unwrap_or(0));
     let st = low_speed_time.unwrap_or(Duration::ZERO);
     let chk = sl > 0 && !st.is_zero();
     loop {
@@ -297,7 +301,7 @@ pub async fn download(
                     data.extend_from_slice(&pkt[4..]);
                     exp_block = exp_block.wrapping_add(1);
                 }
-                socket
+                let _ = socket
                     .send_to(&build_ack(bn), src)
                     .await
                     .map_err(|e| Error::Http(format!("TFTP send ACK error: {e}")))?;
@@ -320,7 +324,7 @@ pub async fn download(
                         }
                     }
                 }
-                socket
+                let _ = socket
                     .send_to(&build_ack(0), src)
                     .await
                     .map_err(|e| Error::Http(format!("TFTP send OACK ACK error: {e}")))?;
@@ -331,7 +335,7 @@ pub async fn download(
         }
     }
     let mut h = std::collections::HashMap::new();
-    h.insert("content-length".to_string(), data.len().to_string());
+    let _ = h.insert("content-length".to_string(), data.len().to_string());
     Ok(Response::new(200, h, data, url.as_str().to_string()))
 }
 
@@ -355,6 +359,8 @@ pub async fn upload(
     if filename.is_empty() {
         return Err(Error::Http("TFTP filename is required in URL path".to_string()));
     }
+    // DEFAULT_BLOCK_SIZE (512) always fits in u16
+    #[allow(clippy::cast_possible_truncation)]
     let bs = blksize.unwrap_or(DEFAULT_BLOCK_SIZE as u16);
     // Check filename length BEFORE attempting connection (curl compat: test 1453)
     // curl's check: filename_len + mode_len + 4 > blksize
@@ -370,7 +376,7 @@ pub async fn upload(
         wrq.extend_from_slice(t.to_string().as_bytes());
         wrq.push(0);
     }
-    socket
+    let _ = socket
         .send_to(&wrq, &addr)
         .await
         .map_err(|e| Error::Http(format!("TFTP send WRQ error: {e}")))?;
@@ -410,7 +416,7 @@ pub async fn upload(
     loop {
         let end = std::cmp::min(off + eff_bs, data.len());
         let chunk = &data[off..end];
-        socket
+        let _ = socket
             .send_to(&build_data(bn, chunk), peer)
             .await
             .map_err(|e| Error::Http(format!("TFTP send DATA error: {e}")))?;
@@ -427,11 +433,11 @@ pub async fn upload(
             break;
         }
         if off == data.len() {
-            socket
+            let _ = socket
                 .send_to(&build_data(bn, &[]), peer)
                 .await
                 .map_err(|e| Error::Http(format!("TFTP send final error: {e}")))?;
-            socket
+            let _ = socket
                 .recv_from(&mut buf)
                 .await
                 .map_err(|e| Error::Http(format!("TFTP recv final error: {e}")))?;
@@ -439,7 +445,7 @@ pub async fn upload(
         }
     }
     let mut h = std::collections::HashMap::new();
-    h.insert("content-length".to_string(), "0".to_string());
+    let _ = h.insert("content-length".to_string(), "0".to_string());
     Ok(Response::new(200, h, Vec::new(), url.as_str().to_string()))
 }
 

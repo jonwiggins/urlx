@@ -1513,7 +1513,7 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
                     return Err(1);
                 }
             }
-            "-Y" | "-Y" | "--speed-limit" => {
+            "-Y" | "--speed-limit" => {
                 i += 1;
                 let val = require_arg(args, i, "--speed-limit")?;
                 if let Ok(limit) = val.parse::<u32>() {
@@ -1524,7 +1524,7 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
                     return Err(1);
                 }
             }
-            "-y" | "-y" | "--speed-time" => {
+            "-y" | "--speed-time" => {
                 i += 1;
                 let val = require_arg(args, i, "--speed-time")?;
                 if let Ok(secs) = val.parse::<u64>() {
