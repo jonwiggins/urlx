@@ -77,6 +77,19 @@ impl Url {
                 if inner.host_str().is_some_and(|h| h.len() > 65535) {
                     return Err(Error::UrlParse("hostname too long".to_string()));
                 }
+                // Validate Punycode label lengths (max 63 bytes per label).
+                // The `url` crate converts IDN hostnames to Punycode but does not
+                // reject labels that exceed the 63-byte DNS limit. Only check
+                // labels starting with "xn--" (Punycode-encoded from non-ASCII
+                // input) to avoid rejecting long ASCII hostnames that may be
+                // valid for SOCKS5h proxies (curl compat: tests 728, 1035).
+                if let Some(h) = inner.host_str() {
+                    for label in h.split('.') {
+                        if label.starts_with("xn--") && label.len() > 63 {
+                            return Err(Error::UrlParse("hostname label too long".to_string()));
+                        }
+                    }
+                }
                 Ok(Self { inner, override_host: None, raw_input: Some(input.clone()) })
             }
             Err(e) => {
@@ -102,6 +115,16 @@ impl Url {
                         let host_end =
                             host_rest.find([':', '/', '?', '#']).unwrap_or(host_rest.len());
                         let original_host = &host_rest[..host_end];
+
+                        // If the hostname contains non-ASCII characters, this is a
+                        // genuine IDN conversion failure (not a WHATWG quirk for
+                        // hostnames like "test.80"). Reject it as malformed
+                        // (curl compat: test 1034).
+                        if !original_host.is_ascii() {
+                            return Err(Error::UrlParse(format!(
+                                "IDN hostname conversion failed: {original_host}"
+                            )));
+                        }
 
                         // Replace with a placeholder hostname that the url crate accepts
                         let placeholder = "urlx-placeholder.invalid";

@@ -1894,6 +1894,7 @@ dependencies = [
  "httparse",
  "hyper",
  "hyper-util",
+ "idna",
  "md-5",
  "md4",
  "openssl",

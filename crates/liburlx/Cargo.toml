@@ -67,6 +67,7 @@ openssl = { version = "0.10", optional = true }
 openssl-sys = { version = "0.9", optional = true }
 tokio-openssl = { version = "0.6", optional = true }
 psl = "2"
+idna = "1"
 des = "0.8"
 cipher = "0.4"
 
