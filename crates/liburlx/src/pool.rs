@@ -32,6 +32,9 @@ pub enum PooledStream {
     /// TLS-wrapped connection (HTTPS).
     #[cfg(feature = "rustls")]
     Tls(tokio_rustls::client::TlsStream<TcpStream>),
+    /// TLS-SRP connection via OpenSSL.
+    #[cfg(feature = "tls-srp")]
+    OpenSslTls(tokio_openssl::SslStream<TcpStream>),
     /// Unix domain socket connection.
     #[cfg(unix)]
     Unix(tokio::net::UnixStream),
@@ -44,6 +47,8 @@ impl PooledStream {
             Self::Tcp(s) => s.local_addr().ok(),
             #[cfg(feature = "rustls")]
             Self::Tls(s) => s.get_ref().0.local_addr().ok(),
+            #[cfg(feature = "tls-srp")]
+            Self::OpenSslTls(s) => s.get_ref().local_addr().ok(),
             #[cfg(unix)]
             Self::Unix(_) => None,
         }
@@ -55,6 +60,8 @@ impl PooledStream {
             Self::Tcp(s) => s.peer_addr().ok(),
             #[cfg(feature = "rustls")]
             Self::Tls(s) => s.get_ref().0.peer_addr().ok(),
+            #[cfg(feature = "tls-srp")]
+            Self::OpenSslTls(s) => s.get_ref().peer_addr().ok(),
             #[cfg(unix)]
             Self::Unix(_) => None,
         }
@@ -71,6 +78,8 @@ impl AsyncRead for PooledStream {
             Self::Tcp(s) => Pin::new(s).poll_read(cx, buf),
             #[cfg(feature = "rustls")]
             Self::Tls(s) => Pin::new(s).poll_read(cx, buf),
+            #[cfg(feature = "tls-srp")]
+            Self::OpenSslTls(s) => Pin::new(s).poll_read(cx, buf),
             #[cfg(unix)]
             Self::Unix(s) => Pin::new(s).poll_read(cx, buf),
         }
@@ -87,6 +96,8 @@ impl AsyncWrite for PooledStream {
             Self::Tcp(s) => Pin::new(s).poll_write(cx, buf),
             #[cfg(feature = "rustls")]
             Self::Tls(s) => Pin::new(s).poll_write(cx, buf),
+            #[cfg(feature = "tls-srp")]
+            Self::OpenSslTls(s) => Pin::new(s).poll_write(cx, buf),
             #[cfg(unix)]
             Self::Unix(s) => Pin::new(s).poll_write(cx, buf),
         }
@@ -97,6 +108,8 @@ impl AsyncWrite for PooledStream {
             Self::Tcp(s) => Pin::new(s).poll_flush(cx),
             #[cfg(feature = "rustls")]
             Self::Tls(s) => Pin::new(s).poll_flush(cx),
+            #[cfg(feature = "tls-srp")]
+            Self::OpenSslTls(s) => Pin::new(s).poll_flush(cx),
             #[cfg(unix)]
             Self::Unix(s) => Pin::new(s).poll_flush(cx),
         }
@@ -107,6 +120,8 @@ impl AsyncWrite for PooledStream {
             Self::Tcp(s) => Pin::new(s).poll_shutdown(cx),
             #[cfg(feature = "rustls")]
             Self::Tls(s) => Pin::new(s).poll_shutdown(cx),
+            #[cfg(feature = "tls-srp")]
+            Self::OpenSslTls(s) => Pin::new(s).poll_shutdown(cx),
             #[cfg(unix)]
             Self::Unix(s) => Pin::new(s).poll_shutdown(cx),
         }

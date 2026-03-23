@@ -1640,6 +1640,16 @@ impl Easy {
         self.tls_config.session_cache = enable;
     }
 
+    /// Set the TLS-SRP username. Equivalent to curl's `--tlsuser`.
+    pub fn ssl_srp_user(&mut self, user: &str) {
+        self.tls_config.srp_user = Some(user.to_string());
+    }
+
+    /// Set the TLS-SRP password. Equivalent to curl's `--tlspassword`.
+    pub fn ssl_srp_password(&mut self, password: &str) {
+        self.tls_config.srp_password = Some(password.to_string());
+    }
+
     /// Enable or disable `TCP_NODELAY` (Nagle's algorithm).
     ///
     /// When enabled (the default), small packets are sent immediately without
@@ -6439,6 +6449,57 @@ async fn do_single_request(
                 } else {
                     tcp_stream
                 };
+
+                // TLS-SRP path: use OpenSSL SRP connector instead of rustls
+                #[cfg(feature = "tls-srp")]
+                if tls_config.srp_user.is_some() && tls_config.srp_password.is_some() {
+                    let srp_tls = crate::tls::SrpTlsConnector::new(tls_config)?;
+                    let srp_stream = srp_tls.connect(tls_stream_inner, &host).await?;
+                    let time_appconnect = request_start.elapsed();
+                    let tls_certs_der: Vec<Vec<u8>> = Vec::new();
+
+                    let request_target =
+                        resolve_request_target(custom_request_target, url, path_as_is);
+                    let use_http10 = http_version == HttpVersion::Http10;
+                    let time_pretransfer = request_start.elapsed();
+                    let mut stream = PooledStream::OpenSslTls(srp_stream);
+                    let (resp, can_reuse) = crate::protocol::http::h1::request(
+                        &mut stream,
+                        method,
+                        &host_header,
+                        &request_target,
+                        &effective_headers,
+                        body,
+                        url.as_str(),
+                        use_pool,
+                        use_http10,
+                        expect_100_timeout,
+                        ignore_content_length,
+                        speed_limits,
+                        chunked_upload,
+                        http09_allowed,
+                        deadline,
+                        raw,
+                        fail_on_error,
+                    )
+                    .await?;
+                    let time_starttransfer = request_start.elapsed();
+
+                    if can_reuse && use_pool && !forbid_reuse {
+                        pool.put(&host, port, is_tls, stream);
+                    }
+
+                    let mut resp = resp;
+                    let mut info = resp.transfer_info().clone();
+                    info.time_namelookup = time_namelookup;
+                    info.time_connect = time_connect;
+                    info.time_appconnect = time_appconnect;
+                    info.time_pretransfer = time_pretransfer;
+                    info.time_starttransfer = time_starttransfer;
+                    info.certs_der = tls_certs_der;
+                    resp.set_transfer_info(info);
+                    return Ok(resp);
+                }
 
                 let tls = crate::tls::TlsConnector::new(tls_config)?;
                 let (tls_stream, alpn) = tls.connect(tls_stream_inner, &host).await?;
