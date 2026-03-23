@@ -24,6 +24,7 @@ http3 = ["dep:quinn", "dep:h3", "dep:h3-quinn", "dep:bytes"]
 
 # TLS backends
 rustls = ["dep:rustls", "dep:webpki-roots", "dep:tokio-rustls"]
+tls-srp = ["dep:openssl", "dep:openssl-sys", "dep:tokio-openssl"]
 
 # SSH/SFTP/SCP protocols
 ssh = ["dep:russh", "dep:russh-sftp"]
@@ -62,6 +63,9 @@ flate2 = { version = "1", optional = true }
 brotli = { version = "7", optional = true }
 zstd = { version = "0.13", optional = true, default-features = false }
 hickory-resolver = { version = "0.25", optional = true, default-features = false, features = ["tokio", "system-config", "https-ring", "tls-ring"] }
+openssl = { version = "0.10", optional = true }
+openssl-sys = { version = "0.9", optional = true }
+tokio-openssl = { version = "0.6", optional = true }
 psl = "2"
 idna = "1"
 des = "0.8"
