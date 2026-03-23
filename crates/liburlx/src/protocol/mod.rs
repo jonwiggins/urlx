@@ -6,6 +6,7 @@
 pub mod dict;
 pub mod file;
 pub mod ftp;
+pub mod gopher;
 pub mod http;
 pub mod imap;
 pub mod mqtt;
