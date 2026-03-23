@@ -113,7 +113,7 @@ Document every skip with a reason. Skips without rationale are not allowed.
 
 Full test suite run: 1,300 pass / 0 fail / 92 skip (tests 1-1400). **100% pass rate of evaluated tests.**
 25 tests permanently excluded (see `tests/excluded-tests.txt`): 19 source/build analysis + 6 libcurl C API.
-2 tests (24, 223) hang due to HTTP body read blocking — tracked in [#96](https://github.com/jonwiggins/urlx/issues/96) and [#97](https://github.com/jonwiggins/urlx/issues/97).
+Tests 24 and 223 previously hung due to HTTP body read blocking ([#96](https://github.com/jonwiggins/urlx/issues/96), [#97](https://github.com/jonwiggins/urlx/issues/97)) — both are now fixed and passing. Test 24 was fixed by propagating `--fail` to the Easy handle (commit 129e242). Test 223 was fixed by `read_exact_body_with_encoding_check()` which detects corrupt deflate encoding via incremental decompression checking without waiting for full Content-Length.
 1 test (625) fails for SFTP multi-upload — tracked in [#45](https://github.com/jonwiggins/urlx/issues/45).
 
 ### Permanently Skipped (25 tests)
