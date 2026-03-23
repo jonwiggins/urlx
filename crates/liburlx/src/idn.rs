@@ -79,7 +79,10 @@ mod tests {
     #[test]
     fn german_sharp_s() {
         let result = hostname_to_ascii("große.de").unwrap();
-        assert!(result.ends_with(".de"));
+        // ".de" is a TLD, not a file extension — clippy's heuristic is a false positive here
+        #[allow(clippy::case_sensitive_file_extension_comparisons)]
+        let ends_with_de = result.ends_with(".de");
+        assert!(ends_with_de);
         assert!(result.starts_with("xn--") || result.contains("xn--"));
     }
 

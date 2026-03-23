@@ -86,9 +86,7 @@ impl Url {
                 if let Some(h) = inner.host_str() {
                     for label in h.split('.') {
                         if label.starts_with("xn--") && label.len() > 63 {
-                            return Err(Error::UrlParse(
-                                "hostname label too long".to_string(),
-                            ));
+                            return Err(Error::UrlParse("hostname label too long".to_string()));
                         }
                     }
                 }
