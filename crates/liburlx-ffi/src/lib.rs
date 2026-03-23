@@ -1269,7 +1269,7 @@ struct EasyHandle {
     /// MIME handle for `CURLOPT_MIMEPOST`.
     mimepost: *mut c_void,
     error_buf: [u8; 256],
-    /// When true, include HTTP headers in the body output (CURLOPT_HEADER).
+    /// When true, include HTTP headers in the body output (`CURLOPT_HEADER`).
     include_headers: bool,
 }
 
