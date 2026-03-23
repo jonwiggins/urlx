@@ -758,8 +758,14 @@ mod openssl_srp_impl {
                 Self::set_srp_credentials(&mut builder, user, password)?;
             }
 
-            // Enable SRP cipher suites alongside normal ones for negotiation
-            builder.set_cipher_list("SRP:DEFAULT").map_err(|e| Error::Tls(Box::new(e)))?;
+            // Use SRP-only cipher suites (no fallback to non-SRP ciphers).
+            // SRP ciphers only work with TLS 1.2 and below, so cap the max version.
+            builder
+                .set_cipher_list("SRP")
+                .map_err(|e| Error::Tls(Box::new(e)))?;
+            builder
+                .set_max_proto_version(Some(openssl::ssl::SslVersion::TLS1_2))
+                .map_err(|e| Error::Tls(Box::new(e)))?;
 
             // Configure certificate verification
             if !tls_config.verify_peer {
@@ -768,23 +774,9 @@ mod openssl_srp_impl {
 
             // Set CA cert if provided
             if let Some(ref ca_path) = tls_config.ca_cert {
-                builder.set_ca_file(ca_path).map_err(|e| Error::Tls(Box::new(e)))?;
-            }
-
-            // Restrict TLS versions if configured
-            if let Some(ref min) = tls_config.min_tls_version {
-                let ver = match min {
-                    super::TlsVersion::Tls12 => openssl::ssl::SslVersion::TLS1_2,
-                    super::TlsVersion::Tls13 => openssl::ssl::SslVersion::TLS1_3,
-                };
-                builder.set_min_proto_version(Some(ver)).map_err(|e| Error::Tls(Box::new(e)))?;
-            }
-            if let Some(ref max) = tls_config.max_tls_version {
-                let ver = match max {
-                    super::TlsVersion::Tls12 => openssl::ssl::SslVersion::TLS1_2,
-                    super::TlsVersion::Tls13 => openssl::ssl::SslVersion::TLS1_3,
-                };
-                builder.set_max_proto_version(Some(ver)).map_err(|e| Error::Tls(Box::new(e)))?;
+                builder
+                    .set_ca_file(ca_path)
+                    .map_err(|e| Error::Tls(Box::new(e)))?;
             }
 
             let connector = builder.build();
