@@ -1923,12 +1923,6 @@ pub unsafe extern "C" fn curl_easy_setopt(
                 CURLcode::CURLE_OK
             }
 
-            // CURLOPT_HEADER = 42
-            42 => {
-                h.include_headers = value as c_long != 0;
-                CURLcode::CURLE_OK
-            }
-
             // CURLOPT_SSLVERSION = 32
             32 => {
                 // libcurl: 0=default, 6=TLSv1.2, 7=TLSv1.3
