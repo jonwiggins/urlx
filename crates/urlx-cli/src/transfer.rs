@@ -1748,6 +1748,13 @@ pub fn run(args: &[String]) -> ExitCode {
         }
     }
 
+    // Propagate --fail flag to the Easy handle so the HTTP protocol handler
+    // can skip body reading on error status (avoids hang on HTTP/1.0 responses
+    // without Content-Length; curl compat: test 24).
+    if opts.fail_on_error {
+        opts.easy.fail_on_error(true);
+    }
+
     let result = perform_with_retry(&mut opts);
 
     // Save cookie jar after transfer (even on error)
@@ -2740,6 +2747,11 @@ pub fn run_multi(
         });
 
     let mut easy = template.clone();
+    // Propagate fail_on_error to the Easy handle so the HTTP protocol handler
+    // can skip body reading on error status (curl compat: test 24).
+    if fail_on_error {
+        easy.fail_on_error(true);
+    }
     let mut last_exit = ExitCode::SUCCESS;
     // Track HTTP version downgrade across requests (curl compat: test 1074).
     // When server responds with HTTP/1.0, subsequent requests should also use HTTP/1.0.
@@ -3487,6 +3499,9 @@ fn run_multi_parallel(
 
     for url in urls {
         let mut easy = template.clone();
+        if fail_on_error {
+            easy.fail_on_error(true);
+        }
         if let Err(e) = easy.url(url) {
             if !silent || show_error {
                 eprintln!("curl: error parsing URL '{url}': {e}");
