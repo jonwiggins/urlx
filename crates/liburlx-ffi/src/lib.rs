@@ -3508,21 +3508,36 @@ pub unsafe extern "C" fn curl_easy_getinfo(
             // CURLINFO_RTSP_CLIENT_CSEQ = 0x200045
             0x20_0045 => {
                 let out = unsafe { &mut *out.cast::<c_long>() };
-                *out = c_long::from(h.easy.rtsp_client_cseq());
+                // `as c_long` needed: c_long is i32 on Windows, i64 on Unix;
+                // From<u32> is not impl for i32.
+                #[allow(clippy::cast_lossless)]
+                {
+                    *out = h.easy.rtsp_client_cseq() as c_long;
+                }
                 CURLcode::CURLE_OK
             }
 
             // CURLINFO_RTSP_SERVER_CSEQ = 0x200046
             0x20_0046 => {
                 let out = unsafe { &mut *out.cast::<c_long>() };
-                *out = c_long::from(h.easy.rtsp_server_cseq());
+                // `as c_long` needed: c_long is i32 on Windows, i64 on Unix;
+                // From<u32> is not impl for i32.
+                #[allow(clippy::cast_lossless)]
+                {
+                    *out = h.easy.rtsp_server_cseq() as c_long;
+                }
                 CURLcode::CURLE_OK
             }
 
             // CURLINFO_RTSP_CSEQ_RECV = 0x200047
             0x20_0047 => {
                 let out = unsafe { &mut *out.cast::<c_long>() };
-                *out = c_long::from(h.easy.rtsp_cseq_recv());
+                // `as c_long` needed: c_long is i32 on Windows, i64 on Unix;
+                // From<u32> is not impl for i32.
+                #[allow(clippy::cast_lossless)]
+                {
+                    *out = h.easy.rtsp_cseq_recv() as c_long;
+                }
                 CURLcode::CURLE_OK
             }
 
