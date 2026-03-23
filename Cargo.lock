@@ -1874,7 +1874,7 @@ dependencies = [
 
 [[package]]
 name = "liburlx"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "base64",
  "brotli",
@@ -1921,7 +1921,7 @@ dependencies = [
 
 [[package]]
 name = "liburlx-ffi"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "cbindgen",
  "liburlx",
@@ -3682,7 +3682,7 @@ dependencies = [
 
 [[package]]
 name = "urlx-cli"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "filetime",
  "libc",
