@@ -4,7 +4,7 @@ exclude = ["crates/liburlx/fuzz"]
 resolver = "2"
 
 [workspace.package]
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 rust-version = "1.85.0"
 license = "MIT"
