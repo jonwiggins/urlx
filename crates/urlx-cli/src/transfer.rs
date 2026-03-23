@@ -1680,7 +1680,8 @@ pub fn run(args: &[String]) -> ExitCode {
                 || lower.starts_with("smtps://")
                 || lower.starts_with("mqtt://")
                 || lower.starts_with("gopher://")
-                || lower.starts_with("gophers://"))
+                || lower.starts_with("gophers://")
+                || lower.starts_with("tftp://"))
     }) {
         opts.include_headers = false;
     }
