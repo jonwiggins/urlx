@@ -803,8 +803,15 @@ where
         {
             Ok((body, eof, trailers, raw_trailers)) => (body, eof, trailers, raw_trailers, None),
             Err(Error::PartialBody { partial_body, message }) => {
-                // Chunked decode error with partial data — return headers + partial body
-                (partial_body, true, HashMap::new(), Vec::new(), Some(message))
+                // Bad content encoding: discard partial body — it contains raw compressed
+                // data that failed decompression and must not be output
+                // (curl compat: test 223 — broken deflate produces no body output).
+                if message == "bad_content_encoding" {
+                    (Vec::new(), true, HashMap::new(), Vec::new(), Some(message))
+                } else {
+                    // Other partial body errors: return headers + partial body
+                    (partial_body, true, HashMap::new(), Vec::new(), Some(message))
+                }
             }
             Err(e) => {
                 // Other body read errors — return headers only
