@@ -178,6 +178,8 @@ impl Url {
         self.inner.port_or_known_default().or_else(|| match self.inner.scheme() {
             "ftps" => Some(990),
             "sftp" | "scp" | "ssh" => Some(22),
+            "gopher" => Some(70),
+            "gophers" => Some(443),
             "rtsp" => Some(554),
             "rtsps" => Some(322),
             _ => None,
