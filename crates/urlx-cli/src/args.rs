@@ -15,6 +15,8 @@ pub enum ParseResult {
     Help,
     /// `--version` / `-V` was requested — print version and exit 0.
     Version,
+    /// `--engine list` was requested — print available engines and exit 0.
+    EngineList,
     /// Parse error — message already printed to stderr.
     /// Contains the curl-compatible exit code (default 1).
     Error(u8),
@@ -183,7 +185,7 @@ pub fn print_version() {
     let version = env!("CARGO_PKG_VERSION");
     let arch = std::env::consts::ARCH;
     let os = std::env::consts::OS;
-    println!("curl {version} ({arch}-{os}) libcurl/{version} rustls",);
+    println!("curl {version} ({arch}-{os}) libcurl/{version} rustls OpenSSL",);
     println!("Release-Date: 2026-03-16");
     println!("Protocols: dict file ftp ftps http https imap imaps ipfs ipns mqtt pop3 pop3s scp sftp smtp smtps ws wss");
     println!("Features: alt-svc AsynchDNS brotli cookies Digest HSTS HTTP2 HTTP3 HTTPS-proxy IPv6 Largefile libz NTLM PSL ssl-sessions SSL UnixSockets zstd");
@@ -360,11 +362,17 @@ pub fn parse_args(args: &[String]) -> ParseResult {
     // Step 1: Expand combined short flags
     let expanded = expand_combined_flags(args);
 
-    // Step 2: Check for --help/-h and --version/-V (early exit, like curl)
-    for arg in expanded.iter().skip(1) {
+    // Step 2: Check for --help/-h, --version/-V, and --engine list (early exit, like curl)
+    for (idx, arg) in expanded.iter().enumerate().skip(1) {
         match arg.as_str() {
             "-h" | "--help" => return ParseResult::Help,
             "-V" | "--version" => return ParseResult::Version,
+            // --engine list: print available engines and exit (curl compat: test 307)
+            "--engine" => {
+                if expanded.get(idx + 1).map(String::as_str) == Some("list") {
+                    return ParseResult::EngineList;
+                }
+            }
             _ => {}
         }
     }
@@ -559,6 +567,7 @@ fn expand_combined_flags(args: &[String]) -> Vec<String> {
                         | "--speed-time"
                         | "--local-port"
                         | "--ciphers"
+                        | "--engine"
                         | "--tls13-ciphers"
                         | "--proxy-cert"
                         | "--proxy-key"
@@ -2197,6 +2206,19 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
                 let _val = require_arg(args, i, &args[i - 1].clone())?;
                 // Accepted for compat; ssh key auth handled by ssh module
             }
+            // SSL crypto engine selection (curl compat: tests 307, 308)
+            "--engine" => {
+                i += 1;
+                let val = require_arg(args, i, &args[i - 1].clone())?;
+                match val {
+                    // "openssl" and "default" are accepted as no-ops (built-in engine)
+                    "list" | "openssl" | "default" => {}
+                    _ => {
+                        eprintln!("curl: (53) SSL crypto engine '{val}' not found");
+                        return Err(53);
+                    }
+                }
+            }
             // No-op flags that take an argument
             "--create-file-mode"
             | "--service-name"
@@ -2214,7 +2236,6 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
             | "--proxy-pinnedpubkey"
             | "--proxy-pass"
             | "--curves"
-            | "--engine"
             | "--krb"
             | "--random-file"
             | "--egd-file"
@@ -3967,6 +3988,7 @@ mod tests {
             ParseResult::Options(opts) => *opts,
             ParseResult::Help => panic!("expected Options, got Help"),
             ParseResult::Version => panic!("expected Options, got Version"),
+            ParseResult::EngineList => panic!("expected Options, got EngineList"),
             ParseResult::Error(_) => panic!("expected Options, got Error"),
         }
     }
@@ -6361,6 +6383,34 @@ mod tests {
         let args = make_args(&["--key-type", "PEM", "http://example.com"]);
         let opts = unwrap_opts(parse_args(&args));
         assert!(!opts.urls.is_empty());
+    }
+
+    #[test]
+    fn parse_args_engine_list() {
+        let args = make_args(&["--engine", "list"]);
+        let result = parse_args(&args);
+        assert!(matches!(result, ParseResult::EngineList));
+    }
+
+    #[test]
+    fn parse_args_engine_openssl() {
+        let args = make_args(&["--engine", "openssl", "https://example.com"]);
+        let opts = unwrap_opts(parse_args(&args));
+        assert!(!opts.urls.is_empty());
+    }
+
+    #[test]
+    fn parse_args_engine_default() {
+        let args = make_args(&["--engine", "default", "https://example.com"]);
+        let opts = unwrap_opts(parse_args(&args));
+        assert!(!opts.urls.is_empty());
+    }
+
+    #[test]
+    fn parse_args_engine_invalid() {
+        let args = make_args(&["--engine", "invalid-crypto-engine-xyzzy", "https://example.com"]);
+        let result = parse_args(&args);
+        assert!(matches!(result, ParseResult::Error(53)));
     }
 
     #[test]
