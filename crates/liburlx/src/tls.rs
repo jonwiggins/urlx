@@ -760,9 +760,7 @@ mod openssl_srp_impl {
 
             // Use SRP-only cipher suites (no fallback to non-SRP ciphers).
             // SRP ciphers only work with TLS 1.2 and below, so cap the max version.
-            builder
-                .set_cipher_list("SRP")
-                .map_err(|e| Error::Tls(Box::new(e)))?;
+            builder.set_cipher_list("SRP").map_err(|e| Error::Tls(Box::new(e)))?;
             builder
                 .set_max_proto_version(Some(openssl::ssl::SslVersion::TLS1_2))
                 .map_err(|e| Error::Tls(Box::new(e)))?;
@@ -774,9 +772,7 @@ mod openssl_srp_impl {
 
             // Set CA cert if provided
             if let Some(ref ca_path) = tls_config.ca_cert {
-                builder
-                    .set_ca_file(ca_path)
-                    .map_err(|e| Error::Tls(Box::new(e)))?;
+                builder.set_ca_file(ca_path).map_err(|e| Error::Tls(Box::new(e)))?;
             }
 
             let connector = builder.build();
