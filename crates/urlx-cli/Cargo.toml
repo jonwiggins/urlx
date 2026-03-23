@@ -18,11 +18,17 @@ path = "src/main.rs"
 workspace = true
 
 [features]
-default = []
+default = ["rustls", "http2", "decompression", "ssh"]
+rustls = ["liburlx/rustls"]
+http2 = ["liburlx/http2"]
+http3 = ["liburlx/http3"]
+decompression = ["liburlx/decompression"]
+ssh = ["liburlx/ssh"]
 tls-srp = ["liburlx/tls-srp"]
+hickory-dns = ["liburlx/hickory-dns"]
 
 [dependencies]
 filetime = "0.2"
 libc = "0.2"
-liburlx = { path = "../liburlx", version = "0.1.0", features = ["ssh"] }
+liburlx = { path = "../liburlx", version = "0.1.0", default-features = false, features = ["http"] }
 tokio = { version = "1", features = ["rt"] }

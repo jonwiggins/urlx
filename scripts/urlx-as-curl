@@ -5,20 +5,13 @@
 # 3. Overrides default User-Agent to match curl's format
 
 URLX="${URLX_BIN:-$(dirname "$0")/../target/release/urlx}"
-VERSION="0.1.0"
+# Extract version from urlx --version output (first word after "urlx ")
+VERSION=$("$URLX" --version 2>&1 | head -1 | awk '{print $2}')
 
 if [ "$1" = "--version" ]; then
-    # Get urlx version
-    version_output=$("$URLX" --version 2>&1)
-    protocols=$(echo "$version_output" | grep '^Protocols:' | sed 's/^Protocols: //')
-    features=$(echo "$version_output" | grep '^Features:' | sed 's/^Features: //')
-
-    # Output in curl's expected format
-    # Pass through the first line from urlx --version (contains TLS backend info)
-    echo "$version_output" | head -1
-    echo "Release-Date: 2026-03-11"
-    echo "Protocols: ${protocols}"
-    echo "Features: ${features}"
+    # Get urlx version and translate branding to curl-compatible format
+    # for the test runner (runtests.pl expects "curl <ver> ... libcurl/<ver> ...")
+    "$URLX" --version 2>&1 | sed -e 's/^urlx /curl /' -e 's/liburlx\//libcurl\//'
     exit 0
 fi
 

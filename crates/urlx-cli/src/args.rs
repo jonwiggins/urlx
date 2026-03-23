@@ -178,23 +178,87 @@ pub struct CliOptions {
 
 /// Print version information to stdout.
 ///
-/// Matches curl's `--version` output format so that curl's test suite can parse it.
-///
-/// The test runner (`runtests.pl`) expects: `curl <version> (<platform>) libcurl/<version> ...`
+/// Shows urlx's own branding. The `urlx-as-curl` wrapper script translates
+/// this to curl-compatible format for the curl test suite.
 pub fn print_version() {
     let version = env!("CARGO_PKG_VERSION");
     let arch = std::env::consts::ARCH;
     let os = std::env::consts::OS;
-    println!("curl {version} ({arch}-{os}) libcurl/{version} rustls OpenSSL",);
-    println!("Release-Date: 2026-03-16");
-    println!("Protocols: dict file ftp ftps gopher gophers http https imap imaps ipfs ipns mqtt pop3 pop3s rtsp scp sftp smtp smtps tftp ws wss");
-    println!("Features: alt-svc AsynchDNS brotli cookies Digest HSTS HTTP2 HTTP3 HTTPS-proxy IDN IPv6 Largefile libz NTLM PSL ssl-sessions SSL TLS-SRP UnixSockets zstd");
+
+    // TLS backends
+    let mut tls_backends = Vec::new();
+    if cfg!(feature = "rustls") {
+        tls_backends.push("rustls");
+    }
+    if cfg!(feature = "tls-srp") {
+        tls_backends.push("OpenSSL");
+    }
+    let tls_str = tls_backends.join(" ");
+
+    println!("urlx {version} ({arch}-{os}) liburlx/{version} {tls_str}");
+    println!("Release-Date: {}", env!("URLX_RELEASE_DATE"));
+
+    // Protocols — built from compiled features
+    let mut protocols = vec!["dict", "file"];
+    protocols.extend_from_slice(&["ftp", "ftps"]);
+    protocols.extend_from_slice(&["gopher", "gophers"]);
+    protocols.extend_from_slice(&["http", "https"]);
+    protocols.extend_from_slice(&["imap", "imaps"]);
+    protocols.extend_from_slice(&["ipfs", "ipns"]);
+    protocols.push("mqtt");
+    protocols.extend_from_slice(&["pop3", "pop3s"]);
+    protocols.push("rtsp");
+    if cfg!(feature = "ssh") {
+        protocols.extend_from_slice(&["scp", "sftp"]);
+    }
+    protocols.extend_from_slice(&["smtp", "smtps"]);
+    protocols.push("tftp");
+    protocols.extend_from_slice(&["ws", "wss"]);
+    println!("Protocols: {}", protocols.join(" "));
+
+    // Features — built from compiled features
+    let mut features = Vec::new();
+    features.push("alt-svc");
+    features.push("AsynchDNS");
+    if cfg!(feature = "decompression") {
+        features.push("brotli");
+    }
+    features.push("cookies");
+    features.push("Digest");
+    features.push("HSTS");
+    if cfg!(feature = "http2") {
+        features.push("HTTP2");
+    }
+    if cfg!(feature = "http3") {
+        features.push("HTTP3");
+    }
+    features.push("HTTPS-proxy");
+    features.push("IDN");
+    features.push("IPv6");
+    features.push("Largefile");
+    if cfg!(feature = "decompression") {
+        features.push("libz");
+    }
+    features.push("NTLM");
+    features.push("PSL");
+    features.push("ssl-sessions");
+    if cfg!(feature = "rustls") || cfg!(feature = "tls-srp") {
+        features.push("SSL");
+    }
+    if cfg!(feature = "tls-srp") {
+        features.push("TLS-SRP");
+    }
+    features.push("UnixSockets");
+    if cfg!(feature = "decompression") {
+        features.push("zstd");
+    }
+    println!("Features: {}", features.join(" "));
 }
 
 /// Print usage information to stderr.
 #[allow(clippy::too_many_lines)]
 pub fn print_usage() {
-    eprintln!("urlx 0.1.0 — a memory-safe curl replacement");
+    eprintln!("urlx {} — a memory-safe curl replacement", env!("CARGO_PKG_VERSION"));
     eprintln!("Usage: urlx [options] <url>");
     eprintln!();
     eprintln!("Options:");
