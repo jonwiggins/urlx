@@ -6869,6 +6869,17 @@ fn maybe_decompress_inner(mut response: Response, accept_encoding: bool, raw: bo
         return response;
     }
 
+    // If the body reader already detected bad content encoding, clear the body
+    // immediately. The partial body contains raw compressed data that failed
+    // decompression and must not be output (curl compat: test 223).
+    if response
+        .body_error()
+        .is_some_and(|e| e.contains("bad_content_encoding"))
+    {
+        response.set_body(Vec::new());
+        return response;
+    }
+
     // Transfer-Encoding decompression (hop-by-hop): always decompress regardless of
     // --compressed flag. Chunked is already handled at the framing layer; here we
     // handle gzip/deflate/br/zstd that may appear alongside chunked.
