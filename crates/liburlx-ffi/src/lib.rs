@@ -138,6 +138,9 @@ pub enum CURLoption {
     CURLOPT_READDATA = 10009,
     CURLOPT_DEBUGDATA = 10095,
     CURLOPT_DNS_SERVERS = 10211,
+    CURLOPT_TLSAUTH_TYPE = 10216,
+    CURLOPT_TLSAUTH_USERNAME = 10217,
+    CURLOPT_TLSAUTH_PASSWORD = 10218,
     CURLOPT_DOH_URL = 10279,
     CURLOPT_HSTS = 10300,
     CURLOPT_PROTOCOLS_STR = 10318,
@@ -2148,6 +2151,31 @@ pub unsafe extern "C" fn curl_easy_setopt(
                 // SAFETY: value must be a null-terminated C string
                 if let Some(s) = unsafe { read_cstr(value) } {
                     h.easy.bearer_token(s);
+                }
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_TLSAUTH_TYPE = 10216
+            10216 => {
+                // SAFETY: value must be a null-terminated C string
+                // Only "SRP" is supported; other values are silently accepted.
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_TLSAUTH_USERNAME = 10217
+            10217 => {
+                // SAFETY: value must be a null-terminated C string
+                if let Some(s) = unsafe { read_cstr(value) } {
+                    h.easy.ssl_srp_user(s);
+                }
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_TLSAUTH_PASSWORD = 10218
+            10218 => {
+                // SAFETY: value must be a null-terminated C string
+                if let Some(s) = unsafe { read_cstr(value) } {
+                    h.easy.ssl_srp_password(s);
                 }
                 CURLcode::CURLE_OK
             }

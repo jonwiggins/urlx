@@ -186,7 +186,7 @@ pub fn print_version() {
     println!("curl {version} ({arch}-{os}) libcurl/{version} rustls",);
     println!("Release-Date: 2026-03-16");
     println!("Protocols: dict file ftp ftps http https imap imaps ipfs ipns mqtt pop3 pop3s scp sftp smtp smtps ws wss");
-    println!("Features: alt-svc AsynchDNS brotli cookies Digest HSTS HTTP2 HTTP3 HTTPS-proxy IPv6 Largefile libz NTLM PSL ssl-sessions SSL UnixSockets zstd");
+    println!("Features: alt-svc AsynchDNS brotli cookies Digest HSTS HTTP2 HTTP3 HTTPS-proxy IPv6 Largefile libz NTLM PSL ssl-sessions SSL TLS-SRP UnixSockets zstd");
 }
 
 /// Print usage information to stderr.
@@ -602,6 +602,9 @@ fn expand_combined_flags(args: &[String]) -> Vec<String> {
                         | "--http2-ping-interval"
                         | "--libcurl"
                         | "--ipfs-gateway"
+                        | "--tlsauthtype"
+                        | "--tlsuser"
+                        | "--tlspassword"
                 ) {
                     skip_next = true;
                 }
@@ -1185,6 +1188,25 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
                 i += 1;
                 let val = require_arg(args, i, "--pinnedpubkey")?;
                 opts.easy.ssl_pinned_public_key(val);
+            }
+            "--tlsuser" => {
+                i += 1;
+                let val = require_arg(args, i, "--tlsuser")?;
+                opts.easy.ssl_srp_user(val);
+            }
+            "--tlspassword" => {
+                i += 1;
+                let val = require_arg(args, i, "--tlspassword")?;
+                opts.easy.ssl_srp_password(val);
+            }
+            "--tlsauthtype" => {
+                i += 1;
+                let val = require_arg(args, i, "--tlsauthtype")?;
+                if !val.eq_ignore_ascii_case("SRP") {
+                    eprintln!("curl: unsupported TLS auth type: {val}");
+                    return Err(1);
+                }
+                // SRP is the only supported type; credentials set via --tlsuser/--tlspassword
             }
             "--aws-sigv4" => {
                 i += 1;
@@ -2223,9 +2245,6 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
             | "--proxy-tlsauthtype"
             | "--proxy-tlsuser"
             | "--proxy-tlspassword"
-            | "--tlsauthtype"
-            | "--tlsuser"
-            | "--tlspassword"
             | "--socks5-gssapi-service"
             | "--ftp-ssl-ccc-mode"
             | "--mail-rcpt-allowfails"
