@@ -102,6 +102,12 @@ pub struct TlsConfig {
     /// If any certificate in the chain has been revoked, the connection fails
     /// with error 60. Equivalent to curl's `--crlfile`.
     pub crl_file: Option<PathBuf>,
+
+    /// TLS-SRP username for password-based TLS authentication (RFC 5054).
+    pub srp_user: Option<String>,
+
+    /// TLS-SRP password for password-based TLS authentication (RFC 5054).
+    pub srp_password: Option<String>,
 }
 
 impl Default for TlsConfig {
@@ -121,6 +127,8 @@ impl Default for TlsConfig {
             client_cert_blob: None,
             client_key_blob: None,
             crl_file: None,
+            srp_user: None,
+            srp_password: None,
         }
     }
 }
@@ -701,6 +709,150 @@ mod rustls_impl {
 #[cfg(feature = "rustls")]
 pub use rustls_impl::{AlpnProtocol, TlsConnector};
 
+#[cfg(feature = "tls-srp")]
+#[allow(unsafe_code)]
+mod openssl_srp_impl {
+    use std::pin::Pin;
+
+    use tokio::net::TcpStream;
+
+    use super::TlsConfig;
+    use crate::error::Error;
+
+    // FFI bindings for OpenSSL SRP functions (deprecated in 3.0 but still available)
+    extern "C" {
+        fn SSL_CTX_set_srp_username(
+            ctx: *mut openssl_sys::SSL_CTX,
+            name: *const std::os::raw::c_char,
+        ) -> std::os::raw::c_int;
+        fn SSL_CTX_set_srp_password(
+            ctx: *mut openssl_sys::SSL_CTX,
+            password: *const std::os::raw::c_char,
+        ) -> std::os::raw::c_int;
+    }
+
+    /// A TLS connector using OpenSSL with SRP (Secure Remote Password) key exchange.
+    ///
+    /// This connector is used only when TLS-SRP credentials are configured
+    /// (`--tlsuser` and `--tlspassword`). It provides password-based TLS
+    /// authentication without certificates (RFC 5054).
+    pub struct SrpTlsConnector {
+        connector: openssl::ssl::SslConnector,
+    }
+
+    impl SrpTlsConnector {
+        /// Create a new SRP TLS connector with the given configuration.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`Error::Tls`] if the OpenSSL configuration cannot be built
+        /// or SRP credentials cannot be set.
+        pub fn new(tls_config: &TlsConfig) -> Result<Self, Error> {
+            use openssl::ssl::{SslConnector, SslMethod, SslVerifyMode};
+
+            let mut builder = SslConnector::builder(SslMethod::tls_client())
+                .map_err(|e| Error::Tls(Box::new(e)))?;
+
+            // Set SRP credentials via openssl-sys FFI
+            if let (Some(user), Some(password)) = (&tls_config.srp_user, &tls_config.srp_password) {
+                Self::set_srp_credentials(&mut builder, user, password)?;
+            }
+
+            // Use SRP-only cipher suites (no fallback to non-SRP ciphers).
+            // SRP ciphers only work with TLS 1.2 and below, so cap the max version.
+            builder.set_cipher_list("SRP").map_err(|e| Error::Tls(Box::new(e)))?;
+            builder
+                .set_max_proto_version(Some(openssl::ssl::SslVersion::TLS1_2))
+                .map_err(|e| Error::Tls(Box::new(e)))?;
+
+            // Configure certificate verification
+            if !tls_config.verify_peer {
+                builder.set_verify(SslVerifyMode::NONE);
+            }
+
+            // Set CA cert if provided
+            if let Some(ref ca_path) = tls_config.ca_cert {
+                builder.set_ca_file(ca_path).map_err(|e| Error::Tls(Box::new(e)))?;
+            }
+
+            let connector = builder.build();
+            Ok(Self { connector })
+        }
+
+        /// Set SRP username and password on the SSL context via OpenSSL FFI.
+        fn set_srp_credentials(
+            builder: &mut openssl::ssl::SslConnectorBuilder,
+            user: &str,
+            password: &str,
+        ) -> Result<(), Error> {
+            use std::ffi::CString;
+
+            let user_c = CString::new(user)
+                .map_err(|_| Error::Tls("SRP username contains null byte".into()))?;
+            let pass_c = CString::new(password)
+                .map_err(|_| Error::Tls("SRP password contains null byte".into()))?;
+
+            // SAFETY: We pass valid CString pointers to OpenSSL SRP functions.
+            // The SSL_CTX copies these strings internally, so they don't need
+            // to outlive this call. The ctx pointer is valid because it comes
+            // from a live SslConnectorBuilder.
+            unsafe {
+                let ctx = builder.as_ptr();
+                let ret = SSL_CTX_set_srp_username(ctx, user_c.as_ptr());
+                if ret != 1 {
+                    return Err(Error::Tls("failed to set SRP username".into()));
+                }
+                let ret = SSL_CTX_set_srp_password(ctx, pass_c.as_ptr());
+                if ret != 1 {
+                    return Err(Error::Tls("failed to set SRP password".into()));
+                }
+            }
+
+            Ok(())
+        }
+
+        /// Connect to a server using TLS-SRP key exchange.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`Error::Tls`] if the TLS handshake fails (e.g., invalid
+        /// SRP credentials, server doesn't support SRP, or certificate
+        /// verification failure).
+        pub async fn connect(
+            &self,
+            stream: TcpStream,
+            server_name: &str,
+        ) -> Result<tokio_openssl::SslStream<TcpStream>, Error> {
+            let ssl = self
+                .connector
+                .configure()
+                .map_err(|e| Error::Tls(Box::new(e)))?
+                .into_ssl(server_name)
+                .map_err(|e| Error::Tls(Box::new(e)))?;
+
+            let mut ssl_stream =
+                tokio_openssl::SslStream::new(ssl, stream).map_err(|e| Error::Tls(Box::new(e)))?;
+
+            Pin::new(&mut ssl_stream).connect().await.map_err(|e| {
+                // Map OpenSSL errors to curl-compatible error codes.
+                // SSL handshake failures map to Error::Tls (exit code 35).
+                Error::Tls(Box::new(e))
+            })?;
+
+            Ok(ssl_stream)
+        }
+    }
+
+    /// Returns true if TLS-SRP is configured (both user and password set).
+    #[must_use]
+    pub const fn is_srp_configured(tls_config: &TlsConfig) -> bool {
+        tls_config.srp_user.is_some() && tls_config.srp_password.is_some()
+    }
+}
+
+#[cfg(feature = "tls-srp")]
+pub use openssl_srp_impl::{is_srp_configured, SrpTlsConnector};
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -899,5 +1051,60 @@ mod tests {
         let config = TlsConfig { verify_peer: false, ..TlsConfig::default() };
         let connector = TlsConnector::new_no_alpn(&config);
         assert!(connector.is_ok());
+    }
+
+    #[test]
+    fn tls_config_default_has_no_ca_cert_blob() {
+        let config = TlsConfig::default();
+        assert!(config.ca_cert_blob.is_none());
+    }
+
+    #[cfg(feature = "rustls")]
+    #[test]
+    fn tls_connector_with_valid_ca_cert_blob() {
+        let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_params.distinguished_name.push(rcgen::DnType::CommonName, "Test CA");
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+        let ca_pem = ca_cert.pem().into_bytes();
+
+        let config = TlsConfig { ca_cert_blob: Some(ca_pem), ..TlsConfig::default() };
+        let connector = TlsConnector::new(&config);
+        assert!(connector.is_ok(), "valid PEM CA cert blob should create TLS connector");
+    }
+
+    #[cfg(feature = "rustls")]
+    #[test]
+    fn tls_connector_with_invalid_ca_cert_blob_fails() {
+        let config = TlsConfig {
+            ca_cert_blob: Some(b"not valid PEM data".to_vec()),
+            ..TlsConfig::default()
+        };
+        let result = TlsConnector::new(&config);
+        assert!(result.is_err(), "invalid PEM blob should fail");
+    }
+
+    #[cfg(feature = "rustls")]
+    #[test]
+    fn tls_connector_with_empty_ca_cert_blob_fails() {
+        let config = TlsConfig { ca_cert_blob: Some(Vec::new()), ..TlsConfig::default() };
+        let result = TlsConnector::new(&config);
+        assert!(result.is_err(), "empty blob should fail");
+    }
+
+    #[cfg(feature = "rustls")]
+    #[test]
+    fn tls_connector_ca_cert_blob_no_alpn() {
+        let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_params.distinguished_name.push(rcgen::DnType::CommonName, "Test CA");
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+        let ca_pem = ca_cert.pem().into_bytes();
+
+        let config = TlsConfig { ca_cert_blob: Some(ca_pem), ..TlsConfig::default() };
+        let connector = TlsConnector::new_no_alpn(&config);
+        assert!(connector.is_ok(), "valid PEM CA cert blob should work without ALPN");
     }
 }

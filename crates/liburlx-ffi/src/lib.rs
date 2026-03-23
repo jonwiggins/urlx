@@ -138,6 +138,9 @@ pub enum CURLoption {
     CURLOPT_READDATA = 10009,
     CURLOPT_DEBUGDATA = 10095,
     CURLOPT_DNS_SERVERS = 10211,
+    CURLOPT_TLSAUTH_TYPE = 10216,
+    CURLOPT_TLSAUTH_USERNAME = 10217,
+    CURLOPT_TLSAUTH_PASSWORD = 10218,
     CURLOPT_DOH_URL = 10279,
     CURLOPT_HSTS = 10300,
     CURLOPT_PROTOCOLS_STR = 10318,
@@ -1269,6 +1272,8 @@ struct EasyHandle {
     /// MIME handle for `CURLOPT_MIMEPOST`.
     mimepost: *mut c_void,
     error_buf: [u8; 256],
+    /// When true, include HTTP headers in the body output (`CURLOPT_HEADER`).
+    include_headers: bool,
 }
 
 // SAFETY: The raw pointers in EasyHandle (write_data, header_data) are
@@ -1308,6 +1313,7 @@ pub extern "C" fn curl_easy_init() -> *mut c_void {
             mime_parts: Vec::new(),
             mimepost: ptr::null_mut(),
             error_buf: [0u8; 256],
+            include_headers: false,
         });
         Box::into_raw(handle).cast::<c_void>()
     }));
@@ -1368,6 +1374,7 @@ pub unsafe extern "C" fn curl_easy_duphandle(handle: *mut c_void) -> *mut c_void
             mime_parts: Vec::new(),
             mimepost: ptr::null_mut(),
             error_buf: [0u8; 256],
+            include_headers: h.include_headers,
         });
         Box::into_raw(dup).cast::<c_void>()
     }));
@@ -1410,6 +1417,7 @@ pub unsafe extern "C" fn curl_easy_reset(handle: *mut c_void) {
         h.mime_parts.clear();
         h.mimepost = ptr::null_mut();
         h.error_buf = [0u8; 256];
+        h.include_headers = false;
     }));
 }
 
@@ -1780,6 +1788,12 @@ pub unsafe extern "C" fn curl_easy_setopt(
             }
 
             // ─── Long options ───
+
+            // CURLOPT_HEADER = 42 (include headers in body output)
+            42 => {
+                h.include_headers = value as c_long != 0;
+                CURLcode::CURLE_OK
+            }
 
             // CURLOPT_POST = 47
             47 => {
@@ -2152,6 +2166,31 @@ pub unsafe extern "C" fn curl_easy_setopt(
                 CURLcode::CURLE_OK
             }
 
+            // CURLOPT_TLSAUTH_TYPE = 10216
+            10216 => {
+                // SAFETY: value must be a null-terminated C string
+                // Only "SRP" is supported; other values are silently accepted.
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_TLSAUTH_USERNAME = 10217
+            10217 => {
+                // SAFETY: value must be a null-terminated C string
+                if let Some(s) = unsafe { read_cstr(value) } {
+                    h.easy.ssl_srp_user(s);
+                }
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_TLSAUTH_PASSWORD = 10218
+            10218 => {
+                // SAFETY: value must be a null-terminated C string
+                if let Some(s) = unsafe { read_cstr(value) } {
+                    h.easy.ssl_srp_password(s);
+                }
+                CURLcode::CURLE_OK
+            }
+
             // CURLOPT_AWS_SIGV4 = 10306
             10306 => {
                 // SAFETY: value must be a null-terminated C string
@@ -2490,12 +2529,16 @@ pub unsafe extern "C" fn curl_easy_setopt(
             // CURLOPT_CAINFO_BLOB = 40309
             40309 => {
                 if value.is_null() {
-                    return CURLcode::CURLE_BAD_FUNCTION_ARGUMENT;
+                    // NULL pointer clears the blob setting (matches curl behavior)
+                    h.easy.clear_ssl_ca_cert_blob();
+                    return CURLcode::CURLE_OK;
                 }
                 // SAFETY: Caller guarantees value points to a valid curl_blob
                 let blob = unsafe { &*value.cast::<curl_blob>() };
                 if blob.data.is_null() || blob.len == 0 {
-                    return CURLcode::CURLE_BAD_FUNCTION_ARGUMENT;
+                    // Empty/null blob clears the setting (matches curl behavior)
+                    h.easy.clear_ssl_ca_cert_blob();
+                    return CURLcode::CURLE_OK;
                 }
                 // SAFETY: Caller guarantees blob.data points to blob.len bytes
                 let data = unsafe { std::slice::from_raw_parts(blob.data.cast::<u8>(), blob.len) };
@@ -2855,16 +2898,44 @@ pub unsafe extern "C" fn curl_easy_perform(handle: *mut c_void) -> CURLcode {
                 }
             }
 
-            // Call write callback if set
-            if let Some(cb) = h.write_callback {
-                let body = response.body();
-                if !body.is_empty() {
+            // Build output: optionally include headers, then body
+            let mut output = Vec::new();
+            if h.include_headers {
+                if let Some(raw) = response.raw_headers() {
+                    // Use raw headers as received from the wire (preserves
+                    // original casing, order, and line endings).
+                    output.extend_from_slice(raw);
+                } else {
+                    // Fallback: reconstruct from parsed headers
+                    let eol = if response.uses_crlf() { "\r\n" } else { "\n" };
+                    let reason = response.status_reason().unwrap_or("OK");
+                    let http_ver = response.http_version();
+                    let status_line =
+                        format!("HTTP/{http_ver} {} {}{eol}", response.status(), reason);
+                    output.extend_from_slice(status_line.as_bytes());
+                    for (name, value) in response.headers_ordered() {
+                        let line = format!("{name}: {value}{eol}");
+                        output.extend_from_slice(line.as_bytes());
+                    }
+                    output.extend_from_slice(eol.as_bytes());
+                }
+            }
+            output.extend_from_slice(response.body());
+
+            // Write output via callback, or to stdout if no callback is set
+            if !output.is_empty() {
+                if let Some(cb) = h.write_callback {
                     // SAFETY: Caller set up the callback and data pointer correctly
-                    let written =
-                        unsafe { cb(body.as_ptr().cast::<c_char>(), 1, body.len(), h.write_data) };
-                    if written != body.len() {
+                    let written = unsafe {
+                        cb(output.as_ptr().cast::<c_char>(), 1, output.len(), h.write_data)
+                    };
+                    if written != output.len() {
                         return CURLcode::CURLE_WRITE_ERROR;
                     }
+                } else {
+                    // Default: write to stdout (matches libcurl behavior)
+                    use std::io::Write;
+                    let _ = std::io::stdout().write_all(&output);
                 }
             }
 
@@ -7375,11 +7446,22 @@ mod tests {
     }
 
     #[test]
-    fn easy_setopt_blob_null_returns_error() {
+    fn easy_setopt_blob_null_clears_setting() {
         let handle = curl_easy_init();
-        // Null value pointer
+        // Null value pointer clears the setting (matches curl behavior)
         let code = unsafe { curl_easy_setopt(handle, 40309, ptr::null()) };
-        assert_eq!(code, CURLcode::CURLE_BAD_FUNCTION_ARGUMENT);
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn easy_setopt_cainfo_blob_empty_clears_setting() {
+        let handle = curl_easy_init();
+        // Empty blob (null data, 0 len) clears the setting (matches curl precheck)
+        let blob = curl_blob { data: ptr::null(), len: 0, flags: 0 };
+        let code =
+            unsafe { curl_easy_setopt(handle, 40309, ptr::from_ref(&blob).cast::<c_void>()) };
+        assert_eq!(code, CURLcode::CURLE_OK);
         unsafe { curl_easy_cleanup(handle) };
     }
 

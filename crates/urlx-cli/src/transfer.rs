@@ -658,6 +658,11 @@ pub fn run(args: &[String]) -> ExitCode {
             print_version();
             return ExitCode::SUCCESS;
         }
+        ParseResult::EngineList => {
+            println!("Build-time engines:");
+            println!("  openssl");
+            return ExitCode::SUCCESS;
+        }
         ParseResult::Error(code) => {
             return ExitCode::from(code);
         }

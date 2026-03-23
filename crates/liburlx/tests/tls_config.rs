@@ -132,6 +132,51 @@ async fn https_nonexistent_ca_cert_file_fails() {
 }
 
 // =============================================================================
+// In-memory CA certificate blob tests (CURLOPT_CAINFO_BLOB equivalent)
+// =============================================================================
+
+#[tokio::test]
+async fn https_ca_cert_blob_trusts_self_signed() {
+    let certs = TestCerts::generate();
+    let server = start_https_server(&certs).await;
+
+    let mut easy = liburlx::Easy::new();
+    easy.url(&server.url("/test")).unwrap();
+    // Pass CA cert as in-memory blob instead of file path
+    easy.ssl_ca_cert_blob(certs.ca_cert_pem.clone());
+
+    let response = easy.perform_async().await.unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.body(), b"hello from https");
+}
+
+#[tokio::test]
+async fn https_wrong_ca_cert_blob_fails() {
+    let certs = TestCerts::generate();
+    let server = start_https_server(&certs).await;
+
+    // Generate a different CA (won't match server's cert)
+    let wrong_certs = TestCerts::generate();
+
+    let mut easy = liburlx::Easy::new();
+    easy.url(&server.url("/test")).unwrap();
+    easy.ssl_ca_cert_blob(wrong_certs.ca_cert_pem.clone());
+
+    let result = easy.perform_async().await;
+    assert!(result.is_err(), "wrong CA blob should fail verification");
+}
+
+#[tokio::test]
+async fn https_ca_cert_blob_invalid_pem_fails() {
+    let mut easy = liburlx::Easy::new();
+    easy.url("https://127.0.0.1:1/test").unwrap();
+    easy.ssl_ca_cert_blob(b"not valid PEM data".to_vec());
+
+    let result = easy.perform_async().await;
+    assert!(result.is_err(), "invalid PEM blob should fail");
+}
+
+// =============================================================================
 // Client certificate (mTLS) tests
 // =============================================================================
 

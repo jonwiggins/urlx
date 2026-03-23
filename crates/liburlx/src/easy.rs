@@ -1577,6 +1577,13 @@ impl Easy {
         self.tls_config.ca_cert_blob = Some(blob);
     }
 
+    /// Clear the in-memory CA certificate bundle.
+    ///
+    /// Resets the setting so the default CA store is used.
+    pub fn clear_ssl_ca_cert_blob(&mut self) {
+        self.tls_config.ca_cert_blob = None;
+    }
+
     /// Set an in-memory client certificate (PEM format).
     ///
     /// Alternative to `ssl_client_cert` (file path).
@@ -1631,6 +1638,16 @@ impl Easy {
     /// Equivalent to `CURLOPT_SSL_SESSIONID_CACHE`.
     pub const fn ssl_session_cache(&mut self, enable: bool) {
         self.tls_config.session_cache = enable;
+    }
+
+    /// Set the TLS-SRP username. Equivalent to curl's `--tlsuser`.
+    pub fn ssl_srp_user(&mut self, user: &str) {
+        self.tls_config.srp_user = Some(user.to_string());
+    }
+
+    /// Set the TLS-SRP password. Equivalent to curl's `--tlspassword`.
+    pub fn ssl_srp_password(&mut self, password: &str) {
+        self.tls_config.srp_password = Some(password.to_string());
     }
 
     /// Enable or disable `TCP_NODELAY` (Nagle's algorithm).
@@ -6452,6 +6469,57 @@ async fn do_single_request(
                     tcp_stream
                 };
 
+                // TLS-SRP path: use OpenSSL SRP connector instead of rustls
+                #[cfg(feature = "tls-srp")]
+                if tls_config.srp_user.is_some() && tls_config.srp_password.is_some() {
+                    let srp_tls = crate::tls::SrpTlsConnector::new(tls_config)?;
+                    let srp_stream = srp_tls.connect(tls_stream_inner, &host).await?;
+                    let time_appconnect = request_start.elapsed();
+                    let tls_certs_der: Vec<Vec<u8>> = Vec::new();
+
+                    let request_target =
+                        resolve_request_target(custom_request_target, url, path_as_is);
+                    let use_http10 = http_version == HttpVersion::Http10;
+                    let time_pretransfer = request_start.elapsed();
+                    let mut stream = PooledStream::OpenSslTls(srp_stream);
+                    let (resp, can_reuse) = crate::protocol::http::h1::request(
+                        &mut stream,
+                        method,
+                        &host_header,
+                        &request_target,
+                        &effective_headers,
+                        body,
+                        url.as_str(),
+                        use_pool,
+                        use_http10,
+                        expect_100_timeout,
+                        ignore_content_length,
+                        speed_limits,
+                        chunked_upload,
+                        http09_allowed,
+                        deadline,
+                        raw,
+                        fail_on_error,
+                    )
+                    .await?;
+                    let time_starttransfer = request_start.elapsed();
+
+                    if can_reuse && use_pool && !forbid_reuse {
+                        pool.put(&host, port, is_tls, stream);
+                    }
+
+                    let mut resp = resp;
+                    let mut info = resp.transfer_info().clone();
+                    info.time_namelookup = time_namelookup;
+                    info.time_connect = time_connect;
+                    info.time_appconnect = time_appconnect;
+                    info.time_pretransfer = time_pretransfer;
+                    info.time_starttransfer = time_starttransfer;
+                    info.certs_der = tls_certs_der;
+                    resp.set_transfer_info(info);
+                    return Ok(resp);
+                }
+
                 let tls = crate::tls::TlsConnector::new(tls_config)?;
                 let (tls_stream, alpn) = tls.connect(tls_stream_inner, &host).await?;
                 let time_appconnect = request_start.elapsed();
@@ -6889,6 +6957,14 @@ const MAX_ENCODING_LAYERS: usize = 5;
 fn maybe_decompress_inner(mut response: Response, accept_encoding: bool, raw: bool) -> Response {
     // In raw mode, skip all decompression (curl --raw: test 319)
     if raw {
+        return response;
+    }
+
+    // If the body reader already detected an error (e.g., bad_content_encoding
+    // from incremental encoding check, or transfer closed), skip decompression
+    // entirely to avoid overwriting the original error. The body is preserved
+    // as-is so callers can inspect or discard it. (curl compat: test 223)
+    if response.body_error().is_some() {
         return response;
     }
 
@@ -10373,5 +10449,57 @@ mod tests {
                 || err_msg.contains("not yet supported"),
             "unexpected error: {err_msg}"
         );
+    }
+
+    #[test]
+    fn maybe_decompress_preserves_existing_body_error() {
+        // When body_error is already set (e.g., from incremental encoding
+        // check in read_exact_body), decompression should be skipped entirely
+        // to avoid overwriting the original error. curl compat: test 223.
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("content-encoding".to_string(), "deflate".to_string());
+        let broken_body = vec![0x58, 0xdb, 0x6e, 0xe3]; // broken deflate
+        let mut resp = crate::protocol::http::response::Response::new(
+            200,
+            headers,
+            broken_body.clone(),
+            "http://example.com".to_string(),
+        );
+        resp.set_body_error(Some("bad_content_encoding".to_string()));
+
+        let result = maybe_decompress_inner(resp, true, false);
+        assert_eq!(
+            result.body_error(),
+            Some("bad_content_encoding"),
+            "body_error should be preserved"
+        );
+        assert_eq!(result.body(), &broken_body, "body should not be modified");
+    }
+
+    #[test]
+    fn maybe_decompress_preserves_transfer_closed_error() {
+        // When body_error is "transfer closed..." (exit 18), decompression
+        // must not overwrite it with "bad_content_encoding" (exit 61).
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("content-encoding".to_string(), "gzip".to_string());
+        // Partial gzip body (valid magic but truncated — decompression would fail)
+        let partial_body = vec![0x1f, 0x8b, 0x08, 0x00, 0x00];
+        let mut resp = crate::protocol::http::response::Response::new(
+            200,
+            headers,
+            partial_body.clone(),
+            "http://example.com".to_string(),
+        );
+        resp.set_body_error(Some(
+            "transfer closed with outstanding read data remaining".to_string(),
+        ));
+
+        let result = maybe_decompress_inner(resp, true, false);
+        assert_eq!(
+            result.body_error(),
+            Some("transfer closed with outstanding read data remaining"),
+            "body_error should not be overwritten by decompression failure"
+        );
+        assert_eq!(result.body(), &partial_body, "body should not be modified");
     }
 }

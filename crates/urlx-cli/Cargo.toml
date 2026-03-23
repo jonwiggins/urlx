@@ -17,6 +17,10 @@ path = "src/main.rs"
 [lints]
 workspace = true
 
+[features]
+default = []
+tls-srp = ["liburlx/tls-srp"]
+
 [dependencies]
 filetime = "0.2"
 libc = "0.2"
