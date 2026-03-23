@@ -84,14 +84,34 @@ impl TftpErrorCode {
     #[must_use]
     pub const fn to_curl_code(self) -> u32 {
         match self {
-            Self::NoSuchUser => 74,
-            _ => 69,
+            Self::FileNotFound => 68,
+            Self::AccessViolation => 69,
+            Self::DiskFull => 70,
+            Self::IllegalOperation | Self::NotDefined => 71,
+            Self::UnknownTransferId => 72,
+            Self::FileAlreadyExists | Self::NoSuchUser => 73,
+        }
+    }
+
+    /// curl-compatible error message for this TFTP error code.
+    #[must_use]
+    pub const fn curl_message(self) -> &'static str {
+        match self {
+            Self::FileNotFound => "TFTP: File Not Found",
+            Self::AccessViolation => "TFTP: Access Violation",
+            Self::DiskFull => "TFTP: Disk full or allocation exceeded",
+            Self::IllegalOperation | Self::NotDefined => "TFTP: Illegal operation",
+            Self::UnknownTransferId => "TFTP: Unknown transfer ID",
+            Self::FileAlreadyExists => "TFTP: File already exists",
+            Self::NoSuchUser => "TFTP: No such user",
         }
     }
 }
 
 const DEFAULT_BLOCK_SIZE: usize = 512;
 const MAX_BLOCK_SIZE: usize = 65464;
+/// Maximum TFTP filename length.
+const MAX_TFTP_FILENAME: usize = 512;
 const OACK_OPCODE: u16 = 6;
 const DEFAULT_TFTP_TIMEOUT: u16 = 6;
 const TFTP_RETRY_COUNT: u64 = 50;
@@ -155,7 +175,7 @@ fn parse_tftp_error(packet: &[u8]) -> Error {
     } else {
         error_code.description().to_string()
     };
-    Error::Transfer { code: error_code.to_curl_code(), message: format!("TFTP: {msg}") }
+    Error::Transfer { code: error_code.to_curl_code(), message: error_code.curl_message().to_string() }
 }
 
 fn parse_tftp_path(url: &crate::url::Url) -> (String, String) {
@@ -207,9 +227,14 @@ pub async fn download(
     if filename.is_empty() {
         return Err(Error::Http("TFTP filename is required in URL path".to_string()));
     }
+    let bs = blksize.unwrap_or(DEFAULT_BLOCK_SIZE as u16);
+    // Check filename length BEFORE attempting connection (curl compat: test 1453)
+    // curl's check: filename_len + mode_len + 4 > blksize
+    if filename.len() + mode.len() + 4 > bs as usize {
+        return Err(Error::Transfer { code: 71, message: "TFTP filename too long".to_string() });
+    }
     let socket = bind_socket(interface, local_port).await?;
     let addr = format!("{host}:{port}");
-    let bs = blksize.unwrap_or(DEFAULT_BLOCK_SIZE as u16);
     let rrq = build_request(Opcode::Rrq, &filename, &mode, bs, 0, no_options);
     socket
         .send_to(&rrq, &addr)
@@ -330,9 +355,14 @@ pub async fn upload(
     if filename.is_empty() {
         return Err(Error::Http("TFTP filename is required in URL path".to_string()));
     }
+    let bs = blksize.unwrap_or(DEFAULT_BLOCK_SIZE as u16);
+    // Check filename length BEFORE attempting connection (curl compat: test 1453)
+    // curl's check: filename_len + mode_len + 4 > blksize
+    if filename.len() + mode.len() + 4 > bs as usize {
+        return Err(Error::Transfer { code: 71, message: "TFTP filename too long".to_string() });
+    }
     let socket = bind_socket(interface, local_port).await?;
     let addr = format!("{host}:{port}");
-    let bs = blksize.unwrap_or(DEFAULT_BLOCK_SIZE as u16);
     let mut wrq = build_request(Opcode::Wrq, &filename, &mode, bs, data.len() as u64, no_options);
     if !no_options {
         let t = compute_tftp_timeout(connect_timeout_secs);
