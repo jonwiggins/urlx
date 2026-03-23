@@ -1,9 +1,32 @@
-//! `liburlx-ffi` — C ABI compatibility layer for liburlx.
+//! # liburlx-ffi
 //!
-//! This crate provides a libcurl-compatible C API, allowing `liburlx` to serve
-//! as a drop-in replacement for `libcurl` at the binary level.
+//! C ABI compatibility layer for liburlx — a drop-in replacement for libcurl.
+//!
+//! This crate provides libcurl-compatible C functions (`curl_easy_init`,
+//! `curl_easy_setopt`, `curl_easy_perform`, etc.) backed by the pure-Rust
+//! [`liburlx`] engine. Existing C/C++ programs can link against `liburlx_ffi`
+//! instead of `libcurl` without code changes.
 //!
 //! All `unsafe` code in the urlx project is confined to this crate.
+//!
+//! ## Usage
+//!
+//! ```c
+//! #include "urlx.h"
+//!
+//! CURL *curl = curl_easy_init();
+//! curl_easy_setopt(curl, CURLOPT_URL, "https://example.com");
+//! curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+//! CURLcode res = curl_easy_perform(curl);
+//! curl_easy_cleanup(curl);
+//! ```
+//!
+//! ## Coverage
+//!
+//! - **156** `CURLOPT` options
+//! - **49** `CURLINFO` queries
+//! - **41** `CURLcode` error codes
+//! - **57** exported C functions (all wrapped in `catch_unwind`)
 //!
 //! # Safety Invariants
 //!

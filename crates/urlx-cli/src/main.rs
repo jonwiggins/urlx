@@ -1,6 +1,28 @@
-//! `urlx` — A memory-safe command-line URL transfer tool.
+//! # urlx
 //!
-//! Drop-in replacement for the `curl` command.
+//! A memory-safe command-line URL transfer tool — drop-in replacement for `curl`.
+//!
+//! `urlx` accepts the same flags and produces the same output as `curl`, backed
+//! by the pure-Rust [`liburlx`](https://docs.rs/liburlx) engine. 261 long flags
+//! and 46 short flags are supported.
+//!
+//! ## Install
+//!
+//! ```sh
+//! cargo install urlx-cli
+//! # or
+//! brew install jonwiggins/tap/urlx
+//! ```
+//!
+//! ## Examples
+//!
+//! ```sh
+//! urlx https://example.com                                     # GET
+//! urlx -d '{"key":"val"}' -H 'Content-Type: application/json'  # POST JSON
+//! urlx -Lo file.tar.gz https://example.com/file.tar.gz         # Download
+//! urlx -u user:pass --digest https://api.example.com           # Digest auth
+//! urlx -Z https://a.com https://b.com https://c.com            # Parallel
+//! ```
 
 #![deny(unsafe_code)]
 #![allow(
