@@ -178,6 +178,8 @@ impl Url {
         self.inner.port_or_known_default().or_else(|| match self.inner.scheme() {
             "ftps" => Some(990),
             "sftp" | "scp" | "ssh" => Some(22),
+            "rtsp" => Some(554),
+            "rtsps" => Some(322),
             _ => None,
         })
     }
@@ -385,8 +387,8 @@ impl Url {
     /// These schemes work with single-colon syntax (e.g., `file:/path`).
     const KNOWN_SCHEMES: &'static [&'static str] = &[
         "file", "ftp", "ftps", "http", "https", "sftp", "scp", "dict", "tftp", "mqtt", "ws", "wss",
-        "smtp", "smtps", "imap", "imaps", "pop3", "pop3s", "telnet", "ldap", "ldaps", "gopher",
-        "gophers",
+        "smtp", "smtps", "imap", "imaps", "pop3", "pop3s", "rtsp", "telnet", "ldap", "ldaps",
+        "gopher", "gophers",
     ];
 
     fn maybe_add_scheme(input: &str) -> String {
