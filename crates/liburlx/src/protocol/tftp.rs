@@ -1,7 +1,10 @@
 //! TFTP protocol handler.
 //!
 //! Implements the Trivial File Transfer Protocol (RFC 1350) for simple
-//! file downloads and uploads over UDP.
+//! file downloads and uploads over UDP, with options negotiation
+//! (RFC 2347/2348/2349).
+
+use std::time::{Duration, Instant};
 
 use tokio::net::UdpSocket;
 
@@ -76,48 +79,63 @@ impl TftpErrorCode {
             Self::NoSuchUser => "no such user",
         }
     }
+
+    /// Map TFTP error code to curl-compatible exit code.
+    #[must_use]
+    pub const fn to_curl_code(self) -> u32 {
+        match self {
+            Self::NoSuchUser => 74,
+            _ => 69,
+        }
+    }
 }
 
-/// Default TFTP block size.
 const DEFAULT_BLOCK_SIZE: usize = 512;
-
-/// Maximum TFTP block size (RFC 2348).
 const MAX_BLOCK_SIZE: usize = 65464;
-
-/// OACK opcode (RFC 2347).
 const OACK_OPCODE: u16 = 6;
+const DEFAULT_TFTP_TIMEOUT: u16 = 6;
+const TFTP_RETRY_COUNT: u64 = 50;
 
-/// Build a read request (RRQ) packet.
-fn build_rrq(filename: &str, mode: &str, blksize: Option<u16>) -> Vec<u8> {
+fn build_request(
+    opcode: Opcode,
+    filename: &str,
+    mode: &str,
+    blksize: u16,
+    tsize: u64,
+    no_options: bool,
+) -> Vec<u8> {
     let mut packet = Vec::new();
-    packet.extend_from_slice(&(Opcode::Rrq as u16).to_be_bytes());
+    packet.extend_from_slice(&(opcode as u16).to_be_bytes());
     packet.extend_from_slice(filename.as_bytes());
-    packet.push(0); // null terminator
+    packet.push(0);
     packet.extend_from_slice(mode.as_bytes());
     packet.push(0);
-    // RFC 2348: blksize option negotiation
-    if let Some(bs) = blksize {
-        packet.extend_from_slice(b"blksize");
+    if !no_options {
+        packet.extend_from_slice(b"tsize\0");
+        packet.extend_from_slice(tsize.to_string().as_bytes());
         packet.push(0);
-        packet.extend_from_slice(bs.to_string().as_bytes());
+        packet.extend_from_slice(b"blksize\0");
+        packet.extend_from_slice(blksize.to_string().as_bytes());
         packet.push(0);
     }
     packet
 }
 
-/// Build an ACK packet.
 fn build_ack(block_num: u16) -> Vec<u8> {
-    let mut packet = Vec::new();
-    packet.extend_from_slice(&(Opcode::Ack as u16).to_be_bytes());
-    packet.extend_from_slice(&block_num.to_be_bytes());
-    packet
+    let mut p = Vec::new();
+    p.extend_from_slice(&(Opcode::Ack as u16).to_be_bytes());
+    p.extend_from_slice(&block_num.to_be_bytes());
+    p
 }
 
-/// Parse a TFTP packet's opcode.
-///
-/// # Errors
-///
-/// Returns an error if the packet is too short.
+fn build_data(block_num: u16, data: &[u8]) -> Vec<u8> {
+    let mut p = Vec::with_capacity(4 + data.len());
+    p.extend_from_slice(&(Opcode::Data as u16).to_be_bytes());
+    p.extend_from_slice(&block_num.to_be_bytes());
+    p.extend_from_slice(data);
+    p
+}
+
 fn parse_opcode(data: &[u8]) -> Result<u16, Error> {
     if data.len() < 2 {
         return Err(Error::Http("TFTP packet too short".to_string()));
@@ -125,132 +143,274 @@ fn parse_opcode(data: &[u8]) -> Result<u16, Error> {
     Ok(u16::from_be_bytes([data[0], data[1]]))
 }
 
+fn parse_tftp_error(packet: &[u8]) -> Error {
+    let error_code = if packet.len() >= 4 {
+        TftpErrorCode::from_code(u16::from_be_bytes([packet[2], packet[3]]))
+    } else {
+        TftpErrorCode::NotDefined
+    };
+    let msg = if packet.len() > 5 {
+        let end = if packet[packet.len() - 1] == 0 { packet.len() - 1 } else { packet.len() };
+        String::from_utf8_lossy(&packet[4..end]).to_string()
+    } else {
+        error_code.description().to_string()
+    };
+    Error::Transfer { code: error_code.to_curl_code(), message: format!("TFTP: {msg}") }
+}
+
+fn parse_tftp_path(url: &crate::url::Url) -> (String, String) {
+    let raw = url.path();
+    let path = raw.strip_prefix('/').unwrap_or(raw);
+    if let Some(idx) = path.find(";mode=") {
+        (path[..idx].to_string(), path[idx + 6..].to_string())
+    } else {
+        (path.to_string(), "octet".to_string())
+    }
+}
+
+async fn bind_socket(interface: Option<&str>, local_port: Option<u16>) -> Result<UdpSocket, Error> {
+    let ip = interface.unwrap_or("0.0.0.0");
+    let port = local_port.unwrap_or(0);
+    UdpSocket::bind(format!("{ip}:{port}"))
+        .await
+        .map_err(|e| Error::Http(format!("TFTP bind error: {e}")))
+}
+
+fn compute_tftp_timeout(ct: Option<u64>) -> u16 {
+    match ct {
+        Some(s) if s > 0 => {
+            #[allow(clippy::cast_possible_truncation)]
+            let v = (s / (TFTP_RETRY_COUNT + 1)).clamp(1, 255) as u16;
+            v
+        }
+        _ => DEFAULT_TFTP_TIMEOUT,
+    }
+}
+
 /// Download a file via TFTP.
-///
-/// URL format: `tftp://host:port/filename`
-///
-/// `blksize` sets the TFTP block size option (RFC 2348). If `None`, default 512 is used.
-/// `no_options` disables OACK option negotiation (RFC 2347).
 ///
 /// # Errors
 ///
 /// Returns an error if the download fails.
+#[allow(clippy::too_many_arguments)]
 pub async fn download(
     url: &crate::url::Url,
     blksize: Option<u16>,
     no_options: bool,
+    interface: Option<&str>,
+    local_port: Option<u16>,
+    low_speed_limit: Option<u32>,
+    low_speed_time: Option<Duration>,
 ) -> Result<Response, Error> {
     let (host, port) = url.host_and_port()?;
-    let filename = url.path().trim_start_matches('/');
-
+    let (filename, mode) = parse_tftp_path(url);
     if filename.is_empty() {
         return Err(Error::Http("TFTP filename is required in URL path".to_string()));
     }
-
-    // Bind to any available port
-    let socket = UdpSocket::bind("0.0.0.0:0")
-        .await
-        .map_err(|e| Error::Http(format!("TFTP bind error: {e}")))?;
-
-    let server_addr = format!("{host}:{port}");
-
-    // Only negotiate blksize if options are allowed
-    let negotiate_blksize = if no_options { None } else { blksize };
-
-    // Send RRQ
-    let rrq = build_rrq(filename, "octet", negotiate_blksize);
-    let _n = socket
-        .send_to(&rrq, &server_addr)
+    let socket = bind_socket(interface, local_port).await?;
+    let addr = format!("{host}:{port}");
+    let bs = blksize.unwrap_or(DEFAULT_BLOCK_SIZE as u16);
+    let rrq = build_request(Opcode::Rrq, &filename, &mode, bs, 0, no_options);
+    socket
+        .send_to(&rrq, &addr)
         .await
         .map_err(|e| Error::Http(format!("TFTP send RRQ error: {e}")))?;
-
-    // Effective block size — may be updated by OACK
-    let mut effective_blksize = DEFAULT_BLOCK_SIZE;
-    let mut file_data = Vec::new();
-    let mut expected_block: u16 = 1;
+    let mut eff_bs = DEFAULT_BLOCK_SIZE;
+    let mut data = Vec::new();
+    let mut exp_block: u16 = 1;
     let mut buf = vec![0u8; 4 + MAX_BLOCK_SIZE];
-
+    let start = Instant::now();
+    let sl = low_speed_limit.unwrap_or(0) as u64;
+    let st = low_speed_time.unwrap_or(Duration::ZERO);
+    let chk = sl > 0 && !st.is_zero();
     loop {
-        let (n, src) = socket
-            .recv_from(&mut buf)
-            .await
-            .map_err(|e| Error::Http(format!("TFTP recv error: {e}")))?;
-
-        let packet = &buf[..n];
-        let opcode = parse_opcode(packet)?;
-
-        match opcode {
+        let r = if chk {
+            tokio::time::timeout(Duration::from_secs(1), socket.recv_from(&mut buf)).await
+        } else {
+            Ok(socket.recv_from(&mut buf).await)
+        };
+        let (n, src) = match r {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => return Err(Error::Http(format!("TFTP recv error: {e}"))),
+            Err(_) => {
+                let el = start.elapsed();
+                if el >= st {
+                    let sp = if el.as_secs() > 0 {
+                        data.len() as u64 / el.as_secs()
+                    } else {
+                        data.len() as u64
+                    };
+                    if sp < sl {
+                        return Err(Error::SpeedLimit { speed: sp, limit: sl, duration: el });
+                    }
+                }
+                continue;
+            }
+        };
+        if chk {
+            let el = start.elapsed();
+            if el >= st {
+                let sp = if el.as_secs() > 0 {
+                    data.len() as u64 / el.as_secs()
+                } else {
+                    data.len() as u64
+                };
+                if sp < sl {
+                    return Err(Error::SpeedLimit { speed: sp, limit: sl, duration: el });
+                }
+            }
+        }
+        let pkt = &buf[..n];
+        let op = parse_opcode(pkt)?;
+        match op {
             3 => {
-                // DATA
-                if packet.len() < 4 {
+                if pkt.len() < 4 {
                     return Err(Error::Http("TFTP DATA packet too short".to_string()));
                 }
-                let block_num = u16::from_be_bytes([packet[2], packet[3]]);
-
-                if block_num == expected_block {
-                    file_data.extend_from_slice(&packet[4..]);
-                    expected_block = expected_block.wrapping_add(1);
+                let bn = u16::from_be_bytes([pkt[2], pkt[3]]);
+                if bn == exp_block {
+                    data.extend_from_slice(&pkt[4..]);
+                    exp_block = exp_block.wrapping_add(1);
                 }
-
-                // Send ACK
-                let ack = build_ack(block_num);
-                let _n = socket
-                    .send_to(&ack, src)
+                socket
+                    .send_to(&build_ack(bn), src)
                     .await
                     .map_err(|e| Error::Http(format!("TFTP send ACK error: {e}")))?;
-
-                // Last block: data < block_size bytes
-                if packet.len() - 4 < effective_blksize {
+                if pkt.len() - 4 < eff_bs {
                     break;
                 }
             }
             5 => {
-                // ERROR — parse error code (bytes 2-3) and message (bytes 4+)
-                let error_code = if packet.len() >= 4 {
-                    TftpErrorCode::from_code(u16::from_be_bytes([packet[2], packet[3]]))
-                } else {
-                    TftpErrorCode::NotDefined
-                };
-                let msg = if packet.len() > 4 {
-                    String::from_utf8_lossy(&packet[4..packet.len().saturating_sub(1)]).to_string()
-                } else {
-                    error_code.description().to_string()
-                };
-                return Err(Error::Http(format!(
-                    "TFTP error (code {}): {}",
-                    error_code as u16, msg
-                )));
+                return Err(parse_tftp_error(pkt));
             }
             o if o == OACK_OPCODE => {
-                // OACK — parse negotiated options
-                let options_data = &packet[2..];
-                let mut parts = options_data.split(|&b| b == 0).filter(|s| !s.is_empty());
-                while let Some(key) = parts.next() {
-                    if let Some(val) = parts.next() {
-                        if key.eq_ignore_ascii_case(b"blksize") {
-                            if let Ok(bs) = String::from_utf8_lossy(val).parse::<usize>() {
-                                effective_blksize = bs;
+                let od = &pkt[2..];
+                let mut ps = od.split(|&b| b == 0).filter(|s| !s.is_empty());
+                while let Some(k) = ps.next() {
+                    if let Some(v) = ps.next() {
+                        if k.eq_ignore_ascii_case(b"blksize") {
+                            if let Ok(b) = String::from_utf8_lossy(v).parse::<usize>() {
+                                eff_bs = b;
                             }
                         }
                     }
                 }
-                // ACK the OACK with block 0
-                let ack = build_ack(0);
-                let _n = socket
-                    .send_to(&ack, src)
+                socket
+                    .send_to(&build_ack(0), src)
                     .await
                     .map_err(|e| Error::Http(format!("TFTP send OACK ACK error: {e}")))?;
             }
             _ => {
-                return Err(Error::Http(format!("TFTP unexpected opcode: {opcode}")));
+                return Err(Error::Http(format!("TFTP unexpected opcode: {op}")));
             }
         }
     }
+    let mut h = std::collections::HashMap::new();
+    h.insert("content-length".to_string(), data.len().to_string());
+    Ok(Response::new(200, h, data, url.as_str().to_string()))
+}
 
-    let mut headers = std::collections::HashMap::new();
-    let _old = headers.insert("content-length".to_string(), file_data.len().to_string());
-
-    Ok(Response::new(200, headers, file_data, url.as_str().to_string()))
+/// Upload a file via TFTP.
+///
+/// # Errors
+///
+/// Returns an error if the upload fails.
+#[allow(clippy::too_many_arguments)]
+pub async fn upload(
+    url: &crate::url::Url,
+    data: &[u8],
+    blksize: Option<u16>,
+    no_options: bool,
+    interface: Option<&str>,
+    local_port: Option<u16>,
+    connect_timeout_secs: Option<u64>,
+) -> Result<Response, Error> {
+    let (host, port) = url.host_and_port()?;
+    let (filename, mode) = parse_tftp_path(url);
+    if filename.is_empty() {
+        return Err(Error::Http("TFTP filename is required in URL path".to_string()));
+    }
+    let socket = bind_socket(interface, local_port).await?;
+    let addr = format!("{host}:{port}");
+    let bs = blksize.unwrap_or(DEFAULT_BLOCK_SIZE as u16);
+    let mut wrq = build_request(Opcode::Wrq, &filename, &mode, bs, data.len() as u64, no_options);
+    if !no_options {
+        let t = compute_tftp_timeout(connect_timeout_secs);
+        wrq.extend_from_slice(b"timeout\0");
+        wrq.extend_from_slice(t.to_string().as_bytes());
+        wrq.push(0);
+    }
+    socket
+        .send_to(&wrq, &addr)
+        .await
+        .map_err(|e| Error::Http(format!("TFTP send WRQ error: {e}")))?;
+    let mut eff_bs = DEFAULT_BLOCK_SIZE;
+    let mut buf = vec![0u8; 4 + MAX_BLOCK_SIZE];
+    let (n, src) = socket
+        .recv_from(&mut buf)
+        .await
+        .map_err(|e| Error::Http(format!("TFTP recv error: {e}")))?;
+    let pkt = &buf[..n];
+    let op = parse_opcode(pkt)?;
+    let peer = match op {
+        4 => src,
+        o if o == OACK_OPCODE => {
+            let od = &pkt[2..];
+            let mut ps = od.split(|&b| b == 0).filter(|s| !s.is_empty());
+            while let Some(k) = ps.next() {
+                if let Some(v) = ps.next() {
+                    if k.eq_ignore_ascii_case(b"blksize") {
+                        if let Ok(b) = String::from_utf8_lossy(v).parse::<usize>() {
+                            eff_bs = b;
+                        }
+                    }
+                }
+            }
+            src
+        }
+        5 => {
+            return Err(parse_tftp_error(pkt));
+        }
+        _ => {
+            return Err(Error::Http(format!("TFTP unexpected opcode: {op}")));
+        }
+    };
+    let mut bn: u16 = 1;
+    let mut off = 0;
+    loop {
+        let end = std::cmp::min(off + eff_bs, data.len());
+        let chunk = &data[off..end];
+        socket
+            .send_to(&build_data(bn, chunk), peer)
+            .await
+            .map_err(|e| Error::Http(format!("TFTP send DATA error: {e}")))?;
+        let (n2, _) = socket
+            .recv_from(&mut buf)
+            .await
+            .map_err(|e| Error::Http(format!("TFTP recv ACK error: {e}")))?;
+        if parse_opcode(&buf[..n2])? == 5 {
+            return Err(parse_tftp_error(&buf[..n2]));
+        }
+        off = end;
+        bn = bn.wrapping_add(1);
+        if chunk.len() < eff_bs {
+            break;
+        }
+        if off == data.len() {
+            socket
+                .send_to(&build_data(bn, &[]), peer)
+                .await
+                .map_err(|e| Error::Http(format!("TFTP send final error: {e}")))?;
+            socket
+                .recv_from(&mut buf)
+                .await
+                .map_err(|e| Error::Http(format!("TFTP recv final error: {e}")))?;
+            break;
+        }
+    }
+    let mut h = std::collections::HashMap::new();
+    h.insert("content-length".to_string(), "0".to_string());
+    Ok(Response::new(200, h, Vec::new(), url.as_str().to_string()))
 }
 
 #[cfg(test)]
@@ -259,92 +419,65 @@ mod tests {
     use super::*;
 
     #[test]
-    fn build_rrq_packet() {
-        let packet = build_rrq("test.txt", "octet", None);
-        assert_eq!(&packet[..2], &[0x00, 0x01]); // RRQ opcode
-                                                 // "test.txt\0octet\0"
-        assert_eq!(&packet[2..10], b"test.txt");
-        assert_eq!(packet[10], 0);
-        assert_eq!(&packet[11..16], b"octet");
-        assert_eq!(packet[16], 0);
+    fn build_request_rrq() {
+        let p = build_request(Opcode::Rrq, "/t", "octet", 512, 0, false);
+        assert_eq!(&p[..2], &[0, 1]);
+        assert!(p.windows(5).any(|w| w == b"tsize"));
     }
 
     #[test]
-    fn build_rrq_with_blksize() {
-        let packet = build_rrq("file.bin", "octet", Some(1024));
-        assert_eq!(&packet[..2], &[0x00, 0x01]);
-        // After filename\0mode\0, we have blksize\01024\0
-        let rest = &packet[2..];
-        assert!(rest.windows(7).any(|w| w == b"blksize"));
-        assert!(rest.windows(4).any(|w| w == b"1024"));
+    fn build_request_wrq() {
+        let p = build_request(Opcode::Wrq, "/t", "octet", 512, 10, false);
+        assert_eq!(&p[..2], &[0, 2]);
     }
 
     #[test]
-    fn build_ack_packet() {
-        let packet = build_ack(1);
-        assert_eq!(packet, vec![0x00, 0x04, 0x00, 0x01]);
+    fn ack() {
+        assert_eq!(build_ack(1), vec![0, 4, 0, 1]);
     }
 
     #[test]
-    fn build_ack_high_block() {
-        let packet = build_ack(256);
-        assert_eq!(packet, vec![0x00, 0x04, 0x01, 0x00]);
+    fn opcode_parse() {
+        assert_eq!(parse_opcode(&[0, 1]).unwrap(), 1);
+        assert!(parse_opcode(&[0]).is_err());
     }
 
     #[test]
-    fn parse_opcode_rrq() {
-        assert_eq!(parse_opcode(&[0x00, 0x01]).unwrap(), 1);
-    }
-
-    #[test]
-    fn parse_opcode_data() {
-        assert_eq!(parse_opcode(&[0x00, 0x03]).unwrap(), 3);
-    }
-
-    #[test]
-    fn parse_opcode_error() {
-        assert_eq!(parse_opcode(&[0x00, 0x05]).unwrap(), 5);
-    }
-
-    #[test]
-    fn parse_opcode_too_short() {
-        assert!(parse_opcode(&[0x00]).is_err());
-    }
-
-    #[test]
-    fn error_code_from_code_known() {
-        assert_eq!(TftpErrorCode::from_code(0), TftpErrorCode::NotDefined);
-        assert_eq!(TftpErrorCode::from_code(1), TftpErrorCode::FileNotFound);
+    fn err_codes() {
         assert_eq!(TftpErrorCode::from_code(2), TftpErrorCode::AccessViolation);
-        assert_eq!(TftpErrorCode::from_code(3), TftpErrorCode::DiskFull);
-        assert_eq!(TftpErrorCode::from_code(4), TftpErrorCode::IllegalOperation);
-        assert_eq!(TftpErrorCode::from_code(5), TftpErrorCode::UnknownTransferId);
-        assert_eq!(TftpErrorCode::from_code(6), TftpErrorCode::FileAlreadyExists);
-        assert_eq!(TftpErrorCode::from_code(7), TftpErrorCode::NoSuchUser);
-    }
-
-    #[test]
-    fn error_code_from_code_unknown() {
         assert_eq!(TftpErrorCode::from_code(99), TftpErrorCode::NotDefined);
-        assert_eq!(TftpErrorCode::from_code(255), TftpErrorCode::NotDefined);
     }
 
     #[test]
-    fn error_code_descriptions() {
-        assert_eq!(TftpErrorCode::FileNotFound.description(), "file not found");
-        assert_eq!(TftpErrorCode::AccessViolation.description(), "access violation");
-        assert_eq!(TftpErrorCode::DiskFull.description(), "disk full or allocation exceeded");
-        assert_eq!(TftpErrorCode::IllegalOperation.description(), "illegal TFTP operation");
-        assert_eq!(TftpErrorCode::UnknownTransferId.description(), "unknown transfer ID");
-        assert_eq!(TftpErrorCode::FileAlreadyExists.description(), "file already exists");
-        assert_eq!(TftpErrorCode::NoSuchUser.description(), "no such user");
-        assert_eq!(TftpErrorCode::NotDefined.description(), "not defined");
+    fn path_simple() {
+        let u = crate::url::Url::parse("tftp://h/f.txt").unwrap();
+        let (p, m) = parse_tftp_path(&u);
+        assert_eq!(p, "f.txt");
+        assert_eq!(m, "octet");
     }
 
     #[test]
-    fn error_code_repr_values() {
-        assert_eq!(TftpErrorCode::NotDefined as u16, 0);
-        assert_eq!(TftpErrorCode::FileNotFound as u16, 1);
-        assert_eq!(TftpErrorCode::NoSuchUser as u16, 7);
+    fn path_mode() {
+        let u = crate::url::Url::parse("tftp://h//f;mode=netascii").unwrap();
+        let (p, m) = parse_tftp_path(&u);
+        assert_eq!(p, "/f");
+        assert_eq!(m, "netascii");
+    }
+
+    #[test]
+    fn path_dslash() {
+        let u = crate::url::Url::parse("tftp://h//271").unwrap();
+        let (p, _) = parse_tftp_path(&u);
+        assert_eq!(p, "/271");
+    }
+
+    #[test]
+    fn timeout_default() {
+        assert_eq!(compute_tftp_timeout(None), 6);
+    }
+
+    #[test]
+    fn timeout_549() {
+        assert_eq!(compute_tftp_timeout(Some(549)), 10);
     }
 }

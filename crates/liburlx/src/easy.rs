@@ -5404,7 +5404,30 @@ async fn do_single_request(
             return crate::protocol::file::read_file(url, range_start, range_end);
         }
         "tftp" => {
-            return crate::protocol::tftp::download(url, tftp_blksize, tftp_no_options).await;
+            if method == "PUT" {
+                let upload_data = body.unwrap_or(&[]);
+                let timeout_secs = connect_timeout.map(|d| d.as_secs());
+                return crate::protocol::tftp::upload(
+                    url,
+                    upload_data,
+                    tftp_blksize,
+                    tftp_no_options,
+                    interface,
+                    local_port,
+                    timeout_secs,
+                )
+                .await;
+            }
+            return crate::protocol::tftp::download(
+                url,
+                tftp_blksize,
+                tftp_no_options,
+                interface,
+                local_port,
+                speed_limits.low_speed_limit,
+                speed_limits.low_speed_time,
+            )
+            .await;
         }
         #[cfg(feature = "ssh")]
         "sftp" | "scp" => {

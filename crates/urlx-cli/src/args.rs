@@ -185,7 +185,7 @@ pub fn print_version() {
     let os = std::env::consts::OS;
     println!("curl {version} ({arch}-{os}) libcurl/{version} rustls",);
     println!("Release-Date: 2026-03-16");
-    println!("Protocols: dict file ftp ftps http https imap imaps ipfs ipns mqtt pop3 pop3s scp sftp smtp smtps ws wss");
+    println!("Protocols: dict file ftp ftps http https imap imaps ipfs ipns mqtt pop3 pop3s scp sftp smtp smtps tftp ws wss");
     println!("Features: alt-svc AsynchDNS brotli cookies Digest HSTS HTTP2 HTTP3 HTTPS-proxy IPv6 Largefile libz NTLM PSL ssl-sessions SSL UnixSockets zstd");
 }
 
@@ -1206,14 +1206,17 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
             "--local-port" => {
                 i += 1;
                 let val = require_arg(args, i, "--local-port")?;
-                let port: u16 = val.parse().ok().unwrap_or_else(|| {
+                let port = if let Some((start_s, _end_s)) = val.split_once('-') {
+                    start_s.parse::<u16>().ok()
+                } else {
+                    val.parse::<u16>().ok()
+                };
+                if let Some(p) = port {
+                    opts.easy.local_port(p);
+                } else {
                     eprintln!("curl: invalid port: {val}");
-                    0
-                });
-                if port == 0 {
                     return Err(1);
                 }
-                opts.easy.local_port(port);
             }
             "--dns-shuffle" => {
                 opts.easy.dns_shuffle(true);
@@ -1510,7 +1513,7 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
                     return Err(1);
                 }
             }
-            "--speed-limit" => {
+            "-Y" | "-Y" | "--speed-limit" => {
                 i += 1;
                 let val = require_arg(args, i, "--speed-limit")?;
                 if let Ok(limit) = val.parse::<u32>() {
@@ -1521,7 +1524,7 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
                     return Err(1);
                 }
             }
-            "--speed-time" => {
+            "-y" | "-y" | "--speed-time" => {
                 i += 1;
                 let val = require_arg(args, i, "--speed-time")?;
                 if let Ok(secs) = val.parse::<u64>() {
