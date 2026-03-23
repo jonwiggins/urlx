@@ -51,7 +51,7 @@ pub fn idn_email_address(addr: &str) -> Result<String, Error> {
 
 /// Check if a string contains any non-ASCII characters.
 #[must_use]
-pub fn has_non_ascii(s: &str) -> bool {
+pub const fn has_non_ascii(s: &str) -> bool {
     !s.is_ascii()
 }
 

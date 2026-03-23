@@ -409,7 +409,7 @@ pub async fn send_mail(
         .map(|r| crate::idn::idn_email_address(r).unwrap_or_else(|_| r.clone()))
         .collect();
     let need_smtputf8 = config.mail_rcpt.iter().any(|r| crate::idn::has_non_ascii(r))
-        || config.mail_from.is_some_and(|f| crate::idn::has_non_ascii(f));
+        || config.mail_from.is_some_and(crate::idn::has_non_ascii);
 
     // Execute the appropriate SMTP mode
     let mut response_body = Vec::new();
@@ -427,12 +427,11 @@ pub async fn send_mail(
             .await?;
         }
         SmtpMode::Vrfy => {
+            // Append SMTPUTF8 unconditionally when advertised (curl compat: tests 967-969).
+            // Unlike Send mode, VRFY/Custom always use the SMTPUTF8 suffix.
+            let utf8_suffix = if caps.smtputf8 { " SMTPUTF8" } else { "" };
             for rcpt in &idn_rcpts {
-                let mut vrfy_cmd = format!("VRFY {rcpt}");
-                if caps.smtputf8 && need_smtputf8 {
-                    vrfy_cmd.push_str(" SMTPUTF8");
-                }
-                send_command(&mut writer, &vrfy_cmd).await?;
+                send_command(&mut writer, &format!("VRFY {rcpt}{utf8_suffix}")).await?;
                 let resp = read_response(&mut reader).await?;
                 if !resp.is_ok() && resp.code != 553 {
                     let _ = send_command(&mut writer, "QUIT").await;
@@ -442,15 +441,13 @@ pub async fn send_mail(
             }
         }
         SmtpMode::Custom(cmd) => {
+            // Append SMTPUTF8 unconditionally when advertised (curl compat: test 969).
+            let utf8_suffix = if caps.smtputf8 { " SMTPUTF8" } else { "" };
             if idn_rcpts.is_empty() {
-                send_command(&mut writer, &cmd).await?;
+                send_command(&mut writer, &format!("{cmd}{utf8_suffix}")).await?;
             } else {
                 for rcpt in &idn_rcpts {
-                    let mut custom_cmd = format!("{cmd} {rcpt}");
-                    if caps.smtputf8 && need_smtputf8 {
-                        custom_cmd.push_str(" SMTPUTF8");
-                    }
-                    send_command(&mut writer, &custom_cmd).await?;
+                    send_command(&mut writer, &format!("{cmd} {rcpt}{utf8_suffix}")).await?;
                 }
             }
             let resp = read_response(&mut reader).await?;

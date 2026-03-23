@@ -1560,10 +1560,16 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
                     return Err(2);
                 }
                 let contents_result = if val == "-" {
-                    // Read config from stdin
+                    // Read config from stdin as raw bytes, then convert to
+                    // String using lossy UTF-8 so that invalid byte sequences
+                    // (e.g., truncated multi-byte chars) reach URL parsing where
+                    // they are rejected as malformed URLs rather than causing an
+                    // IO read error (curl compat: test 1034).
                     use std::io::Read as _;
-                    let mut buf = String::new();
-                    std::io::stdin().read_to_string(&mut buf).map(|_| buf)
+                    let mut bytes = Vec::new();
+                    std::io::stdin()
+                        .read_to_end(&mut bytes)
+                        .map(|_| String::from_utf8_lossy(&bytes).into_owned())
                 } else {
                     std::fs::read_to_string(val)
                 };
