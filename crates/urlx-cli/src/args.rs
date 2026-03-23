@@ -15,6 +15,8 @@ pub enum ParseResult {
     Help,
     /// `--version` / `-V` was requested — print version and exit 0.
     Version,
+    /// `--engine list` was requested — print available engines and exit 0.
+    EngineList,
     /// Parse error — message already printed to stderr.
     /// Contains the curl-compatible exit code (default 1).
     Error(u8),
@@ -90,6 +92,8 @@ pub struct CliOptions {
     pub(crate) ssl_session_file: Option<String>,
     pub(crate) etag_save_file: Option<String>,
     pub(crate) etag_compare_file: Option<String>,
+    /// IPFS gateway URL from `--ipfs-gateway`.
+    pub(crate) ipfs_gateway: Option<String>,
     pub(crate) proto_default: Option<String>,
     pub(crate) output_dir: Option<String>,
     pub(crate) remove_on_error: bool,
@@ -181,9 +185,9 @@ pub fn print_version() {
     let version = env!("CARGO_PKG_VERSION");
     let arch = std::env::consts::ARCH;
     let os = std::env::consts::OS;
-    println!("curl {version} ({arch}-{os}) libcurl/{version} rustls",);
+    println!("curl {version} ({arch}-{os}) libcurl/{version} rustls OpenSSL",);
     println!("Release-Date: 2026-03-16");
-    println!("Protocols: dict file ftp ftps gopher gophers http https imap imaps mqtt pop3 pop3s scp sftp smtp smtps ws wss");
+    println!("Protocols: dict file ftp ftps gopher gophers http https imap imaps ipfs ipns mqtt pop3 pop3s scp sftp smtp smtps ws wss");
     println!("Features: alt-svc AsynchDNS brotli cookies Digest HSTS HTTP2 HTTP3 HTTPS-proxy IPv6 Largefile libz NTLM PSL ssl-sessions SSL UnixSockets zstd");
 }
 
@@ -358,11 +362,17 @@ pub fn parse_args(args: &[String]) -> ParseResult {
     // Step 1: Expand combined short flags
     let expanded = expand_combined_flags(args);
 
-    // Step 2: Check for --help/-h and --version/-V (early exit, like curl)
-    for arg in expanded.iter().skip(1) {
+    // Step 2: Check for --help/-h, --version/-V, and --engine list (early exit, like curl)
+    for (idx, arg) in expanded.iter().enumerate().skip(1) {
         match arg.as_str() {
             "-h" | "--help" => return ParseResult::Help,
             "-V" | "--version" => return ParseResult::Version,
+            // --engine list: print available engines and exit (curl compat: test 307)
+            "--engine" => {
+                if expanded.get(idx + 1).map(String::as_str) == Some("list") {
+                    return ParseResult::EngineList;
+                }
+            }
             _ => {}
         }
     }
@@ -557,6 +567,7 @@ fn expand_combined_flags(args: &[String]) -> Vec<String> {
                         | "--speed-time"
                         | "--local-port"
                         | "--ciphers"
+                        | "--engine"
                         | "--tls13-ciphers"
                         | "--proxy-cert"
                         | "--proxy-key"
@@ -599,6 +610,7 @@ fn expand_combined_flags(args: &[String]) -> Vec<String> {
                         | "--tftp-blksize"
                         | "--http2-ping-interval"
                         | "--libcurl"
+                        | "--ipfs-gateway"
                 ) {
                     skip_next = true;
                 }
@@ -677,6 +689,7 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
         ssl_session_file: None,
         etag_save_file: None,
         etag_compare_file: None,
+        ipfs_gateway: None,
         proto_default: None,
         output_dir: None,
         remove_on_error: false,
@@ -1855,6 +1868,11 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
                     opts.etag_conflict_blame = Some("--etag-compare".to_string());
                 }
             }
+            "--ipfs-gateway" => {
+                i += 1;
+                let val = require_arg(args, i, "--ipfs-gateway")?;
+                opts.ipfs_gateway = Some(val.to_string());
+            }
             "--haproxy-protocol" => {
                 opts.easy.haproxy_protocol(true);
             }
@@ -2188,6 +2206,19 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
                 let _val = require_arg(args, i, &args[i - 1].clone())?;
                 // Accepted for compat; ssh key auth handled by ssh module
             }
+            // SSL crypto engine selection (curl compat: tests 307, 308)
+            "--engine" => {
+                i += 1;
+                let val = require_arg(args, i, &args[i - 1].clone())?;
+                match val {
+                    // "openssl" and "default" are accepted as no-ops (built-in engine)
+                    "list" | "openssl" | "default" => {}
+                    _ => {
+                        eprintln!("curl: (53) SSL crypto engine '{val}' not found");
+                        return Err(53);
+                    }
+                }
+            }
             // No-op flags that take an argument
             "--create-file-mode"
             | "--service-name"
@@ -2205,7 +2236,6 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
             | "--proxy-pinnedpubkey"
             | "--proxy-pass"
             | "--curves"
-            | "--engine"
             | "--krb"
             | "--random-file"
             | "--egd-file"
@@ -3528,8 +3558,8 @@ pub fn is_protocol_allowed(url: &str, proto_list: &str) -> bool {
 /// Returns the list of allowed protocol names (lowercase).
 pub fn parse_proto_spec(spec: &str) -> Vec<String> {
     let all_protocols: &[&str] = &[
-        "http", "https", "ftp", "ftps", "scp", "sftp", "imap", "imaps", "pop3", "pop3s", "smtp",
-        "smtps", "dict", "file", "tftp", "mqtt", "ws", "wss", "gopher", "gophers",
+        "http", "https", "ftp", "ftps", "scp", "sftp", "imap", "imaps", "ipfs", "ipns", "pop3",
+        "pop3s", "smtp", "smtps", "dict", "file", "tftp", "mqtt", "ws", "wss", "gopher", "gophers",
     ];
 
     // "=proto1,proto2" means exactly these protocols
@@ -3958,6 +3988,7 @@ mod tests {
             ParseResult::Options(opts) => *opts,
             ParseResult::Help => panic!("expected Options, got Help"),
             ParseResult::Version => panic!("expected Options, got Version"),
+            ParseResult::EngineList => panic!("expected Options, got EngineList"),
             ParseResult::Error(_) => panic!("expected Options, got Error"),
         }
     }
@@ -5946,6 +5977,13 @@ mod tests {
     }
 
     #[test]
+    fn parse_ipfs_gateway() {
+        let args = make_args(&["--ipfs-gateway", "http://127.0.0.1:8080", "ipfs://bafyhash"]);
+        let opts = unwrap_opts(parse_args(&args));
+        assert_eq!(opts.ipfs_gateway.as_deref(), Some("http://127.0.0.1:8080"));
+    }
+
+    #[test]
     fn parse_haproxy_protocol() {
         let args = make_args(&["--haproxy-protocol", "http://example.com"]);
         let opts = unwrap_opts(parse_args(&args));
@@ -6345,6 +6383,34 @@ mod tests {
         let args = make_args(&["--key-type", "PEM", "http://example.com"]);
         let opts = unwrap_opts(parse_args(&args));
         assert!(!opts.urls.is_empty());
+    }
+
+    #[test]
+    fn parse_args_engine_list() {
+        let args = make_args(&["--engine", "list"]);
+        let result = parse_args(&args);
+        assert!(matches!(result, ParseResult::EngineList));
+    }
+
+    #[test]
+    fn parse_args_engine_openssl() {
+        let args = make_args(&["--engine", "openssl", "https://example.com"]);
+        let opts = unwrap_opts(parse_args(&args));
+        assert!(!opts.urls.is_empty());
+    }
+
+    #[test]
+    fn parse_args_engine_default() {
+        let args = make_args(&["--engine", "default", "https://example.com"]);
+        let opts = unwrap_opts(parse_args(&args));
+        assert!(!opts.urls.is_empty());
+    }
+
+    #[test]
+    fn parse_args_engine_invalid() {
+        let args = make_args(&["--engine", "invalid-crypto-engine-xyzzy", "https://example.com"]);
+        let result = parse_args(&args);
+        assert!(matches!(result, ParseResult::Error(53)));
     }
 
     #[test]

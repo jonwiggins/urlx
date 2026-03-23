@@ -14,7 +14,8 @@ if [ "$1" = "--version" ]; then
     features=$(echo "$version_output" | grep '^Features:' | sed 's/^Features: //')
 
     # Output in curl's expected format
-    echo "curl ${VERSION} ($(uname -m)-apple-darwin) libcurl/${VERSION} urlx/${VERSION}"
+    # Pass through the first line from urlx --version (contains TLS backend info)
+    echo "$version_output" | head -1
     echo "Release-Date: 2026-03-11"
     echo "Protocols: ${protocols}"
     echo "Features: ${features}"

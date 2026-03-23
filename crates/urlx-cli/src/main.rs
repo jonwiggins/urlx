@@ -21,6 +21,7 @@
 )]
 
 mod args;
+mod ipfs;
 mod output;
 mod transfer;
 

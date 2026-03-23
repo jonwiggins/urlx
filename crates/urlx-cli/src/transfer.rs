@@ -658,6 +658,11 @@ pub fn run(args: &[String]) -> ExitCode {
             print_version();
             return ExitCode::SUCCESS;
         }
+        ParseResult::EngineList => {
+            println!("Build-time engines:");
+            println!("  openssl");
+            return ExitCode::SUCCESS;
+        }
         ParseResult::Error(code) => {
             return ExitCode::from(code);
         }
@@ -1127,6 +1132,7 @@ pub fn run(args: &[String]) -> ExitCode {
             &opts.per_url_group,
             opts.resume_offset,
             &opts.per_url_custom_request,
+            opts.ipfs_gateway.as_deref(),
         );
     }
 
@@ -1172,6 +1178,21 @@ pub fn run(args: &[String]) -> ExitCode {
                 return ExitCode::from(1);
             }
         }
+
+        // IPFS/IPNS URL rewriting: rewrite to HTTP gateway URL before setting on Easy handle
+        let url = if crate::ipfs::is_ipfs_url(&url) {
+            match crate::ipfs::ipfs_url_rewrite(&url, opts.ipfs_gateway.as_deref()) {
+                Ok(rewritten) => rewritten,
+                Err(e) => {
+                    if !opts.silent || opts.show_error {
+                        eprintln!("curl: ({}) {}", e.exit_code(), e.message());
+                    }
+                    return ExitCode::from(e.exit_code());
+                }
+            }
+        } else {
+            url
+        };
 
         // -T filename: append filename to URL path if URL ends with /
         let url = if let Some(ref filename) = opts.upload_filename {
@@ -2692,6 +2713,7 @@ pub fn run_multi(
     per_url_group: &[usize],
     resume_offset: Option<u64>,
     per_url_custom_request: &[Option<String>],
+    ipfs_gateway: Option<&str>,
 ) -> ExitCode {
     if parallel {
         return run_multi_parallel(
@@ -2885,6 +2907,27 @@ pub fn run_multi(
                 }
             }
         }
+
+        // IPFS/IPNS URL rewriting: rewrite to HTTP gateway URL
+        let url = if crate::ipfs::is_ipfs_url(url) {
+            match crate::ipfs::ipfs_url_rewrite(url, ipfs_gateway) {
+                Ok(rewritten) => rewritten,
+                Err(e) => {
+                    if !silent || show_error {
+                        eprintln!("curl: ({}) {}", e.exit_code(), e.message());
+                    }
+                    let exit_code = ExitCode::from(e.exit_code());
+                    if fail_early {
+                        return exit_code;
+                    }
+                    last_exit = exit_code;
+                    continue;
+                }
+            }
+        } else {
+            url.clone()
+        };
+        let url = &url;
 
         // -T filename: append filename to URL path if URL ends with /
         let effective_url = if is_upload {
