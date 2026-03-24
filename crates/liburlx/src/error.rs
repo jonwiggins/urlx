@@ -111,6 +111,10 @@ pub enum Error {
         partial_body: Vec<u8>,
     },
 
+    /// An LDAP search failed (maps to `CURLE_LDAP_SEARCH_FAILED` = 39).
+    #[error("LDAP search failed: {0}")]
+    LdapSearch(String),
+
     /// An SMTP authentication error (maps to `CURLE_LOGIN_DENIED` = 67).
     #[error("SMTP auth error: {0}")]
     SmtpAuth(String),

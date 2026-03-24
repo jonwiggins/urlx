@@ -4912,6 +4912,7 @@ fn error_to_curlcode(err: &liburlx::Error) -> CURLcode {
         liburlx::Error::Timeout(_) | liburlx::Error::SpeedLimit { .. } => {
             CURLcode::CURLE_OPERATION_TIMEDOUT
         }
+        liburlx::Error::LdapSearch(_) => CURLcode::CURLE_LDAP_SEARCH_FAILED,
         liburlx::Error::RtspCseqError(_) => CURLcode::CURLE_RTSP_CSEQ_ERROR,
         liburlx::Error::RtspSessionError(_) => CURLcode::CURLE_RTSP_SESSION_ERROR,
         liburlx::Error::Transfer { code, .. } => match *code {

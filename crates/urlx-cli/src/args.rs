@@ -207,6 +207,7 @@ pub fn print_version() {
     protocols.extend_from_slice(&["http", "https"]);
     protocols.extend_from_slice(&["imap", "imaps"]);
     protocols.extend_from_slice(&["ipfs", "ipns"]);
+    protocols.extend_from_slice(&["ldap", "ldaps"]);
     protocols.push("mqtt");
     protocols.extend_from_slice(&["pop3", "pop3s"]);
     protocols.push("rtsp");
@@ -3684,9 +3685,9 @@ pub fn is_protocol_allowed(url: &str, proto_list: &str) -> bool {
 /// Returns the list of allowed protocol names (lowercase).
 pub fn parse_proto_spec(spec: &str) -> Vec<String> {
     let all_protocols: &[&str] = &[
-        "http", "https", "ftp", "ftps", "scp", "sftp", "imap", "imaps", "ipfs", "ipns", "pop3",
-        "pop3s", "smtp", "smtps", "dict", "file", "tftp", "mqtt", "rtsp", "ws", "wss", "gopher",
-        "gophers",
+        "http", "https", "ftp", "ftps", "scp", "sftp", "imap", "imaps", "ipfs", "ipns", "ldap",
+        "ldaps", "pop3", "pop3s", "smtp", "smtps", "dict", "file", "tftp", "mqtt", "rtsp", "ws",
+        "wss", "gopher", "gophers",
     ];
 
     // "=proto1,proto2" means exactly these protocols
