@@ -26,6 +26,7 @@ http3 = ["liburlx/http3"]
 decompression = ["liburlx/decompression"]
 ssh = ["liburlx/ssh"]
 tls-srp = ["liburlx/tls-srp"]
+gss-api = ["liburlx/gss-api"]
 hickory-dns = ["liburlx/hickory-dns"]
 
 [dependencies]

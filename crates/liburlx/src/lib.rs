@@ -150,7 +150,9 @@ pub mod throttle;
 pub mod tls;
 pub mod url;
 
-pub use auth::{AuthCredentials, AuthMethod, ProxyAuthCredentials, ProxyAuthMethod};
+pub use auth::{
+    AuthCredentials, AuthMethod, GssApiDelegation, ProxyAuthCredentials, ProxyAuthMethod,
+};
 pub use cookie::CookieJar;
 #[cfg(feature = "hickory-dns")]
 pub use dns::HickoryResolver;
