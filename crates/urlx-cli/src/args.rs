@@ -60,6 +60,7 @@ pub struct CliOptions {
     pub(crate) create_dirs: bool,
     pub(crate) proxy_digest: bool,
     pub(crate) proxy_ntlm: bool,
+    pub(crate) proxy_negotiate: bool,
     pub(crate) proxy_anyauth: bool,
     pub(crate) proxy_user: Option<(String, String)>,
     pub(crate) suppress_connect_headers: bool,
@@ -84,6 +85,7 @@ pub struct CliOptions {
     pub(crate) url_queries: Vec<String>,
     pub(crate) rate: Option<String>,
     pub(crate) use_ntlm: bool,
+    pub(crate) use_negotiate: bool,
     pub(crate) use_anyauth: bool,
     /// User-Agent string set via -A/--user-agent (for --libcurl output).
     pub(crate) user_agent_str: Option<String>,
@@ -726,6 +728,7 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
         create_dirs: false,
         proxy_digest: false,
         proxy_ntlm: false,
+        proxy_negotiate: false,
         proxy_anyauth: false,
         proxy_user: None,
         suppress_connect_headers: false,
@@ -749,6 +752,7 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
         url_queries: Vec::new(),
         rate: None,
         use_ntlm: false,
+        use_negotiate: false,
         use_anyauth: false,
         user_agent_str: None,
         globoff: false,
@@ -1232,6 +1236,9 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
             }
             "--proxy-ntlm" => {
                 opts.proxy_ntlm = true;
+            }
+            "--proxy-negotiate" => {
+                opts.proxy_negotiate = true;
             }
             "--proxy-anyauth" => {
                 opts.proxy_anyauth = true;
@@ -1860,13 +1867,27 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
             "--ntlm" => {
                 opts.use_ntlm = true;
             }
+            "--negotiate" => {
+                opts.use_negotiate = true;
+            }
             "--anyauth" => {
                 opts.use_anyauth = true;
             }
             "--delegation" => {
                 i += 1;
-                let _val = require_arg(args, i, "--delegation")?;
-                // GSS-API delegation not implemented; accepted for compatibility
+                let val = require_arg(args, i, "--delegation")?;
+                match val.to_lowercase().as_str() {
+                    "none" => {
+                        opts.easy.gss_api_delegation(liburlx::auth::GssApiDelegation::None);
+                    }
+                    "policy" => {
+                        opts.easy.gss_api_delegation(liburlx::auth::GssApiDelegation::Policy);
+                    }
+                    "always" => {
+                        opts.easy.gss_api_delegation(liburlx::auth::GssApiDelegation::Always);
+                    }
+                    _ => {} // Unknown delegation level — ignore (curl compat)
+                }
             }
             "--sasl-authzid" => {
                 i += 1;
@@ -2220,7 +2241,6 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
             | "--ftp-pasv"
             | "--styled-output"
             | "--no-styled-output"
-            | "--negotiate"
             | "--xattr"
             | "-q"
             | "--disable"
@@ -2240,7 +2260,6 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
             | "--socks5-basic"
             | "--socks5-gssapi"
             | "--ntlm-wb"
-            | "--proxy-negotiate"
             | "--trace-ids"
             | "--socks5-gssapi-nec"
             | "-4"
@@ -2505,7 +2524,9 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
     // Apply proxy auth credentials before site auth so Proxy-Authorization
     // appears before Authorization in the header order (curl compat).
     if let Some((ref user, ref pass)) = opts.proxy_user {
-        if opts.proxy_ntlm {
+        if opts.proxy_negotiate {
+            opts.easy.proxy_negotiate_auth(user, pass);
+        } else if opts.proxy_ntlm {
             opts.easy.proxy_ntlm_auth(user, pass);
         } else if opts.proxy_digest {
             opts.easy.proxy_digest_auth(user, pass);
@@ -2514,13 +2535,15 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
         } else {
             opts.easy.proxy_auth(user, pass);
         }
-    } else if opts.proxy_digest || opts.proxy_ntlm || opts.proxy_anyauth {
+    } else if opts.proxy_negotiate || opts.proxy_digest || opts.proxy_ntlm || opts.proxy_anyauth {
         // Proxy credentials were extracted from the URL (in proxy()). Override the auth
-        // method if --proxy-digest/--proxy-ntlm/--proxy-anyauth was specified.
+        // method if --proxy-negotiate/--proxy-digest/--proxy-ntlm/--proxy-anyauth was specified.
         if let Some(creds) = opts.easy.proxy_credentials_ref() {
             let user = creds.username.clone();
             let pass = creds.password.clone();
-            if opts.proxy_ntlm {
+            if opts.proxy_negotiate {
+                opts.easy.proxy_negotiate_auth(&user, &pass);
+            } else if opts.proxy_ntlm {
                 opts.easy.proxy_ntlm_auth(&user, &pass);
             } else if opts.proxy_digest {
                 opts.easy.proxy_digest_auth(&user, &pass);
@@ -2536,6 +2559,8 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
     if let Some((ref user, ref pass)) = opts.user_credentials {
         if opts.use_aws_sigv4 {
             opts.easy.aws_credentials(user, pass);
+        } else if opts.use_negotiate {
+            opts.easy.negotiate_auth(user, pass);
         } else if opts.use_ntlm {
             opts.easy.ntlm_auth(user, pass);
         } else if opts.use_anyauth {
@@ -2545,6 +2570,9 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
         } else if !opts.use_bearer {
             opts.easy.basic_auth(user, pass);
         }
+    } else if opts.use_negotiate {
+        // --negotiate without -u: use empty credentials (system Kerberos ccache)
+        opts.easy.negotiate_auth("", "");
     }
     // Note: netrc credential loading is deferred to run() where the URL is known
 
@@ -5939,7 +5967,16 @@ mod tests {
     fn parse_negotiate_flag() {
         let args = make_args(&["--negotiate", "http://example.com"]);
         let opts = unwrap_opts(parse_args(&args));
+        assert!(opts.use_negotiate);
         assert_eq!(opts.urls, vec!["http://example.com"]);
+    }
+
+    #[test]
+    fn parse_proxy_negotiate_flag() {
+        let args =
+            make_args(&["--proxy-negotiate", "-x", "http://proxy:8080", "http://example.com"]);
+        let opts = unwrap_opts(parse_args(&args));
+        assert!(opts.proxy_negotiate);
     }
 
     #[test]

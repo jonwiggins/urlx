@@ -1,10 +1,13 @@
 //! HTTP authentication mechanisms.
 //!
-//! Supports Basic, Bearer, Digest (RFC 7616), NTLM, SCRAM-SHA-256, and AWS `SigV4` authentication.
+//! Supports Basic, Bearer, Digest (RFC 7616), NTLM, Negotiate (SPNEGO/Kerberos),
+//! SCRAM-SHA-256, and AWS `SigV4` authentication.
 
 pub mod aws_sigv4;
 pub mod cram_md5;
 pub mod digest;
+#[cfg(feature = "gss-api")]
+pub mod negotiate;
 pub mod ntlm;
 pub mod scram;
 
@@ -28,12 +31,32 @@ pub enum AuthMethod {
     /// Multi-step challenge-response: Type 1 negotiate, Type 2 challenge,
     /// Type 3 authenticate.
     Ntlm,
+    /// HTTP Negotiate (SPNEGO/Kerberos) authentication.
+    ///
+    /// Uses the system GSS-API library to perform Kerberos single sign-on.
+    /// Requires the `gss-api` feature flag.
+    Negotiate,
     /// Automatic authentication method selection.
     ///
     /// Sends the first request without auth, then examines the
     /// `WWW-Authenticate` header to pick the strongest supported method
-    /// (Digest > NTLM > Basic).
+    /// (Negotiate > Digest > NTLM > Basic).
     AnyAuth,
+}
+
+/// GSS-API credential delegation level for Negotiate (SPNEGO/Kerberos) authentication.
+///
+/// Controls whether Kerberos credentials are forwarded to the server.
+/// Equivalent to curl's `--delegation` option.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GssApiDelegation {
+    /// Do not delegate credentials (default).
+    #[default]
+    None,
+    /// Delegate only if the server's credential is `ok_as_delegate` in the service ticket.
+    Policy,
+    /// Always delegate credentials unconditionally.
+    Always,
 }
 
 /// Credentials for HTTP authentication.
@@ -47,6 +70,8 @@ pub struct AuthCredentials {
     pub method: AuthMethod,
     /// Optional NTLM domain (e.g., from `DOMAIN\user` format).
     pub domain: Option<String>,
+    /// GSS-API delegation level for Negotiate authentication.
+    pub gss_api_delegation: GssApiDelegation,
 }
 
 /// Proxy authentication method.
@@ -59,11 +84,13 @@ pub enum ProxyAuthMethod {
     Digest,
     /// NTLM authentication.
     Ntlm,
+    /// Negotiate (SPNEGO/Kerberos) authentication.
+    Negotiate,
     /// Automatic authentication method selection.
     ///
     /// Sends the first request without auth, then examines the
     /// `Proxy-Authenticate` header to pick the strongest supported method
-    /// (NTLM > Digest > Basic).
+    /// (Negotiate > NTLM > Digest > Basic).
     Any,
 }
 

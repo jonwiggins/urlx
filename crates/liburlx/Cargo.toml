@@ -36,6 +36,9 @@ hickory-dns = ["dep:hickory-resolver"]
 # Content-Encoding decompression
 decompression = ["dep:flate2", "dep:brotli", "dep:zstd"]
 
+# GSS-API / Kerberos (Negotiate/SPNEGO) authentication
+gss-api = ["dep:libgssapi"]
+
 [dependencies]
 thiserror.workspace = true
 tokio = { workspace = true, features = ["net", "io-util", "rt", "time", "sync", "macros"] }
@@ -67,6 +70,7 @@ hickory-resolver = { version = "0.25", optional = true, default-features = false
 openssl = { version = "0.10", optional = true }
 openssl-sys = { version = "0.9", optional = true }
 tokio-openssl = { version = "0.6", optional = true }
+libgssapi = { version = "0.7", optional = true }
 psl = "2"
 idna = "1"
 des = "0.8"

@@ -27,6 +27,7 @@ decompression = ["liburlx/decompression"]
 ssh = ["liburlx/ssh"]
 tls-srp = ["liburlx/tls-srp"]
 hickory-dns = ["liburlx/hickory-dns"]
+gss-api = ["liburlx/gss-api"]
 
 [dependencies]
 filetime = "0.2"
