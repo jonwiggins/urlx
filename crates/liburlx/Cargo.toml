@@ -28,6 +28,9 @@ ldap = []
 rustls = ["dep:rustls", "dep:webpki-roots", "dep:tokio-rustls"]
 tls-srp = ["dep:openssl", "dep:openssl-sys", "dep:tokio-openssl"]
 
+# SMB/SMBS file sharing
+smb = []
+
 # SSH/SFTP/SCP protocols
 ssh = ["dep:russh", "dep:russh-sftp"]
 

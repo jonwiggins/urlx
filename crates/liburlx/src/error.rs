@@ -131,6 +131,10 @@ pub enum Error {
     #[error("RTSP Session mismatch: {0}")]
     RtspSessionError(String),
 
+    /// An SMB protocol error occurred.
+    #[error("SMB error: {0}")]
+    Smb(String),
+
     /// A generic protocol error with a curl error code.
     #[error("protocol error (code {0})")]
     Protocol(u32),

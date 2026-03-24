@@ -214,6 +214,9 @@ pub fn print_version() {
     if cfg!(feature = "ssh") {
         protocols.extend_from_slice(&["scp", "sftp"]);
     }
+    if cfg!(feature = "smb") {
+        protocols.extend_from_slice(&["smb", "smbs"]);
+    }
     protocols.extend_from_slice(&["smtp", "smtps"]);
     protocols.push("tftp");
     protocols.extend_from_slice(&["ws", "wss"]);

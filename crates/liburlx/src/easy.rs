@@ -6225,6 +6225,12 @@ async fn do_single_request(
                 crate::protocol::mqtt::subscribe(url).await
             };
         }
+        #[cfg(feature = "smb")]
+        "smb" | "smbs" => {
+            let use_tls = url.scheme() == "smbs";
+            let upload_data = if method == "PUT" { body } else { None };
+            return crate::protocol::smb::transfer(url, tls_config, use_tls, upload_data).await;
+        }
         "dict" => {
             return crate::protocol::dict::lookup(url).await;
         }
