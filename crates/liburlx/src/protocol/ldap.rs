@@ -117,7 +117,7 @@ mod ber {
         bytes
     }
 
-    /// Decode a BER length from a byte slice, returning (length, bytes_consumed).
+    /// Decode a BER length from a byte slice, returning (length, `bytes_consumed`).
     pub fn decode_length(data: &[u8]) -> Result<(usize, usize), String> {
         if data.is_empty() {
             return Err("empty length".to_string());
@@ -148,11 +148,8 @@ mod ber {
             return Err("INTEGER truncated".to_string());
         }
         let value_bytes = &data[1 + len_size..total];
-        let mut value: i64 = if !value_bytes.is_empty() && value_bytes[0] & 0x80 != 0 {
-            -1
-        } else {
-            0
-        };
+        let mut value: i64 =
+            if !value_bytes.is_empty() && value_bytes[0] & 0x80 != 0 { -1 } else { 0 };
         for &b in value_bytes {
             value = (value << 8) | i64::from(b);
         }
@@ -175,7 +172,7 @@ mod ber {
         Ok((data[1 + len_size..total].to_vec(), total))
     }
 
-    /// Decode a TLV (tag-length-value) element, returning (tag, value_bytes, `total_consumed`).
+    /// Decode a TLV (tag-length-value) element, returning (tag, `value_bytes`, `total_consumed`).
     pub fn decode_tlv(data: &[u8]) -> Result<(u8, Vec<u8>, usize), String> {
         if data.is_empty() {
             return Err("empty TLV".to_string());
@@ -291,8 +288,21 @@ fn split_filter_list(s: &str) -> Result<Vec<String>, Error> {
     let mut start = None;
     for (i, ch) in s.char_indices() {
         match ch {
-            '(' => { if depth == 0 { start = Some(i); } depth += 1; }
-            ')' => { depth -= 1; if depth == 0 { if let Some(s_idx) = start { filters.push(s[s_idx..=i].to_string()); start = None; } } }
+            '(' => {
+                if depth == 0 {
+                    start = Some(i);
+                }
+                depth += 1;
+            }
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    if let Some(s_idx) = start {
+                        filters.push(s[s_idx..=i].to_string());
+                        start = None;
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -344,8 +354,16 @@ fn encode_substring_filter(attr: &str, val: &str) -> Vec<u8> {
     let parts: Vec<&str> = val.split('*').collect();
     let mut substrings = Vec::new();
     for (i, part) in parts.iter().enumerate() {
-        if part.is_empty() { continue; }
-        let tag = if i == 0 { 0 } else if i == parts.len() - 1 { 2 } else { 1 };
+        if part.is_empty() {
+            continue;
+        }
+        let tag = if i == 0 {
+            0
+        } else if i == parts.len() - 1 {
+            2
+        } else {
+            1
+        };
         substrings.extend(ber::encode_context_primitive(tag, part.as_bytes()));
     }
     let substr_seq = ber::encode_sequence(&substrings);
@@ -407,8 +425,14 @@ fn build_unbind_request(message_id: i32) -> Vec<u8> {
     ber::encode_sequence(&msg)
 }
 
-struct LdapAttribute { attr_type: String, values: Vec<Vec<u8>> }
-struct LdapEntry { dn: String, attributes: Vec<LdapAttribute> }
+struct LdapAttribute {
+    attr_type: String,
+    values: Vec<Vec<u8>>,
+}
+struct LdapEntry {
+    dn: String,
+    attributes: Vec<LdapAttribute>,
+}
 
 fn parse_ldap_message(data: &[u8]) -> Result<(i64, u8, Vec<u8>, usize), Error> {
     let (tag, msg_content, total) = ber::decode_tlv(data)
@@ -441,14 +465,18 @@ fn parse_search_result_entry(op_value: &[u8]) -> Result<LdapEntry, Error> {
         let (attr_list_tag, attr_list_value, _) = ber::decode_tlv(&op_value[pos..])
             .map_err(|e| Error::Http(format!("LDAP: failed to parse attribute list: {e}")))?;
         if attr_list_tag != 0x30 {
-            return Err(Error::Http(format!("LDAP: expected SEQUENCE for attribute list, got 0x{attr_list_tag:02X}")));
+            return Err(Error::Http(format!(
+                "LDAP: expected SEQUENCE for attribute list, got 0x{attr_list_tag:02X}"
+            )));
         }
         let mut attr_pos = 0;
         while attr_pos < attr_list_value.len() {
             let (pa_tag, pa_value, pa_total) = ber::decode_tlv(&attr_list_value[attr_pos..])
                 .map_err(|e| Error::Http(format!("LDAP: failed to parse attribute: {e}")))?;
             attr_pos += pa_total;
-            if pa_tag != 0x30 { continue; }
+            if pa_tag != 0x30 {
+                continue;
+            }
             let mut pa_pos = 0;
             let (type_bytes, type_len) = ber::decode_octet_string(&pa_value[pa_pos..])
                 .map_err(|e| Error::Http(format!("LDAP: failed to parse attribute type: {e}")))?;
@@ -462,7 +490,9 @@ fn parse_search_result_entry(op_value: &[u8]) -> Result<LdapEntry, Error> {
                     let mut set_pos = 0;
                     while set_pos < set_value.len() {
                         let (val_bytes, val_len) = ber::decode_octet_string(&set_value[set_pos..])
-                            .map_err(|e| Error::Http(format!("LDAP: failed to parse attribute value: {e}")))?;
+                            .map_err(|e| {
+                                Error::Http(format!("LDAP: failed to parse attribute value: {e}"))
+                            })?;
                         set_pos += val_len;
                         values.push(val_bytes);
                     }
@@ -475,8 +505,9 @@ fn parse_search_result_entry(op_value: &[u8]) -> Result<LdapEntry, Error> {
 }
 
 fn parse_search_result_done(op_value: &[u8]) -> Result<u8, Error> {
-    let (result_code, _) = ber::decode_enumerated(op_value)
-        .map_err(|e| Error::Http(format!("LDAP: failed to parse SearchResultDone result code: {e}")))?;
+    let (result_code, _) = ber::decode_enumerated(op_value).map_err(|e| {
+        Error::Http(format!("LDAP: failed to parse SearchResultDone result code: {e}"))
+    })?;
     Ok(result_code)
 }
 
@@ -514,8 +545,16 @@ fn base64_encode(data: &[u8]) -> String {
         let n = (b0 << 16) | (b1 << 8) | b2;
         result.push(ALPHABET[(n >> 18 & 0x3F) as usize] as char);
         result.push(ALPHABET[(n >> 12 & 0x3F) as usize] as char);
-        if chunk.len() > 1 { result.push(ALPHABET[(n >> 6 & 0x3F) as usize] as char); } else { result.push('='); }
-        if chunk.len() > 2 { result.push(ALPHABET[(n & 0x3F) as usize] as char); } else { result.push('='); }
+        if chunk.len() > 1 {
+            result.push(ALPHABET[(n >> 6 & 0x3F) as usize] as char);
+        } else {
+            result.push('=');
+        }
+        if chunk.len() > 2 {
+            result.push(ALPHABET[(n & 0x3F) as usize] as char);
+        } else {
+            result.push('=');
+        }
     }
     result
 }
@@ -549,10 +588,14 @@ const fn hex_val(b: u8) -> Option<u8> {
 
 async fn read_ldap_message<S: AsyncReadExt + Unpin>(stream: &mut S) -> Result<Vec<u8>, Error> {
     let mut tag_buf = [0u8; 1];
-    let _ = stream.read_exact(&mut tag_buf).await
+    let _ = stream
+        .read_exact(&mut tag_buf)
+        .await
         .map_err(|e| Error::Http(format!("LDAP: failed to read message tag: {e}")))?;
     let mut first_len = [0u8; 1];
-    let _ = stream.read_exact(&mut first_len).await
+    let _ = stream
+        .read_exact(&mut first_len)
+        .await
         .map_err(|e| Error::Http(format!("LDAP: failed to read message length: {e}")))?;
     let (content_len, extra_len_bytes) = if first_len[0] < 0x80 {
         (first_len[0] as usize, 0)
@@ -562,10 +605,14 @@ async fn read_ldap_message<S: AsyncReadExt + Unpin>(stream: &mut S) -> Result<Ve
             return Err(Error::Http(format!("LDAP: invalid length encoding: {num_bytes} octets")));
         }
         let mut len_buf = vec![0u8; num_bytes];
-        let _ = stream.read_exact(&mut len_buf).await
+        let _ = stream
+            .read_exact(&mut len_buf)
+            .await
             .map_err(|e| Error::Http(format!("LDAP: failed to read extended length: {e}")))?;
         let mut len = 0usize;
-        for &b in &len_buf { len = (len << 8) | b as usize; }
+        for &b in &len_buf {
+            len = (len << 8) | b as usize;
+        }
         (len, num_bytes)
     };
     let mut message = Vec::with_capacity(2 + extra_len_bytes + content_len);
@@ -583,8 +630,9 @@ async fn read_ldap_message<S: AsyncReadExt + Unpin>(stream: &mut S) -> Result<Ve
     }
     let content_start = message.len();
     message.resize(content_start + content_len, 0);
-    let _ = stream.read_exact(&mut message[content_start..]).await
-        .map_err(|e| Error::Http(format!("LDAP: failed to read message content ({content_len} bytes): {e}")))?;
+    let _ = stream.read_exact(&mut message[content_start..]).await.map_err(|e| {
+        Error::Http(format!("LDAP: failed to read message content ({content_len} bytes): {e}"))
+    })?;
     Ok(message)
 }
 
@@ -630,10 +678,11 @@ async fn perform_ldap<S: AsyncReadExt + AsyncWriteExt + Unpin>(
         (Some(user), Some(pass)) if !user.is_empty() => build_bind_request_auth(msg_id, user, pass),
         _ => build_bind_request(msg_id),
     };
-    stream.write_all(&bind_msg).await
+    stream
+        .write_all(&bind_msg)
+        .await
         .map_err(|e| Error::Http(format!("LDAP: failed to send BindRequest: {e}")))?;
-    stream.flush().await
-        .map_err(|e| Error::Http(format!("LDAP: flush error: {e}")))?;
+    stream.flush().await.map_err(|e| Error::Http(format!("LDAP: flush error: {e}")))?;
     let resp_data = read_ldap_message(&mut stream).await?;
     let (_id, op_tag, op_value, _) = parse_ldap_message(&resp_data)?;
     if op_tag != 0x61 {
@@ -641,29 +690,40 @@ async fn perform_ldap<S: AsyncReadExt + AsyncWriteExt + Unpin>(
     }
     let result_code = parse_bind_response(&op_value)?;
     if result_code != 0 {
-        return Err(Error::Transfer { code: 39, message: format!("LDAP bind failed with result code {result_code}") });
+        return Err(Error::Transfer {
+            code: 39,
+            message: format!("LDAP bind failed with result code {result_code}"),
+        });
     }
     msg_id += 1;
     let search_msg = build_search_request(msg_id, components)?;
-    stream.write_all(&search_msg).await
+    stream
+        .write_all(&search_msg)
+        .await
         .map_err(|e| Error::Http(format!("LDAP: failed to send SearchRequest: {e}")))?;
-    stream.flush().await
-        .map_err(|e| Error::Http(format!("LDAP: flush error: {e}")))?;
+    stream.flush().await.map_err(|e| Error::Http(format!("LDAP: flush error: {e}")))?;
     let mut entries = Vec::new();
     loop {
         let msg_data = read_ldap_message(&mut stream).await?;
         let (_id, op_tag, op_value, _) = parse_ldap_message(&msg_data)?;
         match op_tag {
-            0x64 => { entries.push(parse_search_result_entry(&op_value)?); }
+            0x64 => {
+                entries.push(parse_search_result_entry(&op_value)?);
+            }
             0x73 => { /* SearchResultReference — skip */ }
             0x65 => {
                 let result_code = parse_search_result_done(&op_value)?;
                 if result_code != 0 && result_code != 4 {
-                    return Err(Error::Transfer { code: 39, message: format!("LDAP search failed with result code {result_code}") });
+                    return Err(Error::Transfer {
+                        code: 39,
+                        message: format!("LDAP search failed with result code {result_code}"),
+                    });
                 }
                 break;
             }
-            _ => { return Err(Error::Http(format!("LDAP: unexpected response tag 0x{op_tag:02X}"))); }
+            _ => {
+                return Err(Error::Http(format!("LDAP: unexpected response tag 0x{op_tag:02X}")));
+            }
         }
     }
     msg_id += 1;
@@ -701,7 +761,10 @@ mod tests {
     }
     #[test]
     fn ber_encode_octet_string_basic() {
-        assert_eq!(ber::encode_octet_string(b"hello"), vec![0x04, 0x05, b'h', b'e', b'l', b'l', b'o']);
+        assert_eq!(
+            ber::encode_octet_string(b"hello"),
+            vec![0x04, 0x05, b'h', b'e', b'l', b'l', b'o']
+        );
     }
     #[test]
     fn ber_encode_octet_string_empty() {
@@ -738,7 +801,8 @@ mod tests {
     }
     #[test]
     fn ber_decode_octet_string() {
-        let (val, consumed) = ber::decode_octet_string(&[0x04, 0x05, b'h', b'e', b'l', b'l', b'o']).unwrap();
+        let (val, consumed) =
+            ber::decode_octet_string(&[0x04, 0x05, b'h', b'e', b'l', b'l', b'o']).unwrap();
         assert_eq!(val, b"hello");
         assert_eq!(consumed, 7);
     }
@@ -764,7 +828,10 @@ mod tests {
     }
     #[test]
     fn parse_ldap_url_with_query() {
-        let url = crate::url::Url::parse("ldap://localhost/dc=example,dc=com?cn,mail?sub?(objectClass=person)").unwrap();
+        let url = crate::url::Url::parse(
+            "ldap://localhost/dc=example,dc=com?cn,mail?sub?(objectClass=person)",
+        )
+        .unwrap();
         let c = parse_ldap_url(&url);
         assert_eq!(c.attributes, vec!["cn", "mail"]);
         assert_eq!(c.scope, 2);
@@ -827,7 +894,12 @@ mod tests {
     }
     #[test]
     fn build_search_request_produces_valid_ber() {
-        let c = LdapUrlComponents { base_dn: "dc=example".to_string(), attributes: vec!["cn".to_string()], scope: 2, filter: "(objectClass=*)".to_string() };
+        let c = LdapUrlComponents {
+            base_dn: "dc=example".to_string(),
+            attributes: vec!["cn".to_string()],
+            scope: 2,
+            filter: "(objectClass=*)".to_string(),
+        };
         assert_eq!(build_search_request(2, &c).unwrap()[0], 0x30);
     }
     #[test]
@@ -836,10 +908,16 @@ mod tests {
     }
     #[test]
     fn format_ldap_results_basic() {
-        let entries = vec![LdapEntry { dn: "cn=John Doe,dc=example,dc=com".to_string(), attributes: vec![
-            LdapAttribute { attr_type: "cn".to_string(), values: vec![b"John Doe".to_vec()] },
-            LdapAttribute { attr_type: "mail".to_string(), values: vec![b"john@example.com".to_vec()] },
-        ]}];
+        let entries = vec![LdapEntry {
+            dn: "cn=John Doe,dc=example,dc=com".to_string(),
+            attributes: vec![
+                LdapAttribute { attr_type: "cn".to_string(), values: vec![b"John Doe".to_vec()] },
+                LdapAttribute {
+                    attr_type: "mail".to_string(),
+                    values: vec![b"john@example.com".to_vec()],
+                },
+            ],
+        }];
         let output = format_ldap_results(&entries);
         assert!(output.contains("DN: cn=John Doe,dc=example,dc=com"));
         assert!(output.contains("\tcn: John Doe"));
@@ -851,9 +929,13 @@ mod tests {
     }
     #[test]
     fn format_ldap_results_multi_valued() {
-        let entries = vec![LdapEntry { dn: "cn=Test".to_string(), attributes: vec![
-            LdapAttribute { attr_type: "member".to_string(), values: vec![b"cn=Alice".to_vec(), b"cn=Bob".to_vec()] },
-        ]}];
+        let entries = vec![LdapEntry {
+            dn: "cn=Test".to_string(),
+            attributes: vec![LdapAttribute {
+                attr_type: "member".to_string(),
+                values: vec![b"cn=Alice".to_vec(), b"cn=Bob".to_vec()],
+            }],
+        }];
         let output = format_ldap_results(&entries);
         assert!(output.contains("\tmember: cn=Alice"));
         assert!(output.contains("\tmember: cn=Bob"));
