@@ -1886,7 +1886,13 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
                     "always" => {
                         opts.easy.gss_api_delegation(liburlx::auth::GssApiDelegation::Always);
                     }
-                    _ => {} // Unknown delegation level — ignore (curl compat)
+                    _ => {
+                        eprintln!("curl: option --delegation: expected a proper string");
+                        eprintln!(
+                            "curl: try 'curl --help' or 'curl --manual' for more information"
+                        );
+                        return Err(2);
+                    }
                 }
             }
             "--sasl-authzid" => {
@@ -5984,6 +5990,34 @@ mod tests {
         let args = make_args(&["--delegation", "always", "http://example.com"]);
         let opts = unwrap_opts(parse_args(&args));
         assert_eq!(opts.urls, vec!["http://example.com"]);
+    }
+
+    #[test]
+    fn parse_delegation_none() {
+        let args = make_args(&["--delegation", "none", "http://example.com"]);
+        let opts = unwrap_opts(parse_args(&args));
+        assert_eq!(opts.urls, vec!["http://example.com"]);
+    }
+
+    #[test]
+    fn parse_delegation_policy() {
+        let args = make_args(&["--delegation", "policy", "http://example.com"]);
+        let opts = unwrap_opts(parse_args(&args));
+        assert_eq!(opts.urls, vec!["http://example.com"]);
+    }
+
+    #[test]
+    fn parse_delegation_invalid() {
+        let args = make_args(&["--delegation", "invalid", "http://example.com"]);
+        assert!(matches!(parse_args(&args), ParseResult::Error(2)));
+    }
+
+    #[test]
+    fn negotiate_sets_auth_credentials() {
+        let args = make_args(&["--negotiate", "-u", "user:pass", "http://example.com"]);
+        let opts = unwrap_opts(parse_args(&args));
+        assert!(opts.use_negotiate);
+        assert!(opts.easy.uses_challenge_auth());
     }
 
     #[test]
