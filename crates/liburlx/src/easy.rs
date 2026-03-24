@@ -6,7 +6,9 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use crate::auth::{AuthCredentials, AuthMethod, ProxyAuthCredentials, ProxyAuthMethod};
+use crate::auth::{
+    AuthCredentials, AuthMethod, GssApiDelegation, ProxyAuthCredentials, ProxyAuthMethod,
+};
 use crate::cookie::CookieJar;
 use crate::dns::DnsCache;
 use crate::error::Error;
@@ -74,6 +76,8 @@ pub struct Easy {
     progress_callback: Option<ProgressCallback>,
     fail_on_error: bool,
     auth_credentials: Option<AuthCredentials>,
+    /// GSS-API delegation level for Negotiate (SPNEGO/Kerberos) authentication.
+    gss_api_delegation: GssApiDelegation,
     /// `OAuth2` bearer token for SASL XOAUTH2 (IMAP/POP3/SMTP).
     oauth2_bearer: Option<String>,
     tls_config: TlsConfig,
@@ -406,6 +410,7 @@ impl Clone for Easy {
             progress_callback: self.progress_callback.clone(),
             fail_on_error: self.fail_on_error,
             auth_credentials: self.auth_credentials.clone(),
+            gss_api_delegation: self.gss_api_delegation,
             oauth2_bearer: self.oauth2_bearer.clone(),
             tls_config: self.tls_config.clone(),
             aws_sigv4: self.aws_sigv4.clone(),
@@ -546,6 +551,7 @@ impl Easy {
             progress_callback: None,
             fail_on_error: false,
             auth_credentials: None,
+            gss_api_delegation: GssApiDelegation::None,
             oauth2_bearer: None,
             tls_config: TlsConfig::default(),
             aws_sigv4: None,
@@ -1575,6 +1581,7 @@ impl Easy {
             password: password.to_string(),
             method: AuthMethod::Digest,
             domain: None,
+            gss_api_delegation: GssApiDelegation::None,
         });
     }
 
@@ -1885,14 +1892,17 @@ impl Easy {
         self.netrc_content = Some(content.to_string());
     }
 
-    /// Check if a non-Basic auth method is configured (Digest, NTLM, `AnyAuth`).
+    /// Check if a non-Basic auth method is configured (Digest, NTLM, Negotiate, `AnyAuth`).
     ///
     /// When challenge-response auth is configured, callers should not add
     /// `Authorization: Basic` headers since the auth flow handles credentials.
     #[must_use]
     pub fn uses_challenge_auth(&self) -> bool {
         self.auth_credentials.as_ref().is_some_and(|a| {
-            matches!(a.method, AuthMethod::Digest | AuthMethod::Ntlm | AuthMethod::AnyAuth)
+            matches!(
+                a.method,
+                AuthMethod::Digest | AuthMethod::Ntlm | AuthMethod::Negotiate | AuthMethod::AnyAuth
+            )
         })
     }
 
@@ -2273,14 +2283,58 @@ impl Easy {
             password: password.to_string(),
             method: AuthMethod::Ntlm,
             domain,
+            gss_api_delegation: GssApiDelegation::None,
         });
+    }
+
+    /// Set HTTP Negotiate (SPNEGO/Kerberos) authentication credentials.
+    ///
+    /// Uses the system GSS-API library to perform Kerberos single sign-on.
+    /// The username is used as a hint but authentication relies on the
+    /// system Kerberos credential cache (ccache/keytab).
+    /// Equivalent to curl's `--negotiate -u user:pass`.
+    ///
+    /// Requires the `gss-api` feature flag.
+    pub fn negotiate_auth(&mut self, user: &str, password: &str) {
+        self.auth_credentials = Some(AuthCredentials {
+            username: user.to_string(),
+            password: password.to_string(),
+            method: AuthMethod::Negotiate,
+            domain: None,
+            gss_api_delegation: self.gss_api_delegation,
+        });
+    }
+
+    /// Set proxy Negotiate (SPNEGO/Kerberos) authentication credentials.
+    ///
+    /// Uses the system GSS-API library to perform Kerberos single sign-on
+    /// for proxy authentication.
+    /// Equivalent to curl's `--proxy-negotiate --proxy-user user:pass`.
+    ///
+    /// Requires the `gss-api` feature flag.
+    pub fn proxy_negotiate_auth(&mut self, user: &str, password: &str) {
+        self.headers.retain(|(k, _)| !k.eq_ignore_ascii_case("proxy-authorization"));
+        self.proxy_credentials = Some(ProxyAuthCredentials {
+            username: user.to_string(),
+            password: password.to_string(),
+            method: ProxyAuthMethod::Negotiate,
+            domain: None,
+        });
+    }
+
+    /// Set the GSS-API delegation level for Negotiate authentication.
+    ///
+    /// Controls whether Kerberos credentials are delegated to the server.
+    /// Equivalent to curl's `--delegation` option.
+    pub const fn gss_api_delegation(&mut self, level: GssApiDelegation) {
+        self.gss_api_delegation = level;
     }
 
     /// Set authentication credentials for `--anyauth` mode.
     ///
     /// The first request is sent without auth. On 401, the
     /// `WWW-Authenticate` header is examined and the strongest
-    /// supported method is used (Digest > NTLM > Basic).
+    /// supported method is used (Negotiate > Digest > NTLM > Basic).
     /// Supports `DOMAIN\user` format for NTLM.
     pub fn anyauth(&mut self, user: &str, password: &str) {
         let (domain, username) = if let Some((d, u)) = user.split_once('\\') {
@@ -2293,6 +2347,7 @@ impl Easy {
             password: password.to_string(),
             method: AuthMethod::AnyAuth,
             domain,
+            gss_api_delegation: self.gss_api_delegation,
         });
     }
 
@@ -4147,6 +4202,136 @@ async fn perform_transfer(
                                     ))
                                     .await?;
                                 }
+                            }
+                        }
+                    }
+                    #[cfg(feature = "gss-api")]
+                    Some(AuthMethod::Negotiate) => {
+                        // Negotiate (SPNEGO/Kerberos): use GSS-API to generate token
+                        let hostname = current_url.host_str().unwrap_or("localhost");
+                        let delegation = auth.gss_api_delegation;
+                        match crate::auth::negotiate::init_negotiate(hostname, delegation) {
+                            Ok((_ctx, token)) => {
+                                if verbose {
+                                    #[allow(clippy::print_stderr)]
+                                    {
+                                        eprintln!(
+                                            "* Server auth using Negotiate with host '{hostname}'"
+                                        );
+                                    }
+                                }
+                                let mut auth_resp = response.clone();
+                                auth_resp.set_body(Vec::new());
+                                if let Ok(mut guard) = last_resp_store.lock() {
+                                    *guard = Some(auth_resp.clone());
+                                }
+                                redirect_chain.push(auth_resp);
+
+                                let mut auth_headers = request_headers.clone();
+                                auth_headers.push((
+                                    "_auto_Authorization".to_string(),
+                                    format!("Negotiate {token}"),
+                                ));
+
+                                response = Box::pin(do_single_request(
+                                    &current_url,
+                                    &current_method,
+                                    &auth_headers,
+                                    current_body.as_deref(),
+                                    verbose,
+                                    accept_encoding,
+                                    connect_timeout,
+                                    effective_proxy,
+                                    proxy_credentials,
+                                    resolve_overrides,
+                                    tls_config,
+                                    tcp_nodelay,
+                                    tcp_keepalive,
+                                    unix_socket,
+                                    interface,
+                                    local_port,
+                                    dns_shuffle,
+                                    dns_cache,
+                                    pool,
+                                    #[cfg(feature = "http2")]
+                                    h2_pool,
+                                    http_version,
+                                    expect_100_timeout,
+                                    happy_eyeballs_timeout,
+                                    ignore_content_length,
+                                    speed_limits,
+                                    ftp_ssl_mode,
+                                    use_ssl,
+                                    ssh_key_path,
+                                    proxy_tls_config,
+                                    alt_svc_cache,
+                                    #[cfg(feature = "http2")]
+                                    h2_config,
+                                    dns_resolver,
+                                    custom_request_target,
+                                    tftp_blksize,
+                                    tftp_no_options,
+                                    #[cfg(feature = "ssh")]
+                                    ssh_host_key_policy,
+                                    mail_from,
+                                    mail_rcpt,
+                                    fresh_connect,
+                                    forbid_reuse,
+                                    ftp_config,
+                                    proxy_headers,
+                                    connect_to,
+                                    path_as_is,
+                                    #[cfg(feature = "ssh")]
+                                    ssh_public_keyfile,
+                                    #[cfg(not(feature = "ssh"))]
+                                    None,
+                                    #[cfg(feature = "ssh")]
+                                    ssh_auth_types,
+                                    #[cfg(not(feature = "ssh"))]
+                                    None,
+                                    mail_auth,
+                                    sasl_authzid,
+                                    login_options,
+                                    sasl_ir,
+                                    oauth2_bearer,
+                                    haproxy_protocol,
+                                    abstract_unix_socket,
+                                    chunked_upload,
+                                    http09_allowed,
+                                    deadline,
+                                    http_proxy_tunnel,
+                                    proxy_http_10,
+                                    raw,
+                                    ftp_session,
+                                    rtsp_session,
+                                    rtsp_request_type,
+                                    rtsp_stream_uri,
+                                    rtsp_transport,
+                                    rtsp_session_id_override,
+                                    rtsp_headers,
+                                    redirected_from_http,
+                                    fail_on_error,
+                                ))
+                                .await?;
+                            }
+                            Err(e) => {
+                                if verbose {
+                                    #[allow(clippy::print_stderr)]
+                                    {
+                                        eprintln!("* {e}");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    #[cfg(not(feature = "gss-api"))]
+                    Some(AuthMethod::Negotiate) => {
+                        if verbose {
+                            #[allow(clippy::print_stderr)]
+                            {
+                                eprintln!(
+                                    "* Negotiate auth requested but GSS-API support not compiled in"
+                                );
                             }
                         }
                     }
@@ -7594,9 +7779,10 @@ where
                         "proxy CONNECT NTLM: no Type 2 challenge in 407".to_string(),
                     ));
                 }
-                ProxyAuthMethod::Basic => {
+                ProxyAuthMethod::Basic | ProxyAuthMethod::Negotiate => {
                     // Basic auth should have been in the initial headers already.
-                    // If we still got 407, the credentials are wrong.
+                    // Negotiate not yet supported in CONNECT tunnels.
+                    // If we still got 407, the credentials are wrong or unsupported.
                     return Ok(ConnectTunnelResult::Failed { status, raw_response: raw_connect });
                 }
                 ProxyAuthMethod::Any => {
@@ -7766,10 +7952,12 @@ where
 
 /// Select the strongest proxy auth method from a Proxy-Authenticate header.
 ///
-/// Preference order: NTLM > Digest > Basic (curl compat).
+/// Preference order: Negotiate > NTLM > Digest > Basic (curl compat).
 fn select_proxy_auth_method(header: &str) -> Option<ProxyAuthMethod> {
     let upper = header.to_uppercase();
-    if upper.contains("NTLM") {
+    if upper.contains("NEGOTIATE") {
+        Some(ProxyAuthMethod::Negotiate)
+    } else if upper.contains("NTLM") {
         Some(ProxyAuthMethod::Ntlm)
     } else if upper.contains("DIGEST") {
         Some(ProxyAuthMethod::Digest)
@@ -8186,11 +8374,12 @@ fn strip_raw_header_value(raw: &str) -> &str {
 /// Pick the strongest authentication method from a 401 response's
 /// `WWW-Authenticate` headers.
 ///
-/// Priority order (matching curl): Digest > NTLM > Basic.
+/// Priority order (matching curl): Negotiate > Digest > NTLM > Basic.
 /// Uses `headers_ordered()` to see ALL `WWW-Authenticate` headers
 /// (the HashMap-based `headers()` only keeps the last one per name).
 /// Also handles comma-separated schemes in a single header value.
 fn pick_best_auth_method(response: &Response) -> Option<AuthMethod> {
+    let mut has_negotiate = false;
     let mut has_digest = false;
     let mut has_ntlm = false;
     let mut has_basic = false;
@@ -8205,7 +8394,9 @@ fn pick_best_auth_method(response: &Response) -> Option<AuthMethod> {
         // Also handle full scheme with params: "Digest realm=..."
         for part in value.split(',') {
             let scheme = part.trim().split_ascii_whitespace().next().unwrap_or("");
-            if scheme.eq_ignore_ascii_case("digest") {
+            if scheme.eq_ignore_ascii_case("negotiate") {
+                has_negotiate = true;
+            } else if scheme.eq_ignore_ascii_case("digest") {
                 has_digest = true;
             } else if scheme.eq_ignore_ascii_case("ntlm") {
                 has_ntlm = true;
@@ -8215,8 +8406,10 @@ fn pick_best_auth_method(response: &Response) -> Option<AuthMethod> {
         }
     }
 
-    // Priority: Digest > NTLM > Basic
-    if has_digest {
+    // Priority: Negotiate > Digest > NTLM > Basic (curl compat)
+    if has_negotiate {
+        Some(AuthMethod::Negotiate)
+    } else if has_digest {
         Some(AuthMethod::Digest)
     } else if has_ntlm {
         Some(AuthMethod::Ntlm)

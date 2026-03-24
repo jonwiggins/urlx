@@ -1,10 +1,13 @@
 //! HTTP authentication mechanisms.
 //!
-//! Supports Basic, Bearer, Digest (RFC 7616), NTLM, SCRAM-SHA-256, and AWS `SigV4` authentication.
+//! Supports Basic, Bearer, Digest (RFC 7616), NTLM, Negotiate (SPNEGO/Kerberos),
+//! SCRAM-SHA-256, and AWS `SigV4` authentication.
 
 pub mod aws_sigv4;
 pub mod cram_md5;
 pub mod digest;
+#[cfg(feature = "gss-api")]
+pub mod negotiate;
 pub mod ntlm;
 pub mod scram;
 
@@ -28,11 +31,16 @@ pub enum AuthMethod {
     /// Multi-step challenge-response: Type 1 negotiate, Type 2 challenge,
     /// Type 3 authenticate.
     Ntlm,
+    /// HTTP Negotiate (SPNEGO/Kerberos) authentication (RFC 4559).
+    ///
+    /// Uses GSS-API with the SPNEGO mechanism for Kerberos single sign-on.
+    /// Requires the `gss-api` feature flag and system Kerberos libraries.
+    Negotiate,
     /// Automatic authentication method selection.
     ///
     /// Sends the first request without auth, then examines the
     /// `WWW-Authenticate` header to pick the strongest supported method
-    /// (Digest > NTLM > Basic).
+    /// (Negotiate > Digest > NTLM > Basic).
     AnyAuth,
 }
 
@@ -47,6 +55,24 @@ pub struct AuthCredentials {
     pub method: AuthMethod,
     /// Optional NTLM domain (e.g., from `DOMAIN\user` format).
     pub domain: Option<String>,
+    /// GSS-API delegation level (only used with Negotiate auth).
+    pub gss_api_delegation: GssApiDelegation,
+}
+
+/// GSS-API delegation level for Negotiate authentication.
+///
+/// Controls whether the client's Kerberos credentials are delegated
+/// to the server, allowing it to act on the client's behalf.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum GssApiDelegation {
+    /// No delegation (default). The server cannot impersonate the client.
+    #[default]
+    None,
+    /// Delegate only if the server's service ticket has the OK-AS-DELEGATE flag set.
+    Policy,
+    /// Always delegate credentials unconditionally.
+    Always,
 }
 
 /// Proxy authentication method.
@@ -59,11 +85,16 @@ pub enum ProxyAuthMethod {
     Digest,
     /// NTLM authentication.
     Ntlm,
+    /// HTTP Negotiate (SPNEGO/Kerberos) authentication.
+    ///
+    /// Uses GSS-API with the SPNEGO mechanism for Kerberos single sign-on.
+    /// Requires the `gss-api` feature flag and system Kerberos libraries.
+    Negotiate,
     /// Automatic authentication method selection.
     ///
     /// Sends the first request without auth, then examines the
     /// `Proxy-Authenticate` header to pick the strongest supported method
-    /// (NTLM > Digest > Basic).
+    /// (Negotiate > NTLM > Digest > Basic).
     Any,
 }
 

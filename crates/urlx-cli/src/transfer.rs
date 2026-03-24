@@ -1311,6 +1311,8 @@ pub fn run(args: &[String]) -> ExitCode {
                                             }
                                             return ExitCode::from(3);
                                         }
+                                    } else if opts.use_negotiate {
+                                        opts.easy.negotiate_auth(&user, &pass);
                                     } else if opts.use_digest {
                                         opts.easy.digest_auth(&user, &pass);
                                     } else {
@@ -1439,7 +1441,9 @@ pub fn run(args: &[String]) -> ExitCode {
                 let user = url_user.unwrap_or_default();
                 let pass = url_pass.unwrap_or_default();
                 if !opts.easy.has_auth_header() {
-                    if opts.use_digest {
+                    if opts.use_negotiate {
+                        opts.easy.negotiate_auth(&user, &pass);
+                    } else if opts.use_digest {
                         opts.easy.digest_auth(&user, &pass);
                     } else {
                         opts.easy.basic_auth(&user, &pass);
