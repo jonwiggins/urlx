@@ -22,6 +22,7 @@ default = ["http", "http2", "rustls", "decompression"]
 http = []
 http2 = ["dep:h2", "dep:bytes"]
 http3 = ["dep:quinn", "dep:h3", "dep:h3-quinn", "dep:bytes"]
+ldap = []
 
 # TLS backends
 rustls = ["dep:rustls", "dep:webpki-roots", "dep:tokio-rustls"]

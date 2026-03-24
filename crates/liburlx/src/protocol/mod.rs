@@ -9,6 +9,7 @@ pub mod ftp;
 pub mod gopher;
 pub mod http;
 pub mod imap;
+pub mod ldap;
 pub mod mqtt;
 pub mod pop3;
 pub mod rtsp;

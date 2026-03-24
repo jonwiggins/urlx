@@ -6232,6 +6232,10 @@ async fn do_single_request(
             let use_tls = url.scheme() == "gophers";
             return crate::protocol::gopher::transfer(url, tls_config, use_tls).await;
         }
+        "ldap" | "ldaps" => {
+            let use_tls = url.scheme() == "ldaps";
+            return crate::protocol::ldap::search(url, tls_config, use_tls).await;
+        }
         "ws" | "wss" => {
             return crate::protocol::ws::connect(url, headers, tls_config).await;
         }

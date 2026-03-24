@@ -19,10 +19,11 @@ path = "src/main.rs"
 workspace = true
 
 [features]
-default = ["rustls", "http2", "decompression", "ssh"]
+default = ["rustls", "http2", "decompression", "ssh", "ldap"]
 rustls = ["liburlx/rustls"]
 http2 = ["liburlx/http2"]
 http3 = ["liburlx/http3"]
+ldap = ["liburlx/ldap"]
 decompression = ["liburlx/decompression"]
 ssh = ["liburlx/ssh"]
 tls-srp = ["liburlx/tls-srp"]
