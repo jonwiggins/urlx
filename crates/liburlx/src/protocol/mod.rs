@@ -13,6 +13,8 @@ pub mod ldap;
 pub mod mqtt;
 pub mod pop3;
 pub mod rtsp;
+#[cfg(feature = "smb")]
+pub mod smb;
 pub mod smtp;
 #[cfg(feature = "ssh")]
 pub mod ssh;
