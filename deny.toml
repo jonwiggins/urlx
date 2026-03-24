@@ -5,6 +5,11 @@ ignore = [
     # No upstream fix available. Acceptable risk: SSH key operations are local,
     # not exposed to network-observable timing attacks in our usage.
     "RUSTSEC-2023-0071",
+    # RUSTSEC-2026-0074: Incorrect output of incremental portable SHAKE XOF API
+    # in `libcrux-sha3` < 0.0.8. Transitive dependency via russh -> libcrux-ml-kem
+    # -> libcrux-sha3. The advisory confirms this does not impact libcrux-ml-kem
+    # usage. Cannot upgrade: libcrux-ml-kem 0.0.4 pins libcrux-sha3 = "^0.0.4".
+    "RUSTSEC-2026-0074",
 ]
 
 [licenses]
