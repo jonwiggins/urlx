@@ -3124,6 +3124,7 @@ pub fn run_multi(
                     | "imaps"
                     | "pop3"
                     | "pop3s"
+                    | "telnet"
             );
             if !supported {
                 if !silent || show_error {

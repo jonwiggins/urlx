@@ -182,6 +182,7 @@ impl Url {
             "gophers" => Some(443),
             "rtsp" => Some(554),
             "rtsps" => Some(322),
+            "telnet" => Some(23),
             _ => None,
         })
     }

@@ -15,5 +15,7 @@ pub mod rtsp;
 pub mod smtp;
 #[cfg(feature = "ssh")]
 pub mod ssh;
+#[cfg(feature = "telnet")]
+pub mod telnet;
 pub mod tftp;
 pub mod ws;

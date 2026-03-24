@@ -214,6 +214,9 @@ pub fn print_version() {
         protocols.extend_from_slice(&["scp", "sftp"]);
     }
     protocols.extend_from_slice(&["smtp", "smtps"]);
+    if cfg!(feature = "telnet") {
+        protocols.push("telnet");
+    }
     protocols.push("tftp");
     protocols.extend_from_slice(&["ws", "wss"]);
     println!("Protocols: {}", protocols.join(" "));
@@ -3685,8 +3688,8 @@ pub fn is_protocol_allowed(url: &str, proto_list: &str) -> bool {
 pub fn parse_proto_spec(spec: &str) -> Vec<String> {
     let all_protocols: &[&str] = &[
         "http", "https", "ftp", "ftps", "scp", "sftp", "imap", "imaps", "ipfs", "ipns", "pop3",
-        "pop3s", "smtp", "smtps", "dict", "file", "tftp", "mqtt", "rtsp", "ws", "wss", "gopher",
-        "gophers",
+        "pop3s", "smtp", "smtps", "telnet", "dict", "file", "tftp", "mqtt", "rtsp", "ws", "wss",
+        "gopher", "gophers",
     ];
 
     // "=proto1,proto2" means exactly these protocols

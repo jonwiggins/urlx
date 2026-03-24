@@ -6225,6 +6225,10 @@ async fn do_single_request(
                 crate::protocol::mqtt::subscribe(url).await
             };
         }
+        #[cfg(feature = "telnet")]
+        "telnet" => {
+            return crate::protocol::telnet::transfer(url, body).await;
+        }
         "dict" => {
             return crate::protocol::dict::lookup(url).await;
         }

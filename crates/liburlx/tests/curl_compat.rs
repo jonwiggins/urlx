@@ -527,13 +527,13 @@ async fn response_header_casing_preserved() {
 #[tokio::test]
 async fn unsupported_protocol_error() {
     let mut easy = liburlx::Easy::new();
-    easy.url("telnet://example.com/").unwrap();
+    easy.url("smb://example.com/share").unwrap();
     let result = easy.perform_async().await;
-    assert!(result.is_err(), "telnet:// should fail on perform");
+    assert!(result.is_err(), "smb:// should fail");
     let err = result.unwrap_err();
     assert!(
         matches!(err, liburlx::Error::UnsupportedProtocol(_)),
-        "expected UnsupportedProtocol, got: {err}"
+        "expected UnsupportedProtocol for smb://, got: {err}"
     );
 }
 

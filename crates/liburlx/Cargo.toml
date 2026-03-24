@@ -30,6 +30,9 @@ tls-srp = ["dep:openssl", "dep:openssl-sys", "dep:tokio-openssl"]
 # SSH/SFTP/SCP protocols
 ssh = ["dep:russh", "dep:russh-sftp"]
 
+# Telnet protocol
+telnet = []
+
 # GSS-API / Kerberos (SPNEGO Negotiate) authentication
 gss-api = ["dep:libgssapi"]
 
