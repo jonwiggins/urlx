@@ -3174,7 +3174,7 @@ impl Easy {
         // Check fail_on_error: HTTP status >= 400 becomes an error
         if self.fail_on_error && response.status() >= 400 {
             return Err(Error::Http(format!(
-                "HTTP error {} (fail_on_error enabled)",
+                "The requested URL returned error: {}",
                 response.status()
             )));
         }
