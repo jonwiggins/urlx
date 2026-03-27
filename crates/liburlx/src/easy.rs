@@ -6024,7 +6024,10 @@ async fn do_single_request(
                     let ua = headers
                         .iter()
                         .find(|(k, _)| k.eq_ignore_ascii_case("user-agent"))
-                        .map_or_else(|| "curl/0.1.0".to_string(), |(_, v)| v.clone());
+                        .map_or_else(
+                            || concat!("curl/", env!("CARGO_PKG_VERSION")).to_string(),
+                            |(_, v)| v.clone(),
+                        );
                     Some(crate::protocol::ftp::FtpProxyConfig::HttpConnect {
                         host: ph,
                         port: pp,
@@ -8039,7 +8042,11 @@ where
                 let _ = write!(connect_req, "{name}: {value}\r\n");
             }
             None => {
-                connect_req.push_str("User-Agent: curl/0.1.0\r\n");
+                connect_req.push_str(concat!(
+                    "User-Agent: curl/",
+                    env!("CARGO_PKG_VERSION"),
+                    "\r\n"
+                ));
             }
         }
     }
