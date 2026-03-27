@@ -158,7 +158,7 @@ pub async fn send_request(
 
     let has_user_agent = custom_headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("user-agent"));
     if !has_user_agent {
-        builder = builder.header("user-agent", "curl/0.1.0");
+        builder = builder.header("user-agent", concat!("curl/", env!("CARGO_PKG_VERSION")));
     }
 
     let has_accept = custom_headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("accept"));

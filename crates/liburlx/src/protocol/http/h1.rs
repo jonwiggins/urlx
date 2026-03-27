@@ -196,7 +196,7 @@ where
             let _ = write!(req, "{name}: {value}\r\n");
         }
         None => {
-            req.push_str("User-Agent: curl/0.1.0\r\n");
+            req.push_str(concat!("User-Agent: curl/", env!("CARGO_PKG_VERSION"), "\r\n"));
         }
     }
 
