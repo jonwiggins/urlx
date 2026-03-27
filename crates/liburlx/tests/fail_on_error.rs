@@ -179,7 +179,7 @@ async fn fail_on_error_http10_no_content_length_no_hang() {
     // Should return an HTTP error (status 404 with fail_on_error), NOT a timeout
     assert!(result.is_err(), "404 with fail_on_error should error");
     let err_msg = result.unwrap_err().to_string();
-    assert!(err_msg.contains("HTTP error 404"), "Expected HTTP 404 error, got: {err_msg}");
+    assert!(err_msg.contains("returned error: 404"), "Expected HTTP 404 error, got: {err_msg}");
 
     server_task.abort();
 }

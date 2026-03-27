@@ -2477,7 +2477,7 @@ pub fn error_to_curl_code(err: &liburlx::Error) -> u8 {
                 52 // CURLE_GOT_NOTHING
             } else if msg.contains("too many redirects") || msg.contains("Too many redirects") {
                 47 // CURLE_TOO_MANY_REDIRECTS
-            } else if msg.contains("fail_on_error") {
+            } else if msg.contains("The requested URL returned error") {
                 22 // CURLE_HTTP_RETURNED_ERROR
             } else if msg.contains("unsupported protocol")
                 || msg.contains("Unsupported protocol")

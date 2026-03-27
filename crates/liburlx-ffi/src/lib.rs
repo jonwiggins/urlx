@@ -4899,7 +4899,7 @@ fn error_to_curlcode(err: &liburlx::Error) -> CURLcode {
                 CURLcode::CURLE_UNSUPPORTED_PROTOCOL
             } else if msg.contains("resolve") || msg.contains("DNS") {
                 CURLcode::CURLE_COULDNT_RESOLVE_HOST
-            } else if msg.contains("HTTP error") && msg.contains("fail_on_error") {
+            } else if msg.contains("The requested URL returned error") {
                 CURLcode::CURLE_HTTP_RETURNED_ERROR
             } else if msg.contains("aborted by") || msg.contains("callback") {
                 CURLcode::CURLE_ABORTED_BY_CALLBACK
@@ -5365,7 +5365,7 @@ mod tests {
     fn error_code_http_returned_error() {
         assert_eq!(
             error_to_curlcode(&liburlx::Error::Http(
-                "HTTP error 404 (fail_on_error enabled)".to_string()
+                "The requested URL returned error: 404".to_string()
             )),
             CURLcode::CURLE_HTTP_RETURNED_ERROR
         );
