@@ -2679,9 +2679,12 @@ pub fn perform_with_retry(opts: &mut CliOptions) -> Result<liburlx::Response, li
                 return Ok(response);
             }
             Err(e) => {
+                // Don't retry non-retriable errors like --fail HTTP errors
+                // (curl compat: test 752 — 404 should not be retried).
+                let should_break = error_to_curl_code(&e) == 22; // CURLE_HTTP_RETURNED_ERROR
                 last_err = Some(e);
                 opts.retry_attempts = attempt;
-                if attempt == max_retries {
+                if should_break || attempt == max_retries {
                     break;
                 }
             }
