@@ -70,6 +70,35 @@ elif [ ! -x "$LIBTESTS" ] && [ ! -f "$LIBTESTS_REAL" ]; then
     echo "Installed libtests-shim for C API tests (e.g., test 678)"
 fi
 
+# Override curlinfo to report urlx's actual capabilities.
+#
+# curl's curlinfo binary reflects curl's build configuration, not urlx's.
+# For example, curl may be built without ssl-sessions support, causing the
+# test harness to skip test 777 even though urlx supports ssl-sessions.
+# We replace curlinfo with a wrapper that patches the output.
+CURLINFO_BIN="$CURL_BUILD/src/curlinfo"
+CURLINFO_REAL="$CURL_BUILD/src/curlinfo.real"
+CURLINFO_WRAPPER="$SCRIPT_DIR/curlinfo-urlx"
+
+if [ -x "$CURLINFO_BIN" ] && [ ! -f "$CURLINFO_REAL" ]; then
+    # Move the real binary aside and install our wrapper
+    mv "$CURLINFO_BIN" "$CURLINFO_REAL"
+    cat > "$CURLINFO_BIN" <<CURLINFO_SHIM
+#!/bin/bash
+export CURLINFO_REAL="$CURLINFO_REAL"
+exec "$CURLINFO_WRAPPER" "\$@"
+CURLINFO_SHIM
+    chmod +x "$CURLINFO_BIN"
+elif [ ! -x "$CURLINFO_BIN" ] && [ ! -f "$CURLINFO_REAL" ]; then
+    # No curlinfo binary at all — install our wrapper directly
+    mkdir -p "$CURL_BUILD/src"
+    cat > "$CURLINFO_BIN" <<CURLINFO_SHIM
+#!/bin/bash
+exec "$CURLINFO_WRAPPER" "\$@"
+CURLINFO_SHIM
+    chmod +x "$CURLINFO_BIN"
+fi
+
 # Ensure symlinks are in place
 cd "$TESTS_DIR"
 [ ! -e data ] && ln -sf "$CURL_SRC/tests/data" data
