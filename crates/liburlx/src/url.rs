@@ -185,6 +185,16 @@ impl Url {
             "rtsps" => Some(322),
             "ldap" => Some(389),
             "ldaps" => Some(636),
+            "dict" => Some(2628),
+            "imap" => Some(143),
+            "imaps" => Some(993),
+            "mqtt" => Some(1883),
+            "mqtts" => Some(8883),
+            "pop3" => Some(110),
+            "pop3s" => Some(995),
+            "smtp" => Some(25),
+            "smtps" => Some(465),
+            "telnet" => Some(23),
             _ => None,
         })
     }
