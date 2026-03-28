@@ -636,11 +636,40 @@ async fn read_ldap_message<S: AsyncReadExt + Unpin>(stream: &mut S) -> Result<Ve
     Ok(message)
 }
 
+/// LDAP Extended Request OID for STARTTLS (RFC 4511 Section 4.14.1).
+const STARTTLS_OID: &str = "1.3.6.1.4.1.1466.20037";
+
+/// Build an LDAP Extended Request for STARTTLS.
+fn build_extended_request(message_id: i32, oid: &str) -> Vec<u8> {
+    // ExtendedRequest ::= [APPLICATION 23] SEQUENCE {
+    //     requestName  [0] LDAPOID,
+    //     requestValue [1] OCTET STRING OPTIONAL }
+    let content = ber::encode_context_primitive(0, oid.as_bytes());
+    let ext_req = ber::encode_application(23, &content);
+    let mut msg = Vec::new();
+    msg.extend(ber::encode_integer(message_id));
+    msg.extend(ext_req);
+    ber::encode_sequence(&msg)
+}
+
+/// Parse an LDAP Extended Response, returning the result code.
+fn parse_extended_response(op_value: &[u8]) -> Result<u8, Error> {
+    let (result_code, _) = ber::decode_enumerated(op_value)
+        .map_err(|e| Error::Http(format!("LDAP: failed to parse ExtendedResponse: {e}")))?;
+    Ok(result_code)
+}
+
 /// Perform an LDAP search query.
 ///
 /// Connects to the LDAP server, performs an anonymous bind (or authenticated
 /// bind if credentials are provided in the URL), executes the search
 /// specified by the URL components, and returns the results.
+///
+/// Supports three TLS modes:
+/// - `ldaps://` — implicit TLS (connect with TLS immediately)
+/// - `ldap://` with `use_ssl=All` — STARTTLS required (fail if not supported)
+/// - `ldap://` with `use_ssl=Try` — STARTTLS opportunistic (try, fall back to plain)
+/// - `ldap://` with `use_ssl=None` — plain text
 ///
 /// # Errors
 ///
@@ -649,6 +678,7 @@ pub async fn search(
     url: &crate::url::Url,
     tls_config: &crate::tls::TlsConfig,
     use_tls: bool,
+    use_ssl: crate::protocol::ftp::UseSsl,
 ) -> Result<Response, Error> {
     let (host, port) = url.host_and_port()?;
     let components = parse_ldap_url(url);
@@ -658,12 +688,78 @@ pub async fn search(
     let addr = format!("{host}:{port}");
     let tcp = tokio::net::TcpStream::connect(&addr).await.map_err(Error::Connect)?;
     if use_tls {
+        // ldaps:// — implicit TLS
         let connector = crate::tls::TlsConnector::new_no_alpn(tls_config)?;
         let (tls_stream, _alpn) = connector.connect(tcp, &host).await?;
         perform_ldap(tls_stream, url, &components, username_opt, password).await
+    } else if use_ssl != crate::protocol::ftp::UseSsl::None {
+        // ldap:// with STARTTLS
+        perform_ldap_starttls(
+            tcp,
+            url,
+            &components,
+            username_opt,
+            password,
+            tls_config,
+            &host,
+            use_ssl,
+        )
+        .await
     } else {
         perform_ldap(tcp, url, &components, username_opt, password).await
     }
+}
+
+/// Perform LDAP with STARTTLS upgrade.
+#[allow(clippy::too_many_arguments)]
+async fn perform_ldap_starttls(
+    mut tcp: tokio::net::TcpStream,
+    url: &crate::url::Url,
+    components: &LdapUrlComponents,
+    username: Option<&str>,
+    password: Option<&str>,
+    tls_config: &crate::tls::TlsConfig,
+    host: &str,
+    use_ssl: crate::protocol::ftp::UseSsl,
+) -> Result<Response, Error> {
+    // Send STARTTLS extended request (message ID 1)
+    let starttls_msg = build_extended_request(1, STARTTLS_OID);
+    tcp.write_all(&starttls_msg)
+        .await
+        .map_err(|e| Error::Http(format!("LDAP: failed to send STARTTLS request: {e}")))?;
+    tcp.flush().await.map_err(|e| Error::Http(format!("LDAP: flush error: {e}")))?;
+
+    let resp_data = read_ldap_message(&mut tcp).await?;
+    let (_id, op_tag, op_value, _) = parse_ldap_message(&resp_data)?;
+
+    // ExtendedResponse tag is 0x78 (APPLICATION 24)
+    if op_tag != 0x78 {
+        if use_ssl == crate::protocol::ftp::UseSsl::All {
+            return Err(Error::Transfer {
+                code: 64,
+                message: "LDAP STARTTLS required but server sent unexpected response".to_string(),
+            });
+        }
+        // Try mode — fall back to plain
+        return perform_ldap(tcp, url, components, username, password).await;
+    }
+
+    let result_code = parse_extended_response(&op_value)?;
+    if result_code != 0 {
+        if use_ssl == crate::protocol::ftp::UseSsl::All {
+            return Err(Error::Transfer {
+                code: 64,
+                message: format!("LDAP STARTTLS failed with result code {result_code}"),
+            });
+        }
+        // Try mode — fall back to plain
+        return perform_ldap(tcp, url, components, username, password).await;
+    }
+
+    // STARTTLS accepted — upgrade to TLS
+    let connector = crate::tls::TlsConnector::new_no_alpn(tls_config)?;
+    let (tls_stream, _) = connector.connect(tcp, host).await?;
+    perform_ldap(tls_stream, url, components, username, password).await
 }
 
 async fn perform_ldap<S: AsyncReadExt + AsyncWriteExt + Unpin>(
@@ -690,10 +786,7 @@ async fn perform_ldap<S: AsyncReadExt + AsyncWriteExt + Unpin>(
     }
     let result_code = parse_bind_response(&op_value)?;
     if result_code != 0 {
-        return Err(Error::Transfer {
-            code: 39,
-            message: format!("LDAP bind failed with result code {result_code}"),
-        });
+        return Err(Error::LdapBind(format!("LDAP bind failed with result code {result_code}")));
     }
     msg_id += 1;
     let search_msg = build_search_request(msg_id, components)?;
@@ -714,10 +807,9 @@ async fn perform_ldap<S: AsyncReadExt + AsyncWriteExt + Unpin>(
             0x65 => {
                 let result_code = parse_search_result_done(&op_value)?;
                 if result_code != 0 && result_code != 4 {
-                    return Err(Error::Transfer {
-                        code: 39,
-                        message: format!("LDAP search failed with result code {result_code}"),
-                    });
+                    return Err(Error::LdapSearch(format!(
+                        "LDAP search failed with result code {result_code}"
+                    )));
                 }
                 break;
             }

@@ -111,6 +111,10 @@ pub enum Error {
         partial_body: Vec<u8>,
     },
 
+    /// An LDAP bind (authentication) failed (maps to `CURLE_LDAP_CANNOT_BIND` = 38).
+    #[error("LDAP bind failed: {0}")]
+    LdapBind(String),
+
     /// An LDAP search failed (maps to `CURLE_LDAP_SEARCH_FAILED` = 39).
     #[error("LDAP search failed: {0}")]
     LdapSearch(String),

@@ -111,6 +111,7 @@ pub enum CURLcode {
     CURLE_UNRECOVERABLE_POLL = 99,
     CURLE_FTP_COULDNT_RETR_FILE = 19,
     CURLE_UPLOAD_FAILED = 25,
+    CURLE_LDAP_CANNOT_BIND = 38,
     CURLE_LDAP_SEARCH_FAILED = 39,
     CURLE_FUNCTION_NOT_FOUND = 41,
     CURLE_INTERFACE_FAILED = 45,
@@ -3695,6 +3696,7 @@ pub extern "C" fn curl_easy_strerror(code: CURLcode) -> *const c_char {
             CURLcode::CURLE_UNRECOVERABLE_POLL => c"Unrecoverable error in select/poll",
             CURLcode::CURLE_FTP_COULDNT_RETR_FILE => c"FTP: couldn't retrieve (RETR failed)",
             CURLcode::CURLE_UPLOAD_FAILED => c"Upload failed",
+            CURLcode::CURLE_LDAP_CANNOT_BIND => c"LDAP bind operation failed",
             CURLcode::CURLE_LDAP_SEARCH_FAILED => c"LDAP search failed",
             CURLcode::CURLE_FUNCTION_NOT_FOUND => c"A required function was not found",
             CURLcode::CURLE_INTERFACE_FAILED => c"Failed binding local connection end",
@@ -4920,11 +4922,14 @@ fn error_to_curlcode(err: &liburlx::Error) -> CURLcode {
         liburlx::Error::Timeout(_) | liburlx::Error::SpeedLimit { .. } => {
             CURLcode::CURLE_OPERATION_TIMEDOUT
         }
+        liburlx::Error::LdapBind(_) => CURLcode::CURLE_LDAP_CANNOT_BIND,
         liburlx::Error::LdapSearch(_) => CURLcode::CURLE_LDAP_SEARCH_FAILED,
         liburlx::Error::RtspCseqError(_) => CURLcode::CURLE_RTSP_CSEQ_ERROR,
         liburlx::Error::RtspSessionError(_) => CURLcode::CURLE_RTSP_SESSION_ERROR,
         liburlx::Error::Transfer { code, .. } => match *code {
             8 => CURLcode::CURLE_FTP_WEIRD_SERVER_REPLY,
+            38 => CURLcode::CURLE_LDAP_CANNOT_BIND,
+            39 => CURLcode::CURLE_LDAP_SEARCH_FAILED,
             43 => CURLcode::CURLE_BAD_FUNCTION_ARGUMENT,
             85 => CURLcode::CURLE_RTSP_CSEQ_ERROR,
             86 => CURLcode::CURLE_RTSP_SESSION_ERROR,

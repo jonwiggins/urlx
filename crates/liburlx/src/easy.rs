@@ -6319,7 +6319,8 @@ async fn do_single_request(
         }
         "ldap" | "ldaps" => {
             let use_tls = url.scheme() == "ldaps";
-            return crate::protocol::ldap::search(url, tls_config, use_tls).await;
+            let ldap_use_ssl = if use_tls { crate::protocol::ftp::UseSsl::All } else { use_ssl };
+            return crate::protocol::ldap::search(url, tls_config, use_tls, ldap_use_ssl).await;
         }
         "ws" | "wss" => {
             return crate::protocol::ws::connect(url, headers, tls_config).await;
