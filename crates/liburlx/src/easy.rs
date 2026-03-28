@@ -1526,6 +1526,12 @@ impl Easy {
         self.http_proxy_tunnel = enable;
     }
 
+    /// Returns true if HTTP CONNECT tunnel mode is enabled (`--proxytunnel`).
+    #[must_use]
+    pub const fn is_http_proxy_tunnel(&self) -> bool {
+        self.http_proxy_tunnel
+    }
+
     /// Use HTTP/1.0 for CONNECT proxy requests.
     ///
     /// When enabled, the CONNECT request to the proxy uses HTTP/1.0 instead
@@ -5788,6 +5794,53 @@ async fn do_single_request(
     redirected_from_http: bool,
     fail_on_error: bool,
 ) -> Result<Response, Error> {
+    // When HTTP proxy tunnel (-p) is active, attempt CONNECT tunnel for all
+    // non-HTTP protocols that don't already have their own tunnel handling.
+    // The proxy decides whether to allow the tunnel — if it refuses (e.g. 503),
+    // we return the error. (curl compat: test 445)
+    if http_proxy_tunnel {
+        let is_http_proxy = proxy.is_some_and(|p| {
+            let s = p.scheme();
+            s == "http" || s == "https"
+        });
+        if is_http_proxy {
+            let scheme = url.scheme();
+            // Protocols that already handle tunneling internally: http/https (in the
+            // HTTP code path below), ftp/ftps (FtpProxyConfig::HttpConnect),
+            // smtp/imap/pop3 (establish_email_proxy_tunnel).
+            // For all other protocols, attempt the tunnel here first.
+            let already_handles_tunnel = matches!(
+                scheme,
+                "http"
+                    | "https"
+                    | "ftp"
+                    | "ftps"
+                    | "smtp"
+                    | "smtps"
+                    | "imap"
+                    | "imaps"
+                    | "pop3"
+                    | "pop3s"
+            );
+            if !already_handles_tunnel {
+                // Attempt the CONNECT tunnel — if it fails, return the error.
+                // If it succeeds, drop the tunnel stream and proceed to
+                // protocol-specific handling (which will connect directly).
+                let _tunnel_stream = establish_email_proxy_tunnel(
+                    proxy,
+                    http_proxy_tunnel,
+                    proxy_credentials,
+                    proxy_headers,
+                    verbose,
+                    proxy_http_10,
+                    headers,
+                    url,
+                )
+                .await?;
+            }
+        }
+    }
+
     // Handle non-HTTP schemes directly
     match url.scheme() {
         "file" => {

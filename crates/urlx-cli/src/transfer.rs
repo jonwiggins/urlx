@@ -3106,29 +3106,41 @@ pub fn run_multi(
 
         // Early scheme validation: reject unsupported protocols before attempting
         // DNS resolution or connection (curl compat: test 760).
+        // When HTTP proxy tunnel (-p) is active, skip this check — all protocols
+        // can be tunneled via CONNECT and the proxy decides whether to allow them
+        // (curl compat: test 445).
         if let Some(u) = easy.url_ref() {
             let scheme = u.scheme().to_lowercase();
-            let supported = matches!(
-                scheme.as_str(),
-                "http"
-                    | "https"
-                    | "ftp"
-                    | "ftps"
-                    | "sftp"
-                    | "scp"
-                    | "file"
-                    | "dict"
-                    | "tftp"
-                    | "mqtt"
-                    | "ws"
-                    | "wss"
-                    | "smtp"
-                    | "smtps"
-                    | "imap"
-                    | "imaps"
-                    | "pop3"
-                    | "pop3s"
-            );
+            let tunnel_bypass = easy.is_http_proxy_tunnel() && easy.has_http_proxy();
+            let supported = tunnel_bypass
+                || matches!(
+                    scheme.as_str(),
+                    "http"
+                        | "https"
+                        | "ftp"
+                        | "ftps"
+                        | "sftp"
+                        | "scp"
+                        | "file"
+                        | "dict"
+                        | "tftp"
+                        | "mqtt"
+                        | "ws"
+                        | "wss"
+                        | "smtp"
+                        | "smtps"
+                        | "imap"
+                        | "imaps"
+                        | "pop3"
+                        | "pop3s"
+                        | "gopher"
+                        | "gophers"
+                        | "rtsp"
+                        | "ldap"
+                        | "ldaps"
+                        | "smb"
+                        | "smbs"
+                );
             if !supported {
                 if !silent || show_error {
                     eprintln!("curl: (1) Protocol \"{scheme}\" not supported");
