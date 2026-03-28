@@ -3005,6 +3005,28 @@ impl Easy {
 
         // Handle RTSP directly (uses persistent session, bypasses HTTP pipeline)
         if url.scheme() == "rtsp" {
+            // When proxy tunnel is active, attempt CONNECT tunnel before RTSP
+            // dispatch (same as the generic tunnel code in do_single_request,
+            // which RTSP bypasses). (curl compat: test 445)
+            if self.http_proxy_tunnel {
+                let is_http_proxy = effective_proxy.is_some_and(|p| {
+                    let s = p.scheme();
+                    s == "http" || s == "https"
+                });
+                if is_http_proxy {
+                    let _tunnel_stream = establish_email_proxy_tunnel(
+                        effective_proxy,
+                        self.http_proxy_tunnel,
+                        self.proxy_credentials.as_ref(),
+                        &self.proxy_headers,
+                        self.verbose,
+                        self.proxy_http_10,
+                        &headers,
+                        &url,
+                    )
+                    .await?;
+                }
+            }
             let result = crate::protocol::rtsp::perform_with_session(
                 &url,
                 &headers,
@@ -5811,16 +5833,7 @@ async fn do_single_request(
             // For all other protocols, attempt the tunnel here first.
             let already_handles_tunnel = matches!(
                 scheme,
-                "http"
-                    | "https"
-                    | "ftp"
-                    | "ftps"
-                    | "smtp"
-                    | "smtps"
-                    | "imap"
-                    | "imaps"
-                    | "pop3"
-                    | "pop3s"
+                "http" | "https" | "ftp" | "smtp" | "smtps" | "imap" | "imaps" | "pop3" | "pop3s"
             );
             if !already_handles_tunnel {
                 // Attempt the CONNECT tunnel — if it fails, return the error.
