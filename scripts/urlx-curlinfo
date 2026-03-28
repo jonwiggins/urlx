@@ -1,0 +1,54 @@
+#!/bin/bash
+# Wrapper around curl's curlinfo binary that overrides feature detection
+# to reflect urlx's actual capabilities.
+#
+# The curl test harness uses curlinfo to detect compile-time features.
+# Since curlinfo comes from curl's build (not urlx), it reflects curl's
+# configuration. This wrapper runs the real curlinfo and overrides
+# features that urlx supports but curl may not be built with.
+#
+# Currently overridden:
+#   ssl-sessions: ON  (urlx implements ssl-sessions, see issue #73)
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+REAL_CURLINFO="$PROJECT_ROOT/vendor/curl-build/src/curlinfo.real"
+
+# If the real curlinfo exists, run it and override specific features
+if [ -x "$REAL_CURLINFO" ]; then
+    "$REAL_CURLINFO" | sed 's/^ssl-sessions: OFF$/ssl-sessions: ON/'
+else
+    # Fallback: output a complete feature list based on urlx's capabilities.
+    # This matches the format expected by runtests.pl (see curlinfo.c).
+    cat <<'EOF'
+bindlocal: ON
+cookies: ON
+basic-auth: ON
+bearer-auth: ON
+digest: ON
+negotiate-auth: OFF
+aws: ON
+DoH: ON
+HTTP-auth: ON
+Mime: ON
+netrc: ON
+parsedate: ON
+proxy: ON
+shuffle-dns: ON
+typecheck: OFF
+verbose-strings: ON
+wakeup: ON
+headers-api: ON
+xattr: OFF
+form-api: ON
+large-time: ON
+large-size: ON
+sha512-256: OFF
+win32-ca-searchpath: OFF
+win32-ca-search-safe: OFF
+--libcurl: OFF
+override-dns: OFF
+ssl-sessions: ON
+cert-status: OFF
+EOF
+fi

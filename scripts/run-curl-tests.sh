@@ -52,6 +52,9 @@ FFI_LIB="$PROJECT_ROOT/target/release/libliburlx_ffi.so"
 LIBTESTS="$CURL_BUILD/tests/libtest/libtests"
 LIBTESTS_REAL="$CURL_BUILD/tests/libtest/libtests.real"
 LIBTESTS_SHIM="$SCRIPT_DIR/libtests-shim"
+URLX_CURLINFO="$SCRIPT_DIR/urlx-curlinfo"
+CURLINFO_BIN="$CURL_BUILD/src/curlinfo"
+CURLINFO_REAL="$CURL_BUILD/src/curlinfo.real"
 
 if [ -f "$FFI_LIB" ] && [ -x "$LIBTESTS" ] && [ ! -f "$LIBTESTS_REAL" ]; then
     # LD_PRELOAD approach: override curl_easy_* symbols with our FFI
@@ -68,6 +71,23 @@ elif [ ! -x "$LIBTESTS" ] && [ ! -f "$LIBTESTS_REAL" ]; then
     cp "$LIBTESTS_SHIM" "$LIBTESTS"
     chmod +x "$LIBTESTS"
     echo "Installed libtests-shim for C API tests (e.g., test 678)"
+fi
+
+# Replace curlinfo with urlx-aware version.
+# curl's curlinfo binary reports curl's compile-time features, not urlx's.
+# Our wrapper overrides features that urlx supports (e.g., ssl-sessions).
+if [ -x "$CURLINFO_BIN" ] && [ ! -f "$CURLINFO_REAL" ]; then
+    # Preserve the original curlinfo so the wrapper can delegate to it
+    mv "$CURLINFO_BIN" "$CURLINFO_REAL"
+    cp "$URLX_CURLINFO" "$CURLINFO_BIN"
+    chmod +x "$CURLINFO_BIN"
+    echo "Installed urlx-curlinfo wrapper (original saved as curlinfo.real)"
+elif [ ! -x "$CURLINFO_BIN" ] && [ ! -f "$CURLINFO_REAL" ]; then
+    # curlinfo was never built; install our standalone version
+    mkdir -p "$CURL_BUILD/src"
+    cp "$URLX_CURLINFO" "$CURLINFO_BIN"
+    chmod +x "$CURLINFO_BIN"
+    echo "Installed urlx-curlinfo (no original curlinfo found)"
 fi
 
 # Ensure symlinks are in place
