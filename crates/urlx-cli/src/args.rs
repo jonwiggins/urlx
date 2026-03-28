@@ -246,6 +246,7 @@ pub fn print_version() {
         features.push("libz");
     }
     features.push("NTLM");
+    features.push("OCSP-stapling");
     features.push("PSL");
     features.push("ssl-sessions");
     if cfg!(feature = "rustls") || cfg!(feature = "tls-srp") {
@@ -417,7 +418,7 @@ pub fn print_usage() {
     eprintln!("      --no-sessionid        Disable TLS session ID reuse (no-op)");
     eprintln!("      --no-alpn             Disable ALPN negotiation (no-op)");
     eprintln!("      --no-npn              Disable NPN negotiation (no-op)");
-    eprintln!("      --cert-status         Request OCSP stapling (no-op)");
+    eprintln!("      --cert-status         Request OCSP stapling");
     eprintln!("      --false-start          Enable TLS false start (no-op)");
     eprintln!("      --disable-eprt        Disable EPRT for FTP (no-op)");
     eprintln!("      --disable-epsv        Disable EPSV for FTP (no-op)");
@@ -1178,6 +1179,9 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
             "-k" | "--insecure" => {
                 opts.easy.ssl_verify_peer(false);
                 opts.easy.ssl_verify_host(false);
+            }
+            "--cert-status" => {
+                opts.easy.ssl_verify_status(true);
             }
             "--cacert" => {
                 i += 1;
@@ -2244,7 +2248,6 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
             | "--no-sessionid"
             | "--no-alpn"
             | "--no-npn"
-            | "--cert-status"
             | "--false-start"
             | "--compressed-ssh"
             | "--doh-cert-status"

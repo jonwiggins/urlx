@@ -131,6 +131,11 @@ pub enum Error {
     #[error("RTSP Session mismatch: {0}")]
     RtspSessionError(String),
 
+    /// The server did not provide a valid OCSP certificate status response.
+    /// Maps to `CURLE_SSL_INVALIDCERTSTATUS` (91) at the FFI boundary.
+    #[error("SSL certificate status verification FAILED: {0}")]
+    SslInvalidCertStatus(String),
+
     /// An SMB protocol error occurred.
     #[error("SMB error: {0}")]
     Smb(String),
