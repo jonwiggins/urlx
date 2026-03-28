@@ -218,6 +218,7 @@ pub fn print_version() {
         protocols.extend_from_slice(&["smb", "smbs"]);
     }
     protocols.extend_from_slice(&["smtp", "smtps"]);
+    protocols.push("telnet");
     protocols.push("tftp");
     protocols.extend_from_slice(&["ws", "wss"]);
     println!("Protocols: {}", protocols.join(" "));
@@ -535,7 +536,7 @@ fn expand_combined_flags(args: &[String]) -> Vec<String> {
     // Set of short flags that take an argument (next arg is the value)
     const ARG_FLAGS: &[char] = &[
         'X', 'H', 'd', 'o', 'D', 'w', 'x', 'u', 'A', 'F', 'r', 'C', 'T', 'b', 'e', 'm', 'K', 'c',
-        'z', 'U', 'Q', 'P', 'E', 'Y', 'y',
+        'z', 'U', 'Q', 'P', 'E', 'Y', 'y', 't',
     ];
 
     let mut result = Vec::with_capacity(args.len());
@@ -678,6 +679,7 @@ fn expand_combined_flags(args: &[String]) -> Vec<String> {
                         | "--ftp-alternative-to-user"
                         | "--ssl-sessions"
                         | "--ftp-ssl-ccc-mode"
+                        | "--telnet-option"
                         | "--tftp-blksize"
                         | "--http2-ping-interval"
                         | "--libcurl"
@@ -1966,6 +1968,12 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
                 opts.easy.ftp_method(method);
                 current_ftp_method = method;
             }
+            "-t" | "--telnet-option" => {
+                i += 1;
+                let _val = require_arg(args, i, "--telnet-option")?;
+                // Accepted; telnet options (TTYPE=, XDISPLOC=, NEW_ENV=) are
+                // parsed but the negotiation handler currently refuses all options.
+            }
             "--connect-to" => {
                 i += 1;
                 let val = require_arg(args, i, "--connect-to")?;
@@ -2367,7 +2375,6 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
             | "--random-file"
             | "--egd-file"
             | "--dns-interface"
-            | "--telnet-option"
             | "--proxy-tlsauthtype"
             | "--proxy-tlsuser"
             | "--proxy-tlspassword"

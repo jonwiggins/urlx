@@ -18,5 +18,6 @@ pub mod smb;
 pub mod smtp;
 #[cfg(feature = "ssh")]
 pub mod ssh;
+pub mod telnet;
 pub mod tftp;
 pub mod ws;

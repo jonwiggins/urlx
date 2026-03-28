@@ -6325,6 +6325,9 @@ async fn do_single_request(
         "ws" | "wss" => {
             return crate::protocol::ws::connect(url, headers, tls_config).await;
         }
+        "telnet" => {
+            return crate::protocol::telnet::transfer(url, body, deadline).await;
+        }
         "http" | "https" => {}
         scheme => {
             return Err(Error::UnsupportedProtocol(scheme.to_string()));

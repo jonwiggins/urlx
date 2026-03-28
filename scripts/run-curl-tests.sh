@@ -103,7 +103,7 @@ fi
 cd "$TESTS_DIR"
 [ ! -e data ] && ln -sf "$CURL_SRC/tests/data" data
 [ ! -e certs ] && ln -sf "$CURL_SRC/tests/certs" certs
-for f in "$CURL_SRC/tests/"*.pm "$CURL_SRC/tests/"*.pl; do
+for f in "$CURL_SRC/tests/"*.pm "$CURL_SRC/tests/"*.pl "$CURL_SRC/tests/"*.py; do
     base=$(basename "$f")
     [ ! -e "$base" ] && ln -sf "$f" "$base"
 done
