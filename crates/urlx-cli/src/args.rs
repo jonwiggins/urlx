@@ -7036,7 +7036,7 @@ mod tests {
         assert!(opts.had_next);
 
         // First group should have only cookie_a
-        let first_easy = opts.per_url_easy[0].as_ref().expect("first URL should have Easy");
+        let first_easy = opts.per_url_easy[0].as_ref().unwrap();
         let first_cookie = first_easy
             .header_list()
             .iter()
@@ -7045,7 +7045,7 @@ mod tests {
         assert_eq!(first_cookie.as_deref(), Some("cookie_a=1"));
 
         // Second group should have only cookie_b (not cookie_a)
-        let second_easy = opts.per_url_easy[1].as_ref().expect("second URL should have Easy");
+        let second_easy = opts.per_url_easy[1].as_ref().unwrap();
         let second_cookie = second_easy
             .header_list()
             .iter()
