@@ -823,7 +823,15 @@ where
     // Determine if connection can be reused
     let server_wants_close =
         ph.headers.get("connection").is_some_and(|v| v.eq_ignore_ascii_case("close"));
-    let can_reuse = keep_alive && !use_http10 && !server_wants_close && !body_read_to_eof;
+    // When --fail skips the body (fail_skip), the response body data may still be
+    // sitting on the socket. If the response has body framing (Content-Length or
+    // chunked Transfer-Encoding), the unread body would corrupt the next request
+    // on a reused connection. Disable reuse in that case (curl compat: test 1328).
+    let has_body_framing = ph.headers.contains_key("content-length")
+        || ph.headers.get("transfer-encoding").is_some_and(|te| te_contains_chunked(te));
+    let fail_left_body = fail_skip && has_body_framing;
+    let can_reuse =
+        keep_alive && !use_http10 && !server_wants_close && !body_read_to_eof && !fail_left_body;
 
     let mut resp = Response::new(ph.status, ph.headers, response_body, url.to_string());
     resp.set_header_original_names(ph.original_names);
@@ -4146,5 +4154,53 @@ mod tests {
         let result = is_encoding_corrupt(&[0xFF], "deflate");
         // The result depends on flate2 behavior; just ensure it doesn't panic
         let _ = result;
+    }
+
+    #[tokio::test]
+    async fn request_fail_on_error_no_reuse_with_body() {
+        // When --fail skips a 404 body, the connection must not be reused
+        // because unread body data would corrupt the next request (test 1328).
+        use tokio::io::duplex;
+
+        let (mut client, mut server) = duplex(4096);
+
+        let server_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 1024];
+            let _n = server.read(&mut buf).await.unwrap();
+
+            // 404 with Content-Length — body is NOT drained when fail_on_error skips it
+            let response = b"HTTP/1.1 404 Not Found\r\nContent-Length: 6\r\n\r\n-nooo-";
+            server.write_all(response).await.unwrap();
+        });
+
+        let (resp, can_reuse) = request(
+            &mut client,
+            "GET",
+            "example.com",
+            "/test",
+            &[],
+            None,
+            "http://example.com/test",
+            true,  // keep_alive
+            false, // use_http10
+            None,
+            false,
+            &SpeedLimits::default(),
+            false,
+            true,
+            None,
+            false,
+            true, // fail_on_error
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(resp.status(), 404);
+        assert!(
+            !can_reuse,
+            "connection must not be reused when --fail skips body with Content-Length"
+        );
+
+        server_task.await.unwrap();
     }
 }
