@@ -2418,6 +2418,12 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
                         opts.easy.header("Accept", "application/json");
                     }
                 }
+                // Apply accumulated inline cookies to the current group before saving
+                // so they don't leak to the next --next group.
+                if !opts.inline_cookies.is_empty() {
+                    let cookie_header = opts.inline_cookies.join("; ");
+                    opts.easy.header("Cookie", &cookie_header);
+                }
                 // Save per-URL Easy handles and custom requests for the current group
                 let current_easy = opts.easy.clone();
                 for slot in opts.per_url_easy[opts.group_easy_start..].iter_mut() {
@@ -2436,7 +2442,9 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
                 group_start_idx = opts.per_url_credentials.len();
                 opts.user_credentials = None;
                 current_ftp_method = liburlx::protocol::ftp::FtpMethod::default();
-                // Reset per-request state (curl compat: tests 430-432)
+                // Reset per-request state (curl compat: tests 386, 430-432).
+                // In curl, --next creates a fresh OperationConfig, resetting all
+                // per-operation options. We must reset everything that is per-request.
                 opts.easy.clear_headers();
                 opts.easy.clear_body();
                 opts.has_post_data = false;
@@ -2445,6 +2453,16 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
                 opts.easy.set_form_data(false);
                 opts.json_mode = false;
                 opts.custom_request_original = None;
+                opts.inline_cookies.clear();
+                opts.url_queries.clear();
+                opts.get_mode = false;
+                opts.is_upload = false;
+                opts.is_stdin_upload = false;
+                opts.upload_filename = None;
+                opts.upload_file_path = None;
+                opts.auto_resume = false;
+                opts.resume_check = false;
+                opts.resume_offset = None;
                 opts.next_needs_url = true;
                 opts.had_next = true;
                 opts.group_id += 1;
@@ -2586,9 +2604,31 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
     }
     // Note: netrc credential loading is deferred to run() where the URL is known
 
+    // Apply accumulated inline cookies as a single Cookie header for the last group.
+    // This must happen before per_url_easy is saved so the cookie header is included.
+    if !opts.inline_cookies.is_empty() {
+        let cookie_header = opts.inline_cookies.join("; ");
+        opts.easy.header("Cookie", &cookie_header);
+    }
+
+    // Post-processing: add --json Content-Type and Accept headers AFTER all args
+    // are parsed, only if they're not already set by -H (curl compat: tests 383, 384).
+    // This matches curl's get_args() behavior: --json headers are deferred.
+    // Must happen before per_url_easy save so the last group gets these headers.
+    if opts.json_mode {
+        let has_ct = opts.easy.has_header("content-type");
+        let has_accept = opts.easy.has_header("accept");
+        if !has_ct {
+            opts.easy.header("Content-Type", "application/json");
+        }
+        if !has_accept {
+            opts.easy.header("Accept", "application/json");
+        }
+    }
+
     // Assign last group's Easy handle to URLs that weren't assigned yet.
-    // This must happen AFTER auth credentials are applied so per-URL Easy
-    // handles have correct auth state (curl compat: test 338 — ANYAUTH).
+    // This must happen AFTER auth credentials and deferred headers are applied
+    // so per-URL Easy handles have correct state (curl compat: test 338 — ANYAUTH).
     {
         let current_easy = opts.easy.clone();
         for slot in opts.per_url_easy[opts.group_easy_start..].iter_mut() {
@@ -2604,32 +2644,12 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
         }
     }
 
-    // Apply accumulated inline cookies as a single Cookie header
-    if !opts.inline_cookies.is_empty() {
-        let cookie_header = opts.inline_cookies.join("; ");
-        opts.easy.header("Cookie", &cookie_header);
-    }
-
     // Set output_file from the first collected output file (each -o pairs with a URL by position)
     if !opts.output_files.is_empty() {
         opts.output_file = Some(opts.output_files[0].clone());
         // Warn if more -o options than URLs (curl compat: test 371)
         if opts.output_files.len() > opts.urls.len().max(1) {
             eprintln!("Warning: Got more output options than URLs");
-        }
-    }
-
-    // Post-processing: add --json Content-Type and Accept headers AFTER all args
-    // are parsed, only if they're not already set by -H (curl compat: tests 383, 384).
-    // This matches curl's get_args() behavior: --json headers are deferred.
-    if opts.json_mode {
-        let has_ct = opts.easy.has_header("content-type");
-        let has_accept = opts.easy.has_header("accept");
-        if !has_ct {
-            opts.easy.header("Content-Type", "application/json");
-        }
-        if !has_accept {
-            opts.easy.header("Accept", "application/json");
         }
     }
 
@@ -6997,5 +7017,112 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// --next must reset inline cookies so they don't leak to subsequent groups.
+    #[test]
+    fn parse_args_next_resets_inline_cookies() {
+        let args = make_args(&[
+            "-b",
+            "cookie_a=1",
+            "http://example.com/a",
+            "--next",
+            "-b",
+            "cookie_b=2",
+            "http://example.com/b",
+        ]);
+        let opts = unwrap_opts(parse_args(&args));
+        assert_eq!(opts.urls.len(), 2);
+        assert!(opts.had_next);
+
+        // First group should have only cookie_a
+        let first_easy = opts.per_url_easy[0].as_ref().expect("first URL should have Easy");
+        let first_cookie = first_easy
+            .header_list()
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("cookie"))
+            .map(|(_, v)| v.clone());
+        assert_eq!(first_cookie.as_deref(), Some("cookie_a=1"));
+
+        // Second group should have only cookie_b (not cookie_a)
+        let second_easy = opts.per_url_easy[1].as_ref().expect("second URL should have Easy");
+        let second_cookie = second_easy
+            .header_list()
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("cookie"))
+            .map(|(_, v)| v.clone());
+        assert_eq!(second_cookie.as_deref(), Some("cookie_b=2"));
+    }
+
+    /// --next must reset `get_mode` so -G doesn't leak to subsequent groups.
+    #[test]
+    fn parse_args_next_resets_get_mode() {
+        let args = make_args(&[
+            "-G",
+            "-d",
+            "q=test",
+            "http://example.com/search",
+            "--next",
+            "-d",
+            "data",
+            "http://example.com/post",
+        ]);
+        let opts = unwrap_opts(parse_args(&args));
+        assert_eq!(opts.urls.len(), 2);
+        assert!(opts.had_next);
+        // get_mode should be false after --next resets it; the final group uses POST
+        assert!(!opts.get_mode, "get_mode should be reset after --next");
+    }
+
+    /// --next must reset upload state so -T doesn't leak to subsequent groups.
+    #[test]
+    fn parse_args_next_resets_upload() {
+        let args = make_args(&[
+            "-T",
+            "/dev/null",
+            "http://example.com/upload",
+            "--next",
+            "http://example.com/get",
+        ]);
+        let opts = unwrap_opts(parse_args(&args));
+        assert_eq!(opts.urls.len(), 2);
+        assert!(opts.had_next);
+        // is_upload should be false after --next
+        assert!(!opts.is_upload, "is_upload should be reset after --next");
+        assert!(!opts.is_stdin_upload, "is_stdin_upload should be reset after --next");
+        assert!(opts.upload_filename.is_none(), "upload_filename should be reset after --next");
+    }
+
+    /// --next must reset `url_queries` so --url-query doesn't leak to subsequent groups.
+    #[test]
+    fn parse_args_next_resets_url_queries() {
+        let args = make_args(&[
+            "--url-query",
+            "a=1",
+            "http://example.com/a",
+            "--next",
+            "http://example.com/b",
+        ]);
+        let opts = unwrap_opts(parse_args(&args));
+        assert_eq!(opts.urls.len(), 2);
+        assert!(opts.had_next);
+        assert!(opts.url_queries.is_empty(), "url_queries should be reset after --next");
+    }
+
+    /// --next must reset resume state so -C doesn't leak to subsequent groups.
+    #[test]
+    fn parse_args_next_resets_resume() {
+        let args = make_args(&[
+            "-C",
+            "100",
+            "http://example.com/resume",
+            "--next",
+            "http://example.com/fresh",
+        ]);
+        let opts = unwrap_opts(parse_args(&args));
+        assert_eq!(opts.urls.len(), 2);
+        assert!(opts.had_next);
+        assert!(!opts.resume_check, "resume_check should be reset after --next");
+        assert!(opts.resume_offset.is_none(), "resume_offset should be reset after --next");
     }
 }
