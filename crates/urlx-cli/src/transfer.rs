@@ -1018,39 +1018,52 @@ pub fn run(args: &[String]) -> ExitCode {
     }
 
     // --etag-save with bad path + --next: skip affected transfers (curl compat: test 369).
-    // curl prints a warning and skips the transfer, continuing with --next groups.
+    // curl tries to open the etag file upfront via fopen("ab"). If it fails, it prints
+    // a warning and skips the transfer, continuing with --next groups.
     // For single-URL case without --next, the etag check in run() handles error 26 (test 370).
     if opts.had_next {
         if let Some(ref path) = opts.etag_save_file {
-            if let Some(parent) = std::path::Path::new(path).parent() {
-                if !parent.as_os_str().is_empty() && !parent.exists() && !opts.create_dirs {
-                    eprintln!(
-                    "Warning: Failed creating file for saving etags: \"{path}\". Skip this transfer"
-                );
-                    // Remove URLs from the first group (group 0 = the group with etag-save)
-                    let first_group = opts.per_url_group.first().copied().unwrap_or(0);
-                    let mut i = 0;
-                    while i < opts.urls.len() {
-                        if opts.per_url_group.get(i).copied().unwrap_or(0) == first_group {
-                            let _ = opts.urls.remove(i);
-                            let _ = opts.per_url_credentials.remove(i);
-                            let _ = opts.per_url_ftp_methods.remove(i);
-                            let _ = opts.per_url_easy.remove(i);
-                            let _ = opts.per_url_upload_files.remove(i);
-                            let _ = opts.per_url_group.remove(i);
-                            let _ = opts.glob_values.remove(i);
-                            if i < opts.output_files.len() {
-                                let _ = opts.output_files.remove(i);
-                            }
-                        } else {
-                            i += 1;
+            let bad_etag = if path == "-" {
+                false // stdout is always valid
+            } else {
+                // With --create-dirs, ensure parent directories exist first
+                if opts.create_dirs {
+                    if let Some(parent) = std::path::Path::new(path).parent() {
+                        if !parent.as_os_str().is_empty() && !parent.exists() {
+                            let _ = std::fs::create_dir_all(parent);
                         }
                     }
-                    opts.etag_save_file = None;
-                    // If no URLs left after removal, exit successfully
-                    if opts.urls.is_empty() {
-                        return ExitCode::SUCCESS;
+                }
+                // Try to open the file upfront (matches curl's fopen("ab") in etag_store)
+                std::fs::OpenOptions::new().create(true).append(true).open(path).is_err()
+            };
+            if bad_etag {
+                eprintln!(
+                    "Warning: Failed creating file for saving etags: \"{path}\". Skip this transfer"
+                );
+                // Remove URLs from the first group (group 0 = the group with etag-save)
+                let first_group = opts.per_url_group.first().copied().unwrap_or(0);
+                let mut i = 0;
+                while i < opts.urls.len() {
+                    if opts.per_url_group.get(i).copied().unwrap_or(0) == first_group {
+                        let _ = opts.urls.remove(i);
+                        let _ = opts.per_url_credentials.remove(i);
+                        let _ = opts.per_url_ftp_methods.remove(i);
+                        let _ = opts.per_url_easy.remove(i);
+                        let _ = opts.per_url_upload_files.remove(i);
+                        let _ = opts.per_url_group.remove(i);
+                        let _ = opts.glob_values.remove(i);
+                        if i < opts.output_files.len() {
+                            let _ = opts.output_files.remove(i);
+                        }
+                    } else {
+                        i += 1;
                     }
+                }
+                opts.etag_save_file = None;
+                // If no URLs left after removal, exit successfully
+                if opts.urls.is_empty() {
+                    return ExitCode::SUCCESS;
                 }
             }
         }
@@ -1702,22 +1715,37 @@ pub fn run(args: &[String]) -> ExitCode {
         }
     }
 
-    // --etag-save: validate/create directory before transfer
+    // --etag-save: validate the etag file can be created before transfer.
+    // curl tries fopen(path, "ab") upfront. If it fails, it prints a warning
+    // ("Failed creating file for saving etags"), skips the transfer, and if no
+    // transfer was performed at all, returns CURLE_READ_ERROR (26) with
+    // "no transfer performed" (curl compat: test 370).
     if let Some(ref path) = opts.etag_save_file {
-        if let Some(parent) = std::path::Path::new(path).parent() {
-            if !parent.as_os_str().is_empty() && !parent.exists() {
-                if opts.create_dirs {
-                    if let Err(e) = std::fs::create_dir_all(parent) {
-                        if !opts.silent || opts.show_error {
-                            eprintln!("curl: error creating directories for etag file: {e}");
+        if path != "-" {
+            // With --create-dirs, ensure parent directories exist first
+            if opts.create_dirs {
+                if let Some(parent) = std::path::Path::new(path).parent() {
+                    if !parent.as_os_str().is_empty() && !parent.exists() {
+                        if let Err(e) = std::fs::create_dir_all(parent) {
+                            if !opts.silent || opts.show_error {
+                                eprintln!("curl: error creating directories for etag file: {e}");
+                            }
+                            return ExitCode::FAILURE;
                         }
-                        return ExitCode::FAILURE;
                     }
-                } else {
-                    // curl returns CURLE_READ_ERROR (26) for bad etag-save path
-                    // (curl compat: test 370)
-                    return ExitCode::from(26);
                 }
+            }
+            // Try to open the file upfront (matches curl's fopen("ab") in etag_store)
+            let bad_etag =
+                std::fs::OpenOptions::new().create(true).append(true).open(path).is_err();
+            if bad_etag {
+                eprintln!(
+                    "Warning: Failed creating file for saving etags: \"{path}\". Skip this transfer"
+                );
+                if !opts.silent || opts.show_error {
+                    eprintln!("curl: (26) no transfer performed");
+                }
+                return ExitCode::from(26);
             }
         }
     }
