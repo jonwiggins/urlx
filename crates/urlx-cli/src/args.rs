@@ -6778,7 +6778,7 @@ mod tests {
         assert_eq!(opts.per_url_group[1], 1);
 
         // First group: should have JSON headers
-        let first_easy = opts.per_url_easy[0].as_ref().expect("first URL should have Easy");
+        let first_easy = opts.per_url_easy[0].as_ref().unwrap();
         assert!(first_easy.has_header("content-type"), "first group should have Content-Type");
         assert!(first_easy.has_header("accept"), "first group should have Accept");
         let ct = first_easy
@@ -6799,7 +6799,7 @@ mod tests {
         assert!(first_easy.has_body());
 
         // Second group: should NOT have JSON headers (reset by --next)
-        let second_easy = opts.per_url_easy[1].as_ref().expect("second URL should have Easy");
+        let second_easy = opts.per_url_easy[1].as_ref().unwrap();
         assert!(
             !second_easy.header_list().iter().any(|(k, _)| k.eq_ignore_ascii_case("content-type")),
             "second group should not have Content-Type"
