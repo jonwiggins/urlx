@@ -3171,6 +3171,14 @@ impl Easy {
         // Store the successful response as last_response (overrides any partial from Arc)
         self.last_response = Some(response.clone());
 
+        // Check fail_on_error: HTTP status >= 400 becomes an error
+        if self.fail_on_error && response.status() >= 400 {
+            return Err(Error::Http(format!(
+                "HTTP error {} (fail_on_error enabled)",
+                response.status()
+            )));
+        }
+
         // Call progress callback with final transfer values
         if let Some(ref cb) = self.progress_callback {
             let ul_total = effective_body.as_ref().map_or(0, |b| b.len() as u64);
