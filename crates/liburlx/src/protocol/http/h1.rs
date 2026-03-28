@@ -823,7 +823,20 @@ where
     // Determine if connection can be reused
     let server_wants_close =
         ph.headers.get("connection").is_some_and(|v| v.eq_ignore_ascii_case("close"));
-    let can_reuse = keep_alive && !use_http10 && !server_wants_close && !body_read_to_eof;
+    // When --fail skips the body (fail_skip), the socket still has unread body data.
+    // Don't reuse the connection if the response has body framing (Content-Length or
+    // chunked Transfer-Encoding), because the next request would read stale data
+    // (curl compat: test 1328 — --fail with URL globbing).
+    let has_body_framing = ph.headers.contains_key("content-length")
+        || ph
+            .headers
+            .get("transfer-encoding")
+            .is_some_and(|te| te_contains_chunked(te));
+    let can_reuse = keep_alive
+        && !use_http10
+        && !server_wants_close
+        && !body_read_to_eof
+        && !(fail_skip && has_body_framing);
 
     let mut resp = Response::new(ph.status, ph.headers, response_body, url.to_string());
     resp.set_header_original_names(ph.original_names);
