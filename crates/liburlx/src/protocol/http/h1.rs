@@ -3748,8 +3748,7 @@ mod tests {
             let _n = server.read(&mut buf).await.unwrap();
 
             // Send a 401 response with a body — fail_on_error will skip the body
-            let response =
-                b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 11\r\n\r\nUnauthorized";
+            let response = b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 11\r\n\r\nUnauthorized";
             server.write_all(response).await.unwrap();
             // Don't shutdown — keep-alive means connection stays open
         });

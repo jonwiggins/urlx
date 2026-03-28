@@ -3480,7 +3480,7 @@ async fn perform_transfer(
         // For NTLM, send Content-Length: 0 (body will be sent after Type3).
         let is_challenge_response = !has_digest_state
             && auth_credentials.as_ref().is_some_and(|a| matches!(a.method, AuthMethod::Digest));
-        let mut is_ntlm_probe =
+        let is_ntlm_probe =
             auth_credentials.as_ref().is_some_and(|a| matches!(a.method, AuthMethod::Ntlm));
         let initial_body = if is_challenge_response || is_ntlm_probe {
             if current_body.is_some() {
@@ -4229,10 +4229,6 @@ async fn perform_transfer(
                                         fail_on_error,
                                     ))
                                     .await?;
-                                    // NTLM Type 3 auth completed — clear the probe
-                                    // flag so the probe-retry path at the top of the
-                                    // loop does not fire on the successful response.
-                                    is_ntlm_probe = false;
                                 }
                             }
                         }
