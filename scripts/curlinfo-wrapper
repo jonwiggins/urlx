@@ -1,0 +1,68 @@
+#!/bin/bash
+# Wrapper around curl's curlinfo binary that overrides feature detection
+# to reflect urlx's actual capabilities.
+#
+# The curl test harness runs `curlinfo` to detect which features are compiled
+# in. Since curlinfo comes from curl's own build (not urlx), it may report
+# features as OFF that urlx actually supports. This wrapper runs the real
+# curlinfo and patches the output to match urlx's feature set.
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REAL_CURLINFO="${CURLINFO_REAL:-$(dirname "$0")/../vendor/curl-build/src/curlinfo.real}"
+
+# Features that urlx supports but curl's build may not report
+# Add entries here as: "feature-name"
+URLX_EXTRA_FEATURES=(
+    "ssl-sessions"
+)
+
+if [ -x "$REAL_CURLINFO" ]; then
+    # Run the real curlinfo and override specific features
+    "$REAL_CURLINFO" "$@" | while IFS= read -r line; do
+        overridden=false
+        for feat in "${URLX_EXTRA_FEATURES[@]}"; do
+            if [[ "$line" == "${feat}: OFF" ]]; then
+                echo "${feat}: ON"
+                overridden=true
+                break
+            fi
+        done
+        if ! $overridden; then
+            echo "$line"
+        fi
+    done
+else
+    # No real curlinfo available — output a static feature list matching
+    # urlx's capabilities. This list mirrors curlinfo.c from curl's source.
+    cat <<'FEATURES'
+bindlocal: ON
+cookies: ON
+basic-auth: ON
+bearer-auth: ON
+digest: ON
+negotiate-auth: OFF
+aws: ON
+DoH: ON
+HTTP-auth: ON
+Mime: ON
+netrc: ON
+parsedate: ON
+proxy: ON
+shuffle-dns: ON
+typecheck: ON
+verbose-strings: ON
+wakeup: ON
+headers-api: ON
+xattr: OFF
+form-api: ON
+large-time: ON
+large-size: ON
+sha512-256: OFF
+win32-ca-searchpath: OFF
+win32-ca-search-safe: OFF
+--libcurl: OFF
+override-dns: OFF
+ssl-sessions: ON
+cert-status: OFF
+FEATURES
+fi
