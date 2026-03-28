@@ -826,7 +826,7 @@ where
     // When --fail skips the body (fail_skip), the response body data may still be
     // sitting on the socket. If the response has body framing (Content-Length or
     // chunked Transfer-Encoding), the unread body would corrupt the next request
-    // on a reused connection. Disable reuse in that case (curl compat: test 1328).
+    // on a reused connection. Disable reuse in that case (curl compat: tests 150, 1328).
     let has_body_framing = ph.headers.contains_key("content-length")
         || ph.headers.get("transfer-encoding").is_some_and(|te| te_contains_chunked(te));
     let fail_left_body = fail_skip && has_body_framing;
@@ -3733,6 +3733,52 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(resp.status(), 200);
+
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn request_fail_on_error_prevents_reuse() {
+        use tokio::io::duplex;
+
+        let (mut client, mut server) = duplex(4096);
+
+        let server_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 1024];
+            let _n = server.read(&mut buf).await.unwrap();
+
+            // Send a 401 response with a body — fail_on_error will skip the body
+            let response = b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 11\r\n\r\nUnauthorized";
+            server.write_all(response).await.unwrap();
+            // Don't shutdown — keep-alive means connection stays open
+        });
+
+        let (resp, can_reuse) = request(
+            &mut client,
+            "GET",
+            "example.com",
+            "/test",
+            &[],
+            None,
+            "http://example.com/test",
+            true,
+            false,
+            None,
+            false,
+            &SpeedLimits::default(),
+            false,
+            true,
+            None,
+            false,
+            true, // fail_on_error
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(resp.status(), 401);
+        // Body was skipped due to fail_on_error, so connection has unread data
+        // and must NOT be reused (prevents NTLM Type 3 corruption — test 150).
+        assert!(!can_reuse, "fail_on_error body skip must prevent reuse");
 
         server_task.await.unwrap();
     }
