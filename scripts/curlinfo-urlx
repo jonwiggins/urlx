@@ -1,0 +1,68 @@
+#!/bin/bash
+# Wrapper around curl's curlinfo binary that overrides feature flags
+# to reflect urlx's actual capabilities.
+#
+# curl's test harness (runtests.pl) runs curlinfo to detect which features
+# are available. Since curlinfo comes from curl's own build, it reflects
+# curl's build configuration — not urlx's capabilities. This wrapper runs
+# the real curlinfo and patches the output so that features urlx supports
+# (but curl wasn't built with) are reported as ON.
+#
+# Installed by run-curl-tests.sh in place of vendor/curl-build/src/curlinfo.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# The real curlinfo binary (moved aside by run-curl-tests.sh)
+REAL_CURLINFO="${CURLINFO_REAL:-}"
+
+# Features that urlx supports regardless of curl's build configuration.
+# Add entries here as urlx gains features that curl may not be built with.
+URLX_FEATURES_ON=(
+    "ssl-sessions"
+)
+
+# Run the real curlinfo and patch the output
+if [ -n "$REAL_CURLINFO" ] && [ -x "$REAL_CURLINFO" ]; then
+    # Build a sed expression that overrides each feature to ON
+    sed_args=()
+    for feat in "${URLX_FEATURES_ON[@]}"; do
+        sed_args+=(-e "s/^${feat}: OFF$/${feat}: ON/")
+    done
+    "$REAL_CURLINFO" | sed "${sed_args[@]}"
+else
+    # No real curlinfo available — output a complete feature list based on
+    # urlx's known capabilities. This matches the format of curlinfo.c output.
+    cat <<'EOF'
+bindlocal: ON
+cookies: ON
+basic-auth: ON
+bearer-auth: ON
+digest: ON
+negotiate-auth: ON
+aws: ON
+DoH: ON
+HTTP-auth: ON
+Mime: ON
+netrc: ON
+parsedate: ON
+proxy: ON
+shuffle-dns: ON
+typecheck: ON
+verbose-strings: ON
+wakeup: ON
+headers-api: ON
+xattr: OFF
+form-api: ON
+large-time: ON
+large-size: ON
+sha512-256: ON
+win32-ca-searchpath: OFF
+win32-ca-search-safe: OFF
+--libcurl: ON
+override-dns: OFF
+ssl-sessions: ON
+cert-status: OFF
+EOF
+fi
