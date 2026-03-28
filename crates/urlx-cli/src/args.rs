@@ -6756,4 +6756,246 @@ mod tests {
         let opts = unwrap_opts(parse_args(&args));
         assert!(!opts.urls.is_empty());
     }
+
+    // --next + --config + --json tests (curl compat: tests 386, 430, 431, 432)
+
+    /// Test 386: --json sets Content-Type and Accept for the first group,
+    /// but --next resets them so the second group gets default Accept: */*.
+    #[test]
+    fn parse_args_json_next_headers_reset() {
+        let args = make_args(&[
+            "--json",
+            r#"{ "drink": "coffee" }"#,
+            "http://example.com/386",
+            "--next",
+            "http://example.com/3860002",
+        ]);
+        let opts = unwrap_opts(parse_args(&args));
+        assert_eq!(opts.urls.len(), 2);
+        assert!(opts.had_next);
+        assert_eq!(opts.per_url_group.len(), 2);
+        assert_eq!(opts.per_url_group[0], 0);
+        assert_eq!(opts.per_url_group[1], 1);
+
+        // First group: should have JSON headers
+        let first_easy = opts.per_url_easy[0].as_ref().expect("first URL should have Easy");
+        assert!(first_easy.has_header("content-type"), "first group should have Content-Type");
+        assert!(first_easy.has_header("accept"), "first group should have Accept");
+        let ct = first_easy
+            .header_list()
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+            .map(|(_, v)| v.as_str());
+        assert_eq!(ct, Some("application/json"));
+        let accept = first_easy
+            .header_list()
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("accept"))
+            .map(|(_, v)| v.as_str());
+        assert_eq!(accept, Some("application/json"));
+
+        // First group should be POST with body
+        assert_eq!(first_easy.method_str(), Some("POST"));
+        assert!(first_easy.has_body());
+
+        // Second group: should NOT have JSON headers (reset by --next)
+        let second_easy = opts.per_url_easy[1].as_ref().expect("second URL should have Easy");
+        assert!(
+            !second_easy.header_list().iter().any(|(k, _)| k.eq_ignore_ascii_case("content-type")),
+            "second group should not have Content-Type"
+        );
+        // Second group should not have body or POST method
+        assert!(!second_easy.has_body());
+    }
+
+    /// Test 430: Three -K config files, each starting with --next.
+    /// Each group should have its own header, data, and URL.
+    #[test]
+    fn parse_args_three_config_files_with_next() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join("urlx_test_430");
+        let _ = std::fs::create_dir_all(&dir);
+
+        let write_config = |name: &str, content: &str| {
+            let path = dir.join(name);
+            let mut f = std::fs::File::create(&path).unwrap();
+            f.write_all(content.as_bytes()).unwrap();
+            path.to_str().unwrap().to_string()
+        };
+
+        let config_a = write_config(
+            "config-a",
+            "--next\nurl = http://example.com/4300001\nheader = \"a: a\"\ndata = \"a\"\n",
+        );
+        let config_b = write_config(
+            "config-b",
+            "--next\nurl = http://example.com/4300002\nheader = \"b: b\"\ndata = \"b\"\n",
+        );
+        let config_c = write_config(
+            "config-c",
+            "--next\nurl = http://example.com/4300003\nheader = \"c: c\"\ndata = \"c\"\n",
+        );
+
+        let args = make_args(&["-K", &config_a, "-K", &config_b, "-K", &config_c]);
+        let opts = unwrap_opts(parse_args(&args));
+
+        assert_eq!(opts.urls.len(), 3, "should have 3 URLs");
+        assert!(opts.had_next, "should have had --next");
+        assert_eq!(opts.per_url_group, vec![0, 1, 2], "each URL in its own group");
+
+        // Verify each group has correct headers and body
+        for (i, (expected_header, expected_body, expected_url_suffix)) in
+            [("a", "a", "4300001"), ("b", "b", "4300002"), ("c", "c", "4300003")].iter().enumerate()
+        {
+            let easy =
+                opts.per_url_easy[i].as_ref().unwrap_or_else(|| panic!("URL {i} should have Easy"));
+            assert!(
+                opts.urls[i].contains(expected_url_suffix),
+                "URL {i} should contain {expected_url_suffix}, got {}",
+                opts.urls[i]
+            );
+            let header_val = easy
+                .header_list()
+                .iter()
+                .find(|(k, _)| k == expected_header)
+                .map(|(_, v)| v.as_str());
+            assert_eq!(
+                header_val,
+                Some(*expected_header),
+                "group {i} should have header {expected_header}: {expected_header}"
+            );
+            assert_eq!(
+                easy.peek_body().map(|b| std::str::from_utf8(b).unwrap()),
+                Some(*expected_body),
+                "group {i} should have body {expected_body}"
+            );
+            assert_eq!(easy.method_str(), Some("POST"), "group {i} should be POST");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Test 431: Two -K config files with --next, then --next on cmdline.
+    #[test]
+    fn parse_args_two_configs_then_cmdline_next() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join("urlx_test_431");
+        let _ = std::fs::create_dir_all(&dir);
+
+        let write_config = |name: &str, content: &str| {
+            let path = dir.join(name);
+            let mut f = std::fs::File::create(&path).unwrap();
+            f.write_all(content.as_bytes()).unwrap();
+            path.to_str().unwrap().to_string()
+        };
+
+        let config_a = write_config(
+            "config-a",
+            "--next\nurl = http://example.com/4310001\nheader = \"a: a\"\ndata = \"a\"\n",
+        );
+        let config_b = write_config(
+            "config-b",
+            "--next\nurl = http://example.com/4310002\nheader = \"b: b\"\ndata = \"b\"\n",
+        );
+
+        let args = make_args(&[
+            "-K",
+            &config_a,
+            "-K",
+            &config_b,
+            "--next",
+            "-d",
+            "c",
+            "http://example.com/4310003",
+            "-H",
+            "c: c",
+        ]);
+        let opts = unwrap_opts(parse_args(&args));
+
+        assert_eq!(opts.urls.len(), 3, "should have 3 URLs");
+        assert!(opts.had_next);
+        assert_eq!(opts.per_url_group, vec![0, 1, 2]);
+
+        // Verify all 3 groups have correct state
+        for (i, (expected_header, expected_body)) in
+            [("a", "a"), ("b", "b"), ("c", "c")].iter().enumerate()
+        {
+            let easy =
+                opts.per_url_easy[i].as_ref().unwrap_or_else(|| panic!("URL {i} should have Easy"));
+            let header_val = easy
+                .header_list()
+                .iter()
+                .find(|(k, _)| k == expected_header)
+                .map(|(_, v)| v.as_str());
+            assert_eq!(header_val, Some(*expected_header), "group {i} header mismatch");
+            assert_eq!(
+                easy.peek_body().map(|b| std::str::from_utf8(b).unwrap()),
+                Some(*expected_body),
+                "group {i} body mismatch"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Test 432: Single -K with multiple --next inside, plus nested config directive.
+    #[test]
+    fn parse_args_config_with_nested_config_and_next() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join("urlx_test_432");
+        let _ = std::fs::create_dir_all(&dir);
+
+        let write_config = |name: &str, content: &str| {
+            let path = dir.join(name);
+            let mut f = std::fs::File::create(&path).unwrap();
+            f.write_all(content.as_bytes()).unwrap();
+            path.to_str().unwrap().to_string()
+        };
+
+        let config_c_path = write_config(
+            "config-c",
+            "--next\nurl = http://example.com/4320003\nheader = \"c: c\"\ndata = \"c\"\n",
+        );
+
+        let main_config = write_config(
+            "config",
+            &format!(
+                "--next\nurl = http://example.com/4320001\nheader = \"a: a\"\ndata = \"a\"\n\
+                 --next\nurl = http://example.com/4320002\nheader = \"b: b\"\ndata = \"b\"\n\
+                 config = \"{config_c_path}\"\n"
+            ),
+        );
+
+        let args = make_args(&["-K", &main_config]);
+        let opts = unwrap_opts(parse_args(&args));
+
+        assert_eq!(opts.urls.len(), 3, "should have 3 URLs");
+        assert!(opts.had_next);
+        assert_eq!(opts.per_url_group, vec![0, 1, 2]);
+
+        // Verify all 3 groups
+        for (i, (expected_header, expected_body, expected_url_suffix)) in
+            [("a", "a", "4320001"), ("b", "b", "4320002"), ("c", "c", "4320003")].iter().enumerate()
+        {
+            let easy =
+                opts.per_url_easy[i].as_ref().unwrap_or_else(|| panic!("URL {i} should have Easy"));
+            assert!(
+                opts.urls[i].contains(expected_url_suffix),
+                "URL {i} should contain {expected_url_suffix}"
+            );
+            let header_val = easy
+                .header_list()
+                .iter()
+                .find(|(k, _)| k == expected_header)
+                .map(|(_, v)| v.as_str());
+            assert_eq!(header_val, Some(*expected_header), "group {i} header mismatch");
+            assert_eq!(
+                easy.peek_body().map(|b| std::str::from_utf8(b).unwrap()),
+                Some(*expected_body),
+                "group {i} body mismatch"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
