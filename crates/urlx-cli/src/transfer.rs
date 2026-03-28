@@ -1755,7 +1755,9 @@ pub fn run(args: &[String]) -> ExitCode {
     // Propagate --fail flag to the Easy handle so the HTTP protocol handler
     // can skip body reading on error status (avoids hang on HTTP/1.0 responses
     // without Content-Length; curl compat: test 24).
-    if opts.fail_on_error {
+    // Only set when --fail is used WITHOUT --fail-with-body, because
+    // --fail-with-body needs the body to be read (curl compat: tests 349, 361).
+    if opts.fail_on_error && !opts.fail_with_body {
         opts.easy.fail_on_error(true);
     }
 
@@ -2753,7 +2755,9 @@ pub fn run_multi(
     let mut easy = template.clone();
     // Propagate fail_on_error to the Easy handle so the HTTP protocol handler
     // can skip body reading on error status (curl compat: test 24).
-    if fail_on_error {
+    // Only set when --fail is used WITHOUT --fail-with-body, because
+    // --fail-with-body needs the body to be read (curl compat: tests 349, 361).
+    if fail_on_error && !fail_with_body {
         easy.fail_on_error(true);
     }
     let mut last_exit = ExitCode::SUCCESS;
