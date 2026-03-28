@@ -2487,6 +2487,7 @@ pub fn error_to_curl_code(err: &liburlx::Error) -> u8 {
                 _ => 7, // CURLE_COULDNT_CONNECT
             }
         }
+        liburlx::Error::SslInvalidCertStatus(_) => 91, // CURLE_SSL_INVALIDCERTSTATUS
         liburlx::Error::Tls(e) => {
             let msg = e.to_string();
             if msg.contains("certificate") || msg.contains("verify") {
@@ -2590,6 +2591,7 @@ pub fn curl_error_message(err: &liburlx::Error) -> String {
         liburlx::Error::SshRangeError(msg) => msg.clone(),
         liburlx::Error::SshQuoteErrorWithData { message, .. } => message.clone(),
         liburlx::Error::Connect(e) => format!("Failed to connect: {e}"),
+        liburlx::Error::SslInvalidCertStatus(msg) => msg.clone(),
         liburlx::Error::Tls(e) => e.to_string(),
         liburlx::Error::FileError(msg) => msg.clone(),
         liburlx::Error::PartialBody { message, .. } => message.clone(),

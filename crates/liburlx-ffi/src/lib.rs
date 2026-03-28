@@ -226,6 +226,7 @@ pub enum CURLoption {
     CURLOPT_STREAM_WEIGHT = 239,
     CURLOPT_TCP_FASTOPEN = 244,
     CURLOPT_SOCKS5_AUTH = 267,
+    CURLOPT_SSL_VERIFYSTATUS = 232,
     CURLOPT_HTTP09_ALLOWED = 285,
 
     // Off_t options (CURLOPTTYPE_OFF_T = 30000)
@@ -2032,6 +2033,12 @@ pub unsafe extern "C" fn curl_easy_setopt(
             // CURLOPT_SSL_SESSIONID_CACHE = 150
             150 => {
                 h.easy.ssl_session_cache(value as c_long != 0);
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_SSL_VERIFYSTATUS = 232
+            232 => {
+                h.easy.ssl_verify_status(value as c_long != 0);
                 CURLcode::CURLE_OK
             }
 
@@ -4893,6 +4900,7 @@ fn error_to_curlcode(err: &liburlx::Error) -> CURLcode {
     match err {
         liburlx::Error::UrlParse(_) => CURLcode::CURLE_URL_MALFORMAT,
         liburlx::Error::Connect(_) => CURLcode::CURLE_COULDNT_CONNECT,
+        liburlx::Error::SslInvalidCertStatus(_) => CURLcode::CURLE_SSL_INVALIDCERTSTATUS,
         liburlx::Error::Tls(_) => CURLcode::CURLE_SSL_CONNECT_ERROR,
         liburlx::Error::Http(msg) => {
             if msg.contains("unsupported scheme") {

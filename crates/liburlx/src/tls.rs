@@ -19,6 +19,7 @@ pub enum TlsVersion {
 /// Controls certificate verification, custom CA bundles, client certificates,
 /// and TLS version negotiation.
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct TlsConfig {
     /// Whether to verify the server's TLS certificate (default: true).
     ///
@@ -108,6 +109,14 @@ pub struct TlsConfig {
 
     /// TLS-SRP password for password-based TLS authentication (RFC 5054).
     pub srp_password: Option<String>,
+
+    /// Whether to request and verify the server's OCSP certificate status (default: false).
+    ///
+    /// When `true`, the server must provide a valid OCSP stapled response
+    /// during the TLS handshake. If no stapled response is provided, the
+    /// connection fails with [`crate::error::Error::SslInvalidCertStatus`].
+    /// Equivalent to curl's `--cert-status` flag or `CURLOPT_SSL_VERIFYSTATUS`.
+    pub verify_status: bool,
 }
 
 impl Default for TlsConfig {
@@ -129,6 +138,7 @@ impl Default for TlsConfig {
             crl_file: None,
             srp_user: None,
             srp_password: None,
+            verify_status: false,
         }
     }
 }
@@ -158,6 +168,8 @@ mod rustls_impl {
         config: Arc<rustls::ClientConfig>,
         /// SHA-256 pin of the server's public key (base64-encoded).
         pinned_public_key: Option<String>,
+        /// Whether to require OCSP stapled responses from the server.
+        verify_status: bool,
     }
 
     impl TlsConnector {
@@ -187,12 +199,16 @@ mod rustls_impl {
             Self::build(tls_config, false)
         }
 
+        /// Marker prefix used in OCSP verification errors for detection in `connect`.
+        const OCSP_ERROR_PREFIX: &str = "OCSP_CERT_STATUS:";
+
         /// Internal builder shared by `new()` and `new_no_alpn()`.
+        #[allow(clippy::too_many_lines)] // verify_status branches add unavoidable depth
         fn build(tls_config: &TlsConfig, use_http_alpn: bool) -> Result<Self, Error> {
             let versions = Self::protocol_versions(tls_config);
 
             let config = if !tls_config.verify_peer {
-                // Insecure mode: accept any certificate
+                // Insecure mode: accept any certificate (no OCSP check)
                 let mut config = Self::config_builder(&versions)
                     .dangerous()
                     .with_custom_certificate_verifier(Arc::new(NoVerifier))
@@ -218,11 +234,33 @@ mod rustls_impl {
                                 Error::Tls(format!("CRL verifier build failed: {e}").into())
                             })?;
 
+                    let verifier = Self::maybe_wrap_ocsp(verifier, tls_config.verify_status);
+
                     let builder = Self::config_builder(&versions)
                         .dangerous()
                         .with_custom_certificate_verifier(verifier);
 
                     let mut config = builder.with_no_client_auth();
+                    if use_http_alpn {
+                        Self::configure_alpn(&mut config);
+                    }
+                    config
+                } else if tls_config.verify_status {
+                    // Need explicit verifier for OCSP status checking
+                    let verifier =
+                        rustls::client::WebPkiServerVerifier::builder(Arc::new(root_store))
+                            .build()
+                            .map_err(|e| {
+                                Error::Tls(format!("verifier build failed: {e}").into())
+                            })?;
+                    let verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> =
+                        Arc::new(OcspCheckingVerifier { inner: verifier });
+
+                    let builder = Self::config_builder(&versions)
+                        .dangerous()
+                        .with_custom_certificate_verifier(verifier);
+
+                    let mut config = Self::with_client_auth(builder, tls_config)?;
                     if use_http_alpn {
                         Self::configure_alpn(&mut config);
                     }
@@ -241,25 +279,69 @@ mod rustls_impl {
                 // Custom CA bundle from in-memory blob
                 let root_store = load_ca_certs_from_blob(ca_blob)?;
 
-                let builder = Self::config_builder(&versions).with_root_certificates(root_store);
+                if tls_config.verify_status {
+                    let verifier =
+                        rustls::client::WebPkiServerVerifier::builder(Arc::new(root_store))
+                            .build()
+                            .map_err(|e| {
+                                Error::Tls(format!("verifier build failed: {e}").into())
+                            })?;
+                    let verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> =
+                        Arc::new(OcspCheckingVerifier { inner: verifier });
 
-                let mut config = Self::with_client_auth(builder, tls_config)?;
-                if use_http_alpn {
-                    Self::configure_alpn(&mut config);
+                    let builder = Self::config_builder(&versions)
+                        .dangerous()
+                        .with_custom_certificate_verifier(verifier);
+
+                    let mut config = Self::with_client_auth(builder, tls_config)?;
+                    if use_http_alpn {
+                        Self::configure_alpn(&mut config);
+                    }
+                    config
+                } else {
+                    let builder =
+                        Self::config_builder(&versions).with_root_certificates(root_store);
+
+                    let mut config = Self::with_client_auth(builder, tls_config)?;
+                    if use_http_alpn {
+                        Self::configure_alpn(&mut config);
+                    }
+                    config
                 }
-                config
             } else {
                 // Default: system root certificates
                 let root_store: rustls::RootCertStore =
                     webpki_roots::TLS_SERVER_ROOTS.iter().cloned().collect();
 
-                let builder = Self::config_builder(&versions).with_root_certificates(root_store);
+                if tls_config.verify_status {
+                    let verifier =
+                        rustls::client::WebPkiServerVerifier::builder(Arc::new(root_store))
+                            .build()
+                            .map_err(|e| {
+                                Error::Tls(format!("verifier build failed: {e}").into())
+                            })?;
+                    let verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> =
+                        Arc::new(OcspCheckingVerifier { inner: verifier });
 
-                let mut config = Self::with_client_auth(builder, tls_config)?;
-                if use_http_alpn {
-                    Self::configure_alpn(&mut config);
+                    let builder = Self::config_builder(&versions)
+                        .dangerous()
+                        .with_custom_certificate_verifier(verifier);
+
+                    let mut config = Self::with_client_auth(builder, tls_config)?;
+                    if use_http_alpn {
+                        Self::configure_alpn(&mut config);
+                    }
+                    config
+                } else {
+                    let builder =
+                        Self::config_builder(&versions).with_root_certificates(root_store);
+
+                    let mut config = Self::with_client_auth(builder, tls_config)?;
+                    if use_http_alpn {
+                        Self::configure_alpn(&mut config);
+                    }
+                    config
                 }
-                config
             };
 
             // Extract the base64 hash from the "sha256//..." format
@@ -268,7 +350,23 @@ mod rustls_impl {
                 .as_ref()
                 .and_then(|pin| pin.strip_prefix("sha256//").map(ToString::to_string));
 
-            Ok(Self { config: Arc::new(config), pinned_public_key })
+            Ok(Self {
+                config: Arc::new(config),
+                pinned_public_key,
+                verify_status: tls_config.verify_status,
+            })
+        }
+
+        /// Optionally wrap a verifier with OCSP status checking.
+        fn maybe_wrap_ocsp(
+            verifier: Arc<dyn rustls::client::danger::ServerCertVerifier>,
+            verify_status: bool,
+        ) -> Arc<dyn rustls::client::danger::ServerCertVerifier> {
+            if verify_status {
+                Arc::new(OcspCheckingVerifier { inner: verifier })
+            } else {
+                verifier
+            }
         }
 
         /// Determine the allowed TLS protocol versions based on config.
@@ -351,7 +449,7 @@ mod rustls_impl {
             let tls_stream = connector
                 .connect(server_name, stream)
                 .await
-                .map_err(|e| Error::Tls(Box::new(e)))?;
+                .map_err(|e| Self::map_tls_error(e, self.verify_status))?;
 
             // Verify certificate pinning if configured
             if let Some(ref expected_hash) = self.pinned_public_key {
@@ -392,7 +490,7 @@ mod rustls_impl {
             let tls_stream = connector
                 .connect(server_name, stream)
                 .await
-                .map_err(|e| Error::Tls(Box::new(e)))?;
+                .map_err(|e| Self::map_tls_error(e, self.verify_status))?;
 
             let alpn = tls_stream
                 .get_ref()
@@ -440,6 +538,85 @@ mod rustls_impl {
             }
 
             Ok(())
+        }
+
+        /// Map a TLS I/O error to the appropriate liburlx error type.
+        ///
+        /// When `verify_status` is true, detects OCSP-related failures from the
+        /// custom verifier and returns [`Error::SslInvalidCertStatus`] instead
+        /// of the generic [`Error::Tls`].
+        fn map_tls_error(e: std::io::Error, verify_status: bool) -> Error {
+            if verify_status {
+                let msg = e.to_string();
+                if msg.contains(Self::OCSP_ERROR_PREFIX) {
+                    return Error::SslInvalidCertStatus(
+                        "SSL certificate status verification FAILED".to_string(),
+                    );
+                }
+            }
+            Error::Tls(Box::new(e))
+        }
+    }
+
+    /// A certificate verifier wrapper that requires OCSP stapled responses.
+    ///
+    /// Delegates normal certificate verification to the inner verifier,
+    /// then checks that the server provided a non-empty OCSP response.
+    /// Used when `--cert-status` / `CURLOPT_SSL_VERIFYSTATUS` is enabled.
+    #[derive(Debug)]
+    struct OcspCheckingVerifier {
+        inner: Arc<dyn rustls::client::danger::ServerCertVerifier>,
+    }
+
+    impl rustls::client::danger::ServerCertVerifier for OcspCheckingVerifier {
+        fn verify_server_cert(
+            &self,
+            end_entity: &rustls::pki_types::CertificateDer<'_>,
+            intermediates: &[rustls::pki_types::CertificateDer<'_>],
+            server_name: &rustls::pki_types::ServerName<'_>,
+            ocsp_response: &[u8],
+            now: rustls::pki_types::UnixTime,
+        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            // Perform normal certificate verification first
+            let _ = self.inner.verify_server_cert(
+                end_entity,
+                intermediates,
+                server_name,
+                ocsp_response,
+                now,
+            )?;
+
+            // Then require a non-empty OCSP stapled response
+            if ocsp_response.is_empty() {
+                return Err(rustls::Error::General(format!(
+                    "{} no certificate status response from server",
+                    TlsConnector::OCSP_ERROR_PREFIX,
+                )));
+            }
+
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            message: &[u8],
+            cert: &rustls::pki_types::CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            self.inner.verify_tls12_signature(message, cert, dss)
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            cert: &rustls::pki_types::CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            self.inner.verify_tls13_signature(message, cert, dss)
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            self.inner.supported_verify_schemes()
         }
     }
 

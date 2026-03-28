@@ -1743,6 +1743,16 @@ impl Easy {
         self.tls_config.session_cache = enable;
     }
 
+    /// Enable or disable OCSP certificate status verification.
+    ///
+    /// When enabled, the server must provide a valid OCSP stapled response
+    /// during the TLS handshake. If no stapled response is provided, the
+    /// transfer fails with [`crate::error::Error::SslInvalidCertStatus`].
+    /// Equivalent to curl's `--cert-status` flag or `CURLOPT_SSL_VERIFYSTATUS`.
+    pub const fn ssl_verify_status(&mut self, enable: bool) {
+        self.tls_config.verify_status = enable;
+    }
+
     /// Set the TLS-SRP username. Equivalent to curl's `--tlsuser`.
     pub fn ssl_srp_user(&mut self, user: &str) {
         self.tls_config.srp_user = Some(user.to_string());
