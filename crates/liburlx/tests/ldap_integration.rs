@@ -5,7 +5,17 @@
 //! against it covering anonymous bind, authenticated bind, filter types,
 //! scopes, attribute selection, LDAPS (TLS), STARTTLS, and error paths.
 
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::similar_names,
+    clippy::doc_markdown,
+    clippy::redundant_closure_for_method_calls,
+    clippy::used_underscore_binding,
+    unused_results
+)]
 
 use std::sync::Arc;
 
