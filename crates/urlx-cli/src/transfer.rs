@@ -2679,9 +2679,12 @@ pub fn perform_with_retry(opts: &mut CliOptions) -> Result<liburlx::Response, li
                 return Ok(response);
             }
             Err(e) => {
+                // Don't retry non-retriable errors like --fail HTTP errors
+                // (curl compat: test 752 — 404 should not be retried).
+                let should_break = error_to_curl_code(&e) == 22; // CURLE_HTTP_RETURNED_ERROR
                 last_err = Some(e);
                 opts.retry_attempts = attempt;
-                if attempt == max_retries {
+                if should_break || attempt == max_retries {
                     break;
                 }
             }
@@ -3310,10 +3313,53 @@ pub fn run_multi(
                         false,
                     );
                 }
+                let curl_code = error_to_curl_code(&e);
+                // --fail HTTP error: use actual response for headers/write-out
+                // (curl compat: test 1188). The Easy handle stores the response
+                // before returning the fail_on_error error.
+                let is_fail_http_error = fail_on_error && curl_code == 22;
+                if is_fail_http_error {
+                    if let Some(response) = easy.last_response() {
+                        let err_msg =
+                            format!("The requested URL returned error: {}", response.status());
+                        let file_for_this = output_files.get(i).map(String::as_str);
+                        let ctx = WriteOutContext {
+                            urlnum: i,
+                            exitcode: 22,
+                            errormsg: err_msg.clone(),
+                            had_error: true,
+                            ..WriteOutContext::default()
+                        };
+                        let suppress = !fail_with_body;
+                        let shares_file_with_next = file_for_this.is_some()
+                            && output_files.get(i + 1).map(String::as_str) == file_for_this;
+                        let effective_file =
+                            if suppress && shares_file_with_next { None } else { file_for_this };
+                        let effective_include =
+                            if suppress && shares_file_with_next { false } else { include_headers };
+                        let _ = output_response_with_context(
+                            response,
+                            effective_file,
+                            write_out,
+                            effective_include,
+                            silent,
+                            suppress,
+                            &ctx,
+                        );
+                        if !silent || show_error {
+                            eprintln!("curl: (22) {err_msg}");
+                        }
+                        let exit_code = ExitCode::from(22_u8);
+                        if fail_early {
+                            return exit_code;
+                        }
+                        last_exit = exit_code;
+                        continue;
+                    }
+                }
                 if !silent || show_error {
                     eprintln!("curl: transfer {} ({}): {e}", i + 1, url);
                 }
-                let curl_code = error_to_curl_code(&e);
                 // Still produce write-out for failed transfers (curl compat: test 423)
                 if let Some(wo) = write_out {
                     let dummy_response = liburlx::Response::new(
