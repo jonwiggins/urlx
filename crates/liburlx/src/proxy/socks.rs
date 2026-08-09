@@ -219,6 +219,13 @@ pub async fn connect_socks4(
     target_port: u16,
     user_id: &str,
 ) -> Result<TcpStream, Error> {
+    // The SOCKS4 protocol has no user-id length limit, but curl rejects
+    // names over 255 bytes (the SOCKS5 field limit) as likely mistakes or
+    // malicious input (curl compat: test 729).
+    if user_id.len() > 255 {
+        return Err(proxy_err("SOCKS4: user name is too long".to_string()));
+    }
+
     let mut request = Vec::new();
     request.push(0x04); // SOCKS4 version
     request.push(0x01); // CONNECT command

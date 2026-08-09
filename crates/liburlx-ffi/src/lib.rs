@@ -23,10 +23,10 @@
 //!
 //! ## Coverage
 //!
-//! - **156** `CURLOPT` options
+//! - **158** `CURLOPT` options
 //! - **49** `CURLINFO` queries
-//! - **41** `CURLcode` error codes
-//! - **57** exported C functions (all wrapped in `catch_unwind`)
+//! - **43** `CURLcode` error codes
+//! - **60** exported C functions (all wrapped in `catch_unwind`)
 //!
 //! # Safety Invariants
 //!
@@ -66,7 +66,7 @@
 
 #![warn(missing_docs)]
 
-use std::ffi::{c_char, c_long, c_short, c_void, CStr};
+use std::ffi::{c_char, c_int, c_long, c_short, c_uint, c_void, CStr};
 use std::ptr;
 
 // ───────────────────────── CURLcode ─────────────────────────
@@ -80,6 +80,7 @@ pub enum CURLcode {
     CURLE_UNSUPPORTED_PROTOCOL = 1,
     CURLE_FAILED_INIT = 2,
     CURLE_URL_MALFORMAT = 3,
+    CURLE_NOT_BUILT_IN = 4,
     CURLE_COULDNT_RESOLVE_PROXY = 5,
     CURLE_COULDNT_RESOLVE_HOST = 6,
     CURLE_COULDNT_CONNECT = 7,
@@ -109,6 +110,7 @@ pub enum CURLcode {
     CURLE_AGAIN = 81,
     CURLE_AUTH_ERROR = 94,
     CURLE_UNRECOVERABLE_POLL = 99,
+    CURLE_TOO_LARGE = 100,
     CURLE_FTP_COULDNT_RETR_FILE = 19,
     CURLE_UPLOAD_FAILED = 25,
     CURLE_LDAP_CANNOT_BIND = 38,
@@ -229,6 +231,8 @@ pub enum CURLoption {
     CURLOPT_SOCKS5_AUTH = 267,
     CURLOPT_SSL_VERIFYSTATUS = 232,
     CURLOPT_HTTP09_ALLOWED = 285,
+    CURLOPT_CONNECT_ONLY = 141,
+    CURLOPT_WS_OPTIONS = 320,
 
     // Off_t options (CURLOPTTYPE_OFF_T = 30000)
     CURLOPT_POSTFIELDSIZE_LARGE = 30120,
@@ -1311,6 +1315,12 @@ struct EasyHandle {
     rtsp_session_id_cstr: Option<std::ffi::CString>,
     /// When true, include HTTP headers in the body output (`CURLOPT_HEADER`).
     include_headers: bool,
+    /// Metadata of the most recent `curl_ws_recv` chunk. `curl_ws_recv` and
+    /// `curl_ws_meta` hand out a pointer into this field, so it must live as
+    /// long as the handle.
+    ws_frame: curl_ws_frame,
+    /// Whether `ws_frame` holds metadata from a completed `curl_ws_recv`.
+    ws_frame_valid: bool,
 }
 
 // SAFETY: The raw pointers in EasyHandle (write_data, header_data) are
@@ -1354,6 +1364,8 @@ pub extern "C" fn curl_easy_init() -> *mut c_void {
             interleave_data: ptr::null_mut(),
             rtsp_session_id_cstr: None,
             include_headers: false,
+            ws_frame: curl_ws_frame::EMPTY,
+            ws_frame_valid: false,
         });
         Box::into_raw(handle).cast::<c_void>()
     }));
@@ -1418,6 +1430,8 @@ pub unsafe extern "C" fn curl_easy_duphandle(handle: *mut c_void) -> *mut c_void
             interleave_data: h.interleave_data,
             rtsp_session_id_cstr: None,
             include_headers: h.include_headers,
+            ws_frame: curl_ws_frame::EMPTY,
+            ws_frame_valid: false,
         });
         Box::into_raw(dup).cast::<c_void>()
     }));
@@ -1464,6 +1478,8 @@ pub unsafe extern "C" fn curl_easy_reset(handle: *mut c_void) {
         h.interleave_data = ptr::null_mut();
         h.rtsp_session_id_cstr = None;
         h.include_headers = false;
+        h.ws_frame = curl_ws_frame::EMPTY;
+        h.ws_frame_valid = false;
     }));
 }
 
@@ -2046,6 +2062,25 @@ pub unsafe extern "C" fn curl_easy_setopt(
             // CURLOPT_PROXY_SSL_VERIFYPEER = 248
             248 => {
                 h.easy.proxy_ssl_verify_peer(value as c_long != 0);
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_CONNECT_ONLY = 141
+            141 => {
+                // libcurl rejects values outside 0..=2 at setopt time.
+                let mode = value as c_long;
+                if !(0..=2).contains(&mode) {
+                    return CURLcode::CURLE_BAD_FUNCTION_ARGUMENT;
+                }
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                h.easy.set_connect_only(mode as u32);
+                CURLcode::CURLE_OK
+            }
+
+            // CURLOPT_WS_OPTIONS = 320
+            320 => {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                h.easy.set_ws_options(value as u32);
                 CURLcode::CURLE_OK
             }
 
@@ -3663,6 +3698,9 @@ pub extern "C" fn curl_easy_strerror(code: CURLcode) -> *const c_char {
             CURLcode::CURLE_UNSUPPORTED_PROTOCOL => c"Unsupported protocol",
             CURLcode::CURLE_FAILED_INIT => c"Failed initialization",
             CURLcode::CURLE_URL_MALFORMAT => c"URL using bad/illegal format or missing URL",
+            CURLcode::CURLE_NOT_BUILT_IN => {
+                c"A requested feature, protocol or option was not found built-in in this libcurl due to a build-time decision."
+            }
             CURLcode::CURLE_COULDNT_RESOLVE_PROXY => c"Couldn't resolve proxy name",
             CURLcode::CURLE_COULDNT_RESOLVE_HOST => c"Couldn't resolve host name",
             CURLcode::CURLE_COULDNT_CONNECT => c"Failed to connect to host or proxy",
@@ -3694,6 +3732,7 @@ pub extern "C" fn curl_easy_strerror(code: CURLcode) -> *const c_char {
             CURLcode::CURLE_AGAIN => c"Socket is not ready for send/recv",
             CURLcode::CURLE_AUTH_ERROR => c"An authentication function returned an error",
             CURLcode::CURLE_UNRECOVERABLE_POLL => c"Unrecoverable error in select/poll",
+            CURLcode::CURLE_TOO_LARGE => c"A value or data field grew larger than allowed",
             CURLcode::CURLE_FTP_COULDNT_RETR_FILE => c"FTP: couldn't retrieve (RETR failed)",
             CURLcode::CURLE_UPLOAD_FAILED => c"Upload failed",
             CURLcode::CURLE_LDAP_CANNOT_BIND => c"LDAP bind operation failed",
@@ -4895,6 +4934,223 @@ pub extern "C" fn curl_multi_assign(
     result.unwrap_or(CURLMcode::CURLM_INTERNAL_ERROR)
 }
 
+// ───────────────────────── WebSocket API ─────────────────────────
+
+/// `CURLWS_TEXT` — text frame payload.
+pub const CURLWS_TEXT: c_int = 1 << 0;
+/// `CURLWS_BINARY` — binary frame payload.
+pub const CURLWS_BINARY: c_int = 1 << 1;
+/// `CURLWS_CONT` — this is a fragment of a larger message (not the final fragment).
+pub const CURLWS_CONT: c_int = 1 << 2;
+/// `CURLWS_CLOSE` — close frame.
+pub const CURLWS_CLOSE: c_int = 1 << 3;
+/// `CURLWS_PING` — ping frame.
+pub const CURLWS_PING: c_int = 1 << 4;
+/// `CURLWS_OFFSET` — the frame length is declared up front (send only).
+pub const CURLWS_OFFSET: c_int = 1 << 5;
+/// `CURLWS_PONG` — pong frame.
+pub const CURLWS_PONG: c_int = 1 << 6;
+
+/// `CURLWS_RAW_MODE` — `CURLOPT_WS_OPTIONS` bit: deliver and accept raw frame
+/// bytes instead of decoded payloads.
+pub const CURLWS_RAW_MODE: c_long = 1 << 0;
+/// `CURLWS_NOAUTOPONG` — `CURLOPT_WS_OPTIONS` bit: do not automatically reply
+/// to PING frames with a PONG.
+pub const CURLWS_NOAUTOPONG: c_long = 1 << 1;
+
+/// WebSocket frame metadata returned by `curl_ws_recv` and `curl_ws_meta`.
+///
+/// Equivalent to libcurl's `struct curl_ws_frame`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+#[allow(non_camel_case_types)]
+pub struct curl_ws_frame {
+    /// Age of this struct (always zero).
+    pub age: c_int,
+    /// Frame-type flags (`CURLWS_*` bits).
+    pub flags: c_int,
+    /// Offset of this chunk within the frame payload (`curl_off_t`).
+    pub offset: i64,
+    /// Number of payload bytes still pending after this chunk (`curl_off_t`).
+    pub bytesleft: i64,
+    /// Number of bytes in the current data chunk.
+    pub len: usize,
+}
+
+impl curl_ws_frame {
+    /// A zeroed frame descriptor (no receive has happened yet).
+    const EMPTY: Self = Self { age: 0, flags: 0, offset: 0, bytesleft: 0, len: 0 };
+}
+
+/// `curl_ws_send` — send a WebSocket frame over a connect-only connection.
+///
+/// Use after a successful `curl_easy_perform` with `CURLOPT_CONNECT_ONLY`
+/// set to 2. `flags` takes `CURLWS_*` bits describing the frame type.
+///
+/// `fragsize` (the `CURLWS_OFFSET` streaming mode) is not supported: any
+/// non-zero value returns `CURLE_BAD_FUNCTION_ARGUMENT`.
+///
+/// # Safety
+///
+/// `curl` must be a valid pointer from `curl_easy_init`. `buffer` must point
+/// to at least `buflen` readable bytes (it may be null only when `buflen` is
+/// zero). `sent` may be null or must be a valid pointer to a `size_t`.
+#[no_mangle]
+pub unsafe extern "C" fn curl_ws_send(
+    curl: *mut c_void,
+    buffer: *const c_void,
+    buflen: usize,
+    sent: *mut usize,
+    fragsize: i64,
+    flags: c_uint,
+) -> CURLcode {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if curl.is_null() {
+            return CURLcode::CURLE_BAD_FUNCTION_ARGUMENT;
+        }
+        if buffer.is_null() && buflen > 0 {
+            return CURLcode::CURLE_BAD_FUNCTION_ARGUMENT;
+        }
+        // CURLWS_OFFSET streaming (pre-declared frame length) is not supported.
+        if fragsize != 0 {
+            return CURLcode::CURLE_BAD_FUNCTION_ARGUMENT;
+        }
+
+        // `sent` may be null (libcurl tolerates it with an internal dummy).
+        if !sent.is_null() {
+            // SAFETY: Caller guarantees a non-null sent is a valid size_t pointer
+            unsafe { *sent = 0 };
+        }
+
+        // SAFETY: Caller guarantees curl is from curl_easy_init
+        let h = unsafe { &mut *curl.cast::<EasyHandle>() };
+
+        let payload: &[u8] = if buflen == 0 {
+            &[]
+        } else {
+            // SAFETY: Caller guarantees buffer points to buflen readable bytes
+            unsafe { std::slice::from_raw_parts(buffer.cast::<u8>(), buflen) }
+        };
+
+        match h.easy.ws_send(payload, flags) {
+            Ok(n) => {
+                if !sent.is_null() {
+                    // SAFETY: Caller guarantees a non-null sent is a valid
+                    // size_t pointer
+                    unsafe { *sent = n };
+                }
+                CURLcode::CURLE_OK
+            }
+            Err(ref e) => error_to_curlcode(e),
+        }
+    }));
+    result.unwrap_or(CURLcode::CURLE_SEND_ERROR)
+}
+
+/// `curl_ws_recv` — receive WebSocket payload data from a connect-only
+/// connection.
+///
+/// Use after a successful `curl_easy_perform` with `CURLOPT_CONNECT_ONLY`
+/// set to 2. On success, `*recv` holds the number of bytes written to
+/// `buffer` and `*metap` (when non-null) points to frame metadata owned by
+/// the handle, valid until the next `curl_ws_recv` call or handle cleanup.
+/// Returns `CURLE_GOT_NOTHING` when the server closed the connection.
+///
+/// # Safety
+///
+/// `curl` must be a valid pointer from `curl_easy_init`. `buffer` must point
+/// to at least `buflen` writable bytes (it may be null only when `buflen` is
+/// zero). `recv` must be a valid pointer to a `size_t`. `metap` may be null.
+#[no_mangle]
+pub unsafe extern "C" fn curl_ws_recv(
+    curl: *mut c_void,
+    buffer: *mut c_void,
+    buflen: usize,
+    recv: *mut usize,
+    metap: *mut *const curl_ws_frame,
+) -> CURLcode {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if curl.is_null() || recv.is_null() {
+            return CURLcode::CURLE_BAD_FUNCTION_ARGUMENT;
+        }
+        if buffer.is_null() && buflen > 0 {
+            return CURLcode::CURLE_BAD_FUNCTION_ARGUMENT;
+        }
+
+        // SAFETY: Caller guarantees recv is a valid size_t pointer
+        unsafe { *recv = 0 };
+        if !metap.is_null() {
+            // SAFETY: Caller guarantees a non-null metap is a valid pointer;
+            // libcurl guarantees *metap is NULL on failure.
+            unsafe { *metap = ptr::null() };
+        }
+
+        // SAFETY: Caller guarantees curl is from curl_easy_init
+        let h = unsafe { &mut *curl.cast::<EasyHandle>() };
+
+        let buf: &mut [u8] = if buflen == 0 {
+            &mut []
+        } else {
+            // SAFETY: Caller guarantees buffer points to buflen writable bytes
+            unsafe { std::slice::from_raw_parts_mut(buffer.cast::<u8>(), buflen) }
+        };
+
+        match h.easy.ws_recv(buf) {
+            Ok(Some((n, meta))) => {
+                // SAFETY: Caller guarantees recv is a valid size_t pointer
+                unsafe { *recv = n };
+                #[allow(clippy::cast_possible_wrap)]
+                let frame = curl_ws_frame {
+                    age: 0,
+                    flags: meta.flags as c_int,
+                    offset: meta.offset as i64,
+                    bytesleft: meta.bytesleft as i64,
+                    len: meta.len,
+                };
+                h.ws_frame = frame;
+                h.ws_frame_valid = true;
+                if !metap.is_null() {
+                    // SAFETY: Caller guarantees metap (when non-null) is a
+                    // valid pointer to a *const curl_ws_frame. The stored
+                    // pointer aims into the Box-allocated handle, so it stays
+                    // valid until the handle is cleaned up.
+                    unsafe { *metap = std::ptr::from_ref(&h.ws_frame) };
+                }
+                CURLcode::CURLE_OK
+            }
+            Ok(None) => CURLcode::CURLE_GOT_NOTHING,
+            Err(ref e) => error_to_curlcode(e),
+        }
+    }));
+    result.unwrap_or(CURLcode::CURLE_RECV_ERROR)
+}
+
+/// `curl_ws_meta` — return frame metadata for the most recent `curl_ws_recv`.
+///
+/// Returns null if `curl` is null or no `curl_ws_recv` has completed on this
+/// handle. The returned pointer is owned by the handle and stays valid until
+/// the next `curl_ws_recv` call or handle cleanup.
+///
+/// # Safety
+///
+/// `curl` must be a valid pointer from `curl_easy_init`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn curl_ws_meta(curl: *mut c_void) -> *const curl_ws_frame {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if curl.is_null() {
+            return ptr::null();
+        }
+        // SAFETY: Caller guarantees curl is from curl_easy_init
+        let h = unsafe { &*curl.cast::<EasyHandle>() };
+        if h.ws_frame_valid {
+            std::ptr::from_ref(&h.ws_frame)
+        } else {
+            ptr::null()
+        }
+    }));
+    result.unwrap_or(ptr::null())
+}
+
 // ───────────────────────── Error mapping ─────────────────────────
 
 /// Convert a liburlx error to a `CURLcode`.
@@ -4927,12 +5183,18 @@ fn error_to_curlcode(err: &liburlx::Error) -> CURLcode {
         liburlx::Error::RtspCseqError(_) => CURLcode::CURLE_RTSP_CSEQ_ERROR,
         liburlx::Error::RtspSessionError(_) => CURLcode::CURLE_RTSP_SESSION_ERROR,
         liburlx::Error::Transfer { code, .. } => match *code {
+            1 => CURLcode::CURLE_UNSUPPORTED_PROTOCOL,
+            4 => CURLcode::CURLE_NOT_BUILT_IN,
             8 => CURLcode::CURLE_FTP_WEIRD_SERVER_REPLY,
+            22 => CURLcode::CURLE_HTTP_RETURNED_ERROR,
             38 => CURLcode::CURLE_LDAP_CANNOT_BIND,
             39 => CURLcode::CURLE_LDAP_SEARCH_FAILED,
             43 => CURLcode::CURLE_BAD_FUNCTION_ARGUMENT,
+            52 => CURLcode::CURLE_GOT_NOTHING,
+            55 => CURLcode::CURLE_SEND_ERROR,
             85 => CURLcode::CURLE_RTSP_CSEQ_ERROR,
             86 => CURLcode::CURLE_RTSP_SESSION_ERROR,
+            100 => CURLcode::CURLE_TOO_LARGE,
             _ => CURLcode::CURLE_RECV_ERROR,
         },
         _ => CURLcode::CURLE_RECV_ERROR,
@@ -7980,6 +8242,247 @@ mod tests {
         };
         assert_eq!(code, CURLcode::CURLE_OK);
         assert_eq!(auth, 0);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    // ───────────────────────── WebSocket API ─────────────────────────
+
+    #[test]
+    fn ws_setopt_connect_only_and_ws_options() {
+        let handle = curl_easy_init();
+        // CURLOPT_CONNECT_ONLY = 141
+        let code = unsafe { curl_easy_setopt(handle, 141, 2 as *const c_void) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        // Any value is accepted at setopt time (matching libcurl);
+        // dangling::<c_void>() has address 1 (alignment of c_void)
+        let code = unsafe { curl_easy_setopt(handle, 141, std::ptr::dangling::<c_void>()) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        // CURLOPT_WS_OPTIONS = 320, value 1 = CURLWS_RAW_MODE
+        let code = unsafe { curl_easy_setopt(handle, 320, std::ptr::dangling::<c_void>()) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn ws_meta_fresh_handle_is_null() {
+        let handle = curl_easy_init();
+        let meta = unsafe { curl_ws_meta(handle) };
+        assert!(meta.is_null());
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn ws_meta_null_handle_is_null() {
+        let meta = unsafe { curl_ws_meta(ptr::null_mut()) };
+        assert!(meta.is_null());
+    }
+
+    #[test]
+    fn ws_send_recv_without_connection() {
+        let handle = curl_easy_init();
+        let mut sent: usize = 0;
+        let code =
+            unsafe { curl_ws_send(handle, c"x".as_ptr().cast::<c_void>(), 1, &raw mut sent, 0, 1) };
+        assert_eq!(code, CURLcode::CURLE_SEND_ERROR);
+
+        let mut buf = [0u8; 16];
+        let mut nread: usize = 0;
+        let code = unsafe {
+            curl_ws_recv(
+                handle,
+                buf.as_mut_ptr().cast::<c_void>(),
+                buf.len(),
+                &raw mut nread,
+                ptr::null_mut(),
+            )
+        };
+        assert_eq!(code, CURLcode::CURLE_UNSUPPORTED_PROTOCOL);
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn ws_send_bad_arguments() {
+        let handle = curl_easy_init();
+        let mut sent: usize = 0;
+        let payload = c"x";
+
+        // Null curl handle
+        let code = unsafe {
+            curl_ws_send(ptr::null_mut(), payload.as_ptr().cast::<c_void>(), 1, &raw mut sent, 0, 1)
+        };
+        assert_eq!(code, CURLcode::CURLE_BAD_FUNCTION_ARGUMENT);
+
+        // Null sent pointer is tolerated (libcurl uses an internal dummy);
+        // the call proceeds and fails only because no connection exists.
+        let code = unsafe {
+            curl_ws_send(handle, payload.as_ptr().cast::<c_void>(), 1, ptr::null_mut(), 0, 1)
+        };
+        assert_eq!(code, CURLcode::CURLE_SEND_ERROR);
+
+        // Null buffer with non-zero length
+        let code = unsafe { curl_ws_send(handle, ptr::null(), 1, &raw mut sent, 0, 1) };
+        assert_eq!(code, CURLcode::CURLE_BAD_FUNCTION_ARGUMENT);
+
+        // Non-zero fragsize (CURLWS_OFFSET streaming) is unsupported
+        let code = unsafe {
+            curl_ws_send(handle, payload.as_ptr().cast::<c_void>(), 1, &raw mut sent, 5, 1)
+        };
+        assert_eq!(code, CURLcode::CURLE_BAD_FUNCTION_ARGUMENT);
+
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn ws_recv_bad_arguments() {
+        let handle = curl_easy_init();
+        let mut buf = [0u8; 16];
+        let mut nread: usize = 0;
+
+        // Null curl handle
+        let code = unsafe {
+            curl_ws_recv(
+                ptr::null_mut(),
+                buf.as_mut_ptr().cast::<c_void>(),
+                buf.len(),
+                &raw mut nread,
+                ptr::null_mut(),
+            )
+        };
+        assert_eq!(code, CURLcode::CURLE_BAD_FUNCTION_ARGUMENT);
+
+        // Null recv pointer
+        let code = unsafe {
+            curl_ws_recv(
+                handle,
+                buf.as_mut_ptr().cast::<c_void>(),
+                buf.len(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+            )
+        };
+        assert_eq!(code, CURLcode::CURLE_BAD_FUNCTION_ARGUMENT);
+
+        // Null buffer with non-zero length
+        let code =
+            unsafe { curl_ws_recv(handle, ptr::null_mut(), 16, &raw mut nread, ptr::null_mut()) };
+        assert_eq!(code, CURLcode::CURLE_BAD_FUNCTION_ARGUMENT);
+
+        unsafe { curl_easy_cleanup(handle) };
+    }
+
+    #[test]
+    fn ws_connect_only_round_trip() {
+        use std::io::{Read, Write};
+
+        // Mock WebSocket server: complete the upgrade handshake, send a TEXT
+        // frame "hello", then read the client's masked TEXT frame and close.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || -> Vec<u8> {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(std::time::Duration::from_secs(10))).unwrap();
+
+            // Read the upgrade request until the blank line
+            let mut req = Vec::new();
+            let mut byte = [0u8; 1];
+            while !req.ends_with(b"\r\n\r\n") {
+                if stream.read(&mut byte).unwrap() == 0 {
+                    break;
+                }
+                req.extend_from_slice(&byte);
+            }
+
+            // 101 reply plus an unmasked TEXT frame "hello" (0x81 0x05)
+            stream
+                .write_all(
+                    b"HTTP/1.1 101 Switching to WebSockets\r\n\
+                      Upgrade: websocket\r\n\
+                      Connection: Upgrade\r\n\
+                      Sec-WebSocket-Accept: x\r\n\r\n\
+                      \x81\x05hello",
+                )
+                .unwrap();
+
+            // Client TEXT frame "world": 2 header + 4 mask + 5 payload bytes
+            let mut frame = [0u8; 11];
+            stream.read_exact(&mut frame).unwrap();
+            frame.to_vec()
+            // Dropping the stream closes the connection
+        });
+
+        let handle = curl_easy_init();
+        let url = std::ffi::CString::new(format!("ws://127.0.0.1:{port}/")).unwrap();
+        let code = unsafe { curl_easy_setopt(handle, 10002, url.as_ptr().cast::<c_void>()) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        // CURLOPT_CONNECT_ONLY = 141, mode 2 = WebSocket handshake only
+        let code = unsafe { curl_easy_setopt(handle, 141, 2 as *const c_void) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+
+        let code = unsafe { curl_easy_perform(handle) };
+        assert_eq!(code, CURLcode::CURLE_OK);
+
+        // Receive "hello" with TEXT flags and populated metadata
+        let mut buf = [0u8; 256];
+        let mut nread: usize = 0;
+        let mut metap: *const curl_ws_frame = ptr::null();
+        let code = unsafe {
+            curl_ws_recv(
+                handle,
+                buf.as_mut_ptr().cast::<c_void>(),
+                buf.len(),
+                &raw mut nread,
+                &raw mut metap,
+            )
+        };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        assert_eq!(nread, 5);
+        assert_eq!(&buf[..5], b"hello");
+        assert!(!metap.is_null());
+        // SAFETY: metap points into the handle, valid until the next recv
+        let meta = unsafe { &*metap };
+        assert_eq!(meta.age, 0);
+        assert_eq!(meta.flags, CURLWS_TEXT);
+        assert_eq!(meta.offset, 0);
+        assert_eq!(meta.bytesleft, 0);
+        assert_eq!(meta.len, 5);
+
+        // Send a TEXT frame "world"
+        let mut sent: usize = 0;
+        #[allow(clippy::cast_sign_loss)]
+        let text_flag = CURLWS_TEXT as c_uint;
+        let code = unsafe {
+            curl_ws_send(handle, b"world".as_ptr().cast::<c_void>(), 5, &raw mut sent, 0, text_flag)
+        };
+        assert_eq!(code, CURLcode::CURLE_OK);
+        assert_eq!(sent, 5);
+
+        // curl_ws_meta reports the last received frame
+        let meta = unsafe { curl_ws_meta(handle) };
+        assert!(!meta.is_null());
+        // SAFETY: meta points into the handle
+        assert_eq!(unsafe { (*meta).flags }, CURLWS_TEXT);
+
+        // Verify the server received a masked TEXT frame carrying "world"
+        let frame = server.join().unwrap();
+        assert_eq!(frame[0], 0x81, "FIN + TEXT opcode");
+        assert_eq!(frame[1], 0x85, "mask bit + length 5");
+        let mask = [frame[2], frame[3], frame[4], frame[5]];
+        let payload: Vec<u8> =
+            frame[6..].iter().enumerate().map(|(i, b)| b ^ mask[i % 4]).collect();
+        assert_eq!(payload, b"world");
+
+        // Server has closed the connection: recv reports GOT_NOTHING
+        let code = unsafe {
+            curl_ws_recv(
+                handle,
+                buf.as_mut_ptr().cast::<c_void>(),
+                buf.len(),
+                &raw mut nread,
+                ptr::null_mut(),
+            )
+        };
+        assert_eq!(code, CURLcode::CURLE_GOT_NOTHING);
+
         unsafe { curl_easy_cleanup(handle) };
     }
 }

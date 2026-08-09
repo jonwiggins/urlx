@@ -21,11 +21,11 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ### What Has Been Built
 
-A functional curl replacement covering HTTP/1.0-1.1, HTTP/2, HTTP/3 (QUIC via quinn), TLS (rustls + native-tls + STARTTLS), FTP/FTPS, SSH/SFTP/SCP, WebSocket, MQTT, SMTP, IMAP, POP3, DICT, TFTP, file://, DNS (system + hickory + DoH + DoT + Happy Eyeballs), cookies (Netscape format, domain-indexed, PSL, SameSite), HSTS, proxies (HTTP/SOCKS4/SOCKS4a/SOCKS5/HTTPS tunnel), authentication (Basic, Digest, Bearer, AWS SigV4, NTLMv2, SCRAM-SHA-256, SASL CRAM-MD5/OAUTHBEARER/XOAUTH2/EXTERNAL), connection pooling, rate limiting, multipart form upload, decompression (gzip, deflate, br, zstd), and a C ABI compatibility layer (liburlx-ffi with 57 exported functions).
+A functional curl replacement covering HTTP/1.0-1.1, HTTP/2, HTTP/3 (QUIC via quinn), TLS (rustls + native-tls + STARTTLS), FTP/FTPS, SSH/SFTP/SCP, WebSocket (RFC 6455 client with retained connections, curl-style transfers, connect-only mode, and `curl_ws_send`/`curl_ws_recv`/`curl_ws_meta` FFI), MQTT, SMTP, IMAP, POP3, DICT, TFTP, file://, DNS (system + hickory + DoH + DoT + Happy Eyeballs), cookies (Netscape format, domain-indexed, PSL, SameSite), HSTS, proxies (HTTP/SOCKS4/SOCKS4a/SOCKS5/HTTPS tunnel), authentication (Basic, Digest, Bearer, AWS SigV4, NTLMv2, SCRAM-SHA-256, SASL CRAM-MD5/OAUTHBEARER/XOAUTH2/EXTERNAL), connection pooling, rate limiting, multipart form upload, decompression (gzip, deflate, br, zstd), and a C ABI compatibility layer (liburlx-ffi with 60 exported functions).
 
 **Key stats:**
 - CLI flags: 261 long + 46 short; curl has ~250 long flags
-- FFI: 156 CURLOPT, 49 CURLINFO, 41 CURLcode, 57 exported functions (all with catch_unwind)
+- FFI: 158 CURLOPT, 49 CURLINFO, 43 CURLcode, 60 exported functions (all with catch_unwind)
 - 141 Rust source files, ~72,000 lines of code
 - 4 fuzz harnesses, 9 benchmark groups, 20+ feature flags
 
@@ -35,6 +35,10 @@ A functional curl replacement covering HTTP/1.0-1.1, HTTP/2, HTTP/3 (QUIC via qu
 - FFI returns CURLE_OK for ~15 unimplemented options (should return CURLE_NOT_BUILT_IN)
 - curl_easy_pause() returns OK but does nothing
 - Multi API event loop functions are no-ops (tokio architecture mismatch)
+- curl_ws_recv blocks instead of returning CURLE_AGAIN; curl_ws_meta unavailable inside write callbacks ([#140](https://github.com/jonwiggins/urlx/issues/140))
+- `-T .` / `-T -` read stdin up front instead of streaming during the transfer ([#141](https://github.com/jonwiggins/urlx/issues/141))
+- SOCKS4 proxy user name measured/sent percent-encoded, curl uses decoded form ([#142](https://github.com/jonwiggins/urlx/issues/142))
+- Test 339 (--etag-save, chunked + trailer) is flaky — intermittent exit 56, pre-existing on main ([#143](https://github.com/jonwiggins/urlx/issues/143))
 
 ---
 
@@ -109,19 +113,21 @@ Document every skip with a reason. Skips without rationale are not allowed.
 
 ---
 
-## Remaining Work (as of 2026-03-23)
+## Remaining Work (as of 2026-08-08)
 
-Full test suite run: 1,300 pass / 0 fail / 92 skip (tests 1-1400). **100% pass rate of evaluated tests.**
-25 tests permanently excluded (see `tests/excluded-tests.txt`): 19 source/build analysis + 6 libcurl C API.
+Full test suite run (2026-08-08, macOS): 1,304 of 1,304 runnable tests pass (tests 1-1400 after permanent exclusions and environment-dependent skips; the runnable count varies by machine — the count grew from 1,300 as telnet/LDAP features un-skipped tests). WebSocket test 2300 also passes. **100% pass rate of evaluated tests.**
+53 tests permanently excluded (see `tests/excluded-tests.txt`): 19 source/build analysis + 34 libcurl C API (including WebSocket tests 2301-2304 and 2700-2723, which run C `<tool>` programs against `curl_ws_send`/`curl_ws_recv`).
+
+WebSocket (issue #139) is implemented end to end: `ws::connect_stream` retains the upgraded connection, `WsConnection` provides libcurl-fidelity frame I/O, the CLI performs full curl-style ws:// transfers (test 2300 passes — run with `URLX_EXTRA_FEATURES=Debug ./scripts/run-curl-tests.sh 2300`; the Debug feature is opt-in in `scripts/urlx-as-curl` because advertising it globally would un-skip ~35 unrelated debug-env-var tests), and liburlx-ffi exports `curl_ws_send`/`curl_ws_recv`/`curl_ws_meta` with `CURLOPT_CONNECT_ONLY`/`CURLOPT_WS_OPTIONS`. urlx honors `CURL_ENTROPY` and `CURL_WS_FORCE_ZERO_MASK` for deterministic test keys/masks in all builds.
 Tests 24 and 223 previously hung due to HTTP body read blocking ([#96](https://github.com/jonwiggins/urlx/issues/96), [#97](https://github.com/jonwiggins/urlx/issues/97)) — both are now fixed and passing. Test 24 was fixed by propagating `--fail` to the Easy handle (commit 129e242). Test 223 was fixed by `read_exact_body_with_encoding_check()` which detects corrupt deflate encoding via incremental decompression checking without waiting for full Content-Length.
 1 test (625) fails for SFTP multi-upload — tracked in [#45](https://github.com/jonwiggins/urlx/issues/45).
 
-### Permanently Skipped (25 tests)
+### Permanently Skipped (53 tests)
 
 - Source/build analysis tests (19): 745, 971, 1013, 1014, 1022, 1023, 1026, 1027, 1119, 1135, 1139, 1140, 1165, 1167, 1173, 1177, 1185, 1222, 1279
-- libcurl C API tests (6): 547, 548, 555, 560, 590, 694
+- libcurl C API tests (34): 547, 548, 555, 560, 590, 694, plus the WebSocket `<tool>` tests 2301-2304 and 2700-2723 (their scenarios are covered by Rust integration tests in `crates/liburlx/tests/ws_e2e.rs` and liburlx-ffi unit tests)
 
-All permanently excluded via `tests/excluded-tests.txt`. They verify curl's own source code structure or test libcurl's C API — not applicable to urlx.
+All permanently excluded via `tests/excluded-tests.txt`. They verify curl's own source code structure or test libcurl's C API — not applicable to urlx CLI testing.
 
 ### Missing Features
 
@@ -134,7 +140,7 @@ All permanently excluded via `tests/excluded-tests.txt`. They verify curl's own 
 
 ## Test Suite Progress
 
-1,300 of 1,300 evaluated tests pass (100%). The test suite spans tests 1-1400 with 92 skipped and 25 permanently excluded.
+1,304 of 1,304 evaluated tests pass (100%). The test suite spans tests 1-1400 (plus WebSocket test 2300) with 53 permanently excluded; the number of environment-dependent skips varies by machine.
 
 ---
 

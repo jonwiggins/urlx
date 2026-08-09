@@ -44,3 +44,38 @@ test:555:libcurl C API test — NTLM proxy auth with POST via multi interface (l
 test:560:libcurl C API test — HTTPS GET with multi interface (lib560)
 test:590:libcurl C API test — proxy Negotiate+NTLM selection (lib590)
 test:694:libcurl C API test — NTLM twice, CURLINFO_HTTPAUTH_USED (lib694)
+
+# WebSocket libcurl C API tests — run C tool programs (lib2301/lib2302/
+# lib2304/lib2700) against libcurl's curl_ws_send/curl_ws_recv API. urlx
+# implements that API in liburlx-ffi (covered by Rust integration tests in
+# crates/liburlx/tests/ws_e2e.rs and liburlx-ffi tests), but the C tools
+# cannot be run against the urlx CLI. Test 2300 — the only CLI-driven WS
+# test — passes (run with URLX_EXTRA_FEATURES=Debug, see scripts/urlx-as-curl).
+test:2301:libcurl C API test — WebSocket raw mode + curl_ws_send (lib2301)
+test:2302:libcurl C API test — WebSocket frame mode callback + curl_ws_send (lib2302)
+test:2303:libcurl C API test — WebSocket upgrade refused with 200 (lib2302)
+test:2304:libcurl C API test — curl_ws_recv on closed connection (lib2304)
+test:2700:libcurl C API test — ws: Frame types (lib2700)
+test:2701:libcurl C API test — ws: Invalid opcode 0x3 (lib2700)
+test:2702:libcurl C API test — ws: Invalid opcode 0xB (lib2700)
+test:2703:libcurl C API test — ws: Invalid reserved bit RSV1 (lib2700)
+test:2704:libcurl C API test — ws: Invalid reserved bit RSV2 (lib2700)
+test:2705:libcurl C API test — ws: Invalid reserved bit RSV3 (lib2700)
+test:2706:libcurl C API test — ws: Invalid masked server message (lib2700)
+test:2707:libcurl C API test — ws: Peculiar frame sizes (lib2700)
+test:2708:libcurl C API test — ws: Automatic PONG (lib2700)
+test:2709:libcurl C API test — ws: No automatic PONG (lib2700)
+test:2710:libcurl C API test — ws: Unsolicited PONG (lib2700)
+test:2711:libcurl C API test — ws: Empty PING/PONG/CLOSE (lib2700)
+test:2712:libcurl C API test — ws: Max sized PING/PONG/CLOSE (lib2700)
+test:2713:libcurl C API test — ws: Invalid oversized PING (lib2700)
+test:2714:libcurl C API test — ws: Invalid oversized PONG (lib2700)
+test:2715:libcurl C API test — ws: Invalid oversized CLOSE (lib2700)
+test:2716:libcurl C API test — ws: Invalid fragmented PING (lib2700)
+test:2717:libcurl C API test — ws: Invalid fragmented PONG (lib2700)
+test:2718:libcurl C API test — ws: Invalid fragmented CLOSE (lib2700)
+test:2719:libcurl C API test — ws: Fragmented messages (lib2700)
+test:2720:libcurl C API test — ws: Fragmented messages with empty fragments (lib2700)
+test:2721:libcurl C API test — ws: Fragmented messages with interleaved pong (lib2700)
+test:2722:libcurl C API test — ws: Invalid fragmented message without initial frame (lib2700)
+test:2723:libcurl C API test — ws: Invalid fragmented message without final frame (lib2700)
