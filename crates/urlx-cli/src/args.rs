@@ -440,10 +440,8 @@ pub fn parse_args(args: &[String]) -> ParseResult {
             "-h" | "--help" => return ParseResult::Help,
             "-V" | "--version" => return ParseResult::Version,
             // --engine list: print available engines and exit (curl compat: test 307)
-            "--engine" => {
-                if expanded.get(idx + 1).map(String::as_str) == Some("list") {
-                    return ParseResult::EngineList;
-                }
+            "--engine" if expanded.get(idx + 1).map(String::as_str) == Some("list") => {
+                return ParseResult::EngineList;
             }
             _ => {}
         }

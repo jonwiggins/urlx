@@ -193,7 +193,7 @@ impl CookieJar {
         // When over the limit, drop the newest cookies (highest creation_index).
         if matching.len() > MAX_COOKIE_SEND {
             // Sort by creation_index ASC to find oldest, then take first 150
-            matching.sort_by(|a, b| a.creation_index.cmp(&b.creation_index));
+            matching.sort_by_key(|c| c.creation_index);
             matching.truncate(MAX_COOKIE_SEND);
             // Re-sort in curl's output order
             matching.sort_by(|a, b| {
@@ -404,7 +404,7 @@ impl CookieJar {
                 c.expires.is_none_or(|exp| now < exp)
             })
             .collect();
-        sorted.sort_by(|a, b| b.creation_index.cmp(&a.creation_index));
+        sorted.sort_by_key(|c| std::cmp::Reverse(c.creation_index));
 
         for cookie in sorted {
             let domain_str = if cookie.http_only {

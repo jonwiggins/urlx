@@ -244,7 +244,7 @@ fn derive_signing_key(
     provider: &str,
 ) -> Vec<u8> {
     let k_secret =
-        format!("{provider_upper}4{secret_key}", provider_upper = provider.to_uppercase(),);
+        format!("{provider_upper}4{secret_key}", provider_upper = provider.to_uppercase());
     let k_date = hmac_sha256(k_secret.as_bytes(), date.as_bytes());
     let k_region = hmac_sha256(&k_date, region.as_bytes());
     let k_service = hmac_sha256(&k_region, service.as_bytes());

@@ -1967,7 +1967,7 @@ pub fn run(args: &[String]) -> ExitCode {
                     );
                 }
                 if !opts.silent || opts.show_error {
-                    eprintln!("curl: (22) The requested URL returned error: {}", response.status(),);
+                    eprintln!("curl: (22) The requested URL returned error: {}", response.status());
                 }
                 return ExitCode::from(22);
             }
@@ -1982,7 +1982,7 @@ pub fn run(args: &[String]) -> ExitCode {
                 if cl_exceeded {
                     // Content-Length known upfront: error without output
                     if !opts.silent || opts.show_error {
-                        eprintln!("curl: maximum file size exceeded",);
+                        eprintln!("curl: maximum file size exceeded");
                     }
                     return ExitCode::from(63);
                 }
@@ -2006,7 +2006,7 @@ pub fn run(args: &[String]) -> ExitCode {
                         false, // don't suppress body
                     );
                     if !opts.silent || opts.show_error {
-                        eprintln!("curl: (63) Maximum file size exceeded",);
+                        eprintln!("curl: (63) Maximum file size exceeded");
                     }
                     return ExitCode::from(63);
                 }
@@ -2245,7 +2245,7 @@ pub fn run(args: &[String]) -> ExitCode {
             // --fail-with-body: output body first, then return error exit code
             if opts.fail_with_body && response.status() >= 400 {
                 if !opts.silent || opts.show_error {
-                    eprintln!("curl: (22) The requested URL returned error: {}", response.status(),);
+                    eprintln!("curl: (22) The requested URL returned error: {}", response.status());
                 }
                 return ExitCode::from(22);
             }
