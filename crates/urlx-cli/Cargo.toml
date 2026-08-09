@@ -34,5 +34,5 @@ hickory-dns = ["liburlx/hickory-dns"]
 [dependencies]
 filetime = "0.2"
 libc = "0.2"
-liburlx = { path = "../liburlx", version = "0.2.0", default-features = false, features = ["http"] }
+liburlx = { path = "../liburlx", version = "0.3.0", default-features = false, features = ["http"] }
 tokio = { version = "1", features = ["rt"] }

@@ -92,7 +92,7 @@ println!("{}", response.body_str()?); // {"origin": "..."}
 
 ```toml
 [dependencies]
-liburlx = "0.2"
+liburlx = "0.3"
 ```
 
 ## Use as a C Library (libcurl ABI)

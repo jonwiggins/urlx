@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-09
+
+### Added
+
+- **WebSocket connections** — the ws/wss upgrade now retains the connection instead of dropping it after the 101 handshake ([#139](https://github.com/jonwiggins/urlx/issues/139)): `WsConnection` provides libcurl-fidelity frame I/O (chunked receive with `curl_ws_frame`-style metadata, `curl_ws_send` flag semantics including fragmentation and raw mode, automatic PONG replies, curl's inbound validation rules), and `urlx ws://…` performs full curl-style transfers with curl's exit codes
+- **WebSocket C API** — `curl_ws_send`, `curl_ws_recv`, `curl_ws_meta`, `struct curl_ws_frame`, `CURLWS_*` constants, `CURLOPT_CONNECT_ONLY` (mode 2) and `CURLOPT_WS_OPTIONS` in liburlx-ffi; `Easy::set_connect_only(2)` retains the connection for sync `ws_send`/`ws_recv`/`ws_meta` or async use via `take_ws_connection()`
+- **WebSocket proxy + timeout support** — ws/wss connections route through HTTP CONNECT and SOCKS4/4a/5/5h proxies and honor `--connect-timeout`
+- **Deterministic test entropy** — `CURL_ENTROPY` and `CURL_WS_FORCE_ZERO_MASK` reproduce curl's debug-build key/mask sequences (curl WebSocket test 2300 passes)
+- **Telnet protocol** — RFC 854 option negotiation, `--telnet-option` (tests 1326, 1327, 1452, 1548)
+- **LDAP/LDAPS protocol** — search queries with STARTTLS support and curl-compatible error codes
+- **SMB/SMBS protocol** — SMB2 file download/upload support
+- **GSS-API / Kerberos authentication** — `--negotiate` support
+- **OCSP stapling** — `--cert-status` support
+
+### Fixed
+
+- **SOCKS4 proxy** — user names over 255 bytes are rejected before any proxy I/O like curl (test 729)
+- **NTLM** — no duplicate Type 3 request when `--fail` is set (test 150)
+- **HTTP** — no connection reuse after `--fail` skips a response body (test 1328); `--fail`/`--fail-with-body` regressions; curl-compatible `--fail` error message; test 24/223 hangs
+- **CLI** — `--etag-save` error path matches curl (test 369); `--write-out` `%{onerror}`/`%{urlnum}` to stderr (test 1188); per-operation state reset across `--next` boundaries; default User-Agent uses the crate version
+- **Proxy** — non-HTTP protocols refused through HTTP proxies without `-p` (curl compat)
+
+### Changed
+
+- **curl test suite compatibility: 1,304 pass / 0 fail** (tests 1-1400, 100% pass rate of evaluated tests), plus WebSocket test 2300
+- **2,891 Rust tests**, up from 2,655
+- **russh 0.58 → 0.62** and dependency updates clearing all cargo-deny advisories
+
+## [0.2.2] - 2026-03-28
+
+### Fixed
+
+- Doc test compilation errors; crate-level documentation for all three crates (crates.io docs release)
+
+## [0.2.1] - 2026-03-24
+
+### Fixed
+
+- README added to crates.io listings
+
 ## [0.2.0] - 2026-03-23
 
 ### Added
@@ -94,5 +134,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   - Property-based tests (proptest) for parsers
   - 4 fuzz harnesses (URL, HTTP, cookie, HSTS)
 
+[0.3.0]: https://github.com/jonwiggins/urlx/compare/v0.2.0...v0.3.0
+[0.2.2]: https://github.com/jonwiggins/urlx/compare/v0.2.0...v0.3.0
+[0.2.1]: https://github.com/jonwiggins/urlx/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/jonwiggins/urlx/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/jonwiggins/urlx/releases/tag/v0.1.0
