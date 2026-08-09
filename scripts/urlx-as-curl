@@ -11,7 +11,25 @@ VERSION=$("$URLX" --version 2>&1 | head -1 | awk '{print $2}')
 if [ "$1" = "--version" ]; then
     # Get urlx version and translate branding to curl-compatible format
     # for the test runner (runtests.pl expects "curl <ver> ... libcurl/<ver> ...")
-    "$URLX" --version 2>&1 | sed -e 's/^urlx /curl /' -e 's/liburlx\//libcurl\//'
+    #
+    # URLX_EXTRA_FEATURES optionally injects extra feature words into the
+    # Features line. Used to advertise "Debug" when running the WebSocket
+    # tests (urlx honors CURL_ENTROPY/CURL_WS_FORCE_ZERO_MASK regardless of
+    # build type, but curl gates those tests on a debug build). Off by
+    # default because advertising Debug un-skips ~35 unrelated tests that
+    # need other curl debug-build env-var behaviors.
+    extra_sed=()
+    if [ -n "${URLX_EXTRA_FEATURES:-}" ]; then
+        case "$URLX_EXTRA_FEATURES" in
+            *[!A-Za-z0-9\ _-]*)
+                echo "urlx-as-curl: ignoring URLX_EXTRA_FEATURES with unsafe characters" >&2
+                ;;
+            *)
+                extra_sed=(-e "s/^Features: /Features: ${URLX_EXTRA_FEATURES} /")
+                ;;
+        esac
+    fi
+    "$URLX" --version 2>&1 | sed -e 's/^urlx /curl /' -e 's/liburlx\//libcurl\//' "${extra_sed[@]}"
     exit 0
 fi
 

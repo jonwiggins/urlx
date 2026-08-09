@@ -806,32 +806,80 @@ async fn write_frame_masked<S: AsyncWrite + Unpin>(
     Ok(())
 }
 
-/// Generate the WebSocket handshake key.
-#[must_use]
-pub fn generate_ws_key() -> String {
-    use base64::Engine;
+/// Fill `buf` with random bytes for WebSocket key/mask generation.
+///
+/// When the `CURL_ENTROPY` environment variable is set, produces the same
+/// deterministic sequence as curl's debug builds (curl compat: WebSocket
+/// tests pin `Sec-WebSocket-Key` and frame masks via `CURL_ENTROPY`):
+/// the seed is the first four bytes of the variable interpreted big-endian,
+/// each subsequent draw increments it, and every 32-bit value is serialized
+/// least-significant byte first (see curl's `lib/rand.c`).
+fn ws_rand_fill(buf: &mut [u8]) {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
+    if let Ok(entropy) = std::env::var("CURL_ENTROPY") {
+        ws_rand_fill_deterministic(&entropy, buf);
+        return;
+    }
+
     let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
     let count = COUNTER.fetch_add(1, Ordering::Relaxed);
 
     #[allow(clippy::cast_possible_truncation)]
-    let bytes: [u8; 16] = {
-        let mut buf = [0u8; 16];
-        // Mix timestamp into first 8 bytes
-        for (i, b) in buf[..8].iter_mut().enumerate() {
-            *b = ((nanos >> (i * 8)) & 0xFF) as u8;
-        }
-        // Mix counter into last 8 bytes for uniqueness within the same nanosecond
-        for (i, b) in buf[8..].iter_mut().enumerate() {
-            *b = ((count >> (i * 8)) & 0xFF) as u8;
-        }
-        buf
-    };
+    for (i, b) in buf.iter_mut().enumerate() {
+        let mixed = (nanos >> ((i % 8) * 8)) as u8 ^ (count >> ((i % 8) * 8)) as u8;
+        *b = mixed ^ (i as u8).wrapping_mul(0x9D);
+    }
+}
 
+/// Fill `buf` from the deterministic `CURL_ENTROPY` sequence: one 32-bit
+/// value per 4 output bytes, serialized LSB-first like curl's
+/// `Curl_rand_bytes` (see `lib/rand.c`).
+// significant_drop_tightening false positive: the mutex guard is used by the
+// seeding branch and every loop iteration, so it cannot be dropped earlier.
+#[allow(clippy::significant_drop_tightening)]
+fn ws_rand_fill_deterministic(entropy: &str, buf: &mut [u8]) {
+    use std::sync::Mutex;
+
+    // Deterministic state shared by all keys and masks in the process,
+    // mirroring curl's static randseed.
+    static ENTROPY_STATE: Mutex<Option<u32>> = Mutex::new(None);
+
+    let n_words = buf.len().div_ceil(4);
+    let mut words = Vec::with_capacity(n_words);
+    {
+        let mut state = ENTROPY_STATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.is_none() {
+            let mut seed_bytes = [0u8; 4];
+            for (dst, src) in seed_bytes.iter_mut().zip(entropy.bytes()) {
+                *dst = src;
+            }
+            *state = Some(u32::from_be_bytes(seed_bytes));
+        }
+        for _ in 0..n_words {
+            let word = state.unwrap_or(0);
+            *state = Some(word.wrapping_add(1));
+            words.push(word);
+        }
+    }
+    for (chunk, word) in buf.chunks_mut(4).zip(words) {
+        #[allow(clippy::cast_possible_truncation)]
+        for (i, b) in chunk.iter_mut().enumerate() {
+            *b = (word >> (i * 8)) as u8;
+        }
+    }
+}
+
+/// Generate the WebSocket handshake key.
+#[must_use]
+pub fn generate_ws_key() -> String {
+    use base64::Engine;
+
+    let mut bytes = [0u8; 16];
+    ws_rand_fill(&mut bytes);
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
@@ -851,17 +899,17 @@ pub fn compute_accept_key(key: &str) -> String {
 }
 
 /// Generate a masking key for client frames.
+///
+/// Honors `CURL_ENTROPY` (deterministic sequence) and `CURL_WS_FORCE_ZERO_MASK`
+/// (zeroes the mask bytes after drawing them, so the entropy sequence still
+/// advances — curl compat: WebSocket tests 2700+).
 fn generate_mask_key() -> [u8; 4] {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
-
-    #[allow(clippy::cast_possible_truncation)]
-    [
-        (nanos & 0xFF) as u8,
-        ((nanos >> 8) & 0xFF) as u8,
-        ((nanos >> 16) & 0xFF) as u8,
-        ((nanos >> 24) & 0xFF) as u8,
-    ]
+    let mut key = [0u8; 4];
+    ws_rand_fill(&mut key);
+    if std::env::var_os("CURL_WS_FORCE_ZERO_MASK").is_some() {
+        key = [0u8; 4];
+    }
+    key
 }
 
 /// Minimal SHA-1 implementation (RFC 3174).
@@ -934,12 +982,67 @@ fn sha1_hash(data: &[u8]) -> [u8; 20] {
     result
 }
 
+/// Frame-type flags for [`WsConnection`] send and receive operations.
+///
+/// The values match libcurl's `CURLWS_*` constants so the FFI layer can pass
+/// them through unchanged.
+pub mod ws_flags {
+    /// Text frame payload.
+    pub const TEXT: u32 = 1 << 0;
+    /// Binary frame payload.
+    pub const BINARY: u32 = 1 << 1;
+    /// This is a fragment of a larger message (not the final fragment).
+    pub const CONT: u32 = 1 << 2;
+    /// Close frame.
+    pub const CLOSE: u32 = 1 << 3;
+    /// Ping frame.
+    pub const PING: u32 = 1 << 4;
+    /// The frame length is declared up front (send only; not yet supported).
+    pub const OFFSET: u32 = 1 << 5;
+    /// Pong frame.
+    pub const PONG: u32 = 1 << 6;
+}
+
+/// Options for [`WsConnection`] behavior (libcurl `CURLOPT_WS_OPTIONS` bits).
+pub mod ws_options {
+    /// Deliver and accept raw frame bytes instead of decoded payloads.
+    pub const RAW_MODE: u32 = 1 << 0;
+    /// Do not automatically reply to PING frames with a PONG.
+    pub const NO_AUTO_PONG: u32 = 1 << 1;
+}
+
+/// Metadata describing the frame chunk returned by [`WsConnection::recv`].
+///
+/// Mirrors libcurl's `struct curl_ws_frame`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WsFrameMeta {
+    /// Frame-type flags ([`ws_flags`] bits).
+    pub flags: u32,
+    /// Offset of this chunk within the frame payload.
+    pub offset: u64,
+    /// Payload bytes of this frame still to be delivered after this chunk.
+    pub bytesleft: u64,
+    /// Number of bytes in this chunk.
+    pub len: usize,
+}
+
+/// Transport requirements for a WebSocket connection stream.
+///
+/// `Sync` is required so that holding a [`WsConnection`] does not strip
+/// `Sync` from containing types (e.g. `Easy`).
+pub trait WsTransport: AsyncRead + AsyncWrite + Unpin + Send + Sync {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send + Sync> WsTransport for T {}
+
+/// A boxed transport carrying an upgraded WebSocket connection.
+pub type BoxedWsTransport = Box<dyn WsTransport>;
+
 /// Perform a WebSocket handshake and return the upgrade response.
 ///
 /// Connects to the server at the given URL (ws:// or wss://), sends an HTTP
 /// upgrade request, and returns a response with the server's handshake reply.
 /// The response body is empty; the connection status is reported via the HTTP
-/// status code (101 = success).
+/// status code (101 = success). The upgraded connection is dropped — use
+/// [`connect_stream`] to keep it.
 ///
 /// # Errors
 ///
@@ -950,65 +1053,257 @@ pub async fn connect(
     headers: &[(String, String)],
     tls_config: &crate::tls::TlsConfig,
 ) -> Result<crate::protocol::http::response::Response, Error> {
-    let (host, port) = url.host_and_port()?;
-    let is_tls = url.scheme() == "wss";
+    let (response, _stream) =
+        connect_stream(url, headers, tls_config, &WsConnectOptions::default()).await?;
+    Ok(response)
+}
 
-    // Build the WebSocket key
-    let ws_key = generate_ws_key();
-    let expected_accept = compute_accept_key(&ws_key);
+/// Connection-establishment options for the WebSocket handshake.
+#[derive(Debug, Default)]
+pub struct WsConnectOptions<'a> {
+    /// Proxy to route the connection through. Supported schemes: `http`
+    /// (CONNECT tunnel — curl always tunnels WebSocket through HTTP
+    /// proxies), `socks4`, `socks4a`, `socks5`, `socks5h`.
+    pub proxy: Option<&'a crate::url::Url>,
+    /// Username/password for proxy authentication.
+    pub proxy_auth: Option<(&'a str, &'a str)>,
+    /// Timeout covering TCP connect, proxy handshake, and TLS negotiation
+    /// (curl `--connect-timeout`).
+    pub connect_timeout: Option<std::time::Duration>,
+}
 
-    // Build the HTTP upgrade request
-    let path = if url.path().is_empty() { "/" } else { url.path() };
-    let query = url.query().map_or(String::new(), |q| format!("?{q}"));
+/// Establish the TCP transport to the target, directly or via a proxy.
+async fn establish_transport(
+    target_host: &str,
+    target_port: u16,
+    options: &WsConnectOptions<'_>,
+) -> Result<tokio::net::TcpStream, Error> {
+    let Some(proxy) = options.proxy else {
+        return tokio::net::TcpStream::connect(format!("{target_host}:{target_port}"))
+            .await
+            .map_err(Error::Connect);
+    };
 
-    let mut request = format!(
-        "GET {path}{query} HTTP/1.1\r\n\
-         Host: {host}\r\n\
-         Upgrade: websocket\r\n\
-         Connection: Upgrade\r\n\
-         Sec-WebSocket-Key: {ws_key}\r\n\
-         Sec-WebSocket-Version: 13\r\n"
-    );
-    for (key, val) in headers {
-        use std::fmt::Write;
-        let _ = write!(request, "{key}: {val}\r\n");
-    }
-    request.push_str("\r\n");
-
-    // Connect via TCP
-    let tcp_stream = tokio::net::TcpStream::connect(format!("{host}:{port}"))
+    let (proxy_host, proxy_port) = proxy.host_and_port()?;
+    let tcp = tokio::net::TcpStream::connect(format!("{proxy_host}:{proxy_port}"))
         .await
-        .map_err(|e| Error::Http(format!("WebSocket connect error: {e}")))?;
+        .map_err(Error::Connect)?;
 
-    if is_tls {
-        let connector = crate::tls::TlsConnector::new_no_alpn(tls_config)?;
-        let (mut tls_stream, _alpn) = connector.connect(tcp_stream, &host).await?;
-
-        tokio::io::AsyncWriteExt::write_all(&mut tls_stream, request.as_bytes())
-            .await
-            .map_err(|e| Error::Http(format!("WebSocket write error: {e}")))?;
-        tokio::io::AsyncWriteExt::flush(&mut tls_stream)
-            .await
-            .map_err(|e| Error::Http(format!("WebSocket flush error: {e}")))?;
-
-        parse_upgrade_response(&mut tls_stream, &expected_accept, url.as_str()).await
-    } else {
-        let mut tcp_stream = tcp_stream;
-        tokio::io::AsyncWriteExt::write_all(&mut tcp_stream, request.as_bytes())
-            .await
-            .map_err(|e| Error::Http(format!("WebSocket write error: {e}")))?;
-        tokio::io::AsyncWriteExt::flush(&mut tcp_stream)
-            .await
-            .map_err(|e| Error::Http(format!("WebSocket flush error: {e}")))?;
-
-        parse_upgrade_response(&mut tcp_stream, &expected_accept, url.as_str()).await
+    match proxy.scheme() {
+        "socks5" | "socks5h" => {
+            crate::proxy::socks::connect_socks5(tcp, target_host, target_port, options.proxy_auth)
+                .await
+        }
+        "socks4" | "socks4a" => {
+            let user_id = options.proxy_auth.map_or("", |(user, _)| user);
+            crate::proxy::socks::connect_socks4(tcp, target_host, target_port, user_id).await
+        }
+        "http" => ws_http_connect_tunnel(tcp, target_host, target_port, options.proxy_auth).await,
+        other => Err(Error::Http(format!(
+            "WebSocket: proxy scheme '{other}' is not supported for ws/wss"
+        ))),
     }
 }
 
+/// Establish an HTTP CONNECT tunnel to the target through a proxy.
+async fn ws_http_connect_tunnel(
+    mut stream: tokio::net::TcpStream,
+    target_host: &str,
+    target_port: u16,
+    proxy_auth: Option<(&str, &str)>,
+) -> Result<tokio::net::TcpStream, Error> {
+    use std::fmt::Write;
+
+    let mut request = format!(
+        "CONNECT {target_host}:{target_port} HTTP/1.1\r\n\
+         Host: {target_host}:{target_port}\r\n"
+    );
+    if let Some((user, pass)) = proxy_auth {
+        use base64::Engine;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pass}"));
+        let _ = write!(request, "Proxy-Authorization: Basic {encoded}\r\n");
+    }
+    request.push_str("Proxy-Connection: Keep-Alive\r\n\r\n");
+
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .map_err(|e| Error::Http(format!("proxy CONNECT write error: {e}")))?;
+
+    // Read the CONNECT response headers byte-by-byte so no tunneled bytes
+    // are consumed.
+    let mut buf = Vec::with_capacity(256);
+    loop {
+        let mut byte = [0u8; 1];
+        let n = stream
+            .read(&mut byte)
+            .await
+            .map_err(|e| Error::Http(format!("proxy CONNECT read error: {e}")))?;
+        if n == 0 {
+            return Err(Error::Http("proxy closed connection during CONNECT".to_string()));
+        }
+        buf.push(byte[0]);
+        if buf.len() >= 4 && buf[buf.len() - 4..] == *b"\r\n\r\n" {
+            break;
+        }
+        if buf.len() > 8192 {
+            return Err(Error::Http("proxy CONNECT response too large".to_string()));
+        }
+    }
+    let response = String::from_utf8_lossy(&buf);
+    let status: u16 = response.split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+    if !(200..300).contains(&status) {
+        return Err(Error::Http(format!("proxy CONNECT refused: HTTP {status}")));
+    }
+    Ok(stream)
+}
+
+/// Perform a WebSocket handshake and return the upgrade response together
+/// with the upgraded transport stream.
+///
+/// This is the connection-retaining variant of [`connect`]: on a `101
+/// Switching Protocols` response the returned stream is positioned exactly
+/// past the response headers, ready for WebSocket frame I/O (wrap it in a
+/// [`WsConnection`]).
+///
+/// # Errors
+///
+/// Returns an error if the connection fails, TLS negotiation fails, or the
+/// handshake response cannot be parsed.
+pub async fn connect_stream(
+    url: &crate::url::Url,
+    headers: &[(String, String)],
+    tls_config: &crate::tls::TlsConfig,
+    options: &WsConnectOptions<'_>,
+) -> Result<(crate::protocol::http::response::Response, BoxedWsTransport), Error> {
+    use std::fmt::Write;
+
+    // Headers handled by dedicated slots below (a custom Connection value is
+    // merged into the final Connection header like curl), and headers that
+    // only make sense for HTTP bodies (a WS upgrade request never carries
+    // one).
+    const SKIP: &[&str] =
+        &["host", "user-agent", "connection", "content-length", "transfer-encoding", "expect"];
+
+    let (host, port) = url.host_and_port()?;
+    let is_tls = url.scheme() == "wss";
+
+    // Build the HTTP upgrade request. Header order matches curl: request
+    // line, Host, User-Agent, Accept, custom headers, then the upgrade
+    // headers with Connection: Upgrade last (curl compat: test 2300). Like
+    // curl, user-supplied Upgrade/Sec-WebSocket-*/Connection headers
+    // override the generated ones.
+    let path = if url.path().is_empty() { "/" } else { url.path() };
+    let query = url.query().map_or(String::new(), |q| format!("?{q}"));
+
+    let has_custom =
+        |name: &str| headers.iter().any(|(k, v)| k.eq_ignore_ascii_case(name) && !v.is_empty());
+
+    let mut request = format!("GET {path}{query} HTTP/1.1\r\n");
+
+    // Host: custom override, suppression sentinel, or derived from the URL.
+    let custom_host = headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("host"));
+    match custom_host {
+        Some((_, v)) if v == "\x01REMOVE\x01" => {}
+        Some((_, v)) if !v.is_empty() => {
+            let _ = write!(request, "Host: {v}\r\n");
+        }
+        _ => {
+            // Includes the port when it is not the scheme default (curl compat).
+            let host_header = url.host_header_value();
+            let _ = write!(request, "Host: {host_header}\r\n");
+        }
+    }
+
+    // User-Agent: custom value from the caller, or curl-compatible default.
+    // An empty value suppresses the header (curl compat).
+    let custom_ua = headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("user-agent"));
+    match custom_ua {
+        Some((_, v)) if v.is_empty() => {}
+        Some((k, v)) => {
+            let _ = write!(request, "{k}: {v}\r\n");
+        }
+        None => {
+            request.push_str(concat!("User-Agent: curl/", env!("CARGO_PKG_VERSION"), "\r\n"));
+        }
+    }
+
+    // Default Accept unless the caller supplied one (emitted below in order).
+    if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("accept")) {
+        request.push_str("Accept: */*\r\n");
+    }
+
+    for (key, val) in headers {
+        if SKIP.iter().any(|s| key.eq_ignore_ascii_case(s)) {
+            continue;
+        }
+        if val.is_empty() {
+            // Empty value = suppression sentinel for default headers.
+            continue;
+        }
+        // Auto-generated Basic credentials are stored under an internal
+        // marker name; emit them as a real Authorization header (matches
+        // the HTTP/1.1 serializer).
+        let emit_key =
+            if key.eq_ignore_ascii_case("_auto_authorization") { "Authorization" } else { key };
+        let _ = write!(request, "{emit_key}: {val}\r\n");
+    }
+
+    // Generated upgrade headers, skipped when the caller supplied its own
+    // (curl compat: Curl_ws_request only adds headers not already present).
+    if !has_custom("upgrade") {
+        request.push_str("Upgrade: websocket\r\n");
+    }
+    if !has_custom("sec-websocket-version") {
+        request.push_str("Sec-WebSocket-Version: 13\r\n");
+    }
+    if !has_custom("sec-websocket-key") {
+        let ws_key = generate_ws_key();
+        let _ = write!(request, "Sec-WebSocket-Key: {ws_key}\r\n");
+    }
+    // Connection is emitted last; a custom value is merged with Upgrade
+    // (curl compat: http_add_connection_hd).
+    match headers.iter().find(|(k, v)| k.eq_ignore_ascii_case("connection") && !v.is_empty()) {
+        Some((_, v)) => {
+            let _ = write!(request, "Connection: {v}, Upgrade\r\n\r\n");
+        }
+        None => request.push_str("Connection: Upgrade\r\n\r\n"),
+    }
+
+    // Establish the transport (TCP, optionally via proxy, then TLS) within
+    // the connect timeout (curl --connect-timeout semantics).
+    let setup = async {
+        let tcp_stream = establish_transport(&host, port, options).await?;
+        let stream: BoxedWsTransport = if is_tls {
+            let connector = crate::tls::TlsConnector::new_no_alpn(tls_config)?;
+            let (tls_stream, _alpn) = connector.connect(tcp_stream, &host).await?;
+            Box::new(tls_stream)
+        } else {
+            Box::new(tcp_stream)
+        };
+        Ok::<_, Error>(stream)
+    };
+    let mut stream = match options.connect_timeout {
+        Some(t) => tokio::time::timeout(t, setup).await.map_err(|_| Error::Timeout(t))??,
+        None => setup.await?,
+    };
+
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .map_err(|e| Error::Http(format!("WebSocket write error: {e}")))?;
+    stream.flush().await.map_err(|e| Error::Http(format!("WebSocket flush error: {e}")))?;
+
+    let response = parse_upgrade_response(&mut stream, url.as_str()).await?;
+    Ok((response, stream))
+}
+
 /// Parse the HTTP upgrade response from the server.
-async fn parse_upgrade_response<S: AsyncRead + Unpin>(
+///
+/// Reads byte-by-byte so no frame data past the header terminator is
+/// consumed from the stream.
+async fn parse_upgrade_response<S: AsyncRead + Unpin + ?Sized>(
     stream: &mut S,
-    expected_accept: &str,
     url_str: &str,
 ) -> Result<crate::protocol::http::response::Response, Error> {
     // Read response bytes until we see \r\n\r\n
@@ -1053,22 +1348,697 @@ async fn parse_upgrade_response<S: AsyncRead + Unpin>(
         }
     }
 
-    // Validate the accept key for 101 responses
-    if status_code == 101 {
-        if let Some(accept) = resp_headers.get("sec-websocket-accept") {
-            if accept != expected_accept {
-                return Err(Error::Http(format!(
-                    "WebSocket: invalid Sec-WebSocket-Accept (got {accept}, expected {expected_accept})"
-                )));
-            }
-        }
-    }
-
+    // Note: curl deliberately does not validate Sec-WebSocket-Accept (see
+    // curl's lib/ws.c) and its test suite sends handshakes that would fail
+    // the RFC 6455 check, so we match curl and skip validation (curl compat:
+    // test 2300).
     Ok(crate::protocol::http::response::Response::new(
         status_code,
         resp_headers,
         Vec::new(),
         url_str.to_string(),
+    ))
+}
+
+/// A frame currently being delivered to the caller in chunks.
+///
+/// Control-frame payloads (at most 125 bytes) are buffered; data-frame
+/// payloads are streamed from the wire as the caller consumes them, so a
+/// frame declaring a huge length never causes a matching allocation.
+struct RecvFrame {
+    flags: u32,
+    /// Total payload length from the frame header.
+    total: u64,
+    /// Payload bytes already delivered to the caller.
+    delivered: u64,
+    /// Buffered payload (control frames only); `None` streams from the wire.
+    buffered: Option<Vec<u8>>,
+}
+
+/// An established WebSocket connection retained after the HTTP upgrade.
+///
+/// Created from the stream returned by [`connect_stream`]. Provides
+/// frame-level send/receive with libcurl-compatible semantics (chunked
+/// delivery with [`WsFrameMeta`], automatic PONG replies to PINGs, curl's
+/// inbound validation rules) plus message-level convenience methods.
+pub struct WsConnection {
+    stream: BoxedWsTransport,
+    response: crate::protocol::http::response::Response,
+    auto_pong: bool,
+    raw_mode: bool,
+    /// Inbound frame currently being delivered in chunks.
+    recv_frame: Option<RecvFrame>,
+    /// Flags of the fragmented message in progress (0 = none), mirroring
+    /// curl's decoder `cont_flags` state.
+    recv_cont_flags: u32,
+    /// Whether an outbound fragmented message is in progress.
+    send_cont: bool,
+    /// Total complete frames received (including control frames).
+    frames_received: u64,
+    /// Metadata of the most recent chunk returned by [`recv`](Self::recv).
+    last_meta: WsFrameMeta,
+}
+
+impl std::fmt::Debug for WsConnection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WsConnection")
+            .field("status", &self.response.status())
+            .field("auto_pong", &self.auto_pong)
+            .field("raw_mode", &self.raw_mode)
+            .field("frames_received", &self.frames_received)
+            .finish_non_exhaustive()
+    }
+}
+
+impl WsConnection {
+    /// Wrap an upgraded transport stream in a WebSocket connection.
+    ///
+    /// `options` is a bitmask of [`ws_options`] flags.
+    #[must_use]
+    pub fn new(
+        stream: BoxedWsTransport,
+        response: crate::protocol::http::response::Response,
+        options: u32,
+    ) -> Self {
+        Self {
+            stream,
+            response,
+            auto_pong: options & ws_options::NO_AUTO_PONG == 0,
+            raw_mode: options & ws_options::RAW_MODE != 0,
+            recv_frame: None,
+            recv_cont_flags: 0,
+            send_cont: false,
+            frames_received: 0,
+            last_meta: WsFrameMeta::default(),
+        }
+    }
+
+    /// The HTTP handshake response that established this connection.
+    #[must_use]
+    pub const fn response(&self) -> &crate::protocol::http::response::Response {
+        &self.response
+    }
+
+    /// Metadata of the most recent chunk returned by [`recv`](Self::recv).
+    #[must_use]
+    pub const fn last_meta(&self) -> &WsFrameMeta {
+        &self.last_meta
+    }
+
+    /// Total complete frames received so far (including control frames).
+    #[must_use]
+    pub const fn frames_received(&self) -> u64 {
+        self.frames_received
+    }
+
+    /// Send one WebSocket frame (or message fragment).
+    ///
+    /// `flags` is a combination of [`ws_flags`] bits with libcurl
+    /// `curl_ws_send` semantics: `TEXT`/`BINARY` send an unfragmented
+    /// message, `TEXT | CONT` starts or continues a fragmented message, and
+    /// a final call without `CONT` finishes it. Control frames (`PING`,
+    /// `PONG`, `CLOSE`) must not carry `CONT` and are limited to 125
+    /// payload bytes. In raw mode (`flags == 0` required) the payload is
+    /// written to the wire verbatim.
+    ///
+    /// Returns the number of payload bytes consumed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on invalid flag combinations (maps to
+    /// `CURLE_BAD_FUNCTION_ARGUMENT`), oversized control payloads (maps to
+    /// `CURLE_TOO_LARGE`), or write failures.
+    pub async fn send(&mut self, payload: &[u8], flags: u32) -> Result<usize, Error> {
+        const FIN: u8 = 0x80;
+
+        if self.raw_mode {
+            if flags != 0 {
+                return Err(Error::Transfer {
+                    code: 43, // CURLE_BAD_FUNCTION_ARGUMENT
+                    message: "WebSocket raw mode does not accept frame flags".to_string(),
+                });
+            }
+            self.stream.write_all(payload).await.map_err(|e| ws_send_io_error(&e))?;
+            self.stream.flush().await.map_err(|e| ws_send_io_error(&e))?;
+            return Ok(payload.len());
+        }
+
+        let is_control = flags & (ws_flags::PING | ws_flags::PONG | ws_flags::CLOSE) != 0;
+        if is_control && payload.len() > 125 {
+            return Err(Error::Transfer {
+                code: 100, // CURLE_TOO_LARGE
+                message: "WebSocket control frame payload exceeds 125 bytes".to_string(),
+            });
+        }
+
+        // Map flags to the frame first byte, mirroring curl's
+        // ws_frame_flags2firstbyte() (lib/ws.c).
+        let (first_byte, next_send_cont) = match flags & !ws_flags::OFFSET {
+            // Final continuation fragment; curl leaves its contfragment
+            // state unchanged here (it only updates on TEXT/BINARY flags).
+            0 if self.send_cont => (FIN, self.send_cont),
+            f if f == ws_flags::CONT && self.send_cont => (0x00, true),
+            f if f == ws_flags::TEXT => {
+                if self.send_cont {
+                    (FIN, false)
+                } else {
+                    (FIN | 0x01, false)
+                }
+            }
+            f if f == ws_flags::TEXT | ws_flags::CONT => {
+                if self.send_cont {
+                    (0x00, true)
+                } else {
+                    (0x01, true)
+                }
+            }
+            f if f == ws_flags::BINARY => {
+                if self.send_cont {
+                    (FIN, false)
+                } else {
+                    (FIN | 0x02, false)
+                }
+            }
+            f if f == ws_flags::BINARY | ws_flags::CONT => {
+                if self.send_cont {
+                    (0x00, true)
+                } else {
+                    (0x02, true)
+                }
+            }
+            f if f == ws_flags::CLOSE => (FIN | 0x08, false),
+            f if f == ws_flags::PING => (FIN | 0x09, false),
+            f if f == ws_flags::PONG => (FIN | 0x0A, false),
+            _ => {
+                return Err(Error::Transfer {
+                    code: 43, // CURLE_BAD_FUNCTION_ARGUMENT
+                    message: format!("invalid WebSocket frame flags: {flags:#x}"),
+                });
+            }
+        };
+        // Control frames do not disturb an in-progress fragmented send.
+        if !is_control {
+            self.send_cont = next_send_cont;
+        }
+
+        let encoded = encode_frame_bytes(first_byte, payload);
+        self.stream.write_all(&encoded).await.map_err(|e| ws_send_io_error(&e))?;
+        self.stream.flush().await.map_err(|e| ws_send_io_error(&e))?;
+        Ok(payload.len())
+    }
+
+    /// Send an unfragmented text message.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the write fails.
+    pub async fn send_text(&mut self, text: &str) -> Result<(), Error> {
+        let _n = self.send(text.as_bytes(), ws_flags::TEXT).await?;
+        Ok(())
+    }
+
+    /// Send an unfragmented binary message.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the write fails.
+    pub async fn send_binary(&mut self, data: &[u8]) -> Result<(), Error> {
+        let _n = self.send(data, ws_flags::BINARY).await?;
+        Ok(())
+    }
+
+    /// Send a ping frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the write fails.
+    pub async fn send_ping(&mut self, data: &[u8]) -> Result<(), Error> {
+        let _n = self.send(data, ws_flags::PING).await?;
+        Ok(())
+    }
+
+    /// Send a pong frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the write fails.
+    pub async fn send_pong(&mut self, data: &[u8]) -> Result<(), Error> {
+        let _n = self.send(data, ws_flags::PONG).await?;
+        Ok(())
+    }
+
+    /// Send a close frame with a status code and reason.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the write fails.
+    pub async fn send_close(&mut self, code: u16, reason: &str) -> Result<(), Error> {
+        let mut payload = Vec::with_capacity(2 + reason.len());
+        payload.extend_from_slice(&code.to_be_bytes());
+        payload.extend_from_slice(reason.as_bytes());
+        let _n = self.send(&payload, ws_flags::CLOSE).await?;
+        Ok(())
+    }
+
+    /// Receive the next chunk of WebSocket payload data.
+    ///
+    /// Fills `buf` with up to one frame's worth of payload bytes and returns
+    /// the byte count plus frame metadata, with libcurl `curl_ws_recv`
+    /// semantics: large frames are delivered across multiple calls (tracked
+    /// via [`WsFrameMeta::offset`]/[`WsFrameMeta::bytesleft`]), PING frames
+    /// are answered with a PONG and never surfaced (unless auto-pong is
+    /// disabled), and zero-length frames produce one zero-length chunk.
+    /// Returns `Ok(None)` when the server has closed the connection at a
+    /// frame boundary (libcurl: `CURLE_GOT_NOTHING`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on protocol violations (masked server frames,
+    /// oversized or fragmented control frames, reserved bits or opcodes,
+    /// stray continuations) and on read failures.
+    pub async fn recv(&mut self, buf: &mut [u8]) -> Result<Option<(usize, WsFrameMeta)>, Error> {
+        loop {
+            // Continue delivering the frame in progress. Data-frame payloads
+            // stream straight from the wire into the caller's buffer, so a
+            // frame's declared length never drives an allocation.
+            if let Some(ref mut cur) = self.recv_frame {
+                let remaining = cur.total - cur.delivered;
+                let n = if let Some(ref payload) = cur.buffered {
+                    // Buffered control-frame payload (<= 125 bytes).
+                    #[allow(clippy::cast_possible_truncation)]
+                    let start = cur.delivered as usize;
+                    let n = (payload.len() - start).min(buf.len());
+                    buf[..n].copy_from_slice(&payload[start..start + n]);
+                    n
+                } else {
+                    #[allow(clippy::cast_possible_truncation)]
+                    let want = remaining.min(buf.len() as u64) as usize;
+                    if want == 0 {
+                        0
+                    } else {
+                        let n = self
+                            .stream
+                            .read(&mut buf[..want])
+                            .await
+                            .map_err(|e| Error::Http(format!("WebSocket read error: {e}")))?;
+                        if n == 0 {
+                            // Connection closed mid-frame: curl treats any
+                            // EOF as the normal end of the websocket data
+                            // (CURLE_GOT_NOTHING in connect-only mode).
+                            self.recv_frame = None;
+                            return Ok(None);
+                        }
+                        n
+                    }
+                };
+                let meta = WsFrameMeta {
+                    flags: cur.flags,
+                    offset: cur.delivered,
+                    bytesleft: remaining - n as u64,
+                    len: n,
+                };
+                cur.delivered += n as u64;
+                if cur.delivered >= cur.total {
+                    self.recv_frame = None;
+                }
+                self.last_meta = meta;
+                return Ok(Some((n, meta)));
+            }
+
+            // Read the next frame header from the wire.
+            let Some((first_byte, payload_len)) = self.read_frame_header().await? else {
+                return Ok(None);
+            };
+            self.frames_received += 1;
+
+            let flags = self.first_byte_to_flags(first_byte)?;
+
+            if first_byte & 0x0F >= 0x8 {
+                // Control frame: the payload is at most 125 bytes (already
+                // validated), so read it fully — PINGs are answered with
+                // their exact payload.
+                #[allow(clippy::cast_possible_truncation)]
+                let mut payload = vec![0u8; payload_len as usize];
+                match self.stream.read_exact(&mut payload).await {
+                    Ok(_) => {}
+                    // EOF is the normal end of the websocket data (curl compat).
+                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+                    Err(e) => return Err(Error::Http(format!("WebSocket read error: {e}"))),
+                }
+
+                // Auto-reply to PING with an identical-payload PONG; the
+                // PING is never surfaced to the caller (curl compat).
+                if flags == ws_flags::PING && self.auto_pong {
+                    let _n = self.send(&payload, ws_flags::PONG).await?;
+                    continue;
+                }
+                self.recv_frame = Some(RecvFrame {
+                    flags,
+                    total: payload_len,
+                    delivered: 0,
+                    buffered: Some(payload),
+                });
+                continue;
+            }
+
+            // Data frame: update the fragmented-message state machine; the
+            // payload streams to the caller from the wire.
+            self.recv_cont_flags = if flags & ws_flags::CONT == 0 { 0 } else { flags };
+            self.recv_frame =
+                Some(RecvFrame { flags, total: payload_len, delivered: 0, buffered: None });
+        }
+    }
+
+    /// Receive and reassemble one complete WebSocket message.
+    ///
+    /// Fragmented text/binary messages are reassembled; control frames are
+    /// returned as their own [`Message`] values. PING frames are auto-ponged
+    /// and not returned unless auto-pong is disabled.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on protocol violations, read failures, or if the
+    /// connection closes mid-message. A clean connection close at a message
+    /// boundary yields `Error::Transfer` with code 52 (`CURLE_GOT_NOTHING`).
+    pub async fn recv_message(&mut self) -> Result<Message, Error> {
+        let mut assembled: Vec<u8> = Vec::new();
+        let mut msg_flags: u32 = 0;
+        let mut mid_message = false;
+        let mut buf = vec![0u8; 65536];
+        loop {
+            let Some((n, meta)) = self.recv(&mut buf).await? else {
+                return Err(Error::Transfer {
+                    code: 52, // CURLE_GOT_NOTHING
+                    message: "WebSocket connection closed".to_string(),
+                });
+            };
+            if meta.flags & ws_flags::CLOSE != 0 {
+                let payload = &buf[..n];
+                let code =
+                    (payload.len() >= 2).then(|| u16::from_be_bytes([payload[0], payload[1]]));
+                let reason = (payload.len() > 2)
+                    .then(|| String::from_utf8_lossy(&payload[2..]).into_owned());
+                return Ok(Message::Close(code, reason));
+            }
+            if meta.flags & (ws_flags::PING | ws_flags::PONG) != 0 {
+                // A control frame interleaved inside a fragmented message
+                // must not discard the fragments assembled so far — skip it
+                // and keep assembling.
+                if mid_message {
+                    continue;
+                }
+                if meta.flags & ws_flags::PING != 0 {
+                    return Ok(Message::Ping(buf[..n].to_vec()));
+                }
+                return Ok(Message::Pong(buf[..n].to_vec()));
+            }
+            mid_message = true;
+            assembled.extend_from_slice(&buf[..n]);
+            if meta.flags & (ws_flags::TEXT | ws_flags::BINARY) != 0 {
+                msg_flags = meta.flags;
+            }
+            // Message complete when the frame is fully delivered and it was
+            // a final (non-CONT) data frame.
+            if meta.bytesleft == 0 && meta.flags & ws_flags::CONT == 0 {
+                if msg_flags & ws_flags::TEXT != 0 {
+                    return String::from_utf8(assembled)
+                        .map(Message::Text)
+                        .map_err(|e| Error::Http(format!("invalid UTF-8 in text message: {e}")));
+                }
+                return Ok(Message::Binary(assembled));
+            }
+        }
+    }
+
+    /// Read one frame header from the wire: `(first_byte, payload_len)`.
+    ///
+    /// Returns `Ok(None)` on a clean connection close at a frame boundary.
+    /// Applies curl's inbound validation rules. The payload is NOT read —
+    /// it is streamed (data frames) or read separately (control frames).
+    async fn read_frame_header(&mut self) -> Result<Option<(u8, u64)>, Error> {
+        // First header byte: EOF here is a clean close.
+        let mut first = [0u8; 1];
+        let n = self
+            .stream
+            .read(&mut first)
+            .await
+            .map_err(|e| Error::Http(format!("WebSocket read error: {e}")))?;
+        if n == 0 {
+            return Ok(None);
+        }
+        let first_byte = first[0];
+
+        let mut second = [0u8; 1];
+        match self.stream.read_exact(&mut second).await {
+            Ok(_) => {}
+            // EOF is the normal end of the websocket data (curl compat).
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(e) => return Err(Error::Http(format!("WebSocket read error: {e}"))),
+        }
+
+        // Server-to-client frames must not be masked (curl compat: rejected
+        // with CURLE_RECV_ERROR).
+        if second[0] & 0x80 != 0 {
+            return Err(Error::Http("WebSocket: received masked frame from server".to_string()));
+        }
+
+        // Control frames (opcode >= 0x8) must be unfragmented and small
+        // enough to declare their length in the 7-bit field. Like curl, the
+        // check is on the raw length byte, so extended-length encodings
+        // (126/127) are rejected for control frames even when the actual
+        // length would fit.
+        let opcode = first_byte & 0x0F;
+        let len7 = second[0] & 0x7F;
+        if opcode >= 0x8 {
+            if len7 > 125 {
+                return Err(Error::Http(
+                    "WebSocket: control frame payload exceeds 125 bytes".to_string(),
+                ));
+            }
+            if first_byte & 0x80 == 0 {
+                return Err(Error::Http("WebSocket: fragmented control frame".to_string()));
+            }
+        }
+
+        let payload_len = match len7 {
+            126 => {
+                let mut ext = [0u8; 2];
+                match self.stream.read_exact(&mut ext).await {
+                    Ok(_) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+                    Err(e) => return Err(Error::Http(format!("WebSocket read error: {e}"))),
+                }
+                u64::from(u16::from_be_bytes(ext))
+            }
+            127 => {
+                let mut ext = [0u8; 8];
+                match self.stream.read_exact(&mut ext).await {
+                    Ok(_) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+                    Err(e) => return Err(Error::Http(format!("WebSocket read error: {e}"))),
+                }
+                let len = u64::from_be_bytes(ext);
+                if len > i64::MAX as u64 {
+                    return Err(Error::Http("WebSocket: frame length too large".to_string()));
+                }
+                len
+            }
+            len => u64::from(len),
+        };
+
+        Ok(Some((first_byte, payload_len)))
+    }
+
+    /// Map a frame first byte to [`ws_flags`] bits, mirroring curl's
+    /// `ws_frame_firstbyte2flags()` validation (lib/ws.c).
+    fn first_byte_to_flags(&self, first_byte: u8) -> Result<u32, Error> {
+        const FIN: u8 = 0x80;
+        let cont = self.recv_cont_flags;
+        let flags = match first_byte {
+            // Intermediate fragment of a TEXT/BINARY message.
+            0x00 => {
+                if cont & ws_flags::CONT == 0 {
+                    return Err(Error::Http(
+                        "WebSocket: no ongoing fragmented message to resume".to_string(),
+                    ));
+                }
+                cont | ws_flags::CONT
+            }
+            // Final fragment.
+            0x80 => {
+                if cont & ws_flags::CONT == 0 {
+                    return Err(Error::Http(
+                        "WebSocket: no ongoing fragmented message to resume".to_string(),
+                    ));
+                }
+                cont & !ws_flags::CONT
+            }
+            0x01 | 0x02 => {
+                if cont & ws_flags::CONT != 0 {
+                    return Err(Error::Http(
+                        "WebSocket: fragmented message interrupted by new message".to_string(),
+                    ));
+                }
+                let base = if first_byte == 0x01 { ws_flags::TEXT } else { ws_flags::BINARY };
+                base | ws_flags::CONT
+            }
+            b if b == FIN | 0x01 || b == FIN | 0x02 => {
+                if cont & ws_flags::CONT != 0 {
+                    return Err(Error::Http(
+                        "WebSocket: fragmented message interrupted by new message".to_string(),
+                    ));
+                }
+                if b == FIN | 0x01 {
+                    ws_flags::TEXT
+                } else {
+                    ws_flags::BINARY
+                }
+            }
+            b if b == FIN | 0x08 => ws_flags::CLOSE,
+            b if b == FIN | 0x09 => ws_flags::PING,
+            b if b == FIN | 0x0A => ws_flags::PONG,
+            b => {
+                let detail = if b & 0x70 != 0 { "reserved bits" } else { "invalid opcode" };
+                return Err(Error::Http(format!("WebSocket: {detail} in frame: {b:#04x}")));
+            }
+        };
+        Ok(flags)
+    }
+}
+
+/// Map a send-side I/O failure (maps to `CURLE_SEND_ERROR`).
+fn ws_send_io_error(e: &std::io::Error) -> Error {
+    Error::Transfer {
+        code: 55, // CURLE_SEND_ERROR
+        message: format!("WebSocket write error: {e}"),
+    }
+}
+
+/// Encode a client frame (header + masked payload) for the wire.
+///
+/// The mask key honors `CURL_ENTROPY` and `CURL_WS_FORCE_ZERO_MASK`.
+fn encode_frame_bytes(first_byte: u8, payload: &[u8]) -> Vec<u8> {
+    let mut buf = encode_raw_frame_header_masked(first_byte, payload.len(), true);
+    let mask_key = generate_mask_key();
+    buf.extend_from_slice(&mask_key);
+    for (i, &byte) in payload.iter().enumerate() {
+        buf.push(byte ^ mask_key[i % 4]);
+    }
+    buf
+}
+
+/// Encode a frame header with the given first byte, length, and mask bit.
+fn encode_raw_frame_header_masked(first_byte: u8, len: usize, mask: bool) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(14);
+    buf.push(first_byte);
+    let mask_bit: u8 = if mask { 0x80 } else { 0x00 };
+    if len < 126 {
+        #[allow(clippy::cast_possible_truncation)]
+        buf.push(mask_bit | len as u8);
+    } else if len <= 65535 {
+        buf.push(mask_bit | 0x7E);
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            buf.push((len >> 8) as u8);
+            buf.push(len as u8);
+        }
+    } else {
+        buf.push(mask_bit | 0x7F);
+        for i in (0..8).rev() {
+            #[allow(clippy::cast_possible_truncation)]
+            buf.push((len >> (i * 8)) as u8);
+        }
+    }
+    buf
+}
+
+/// Perform a complete curl-style WebSocket transfer (the default CLI mode).
+///
+/// Performs the upgrade handshake, optionally sends `upload` data as masked
+/// BINARY frames, then receives frames until the server closes the
+/// connection. Payload bytes of TEXT, BINARY, PONG, and CLOSE frames are
+/// collected as the response body (curl writes them to stdout); PINGs are
+/// answered automatically and never surfaced. The transfer does not stop at
+/// a CLOSE frame — it ends when the server closes the connection.
+///
+/// # Errors
+///
+/// Returns `Error::Transfer` with code 22 (`CURLE_HTTP_RETURNED_ERROR`)
+/// when the server refuses the upgrade, code 52 (`CURLE_GOT_NOTHING`) when
+/// the connection closes without a single frame after the 101 (curl compat:
+/// test 2300), and protocol/IO errors otherwise.
+pub async fn transfer(
+    url: &crate::url::Url,
+    headers: &[(String, String)],
+    tls_config: &crate::tls::TlsConfig,
+    upload: Option<&[u8]>,
+    deadline: Option<tokio::time::Instant>,
+    options: &WsConnectOptions<'_>,
+) -> Result<crate::protocol::http::response::Response, Error> {
+    let handshake = async { connect_stream(url, headers, tls_config, options).await };
+    let (response, stream) = match deadline {
+        Some(d) => tokio::time::timeout_at(d, handshake)
+            .await
+            .map_err(|_| Error::Timeout(std::time::Duration::from_secs(0)))??,
+        None => handshake.await?,
+    };
+
+    if response.status() != 101 {
+        return Err(Error::Transfer {
+            code: 22, // CURLE_HTTP_RETURNED_ERROR
+            message: format!("Refused WebSocket upgrade: {}", response.status()),
+        });
+    }
+
+    let mut conn = WsConnection::new(stream, response.clone(), 0);
+
+    // Send upload data as unfragmented BINARY frames, one per 64 KiB chunk
+    // (curl sends one frame per read-callback chunk).
+    if let Some(data) = upload {
+        for chunk in data.chunks(65536) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let _n = conn.send(chunk, ws_flags::BINARY).await?;
+        }
+    }
+
+    // Receive until the server closes the connection.
+    let mut body: Vec<u8> = Vec::new();
+    let mut buf = vec![0u8; 65536];
+    loop {
+        let read = conn.recv(&mut buf);
+        let result = match deadline {
+            Some(d) => tokio::time::timeout_at(d, read)
+                .await
+                .map_err(|_| Error::Timeout(std::time::Duration::from_secs(0)))?,
+            None => read.await,
+        };
+        match result? {
+            Some((n, _meta)) => {
+                // TEXT/BINARY/PONG/CLOSE payloads all flow to the body; the
+                // CLOSE payload includes its 2-byte status code (curl compat).
+                body.extend_from_slice(&buf[..n]);
+            }
+            None => break,
+        }
+    }
+
+    // Server closed right after the 101 without a single frame: curl deducts
+    // the 1xx header bytes and reports an empty reply (curl compat: test
+    // 2300 expects exit code 52).
+    if conn.frames_received() == 0 {
+        return Err(Error::Transfer {
+            code: 52, // CURLE_GOT_NOTHING
+            message: "Empty reply from server".to_string(),
+        });
+    }
+
+    Ok(crate::protocol::http::response::Response::new(
+        response.status(),
+        response.headers().clone(),
+        body,
+        url.as_str().to_string(),
     ))
 }
 
@@ -1545,7 +2515,7 @@ mod tests {
              \r\n"
         );
         let mut cursor = std::io::Cursor::new(response.into_bytes());
-        let resp = parse_upgrade_response(&mut cursor, &accept, "ws://example.com").await.unwrap();
+        let resp = parse_upgrade_response(&mut cursor, "ws://example.com").await.unwrap();
         assert_eq!(resp.status(), 101);
         assert_eq!(resp.header("upgrade"), Some("websocket"));
     }
@@ -1556,23 +2526,23 @@ mod tests {
              Content-Length: 0\r\n\
              \r\n";
         let mut cursor = std::io::Cursor::new(response.to_vec());
-        let resp =
-            parse_upgrade_response(&mut cursor, "ignored", "ws://example.com").await.unwrap();
+        let resp = parse_upgrade_response(&mut cursor, "ws://example.com").await.unwrap();
         assert_eq!(resp.status(), 403);
     }
 
     #[tokio::test]
-    async fn parse_upgrade_response_invalid_accept() {
+    async fn parse_upgrade_response_mismatched_accept_tolerated() {
+        // curl does not validate Sec-WebSocket-Accept (its own test suite
+        // sends mismatched values), so neither do we (curl compat: test 2300).
         let response = b"HTTP/1.1 101 Switching Protocols\r\n\
              Upgrade: websocket\r\n\
              Connection: Upgrade\r\n\
              Sec-WebSocket-Accept: wrong_value\r\n\
              \r\n";
         let mut cursor = std::io::Cursor::new(response.to_vec());
-        let result = parse_upgrade_response(&mut cursor, "correct_value", "ws://example.com").await;
-        assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("invalid Sec-WebSocket-Accept"));
+        let resp = parse_upgrade_response(&mut cursor, "ws://example.com").await.unwrap();
+        assert_eq!(resp.status(), 101);
+        assert_eq!(resp.header("sec-websocket-accept"), Some("wrong_value"));
     }
 
     #[tokio::test]

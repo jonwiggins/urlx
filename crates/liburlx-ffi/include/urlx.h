@@ -72,6 +72,53 @@ typedef void CURL;
 #define CURLPAUSE_CONT 0
 
 /**
+ * `CURLWS_TEXT` — text frame payload.
+ */
+#define CURLWS_TEXT (1 << 0)
+
+/**
+ * `CURLWS_BINARY` — binary frame payload.
+ */
+#define CURLWS_BINARY (1 << 1)
+
+/**
+ * `CURLWS_CONT` — this is a fragment of a larger message (not the final fragment).
+ */
+#define CURLWS_CONT (1 << 2)
+
+/**
+ * `CURLWS_CLOSE` — close frame.
+ */
+#define CURLWS_CLOSE (1 << 3)
+
+/**
+ * `CURLWS_PING` — ping frame.
+ */
+#define CURLWS_PING (1 << 4)
+
+/**
+ * `CURLWS_OFFSET` — the frame length is declared up front (send only).
+ */
+#define CURLWS_OFFSET (1 << 5)
+
+/**
+ * `CURLWS_PONG` — pong frame.
+ */
+#define CURLWS_PONG (1 << 6)
+
+/**
+ * `CURLWS_RAW_MODE` — `CURLOPT_WS_OPTIONS` bit: deliver and accept raw frame
+ * bytes instead of decoded payloads.
+ */
+#define CURLWS_RAW_MODE (1 << 0)
+
+/**
+ * `CURLWS_NOAUTOPONG` — `CURLOPT_WS_OPTIONS` bit: do not automatically reply
+ * to PING frames with a PONG.
+ */
+#define CURLWS_NOAUTOPONG (1 << 1)
+
+/**
  * `CURLINFO` — info codes for `curl_easy_getinfo`.
  */
 typedef enum CURLINFO {
@@ -179,6 +226,7 @@ typedef enum CURLcode {
     CURLE_UNSUPPORTED_PROTOCOL = 1,
     CURLE_FAILED_INIT = 2,
     CURLE_URL_MALFORMAT = 3,
+    CURLE_NOT_BUILT_IN = 4,
     CURLE_COULDNT_RESOLVE_PROXY = 5,
     CURLE_COULDNT_RESOLVE_HOST = 6,
     CURLE_COULDNT_CONNECT = 7,
@@ -208,6 +256,7 @@ typedef enum CURLcode {
     CURLE_AGAIN = 81,
     CURLE_AUTH_ERROR = 94,
     CURLE_UNRECOVERABLE_POLL = 99,
+    CURLE_TOO_LARGE = 100,
     CURLE_FTP_COULDNT_RETR_FILE = 19,
     CURLE_UPLOAD_FAILED = 25,
     CURLE_LDAP_CANNOT_BIND = 38,
@@ -322,6 +371,8 @@ typedef enum CURLoption {
     CURLOPT_SOCKS5_AUTH = 267,
     CURLOPT_SSL_VERIFYSTATUS = 232,
     CURLOPT_HTTP09_ALLOWED = 285,
+    CURLOPT_CONNECT_ONLY = 141,
+    CURLOPT_WS_OPTIONS = 320,
     CURLOPT_POSTFIELDSIZE_LARGE = 30120,
     CURLOPT_INFILESIZE_LARGE = 30115,
     CURLOPT_MAXFILESIZE_LARGE = 30117,
@@ -429,6 +480,34 @@ typedef struct CurlVersionInfo {
      */
     const char *const *protocols;
 } CurlVersionInfo;
+
+/**
+ * WebSocket frame metadata returned by `curl_ws_recv` and `curl_ws_meta`.
+ *
+ * Equivalent to libcurl's `struct curl_ws_frame`.
+ */
+typedef struct curl_ws_frame {
+    /**
+     * Age of this struct (always zero).
+     */
+    int age;
+    /**
+     * Frame-type flags (`CURLWS_*` bits).
+     */
+    int flags;
+    /**
+     * Offset of this chunk within the frame payload (`curl_off_t`).
+     */
+    int64_t offset;
+    /**
+     * Number of payload bytes still pending after this chunk (`curl_off_t`).
+     */
+    int64_t bytesleft;
+    /**
+     * Number of bytes in the current data chunk.
+     */
+    uintptr_t len;
+} curl_ws_frame;
 
 #ifdef __cplusplus
 extern "C" {
@@ -1044,6 +1123,67 @@ enum CURLMcode curl_multi_socket_action(void *multi,
  * `multi_handle` must be a valid pointer from `curl_multi_init`.
  */
  enum CURLMcode curl_multi_assign(void *_multi_handle, long _sockfd, void *_sockp) ;
+
+/**
+ * `curl_ws_send` — send a WebSocket frame over a connect-only connection.
+ *
+ * Use after a successful `curl_easy_perform` with `CURLOPT_CONNECT_ONLY`
+ * set to 2. `flags` takes `CURLWS_*` bits describing the frame type.
+ *
+ * `fragsize` (the `CURLWS_OFFSET` streaming mode) is not supported: any
+ * non-zero value returns `CURLE_BAD_FUNCTION_ARGUMENT`.
+ *
+ * # Safety
+ *
+ * `curl` must be a valid pointer from `curl_easy_init`. `buffer` must point
+ * to at least `buflen` readable bytes (it may be null only when `buflen` is
+ * zero). `sent` may be null or must be a valid pointer to a `size_t`.
+ */
+
+enum CURLcode curl_ws_send(void *curl,
+                           const void *buffer,
+                           uintptr_t buflen,
+                           uintptr_t *sent,
+                           int64_t fragsize,
+                           unsigned int flags)
+;
+
+/**
+ * `curl_ws_recv` — receive WebSocket payload data from a connect-only
+ * connection.
+ *
+ * Use after a successful `curl_easy_perform` with `CURLOPT_CONNECT_ONLY`
+ * set to 2. On success, `*recv` holds the number of bytes written to
+ * `buffer` and `*metap` (when non-null) points to frame metadata owned by
+ * the handle, valid until the next `curl_ws_recv` call or handle cleanup.
+ * Returns `CURLE_GOT_NOTHING` when the server closed the connection.
+ *
+ * # Safety
+ *
+ * `curl` must be a valid pointer from `curl_easy_init`. `buffer` must point
+ * to at least `buflen` writable bytes (it may be null only when `buflen` is
+ * zero). `recv` must be a valid pointer to a `size_t`. `metap` may be null.
+ */
+
+enum CURLcode curl_ws_recv(void *curl,
+                           void *buffer,
+                           uintptr_t buflen,
+                           uintptr_t *recv,
+                           const struct curl_ws_frame **metap)
+;
+
+/**
+ * `curl_ws_meta` — return frame metadata for the most recent `curl_ws_recv`.
+ *
+ * Returns null if `curl` is null or no `curl_ws_recv` has completed on this
+ * handle. The returned pointer is owned by the handle and stays valid until
+ * the next `curl_ws_recv` call or handle cleanup.
+ *
+ * # Safety
+ *
+ * `curl` must be a valid pointer from `curl_easy_init`, or null.
+ */
+ const struct curl_ws_frame *curl_ws_meta(void *curl) ;
 
 #ifdef __cplusplus
 }  // extern "C"

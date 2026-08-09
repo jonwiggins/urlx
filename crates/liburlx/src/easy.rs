@@ -94,6 +94,18 @@ pub struct Easy {
     #[cfg(feature = "http2")]
     h2_pool: crate::pool::H2Pool,
     share: Option<crate::share::Share>,
+    /// `CURLOPT_CONNECT_ONLY` mode: 0 = full transfer, 2 = stop after the
+    /// WebSocket handshake and retain the connection for `ws_send`/`ws_recv`.
+    connect_only: u32,
+    /// WebSocket behavior bits (`CURLOPT_WS_OPTIONS`): see
+    /// [`crate::protocol::ws::ws_options`].
+    ws_options_bits: u32,
+    /// WebSocket connection retained by a `connect_only == 2` perform.
+    ws_conn: Option<crate::protocol::ws::WsConnection>,
+    /// Runtime kept alive for sync WebSocket I/O after a `connect_only`
+    /// perform (the per-perform runtime would drop the connection's I/O
+    /// registrations with it).
+    ws_runtime: Option<tokio::runtime::Runtime>,
     http_version: HttpVersion,
     /// Allow HTTP/0.9 responses (default: false, curl compat).
     http09_allowed: bool,
@@ -426,6 +438,12 @@ impl Clone for Easy {
             #[cfg(feature = "http2")]
             h2_pool: crate::pool::H2Pool::new(),
             share: self.share.clone(),
+            connect_only: self.connect_only,
+            ws_options_bits: self.ws_options_bits,
+            // A live WebSocket connection and its runtime are not clonable;
+            // the clone starts without one.
+            ws_conn: None,
+            ws_runtime: None,
             http_version: self.http_version,
             http09_allowed: self.http09_allowed,
             expect_100_timeout: self.expect_100_timeout,
@@ -567,6 +585,10 @@ impl Easy {
             #[cfg(feature = "http2")]
             h2_pool: crate::pool::H2Pool::new(),
             share: None,
+            connect_only: 0,
+            ws_options_bits: 0,
+            ws_conn: None,
+            ws_runtime: None,
             http_version: HttpVersion::None,
             http09_allowed: false,
             expect_100_timeout: None,
@@ -2734,6 +2756,24 @@ impl Easy {
     /// Returns errors for connection failures, TLS errors, HTTP protocol
     /// errors, timeouts, and other transfer problems.
     pub fn perform(&mut self) -> Result<Response, Error> {
+        // A connect-only WebSocket perform must keep its runtime alive:
+        // dropping it would deregister the retained connection's I/O and
+        // make ws_send/ws_recv unusable.
+        let ws_connect_only = self.connect_only == 2
+            && self.url.as_ref().is_some_and(|u| matches!(u.scheme(), "ws" | "wss"));
+        if ws_connect_only {
+            let rt = match self.ws_runtime.take() {
+                Some(rt) => rt,
+                None => tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| Error::Http(format!("failed to create runtime: {e}")))?,
+            };
+            let result = rt.block_on(self.perform_async());
+            self.ws_runtime = Some(rt);
+            return result;
+        }
+
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -2744,6 +2784,85 @@ impl Easy {
         // For multi-URL async usage, the caller is responsible for calling ftp_quit().
         rt.block_on(self.ftp_quit());
         result
+    }
+
+    /// Set the connect-only mode (libcurl `CURLOPT_CONNECT_ONLY`).
+    ///
+    /// Mode 2 performs the WebSocket upgrade handshake and retains the
+    /// connection on this handle for [`ws_send`](Self::ws_send) /
+    /// [`ws_recv`](Self::ws_recv) instead of running a full transfer. Mode 1
+    /// (raw TCP/TLS connect-only) is not supported and causes
+    /// [`perform`](Self::perform) to fail.
+    pub const fn set_connect_only(&mut self, mode: u32) {
+        self.connect_only = mode;
+    }
+
+    /// Set WebSocket behavior options (libcurl `CURLOPT_WS_OPTIONS` bits;
+    /// see [`crate::protocol::ws::ws_options`]).
+    pub const fn set_ws_options(&mut self, bits: u32) {
+        self.ws_options_bits = bits;
+    }
+
+    /// Access the WebSocket connection retained by a connect-only perform.
+    ///
+    /// Async callers drive the connection directly with its async methods;
+    /// sync callers can use [`ws_send`](Self::ws_send) /
+    /// [`ws_recv`](Self::ws_recv) instead.
+    pub const fn ws_connection(&mut self) -> Option<&mut crate::protocol::ws::WsConnection> {
+        self.ws_conn.as_mut()
+    }
+
+    /// Take ownership of the WebSocket connection retained by a
+    /// connect-only perform, leaving the handle without one.
+    pub const fn take_ws_connection(&mut self) -> Option<crate::protocol::ws::WsConnection> {
+        self.ws_conn.take()
+    }
+
+    /// Send a WebSocket frame on the retained connection (sync wrapper;
+    /// libcurl `curl_ws_send` semantics — see
+    /// [`WsConnection::send`](crate::protocol::ws::WsConnection::send)).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no connection is retained (perform with
+    /// [`set_connect_only`](Self::set_connect_only) mode 2 first) or the
+    /// send fails.
+    pub fn ws_send(&mut self, payload: &[u8], flags: u32) -> Result<usize, Error> {
+        let (Some(rt), Some(conn)) = (self.ws_runtime.as_ref(), self.ws_conn.as_mut()) else {
+            // curl_ws_send without a connection fails with CURLE_SEND_ERROR.
+            return Err(Error::Transfer {
+                code: 55, // CURLE_SEND_ERROR
+                message: "No associated WebSocket connection".to_string(),
+            });
+        };
+        rt.block_on(conn.send(payload, flags))
+    }
+
+    /// Receive WebSocket payload data on the retained connection (sync
+    /// wrapper; libcurl `curl_ws_recv` semantics — see
+    /// [`WsConnection::recv`](crate::protocol::ws::WsConnection::recv)).
+    /// Returns `Ok(None)` when the server closed the connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no connection is retained (perform with
+    /// [`set_connect_only`](Self::set_connect_only) mode 2 first) or the
+    /// receive fails.
+    pub fn ws_recv(
+        &mut self,
+        buf: &mut [u8],
+    ) -> Result<Option<(usize, crate::protocol::ws::WsFrameMeta)>, Error> {
+        let (Some(rt), Some(conn)) = (self.ws_runtime.as_ref(), self.ws_conn.as_mut()) else {
+            return Err(ws_not_connected());
+        };
+        rt.block_on(conn.recv(buf))
+    }
+
+    /// Metadata of the most recent [`ws_recv`](Self::ws_recv) chunk
+    /// (libcurl `curl_ws_meta`).
+    #[must_use]
+    pub fn ws_meta(&self) -> Option<&crate::protocol::ws::WsFrameMeta> {
+        self.ws_conn.as_ref().map(crate::protocol::ws::WsConnection::last_meta)
     }
 
     /// Perform the transfer and return the response (async).
@@ -2783,6 +2902,21 @@ impl Easy {
                     allowed.join(",")
                 )));
             }
+        }
+
+        // A new perform supersedes any previously retained WebSocket
+        // connection; drop it so ws_send/ws_recv cannot use a stale one.
+        self.ws_conn = None;
+
+        // CONNECT_ONLY is only implemented for WebSocket handshakes (mode 2).
+        if self.connect_only != 0
+            && (self.connect_only != 2 || !matches!(url.scheme(), "ws" | "wss"))
+        {
+            return Err(Error::Transfer {
+                code: 4, // CURLE_NOT_BUILT_IN
+                message: "CONNECT_ONLY is only supported for WebSocket upgrades (mode 2)"
+                    .to_string(),
+            });
         }
 
         // Build effective headers, body, and method considering multipart and range
@@ -3165,6 +3299,9 @@ impl Easy {
             &self.rtsp_headers,
             self.netrc_content.as_deref(),
             self.fail_on_error,
+            self.connect_only == 2,
+            self.ws_options_bits,
+            &mut self.ws_conn,
         );
 
         // Apply total transfer timeout if set.
@@ -3238,6 +3375,17 @@ impl Easy {
 impl Default for Easy {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Error returned by WebSocket operations when no connection is retained.
+///
+/// Matches libcurl, where `curl_ws_send`/`curl_ws_recv` without a
+/// connect-only WebSocket connection fail with `CURLE_UNSUPPORTED_PROTOCOL`.
+fn ws_not_connected() -> Error {
+    Error::Transfer {
+        code: 1, // CURLE_UNSUPPORTED_PROTOCOL
+        message: "WebSocket not connected: perform with connect-only mode 2 first".to_string(),
     }
 }
 
@@ -3333,7 +3481,42 @@ async fn perform_transfer(
     rtsp_headers: &[(String, String)],
     netrc_content: Option<&str>,
     fail_on_error: bool,
+    ws_connect_only: bool,
+    ws_options_bits: u32,
+    ws_conn_out: &mut Option<crate::protocol::ws::WsConnection>,
 ) -> Result<Response, Error> {
+    // WebSocket connect-only mode: perform the upgrade handshake, retain the
+    // connection for ws_send/ws_recv, and skip the transfer pipeline.
+    if ws_connect_only && matches!(url.scheme(), "ws" | "wss") {
+        let effective_proxy = proxy.filter(|_| !should_bypass_proxy(url, noproxy));
+        let ws_options = crate::protocol::ws::WsConnectOptions {
+            proxy: effective_proxy,
+            proxy_auth: proxy_credentials.map(|c| (c.username.as_str(), c.password.as_str())),
+            connect_timeout,
+        };
+        let handshake = crate::protocol::ws::connect_stream(url, headers, tls_config, &ws_options);
+        let (response, stream) = match deadline {
+            Some(d) => tokio::time::timeout_at(d, handshake)
+                .await
+                .map_err(|_| Error::Timeout(Duration::from_secs(0)))??,
+            None => handshake.await?,
+        };
+        // Record the handshake response so CURLINFO_RESPONSE_CODE reflects
+        // it even when the upgrade is refused.
+        if let Ok(mut guard) = last_resp_store.lock() {
+            *guard = Some(response.clone());
+        }
+        if response.status() != 101 {
+            return Err(Error::Transfer {
+                code: 22, // CURLE_HTTP_RETURNED_ERROR
+                message: format!("Refused WebSocket upgrade: {}", response.status()),
+            });
+        }
+        *ws_conn_out =
+            Some(crate::protocol::ws::WsConnection::new(stream, response.clone(), ws_options_bits));
+        return Ok(response);
+    }
+
     let transfer_start = Instant::now();
     let original_url = url.clone();
     let mut current_url = url.clone();
@@ -4363,14 +4546,12 @@ async fn perform_transfer(
                         }
                     }
                     #[cfg(not(feature = "gss-api"))]
-                    Some(AuthMethod::Negotiate) => {
-                        if verbose {
-                            #[allow(clippy::print_stderr)]
-                            {
-                                eprintln!(
-                                    "* Negotiate auth requested but GSS-API support not compiled in"
-                                );
-                            }
+                    Some(AuthMethod::Negotiate) if verbose => {
+                        #[allow(clippy::print_stderr)]
+                        {
+                            eprintln!(
+                                "* Negotiate auth requested but GSS-API support not compiled in"
+                            );
                         }
                     }
                     Some(AuthMethod::Basic) => {
@@ -6323,7 +6504,23 @@ async fn do_single_request(
             return crate::protocol::ldap::search(url, tls_config, use_tls, ldap_use_ssl).await;
         }
         "ws" | "wss" => {
-            return crate::protocol::ws::connect(url, headers, tls_config).await;
+            // Full curl-style WebSocket transfer: upgrade, send any upload
+            // data as BINARY frames, stream received payloads as the body.
+            let upload = if method == "PUT" || method == "POST" { body } else { None };
+            let ws_options = crate::protocol::ws::WsConnectOptions {
+                proxy,
+                proxy_auth: proxy_credentials.map(|c| (c.username.as_str(), c.password.as_str())),
+                connect_timeout,
+            };
+            return crate::protocol::ws::transfer(
+                url,
+                headers,
+                tls_config,
+                upload,
+                deadline,
+                &ws_options,
+            )
+            .await;
         }
         "telnet" => {
             return crate::protocol::telnet::transfer(url, body, deadline).await;
