@@ -18,7 +18,7 @@ crate-type = ["cdylib", "staticlib"]
 workspace = true
 
 [dependencies]
-liburlx = { path = "../liburlx", version = "0.3.0" }
+liburlx = { path = "../liburlx", version = "0.3.1" }
 
 [build-dependencies]
 cbindgen = "0.28"

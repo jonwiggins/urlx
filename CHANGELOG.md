@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-08-10
+
+### Fixed
+
+- **CLI** — `-T .` (stdin upload, curl's non-blocking form) was accidentally dropped from the v0.3.0 squash merge; restored (curl WebSocket test 2300)
+
+### Changed
+
+- **hickory-resolver 0.25 → 0.26** and dependency updates (quinn-proto, rand, rustls-webpki) clearing all current cargo-deny advisories
+
 ## [0.3.0] - 2026-08-09
 
 ### Added
@@ -134,6 +144,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   - Property-based tests (proptest) for parsers
   - 4 fuzz harnesses (URL, HTTP, cookie, HSTS)
 
+[0.3.1]: https://github.com/jonwiggins/urlx/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/jonwiggins/urlx/compare/v0.2.0...v0.3.0
 [0.2.2]: https://github.com/jonwiggins/urlx/compare/v0.2.0...v0.3.0
 [0.2.1]: https://github.com/jonwiggins/urlx/compare/v0.2.0...v0.3.0
