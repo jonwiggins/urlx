@@ -77,24 +77,39 @@ impl HickoryResolver {
     pub fn from_system() -> Result<Self, Error> {
         let resolver = hickory_resolver::TokioResolver::builder_tokio()
             .map_err(|e| Error::Http(format!("failed to create DNS resolver: {e}")))?
-            .build();
+            .build()
+            .map_err(|e| Error::Http(format!("failed to create DNS resolver: {e}")))?;
         Ok(Self { resolver })
     }
 
     /// Create a resolver using custom DNS server addresses.
-    #[must_use]
-    pub fn from_servers(servers: &[SocketAddr]) -> Self {
-        use hickory_resolver::config::{NameServerConfig, ResolverConfig};
-        use hickory_resolver::proto::xfer::Protocol;
-        let mut config = ResolverConfig::new();
-        for addr in servers {
-            config.add_name_server(NameServerConfig::new(*addr, Protocol::Udp));
-            config.add_name_server(NameServerConfig::new(*addr, Protocol::Tcp));
-        }
-        let provider = hickory_resolver::name_server::TokioConnectionProvider::default();
-        let resolver =
-            hickory_resolver::TokioResolver::builder_with_config(config, provider).build();
-        Self { resolver }
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the resolver cannot be constructed.
+    pub fn from_servers(servers: &[SocketAddr]) -> Result<Self, Error> {
+        use hickory_resolver::config::{ConnectionConfig, NameServerConfig, ResolverConfig};
+        use hickory_resolver::net::runtime::TokioRuntimeProvider;
+        let name_servers = servers
+            .iter()
+            .map(|addr| {
+                let mut udp = ConnectionConfig::udp();
+                udp.port = addr.port();
+                let mut tcp = ConnectionConfig::tcp();
+                tcp.port = addr.port();
+                let mut ns = NameServerConfig::udp_and_tcp(addr.ip());
+                ns.connections = vec![udp, tcp];
+                ns
+            })
+            .collect();
+        let config = ResolverConfig::from_parts(None, Vec::new(), name_servers);
+        let resolver = hickory_resolver::TokioResolver::builder_with_config(
+            config,
+            TokioRuntimeProvider::default(),
+        )
+        .build()
+        .map_err(|e| Error::Http(format!("failed to create DNS resolver: {e}")))?;
+        Ok(Self { resolver })
     }
 
     /// Create a resolver that performs DNS-over-HTTPS queries.
@@ -109,14 +124,20 @@ impl HickoryResolver {
     /// so this parameter is stored but not enforced. The `DoH` connection
     /// always uses TLS with certificate verification.
     // TODO: wire insecure to hickory TLS config when the crate supports it
-    #[must_use]
-    pub fn from_doh(_doh_url: &str, _insecure: bool) -> Self {
-        use hickory_resolver::config::ResolverConfig;
-        let config = ResolverConfig::cloudflare_https();
-        let provider = hickory_resolver::name_server::TokioConnectionProvider::default();
-        let resolver =
-            hickory_resolver::TokioResolver::builder_with_config(config, provider).build();
-        Self { resolver }
+    /// # Errors
+    ///
+    /// Returns an error if the resolver cannot be constructed.
+    pub fn from_doh(_doh_url: &str, _insecure: bool) -> Result<Self, Error> {
+        use hickory_resolver::config::{ResolverConfig, CLOUDFLARE};
+        use hickory_resolver::net::runtime::TokioRuntimeProvider;
+        let config = ResolverConfig::https(&CLOUDFLARE);
+        let resolver = hickory_resolver::TokioResolver::builder_with_config(
+            config,
+            TokioRuntimeProvider::default(),
+        )
+        .build()
+        .map_err(|e| Error::Http(format!("failed to create DNS resolver: {e}")))?;
+        Ok(Self { resolver })
     }
 
     /// Resolve a hostname to socket addresses.
@@ -436,7 +457,7 @@ mod tests {
     fn hickory_resolver_from_servers() {
         use std::net::Ipv4Addr;
         let servers = vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53)];
-        let resolver = HickoryResolver::from_servers(&servers);
+        let resolver = HickoryResolver::from_servers(&servers).unwrap();
         let dns = DnsResolver::Hickory(Box::new(resolver));
         let debug = format!("{dns:?}");
         assert!(debug.contains("Hickory"));
@@ -445,7 +466,8 @@ mod tests {
     #[cfg(feature = "hickory-dns")]
     #[test]
     fn hickory_resolver_from_doh() {
-        let resolver = HickoryResolver::from_doh("https://cloudflare-dns.com/dns-query", false);
+        let resolver =
+            HickoryResolver::from_doh("https://cloudflare-dns.com/dns-query", false).unwrap();
         let dns = DnsResolver::Hickory(Box::new(resolver));
         let debug = format!("{dns:?}");
         assert!(debug.contains("Hickory"));
@@ -455,7 +477,8 @@ mod tests {
     #[test]
     fn hickory_resolver_from_doh_insecure() {
         // Verify the insecure parameter is accepted without panic
-        let resolver = HickoryResolver::from_doh("https://cloudflare-dns.com/dns-query", true);
+        let resolver =
+            HickoryResolver::from_doh("https://cloudflare-dns.com/dns-query", true).unwrap();
         let dns = DnsResolver::Hickory(Box::new(resolver));
         let debug = format!("{dns:?}");
         assert!(debug.contains("Hickory"));

@@ -70,7 +70,7 @@ russh-sftp = { version = "2.1", optional = true }
 flate2 = { version = "1", optional = true }
 brotli = { version = "7", optional = true }
 zstd = { version = "0.13", optional = true, default-features = false }
-hickory-resolver = { version = "0.25", optional = true, default-features = false, features = ["tokio", "system-config", "https-ring", "tls-ring"] }
+hickory-resolver = { version = "0.26", optional = true, default-features = false, features = ["tokio", "system-config", "https-ring", "tls-ring"] }
 openssl = { version = "0.10", optional = true }
 openssl-sys = { version = "0.9", optional = true }
 tokio-openssl = { version = "0.6", optional = true }

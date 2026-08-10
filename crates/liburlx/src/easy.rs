@@ -2725,25 +2725,27 @@ impl Easy {
     ///
     /// Uses hickory-dns when available and custom DNS servers or `DoH` URL
     /// is configured. Falls back to the system resolver otherwise.
-    #[allow(clippy::unused_self, clippy::missing_const_for_fn)]
-    fn build_dns_resolver(&self) -> crate::dns::DnsResolver {
+    // unnecessary_wraps: the Result is load-bearing when the hickory-dns
+    // feature enables fallible resolver construction.
+    #[allow(clippy::unused_self, clippy::missing_const_for_fn, clippy::unnecessary_wraps)]
+    fn build_dns_resolver(&self) -> Result<crate::dns::DnsResolver, Error> {
         #[cfg(feature = "hickory-dns")]
         {
             // If DoH URL is configured, use DoH resolver
             if let Some(ref doh_url) = self.doh_url {
-                return crate::dns::DnsResolver::Hickory(Box::new(
-                    crate::dns::HickoryResolver::from_doh(doh_url, self.doh_insecure),
-                ));
+                return Ok(crate::dns::DnsResolver::Hickory(Box::new(
+                    crate::dns::HickoryResolver::from_doh(doh_url, self.doh_insecure)?,
+                )));
             }
             // If custom DNS servers are configured, use hickory with those servers
             if let Some(ref servers) = self.dns_servers {
-                return crate::dns::DnsResolver::Hickory(Box::new(
-                    crate::dns::HickoryResolver::from_servers(servers),
-                ));
+                return Ok(crate::dns::DnsResolver::Hickory(Box::new(
+                    crate::dns::HickoryResolver::from_servers(servers)?,
+                )));
             }
         }
         // Default: system resolver
-        crate::dns::DnsResolver::System
+        Ok(crate::dns::DnsResolver::System)
     }
 
     /// Perform the transfer and return the response (blocking).
@@ -3193,7 +3195,7 @@ impl Easy {
             }
         }
 
-        let dns_resolver = self.build_dns_resolver();
+        let dns_resolver = self.build_dns_resolver()?;
 
         #[cfg(feature = "ssh")]
         let ssh_host_key_policy = build_ssh_host_key_policy(
