@@ -589,12 +589,12 @@ pub fn format_write_out_with_context(
                 let after_scheme = &base[idx + 3..];
                 if let Some(path_start) = after_scheme.find('/') {
                     let authority = &base[..idx + 3 + path_start];
-                    format!("{authority}{}", &redirect_url_raw)
+                    format!("{authority}{redirect_url_raw}")
                 } else {
-                    format!("{base}{}", &redirect_url_raw)
+                    format!("{base}{redirect_url_raw}")
                 }
             } else {
-                format!("{base}{}", &redirect_url_raw)
+                format!("{base}{redirect_url_raw}")
             }
         } else {
             // Relative path — replace last path segment
