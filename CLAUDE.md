@@ -14,7 +14,7 @@ The project is MIT-licensed. The name "urlx" stands for "URL transfer."
 
 ## Current Status
 
-**Version:** v0.3.0 published (crates.io + GitHub Releases + Homebrew)
+**Version:** v0.3.1 published (GitHub Releases + Homebrew; crates.io publish blocked on missing `CARGO_REGISTRY_TOKEN` repo secret)
 **curl test suite:** 1,304 pass / 0 fail (tests 1-1400, 100% pass rate of evaluated tests), plus WebSocket test 2300
 **Rust test count:** 2,891
 **Blockers:** None — infrastructure is live
