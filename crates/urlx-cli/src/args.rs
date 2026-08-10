@@ -1368,8 +1368,10 @@ fn parse_args_options_with_depth(args: &[String], config_depth: u32) -> Result<C
                     eprintln!("Warning: (-T, --upload-file) and POST (-d, --data).");
                     return Err(2);
                 }
-                if val == "-" {
-                    // Read from stdin
+                if val == "-" || val == "." {
+                    // Read from stdin: "-" is curl's blocking stdin, "." its
+                    // non-blocking variant (used by WebSocket test 2300).
+                    // Both are read up-front here.
                     use std::io::Read;
                     let mut data = Vec::new();
                     if let Err(e) = std::io::stdin().read_to_end(&mut data) {
